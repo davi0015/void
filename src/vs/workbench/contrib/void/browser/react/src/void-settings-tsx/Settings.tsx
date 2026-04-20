@@ -3,12 +3,12 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react'; // Added useRef import just in case it was missed, though likely already present
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
 import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName } from '../../../../common/voidSettingsTypes.js'
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js'
 import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js'
 import { useAccessor, useIsDark, useIsOptedOut, useRefreshModelListener, useRefreshModelState, useSettingsState } from '../util/services.js'
-import { X, RefreshCw, Loader2, Check, Asterisk, Plus } from 'lucide-react'
+import { X, RefreshCw, Loader2, Check, Asterisk, Plus, GripVertical } from 'lucide-react'
 import { URI } from '../../../../../../../base/common/uri.js'
 import { ModelDropdown } from './ModelDropdown.js'
 import { ChatMarkdownRender } from '../markdown/ChatMarkdownRender.js'
@@ -390,6 +390,56 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 	const [modelName, setModelName] = useState<string>('');
 	const [errorString, setErrorString] = useState('');
 
+	// Drag-and-drop state for reordering CUSTOM models within a provider.
+	// Default/autodetected models aren't draggable because their order is regenerated
+	// on provider refresh (see _modelsWithSwappedInNewModels).
+	// The list is rendered in "preview order": while dragging, the source row physically
+	// moves to its prospective drop position in the DOM (by mutating modelDump), so there's
+	// no placeholder/collapse animation and nothing visually changes on release.
+	const [dragSource, setDragSource] = useState<{ providerName: ProviderName; modelName: string } | null>(null);
+	const [dropTarget, setDropTarget] = useState<{ key: string; position: 'before' | 'after' } | null>(null);
+	// After a drop, hold drag state until the reordered settingsState arrives, then clear
+	// synchronously (before paint) so we never show an intermediate frame.
+	const awaitingDropCommitRef = useRef(false);
+	useLayoutEffect(() => {
+		if (awaitingDropCommitRef.current) {
+			awaitingDropCommitRef.current = false;
+			setDragSource(null);
+			setDropTarget(null);
+		}
+	}, [settingsState]);
+
+	// Ref to the outer list container — the positioning context for the ghost.
+	const listContainerRef = useRef<HTMLDivElement | null>(null);
+	// Vertical-only drag ghost. Rendered via React (so it inherits theme styles), but
+	// positioned imperatively so `ondrag` doesn't trigger a re-render on every event.
+	const ghostElRef = useRef<HTMLDivElement | null>(null);
+	const ghostMetricsRef = useRef<{
+		offsetY: number; left: number; width: number; height: number;
+		initialTop: number; minTop: number; maxTop: number; containerTop: number;
+		// Viewport rect of each custom row captured at dragStart — used as a stable
+		// threshold for the swap trigger (so thresholds don't move when the preview
+		// reorder shifts rows around mid-drag).
+		originalRowRects: Map<string, { top: number; bottom: number }>;
+	}>({
+		offsetY: 0, left: 0, width: 0, height: 0,
+		initialTop: 0, minTop: 0, maxTop: 0, containerTop: 0,
+		originalRowRects: new Map(),
+	});
+	// When dragSource becomes set, apply the captured position to the just-mounted ghost
+	// before paint so the first frame shows it at the correct spot. Positions are stored
+	// in container-relative coords (see onDragStart).
+	useLayoutEffect(() => {
+		if (dragSource && ghostElRef.current) {
+			const m = ghostMetricsRef.current;
+			const el = ghostElRef.current;
+			el.style.left = `${m.left}px`;
+			el.style.top = `${m.initialTop}px`;
+			el.style.width = `${m.width}px`;
+			el.style.height = `${m.height}px`;
+		}
+	}, [dragSource]);
+
 	// a dump of all the enabled providers' models
 	const modelDump: (VoidStatefulModelInfo & { providerName: ProviderName, providerEnabled: boolean })[] = []
 
@@ -406,6 +456,20 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 	modelDump.sort((a, b) => {
 		return Number(b.providerEnabled) - Number(a.providerEnabled)
 	})
+
+	// Preview reorder: while dragging with a chosen drop target, move the source row
+	// to its prospective position in `modelDump` so the list previews the final order
+	// in real time. On release nothing visually changes because it's already there.
+	if (dragSource && dropTarget) {
+		const srcIdx = modelDump.findIndex(m => m.providerName === dragSource.providerName && m.modelName === dragSource.modelName)
+		const tgtIdx = modelDump.findIndex(m => `${m.providerName}::${m.modelName}` === dropTarget.key)
+		if (srcIdx !== -1 && tgtIdx !== -1 && srcIdx !== tgtIdx) {
+			const [src] = modelDump.splice(srcIdx, 1)
+			const newTgtIdx = modelDump.findIndex(m => `${m.providerName}::${m.modelName}` === dropTarget.key)
+			const insertAt = dropTarget.position === 'before' ? newTgtIdx : newTgtIdx + 1
+			modelDump.splice(insertAt, 0, src)
+		}
+	}
 
 	// Add model handler
 	const handleAddModel = () => {
@@ -435,7 +499,25 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 		setErrorString('');
 	};
 
-	return <div className=''>
+	// Container-level drop handler: catches drops that aren't directly over a specific
+	// row target (the current dropTarget state is the source of truth for where to land).
+	const onContainerDragOver = dragSource ? (e: React.DragEvent) => {
+		e.preventDefault()
+		e.dataTransfer.dropEffect = 'move'
+	} : undefined
+	const onContainerDrop = dragSource ? (e: React.DragEvent) => {
+		e.preventDefault()
+		if (dragSource && dropTarget) {
+			const targetModelName = dropTarget.key.split('::').slice(1).join('::')
+			settingsStateService.reorderCustomModel(dragSource.providerName, dragSource.modelName, targetModelName, dropTarget.position)
+			awaitingDropCommitRef.current = true
+		} else {
+			setDragSource(null)
+			setDropTarget(null)
+		}
+	} : undefined
+
+	return <div ref={listContainerRef} className='relative' onDragOver={onContainerDragOver} onDrop={onContainerDrop}>
 		{modelDump.map((m, i) => {
 			const { isHidden, type, modelName, providerName, providerEnabled } = m
 
@@ -461,14 +543,141 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 
 			const hasOverrides = !!settingsState.overridesOfModel?.[providerName]?.[modelName]
 
+			const isCustom = type === 'custom'
+			const rowKey = `${providerName}::${modelName}`
+			const isValidDropTarget =
+				!!dragSource &&
+				isCustom &&
+				dragSource.providerName === providerName &&
+				dragSource.modelName !== modelName
+			const isBeingDragged = !!dragSource && dragSource.providerName === providerName && dragSource.modelName === modelName
+
 			return <div key={`${modelName}${providerName}`}
+				data-row-provider={isCustom ? providerName : undefined}
+				draggable={isCustom}
+				onDragStart={isCustom ? (e) => {
+					e.dataTransfer.effectAllowed = 'move'
+					e.dataTransfer.setData('text/plain', modelName)
+
+					// Suppress the native drag ghost — we render our own vertical-only ghost.
+					const invisible = document.createElement('div')
+					invisible.style.cssText = 'width:1px;height:1px;position:fixed;top:-1000px;opacity:0;pointer-events:none;'
+					document.body.appendChild(invisible)
+					e.dataTransfer.setDragImage(invisible, 0, 0)
+					setTimeout(() => { invisible.remove() }, 0)
+
+					const rect = e.currentTarget.getBoundingClientRect()
+
+					// The ghost is `position: absolute` inside listContainerRef (which is
+					// `position: relative`), so all coords we store/apply must be
+					// container-relative — not viewport-relative.
+					const container = listContainerRef.current
+					const containerRect = container?.getBoundingClientRect()
+					const cLeft = containerRect?.left ?? 0
+					const cTop = containerRect?.top ?? 0
+
+					// Clamp vertical travel to the first/last custom row of THIS provider.
+					// Also capture each custom row's original viewport rect (stable thresholds
+					// independent of preview reorders), keyed by model name.
+					let minTop = rect.top - cTop
+					let maxTop = rect.top - cTop
+					const originalRowRects = new Map<string, { top: number; bottom: number }>()
+					if (container) {
+						const rows = Array.from(container.querySelectorAll<HTMLElement>(`[data-row-provider="${providerName}"]`))
+						if (rows.length > 0) {
+							const firstR = rows[0].getBoundingClientRect()
+							const lastR = rows[rows.length - 1].getBoundingClientRect()
+							minTop = firstR.top - cTop
+							maxTop = (lastR.bottom - cTop) - rect.height
+						}
+						for (const row of rows) {
+							const mn = row.querySelector<HTMLElement>('[data-row-model-name]')?.dataset.rowModelName
+							if (!mn) continue
+							const r = row.getBoundingClientRect()
+							originalRowRects.set(mn, { top: r.top, bottom: r.bottom })
+						}
+					}
+
+					ghostMetricsRef.current = {
+						offsetY: e.clientY - rect.top,
+						left: rect.left - cLeft,
+						width: rect.width,
+						height: rect.height,
+						initialTop: rect.top - cTop,
+						minTop,
+						maxTop,
+						containerTop: cTop,
+						originalRowRects,
+					}
+
+					setDragSource({ providerName, modelName })
+				} : undefined}
+				onDrag={isCustom ? (e) => {
+					// clientY is 0 on the terminal dragend event — ignore that.
+					const el = ghostElRef.current
+					const mm = ghostMetricsRef.current
+					if (el && e.clientY > 0) {
+						const desired = (e.clientY - mm.offsetY) - mm.containerTop
+						const clamped = Math.max(mm.minTop, Math.min(mm.maxTop, desired))
+						el.style.top = `${clamped}px`
+						el.style.left = `${mm.left}px` // lock X
+					}
+				} : undefined}
+				onDragEnd={() => {
+					// If a drop is being committed, leave drag state alone — the layout effect
+					// on settingsState clears it on the same render that shows the new order.
+					if (awaitingDropCommitRef.current) return
+					setDragSource(null); setDropTarget(null);
+				}}
+				onDragOver={isValidDropTarget ? (e) => {
+					e.preventDefault()
+					e.dataTransfer.dropEffect = 'move'
+					// Ghost center vs target's ORIGINAL rect → stable threshold so "undo swap"
+					// and "do swap" trigger at the same visual point (entry edge).
+					const mm = ghostMetricsRef.current
+					const ghostCenterVp = (e.clientY - mm.offsetY) + mm.height / 2
+					const origRect = mm.originalRowRects.get(modelName) ?? (() => {
+						const r = e.currentTarget.getBoundingClientRect()
+						return { top: r.top, bottom: r.bottom }
+					})()
+					// Direction from ORIGINAL order (modelDump is unmutated by preview reorder here).
+					const srcIdxOrig = modelDump.findIndex(mm => mm.providerName === providerName && mm.modelName === dragSource!.modelName)
+					const tgtIdxOrig = modelDump.findIndex(mm => mm.providerName === providerName && mm.modelName === modelName)
+					const isTargetBelow = tgtIdxOrig > srcIdxOrig
+					const threshold = isTargetBelow ? origRect.top : origRect.bottom
+					const position: 'before' | 'after' = ghostCenterVp < threshold ? 'before' : 'after'
+					if (dropTarget?.key !== rowKey || dropTarget?.position !== position) {
+						setDropTarget({ key: rowKey, position })
+					}
+				} : undefined}
+				onDrop={isValidDropTarget ? (e) => {
+					e.preventDefault()
+					if (dragSource && dropTarget?.key === rowKey) {
+						settingsStateService.reorderCustomModel(providerName, dragSource.modelName, modelName, dropTarget.position)
+						awaitingDropCommitRef.current = true
+					} else {
+						setDragSource(null)
+						setDropTarget(null)
+					}
+				} : undefined}
 				className={`flex items-center justify-between gap-4 hover:bg-black/10 dark:hover:bg-gray-300/10 py-1 px-3 rounded-sm overflow-hidden cursor-default truncate group
+					${isCustom ? 'select-none' : ''}
+					${isBeingDragged ? 'opacity-60' : ''}
 				`}
 			>
 				{/* left part is width:full */}
 				<div className={`flex flex-grow items-center gap-4`}>
 					<span className='w-full max-w-32'>{isNewProviderName ? providerTitle : ''}</span>
-					<span className='w-fit max-w-[400px] truncate'>{modelName}</span>
+					{/* Drag handle (visual cue only; whole row is draggable) */}
+					<span className='w-4 flex items-center justify-center text-void-fg-3'>
+						{isCustom && !dragSource ? (
+							<GripVertical
+								size={12}
+								className='opacity-0 group-hover:opacity-100 cursor-grab active:cursor-grabbing'
+							/>
+						) : null}
+					</span>
+					<span className='w-fit max-w-[400px] truncate' data-row-model-name={isCustom ? modelName : undefined}>{modelName}</span>
 				</div>
 
 				{/* right part is anything that fits */}
@@ -520,6 +729,27 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 				</div>
 			</div>
 		})}
+
+		{/* Vertical-only drag ghost. Mirrors the row's layout + theme classes so it
+		    looks like the dragged row. Position is set in a useLayoutEffect on
+		    dragSource change, and updated imperatively via ghostElRef in `onDrag`. */}
+		{dragSource && (() => {
+			const src = modelDump.find(x => x.providerName === dragSource.providerName && x.modelName === dragSource.modelName)
+			if (!src) return null
+			return (
+				<div
+					ref={ghostElRef}
+					className='absolute flex items-center gap-4 px-3 py-1 rounded-sm bg-void-bg-1 border border-void-border-1 shadow-lg pointer-events-none overflow-hidden truncate opacity-80'
+				>
+					<span className='w-full max-w-32'>
+						{displayInfoOfProviderName(dragSource.providerName).title}
+					</span>
+					{/* Empty slot matching the row's grip-handle column so the model name lines up. */}
+					<span className='w-4' />
+					<span className='w-fit max-w-[400px] truncate'>{dragSource.modelName}</span>
+				</div>
+			)
+		})()}
 
 		{/* Add Model Section */}
 		{showCheckmark ? (
