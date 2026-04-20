@@ -333,11 +333,18 @@ const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, c
 		const displayPct = rawPct < 0.01 ? '<0.01%' : rawPct < 1 ? `${rawPct.toFixed(2)}%` : `${rawPct.toFixed(1)}%`
 		// Use plain text (no HTML) because the renderer enforces Trusted Types and
 		// react-tooltip's html mode would set innerHTML directly, which is blocked.
+		// `cachedInputTokens` is the portion of `inputTokens` served from the provider's
+		// prompt cache (OpenAI `prompt_tokens_details.cached_tokens`, mirrored by OpenRouter,
+		// DeepSeek, etc.). Only show the line when the server actually reported a value —
+		// an undefined field means the server doesn't expose it, which is different from 0.
+		const inputLine = usage.cachedInputTokens !== undefined
+			? `Input: ${formatTokenCount(usage.inputTokens)} (${formatTokenCount(usage.cachedInputTokens)} cached)`
+			: `Input: ${formatTokenCount(usage.inputTokens)}`
 		tooltipContent = [
 			`Context window usage`,
 			`${formatTokenCount(total)} / ${formatTokenCount(contextWindow)} (${displayPct})`,
 			``,
-			`Input: ${formatTokenCount(usage.inputTokens)}`,
+			inputLine,
 			`Output: ${formatTokenCount(usage.outputTokens)}`,
 			usage.reasoningTokens !== undefined ? `Reasoning: ${formatTokenCount(usage.reasoningTokens)}` : null,
 			`Total: ${formatTokenCount(total)}`,

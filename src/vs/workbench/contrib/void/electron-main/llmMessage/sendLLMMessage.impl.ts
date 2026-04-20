@@ -305,6 +305,13 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		model: modelName,
 		messages: messages as any,
 		stream: true,
+		// Ask the server to emit a final usage chunk. Per the OpenAI spec this adds a
+		// trailing chunk with `choices: []` and a populated `usage`. Most OAI-compatible
+		// servers (DeepSeek, OpenRouter, Groq, vLLM, LM Studio, LiteLLM, etc.) honor this;
+		// ones that don't just ignore the field and we get no usage, same as before.
+		// Declared before the spreads so `additionalOpenAIPayload` can override if a
+		// particular model/provider needs a different setting.
+		stream_options: { include_usage: true },
 		...nativeToolsObj,
 		...additionalOpenAIPayload
 		// max_completion_tokens: maxTokens,
@@ -332,6 +339,10 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	let toolName = ''
 	let toolId = ''
 	let toolParamsStr = ''
+
+	// Usage only arrives in the final chunk (and only if the server honored
+	// stream_options.include_usage). `chunk.usage` is typed as `| null` there.
+	let latestUsage: LLMUsage | undefined = undefined
 
 	openai.chat.completions
 		.create(options)
@@ -362,11 +373,26 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 					fullReasoningSoFar += newReasoning
 				}
 
+				// usage — present only on the final chunk (which typically has empty choices).
+				// `prompt_tokens_details.cached_tokens` is OpenAI's implicit prompt-cache hit
+				// count; non-OpenAI servers that mimic the schema (DeepSeek, OpenRouter-for-
+				// OpenAI-routed models, some vLLM deployments) populate it too.
+				if (chunk.usage) {
+					latestUsage = {
+						inputTokens: chunk.usage.prompt_tokens,
+						outputTokens: chunk.usage.completion_tokens,
+						totalTokens: chunk.usage.total_tokens,
+						reasoningTokens: chunk.usage.completion_tokens_details?.reasoning_tokens,
+						cachedInputTokens: chunk.usage.prompt_tokens_details?.cached_tokens,
+					}
+				}
+
 				// call onText
 				onText({
 					fullText: fullTextSoFar,
 					fullReasoning: fullReasoningSoFar,
 					toolCall: !toolName ? undefined : { name: toolName, rawParams: {}, isDone: false, doneParams: [], id: toolId },
+					usage: latestUsage,
 				})
 
 			}
@@ -377,7 +403,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 			else {
 				const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
 				const toolCallObj = toolCall ? { toolCall } : {}
-				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, ...toolCallObj });
+				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, usage: latestUsage, ...toolCallObj });
 			}
 		})
 		// when error/fail - this catches errors of both .create() and .then(for await)

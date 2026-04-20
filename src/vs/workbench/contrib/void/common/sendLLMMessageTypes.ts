@@ -99,6 +99,11 @@ export type LLMUsage = {
 	outputTokens?: number;
 	totalTokens?: number;
 	reasoningTokens?: number;
+	// Portion of `inputTokens` that was served from prompt/context cache.
+	// Populated by OpenAI-compatible servers via `usage.prompt_tokens_details.cached_tokens`
+	// (OpenAI's implicit prompt cache; DeepSeek and a few others mirror the schema).
+	// Undefined on servers that don't return the field.
+	cachedInputTokens?: number;
 }
 
 export type OnText = (p: { fullText: string; fullReasoning: string; toolCall?: RawToolCallObj; usage?: LLMUsage }) => void
