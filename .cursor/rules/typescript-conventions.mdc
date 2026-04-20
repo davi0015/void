@@ -1,0 +1,28 @@
+---
+description: TypeScript conventions for the Void project
+globs: **/*.ts,**/*.tsx
+alwaysApply: false
+---
+
+# TypeScript Conventions
+
+## No Unnecessary Casting
+
+Do **NOT** cast to types if not necessary. **NEVER** lazily cast to `any`. Find the correct type to apply and use it.
+
+```typescript
+// BAD
+const result = (data as any).value;
+const node = something as MyType;
+
+// GOOD
+const result: ValueType = data.value;
+// If types genuinely don't line up, fix the source type or use a type guard:
+if (isMyType(something)) {
+  const node = something;
+}
+```
+
+## Semicolons
+
+Do **not** add or remove semicolons in existing files. Follow the existing convention of the file and make the **least** number of changes.
