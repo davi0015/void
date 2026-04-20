@@ -12,7 +12,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { chat_userMessageContent, isABuiltinToolName } from '../common/prompt/prompts.js';
-import { AnthropicReasoning, getErrorMessage, RawToolCallObj, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
+import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
@@ -232,6 +232,7 @@ export interface IChatThreadService {
 
 	readonly state: ThreadsState;
 	readonly streamState: ThreadStreamState; // not persistent
+	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined }; // not persistent; updated as the model streams
 
 	onDidChangeCurrentThread: Event<void>;
 	onDidChangeStreamState: Event<{ threadId: string }>
@@ -305,6 +306,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	readonly onDidChangeStreamState: Event<{ threadId: string }> = this._onDidChangeStreamState.event;
 
 	readonly streamState: ThreadStreamState = {}
+	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	state: ThreadsState // allThreads is persisted, currentThread is not
 
 	// used in checkpointing
@@ -481,6 +483,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	private _setStreamState(threadId: string, state: ThreadStreamState[string]) {
 		this.streamState[threadId] = state
+		this._onDidChangeStreamState.fire({ threadId })
+	}
+
+	// updates per-thread latest usage and re-uses the streamState emitter so existing
+	// listeners (and the React mirror in services.tsx) re-read without extra plumbing
+	private _setLatestUsage(threadId: string, usage: LLMUsage) {
+		this.latestUsageOfThreadId[threadId] = usage
 		this._onDidChangeStreamState.fire({ threadId })
 	}
 
@@ -811,10 +820,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					overridesOfModel,
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
 					separateSystemMessage: separateSystemMessage,
-					onText: ({ fullText, fullReasoning, toolCall }) => {
+					onText: ({ fullText, fullReasoning, toolCall, usage }) => {
+						if (usage) this._setLatestUsage(threadId, usage)
 						this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallSoFar: toolCall ?? null }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
 					},
-					onFinalMessage: async ({ fullText, fullReasoning, toolCall, anthropicReasoning, }) => {
+					onFinalMessage: async ({ fullText, fullReasoning, toolCall, anthropicReasoning, usage }) => {
+						if (usage) this._setLatestUsage(threadId, usage)
 						resMessageIsDonePromise({ type: 'llmDone', toolCall, info: { fullText, fullReasoning, anthropicReasoning } }) // resolve with tool calls
 					},
 					onError: async (error) => {
