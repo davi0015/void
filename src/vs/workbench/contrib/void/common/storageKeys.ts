@@ -19,5 +19,11 @@ export const VOID_SETTINGS_STORAGE_KEY = 'void.settingsServiceStorageII'
 export const THREAD_STORAGE_KEY = 'void.chatThreadStorageII'
 
 
+// Ordered list of thread ids pinned as tabs in the chat sidebar. Persisted
+// separately from THREAD_STORAGE_KEY so evolving tab UX doesn't force a
+// thread-storage version bump.
+export const PINNED_THREADS_STORAGE_KEY = 'void.chatPinnedThreadsI'
+
+
 
 export const OPT_OUT_KEY = 'void.app.optOutAll'
