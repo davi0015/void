@@ -89,6 +89,7 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 					outputTokens: e.usage.outputTokens,
 					reasoningTokens: e.usage.reasoningTokens,
 					totalTokens: e.usage.totalTokens,
+					cachedInputTokens: e.usage.cachedInputTokens,
 				})
 			}
 			this.llmMessageHooks.onFinalMessage[e.requestId]?.(e);
