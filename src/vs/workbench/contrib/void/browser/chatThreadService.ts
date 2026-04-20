@@ -124,6 +124,13 @@ export type ThreadType = {
 	// after the user sends a new message).
 	latestUsage?: LLMUsage;
 
+	// Model used to send the most recent user message on this thread. Captured
+	// on send, restored on `switchToThread` (writes to settings' `Chat` model
+	// selection). `null` means "no message was sent on this thread yet"; if the
+	// provider/model no longer exists or is hidden, the restore is skipped and
+	// the user keeps whatever model is currently globally selected.
+	lastUsedModelSelection?: ModelSelection | null;
+
 	// this doesn't need to go in a state object, but feels right
 	state: {
 		currCheckpointIdx: number | null; // the latest checkpoint we're at (null if not at a particular checkpoint, like if the chat is streaming, or chat just finished and we haven't clicked on a checkpt)
@@ -372,6 +379,34 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// always be in a thread
 		this.openNewThread()
 
+		// Capture live dropdown changes onto whichever thread is currently in
+		// focus, so switching tabs round-trips the chosen model even when no
+		// message was sent. Without this listener, the field is only written
+		// at send time (see `_addUserMessageAndStreamResponse`) and an "unsent"
+		// dropdown change would be lost on tab switch.
+		//
+		// Races are benign: `switchToThread` itself calls
+		// `setModelSelectionOfFeature` which will fire this listener back, but
+		// by the time it fires `currentThreadId` is already the new thread and
+		// the equality check in `_setThreadLastUsedModelSelection` skips the
+		// redundant write.
+		let lastSeenChatModel = this._settingsService.state.modelSelectionOfFeature['Chat']
+		this._register(this._settingsService.onDidChangeState(() => {
+			const current = this._settingsService.state.modelSelectionOfFeature['Chat']
+			const unchanged = (
+				(!lastSeenChatModel && !current) ||
+				(!!lastSeenChatModel && !!current
+					&& lastSeenChatModel.providerName === current.providerName
+					&& lastSeenChatModel.modelName === current.modelName)
+			)
+			if (unchanged) return
+			lastSeenChatModel = current
+			const threadId = this.state.currentThreadId
+			if (threadId && this.state.allThreads[threadId]) {
+				this._setThreadLastUsedModelSelection(threadId, current)
+			}
+		}))
+
 
 		// keep track of user-modified files
 		// const disposablesOfModelId: { [modelId: string]: IDisposable[] } = {}
@@ -559,6 +594,45 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const modelSelection = this._settingsService.state.modelSelectionOfFeature[featureName]
 		const modelSelectionOptions = modelSelection ? this._settingsService.state.optionsOfModelSelection[featureName][modelSelection.providerName]?.[modelSelection.modelName] : undefined
 		return { modelSelection, modelSelectionOptions }
+	}
+
+	// Persists the given model selection on the thread so that a later
+	// `switchToThread` can restore the dropdown to whatever the user sent with.
+	// Writes through `_storeAllThreads` to survive reloads. No state change
+	// event here — the dropdown state lives on `IVoidSettingsService`, not on
+	// this service, so there's nothing for chat-UI listeners to re-render.
+	private _setThreadLastUsedModelSelection(threadId: string, modelSelection: ModelSelection | null) {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return
+
+		// Skip the (persistent) write if the stored value is already identical.
+		// Without this, every user message would rewrite the whole threads blob
+		// to storage for no reason.
+		const prev = thread.lastUsedModelSelection
+		if (
+			prev && modelSelection &&
+			prev.providerName === modelSelection.providerName &&
+			prev.modelName === modelSelection.modelName
+		) return
+		if (!prev && !modelSelection) return
+
+		const newThreads = {
+			...this.state.allThreads,
+			[threadId]: { ...thread, lastUsedModelSelection: modelSelection },
+		}
+		this._storeAllThreads(newThreads)
+		this._setState({ allThreads: newThreads })
+	}
+
+	// Returns true iff `sel` points at a provider+model that still exists in
+	// settings AND is not currently hidden. Used to decide whether restoring a
+	// thread's saved model is safe, or if we should silently fall back to the
+	// current global selection (e.g. the user deleted that model in Settings
+	// since the thread was last used).
+	private _isModelSelectionCurrentlyValid(sel: ModelSelection): boolean {
+		const providerSettings = this._settingsService.state.settingsOfProvider[sel.providerName]
+		if (!providerSettings) return false
+		return providerSettings.models.some(m => m.modelName === sel.modelName && !m.isHidden)
 	}
 
 
@@ -1322,8 +1396,15 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 		this._setThreadState(threadId, { currCheckpointIdx: null }) // no longer at a checkpoint because started streaming
 
+		const modelProps = this._currentModelSelectionProps()
+		// Capture the chosen model at send time so future switches to this
+		// thread restore this exact dropdown choice. Intentionally NOT captured
+		// on tool approve/reject/edit — those don't represent a fresh user
+		// decision about which model to use.
+		this._setThreadLastUsedModelSelection(threadId, modelProps.modelSelection)
+
 		this._wrapRunAgentToNotify(
-			this._runChatAgent({ threadId, ...this._currentModelSelectionProps(), }),
+			this._runChatAgent({ threadId, ...modelProps, }),
 			threadId,
 		)
 
@@ -1697,6 +1778,25 @@ We only need to do it for files that were edited since `from`, ie files between 
 			const newPinned = [...this.state.pinnedThreadIds, threadId]
 			this._storePinnedThreadIds(newPinned)
 			this._setState({ currentThreadId: threadId, pinnedThreadIds: newPinned })
+		}
+
+		// Restore the dropdown to the model that was last used to send a
+		// message on this thread. Fire-and-forget: the switch already took
+		// effect visually; `setModelSelectionOfFeature` just updates settings
+		// state which the model-selector component listens to separately.
+		// Skip when the thread has no saved selection (fresh thread, or
+		// pre-feature thread) or when the saved model has since been deleted
+		// or hidden — in both cases we intentionally leave the current global
+		// selection alone so the user isn't surprised by a blank dropdown.
+		const saved = this.state.allThreads[threadId]?.lastUsedModelSelection
+		if (saved && this._isModelSelectionCurrentlyValid(saved)) {
+			const current = this._settingsService.state.modelSelectionOfFeature['Chat']
+			const alreadyMatches = current
+				&& current.providerName === saved.providerName
+				&& current.modelName === saved.modelName
+			if (!alreadyMatches) {
+				this._settingsService.setModelSelectionOfFeature('Chat', saved)
+			}
 		}
 	}
 
