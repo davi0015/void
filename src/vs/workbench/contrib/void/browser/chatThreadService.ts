@@ -119,6 +119,11 @@ export type ThreadType = {
 	messages: ChatMessage[];
 	filesWithUserChanges: Set<string>;
 
+	// Last-seen token usage from the LLM for this thread. Persisted so the
+	// context-usage ring shows a value immediately on reload (instead of only
+	// after the user sends a new message).
+	latestUsage?: LLMUsage;
+
 	// this doesn't need to go in a state object, but feels right
 	state: {
 		currCheckpointIdx: number | null; // the latest checkpoint we're at (null if not at a particular checkpoint, like if the chat is streaming, or chat just finished and we haven't clicked on a checkpt)
@@ -232,7 +237,7 @@ export interface IChatThreadService {
 
 	readonly state: ThreadsState;
 	readonly streamState: ThreadStreamState; // not persistent
-	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined }; // not persistent; updated as the model streams
+	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined }; // hydrated from persisted threads on startup; updated as the model streams
 
 	onDidChangeCurrentThread: Event<void>;
 	onDidChangeStreamState: Event<{ threadId: string }>
@@ -339,6 +344,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this.state = {
 			allThreads: allThreads,
 			currentThreadId: null as unknown as string, // gets set in startNewThread()
+		}
+
+		// hydrate in-memory latestUsage map from the persisted threads so the
+		// context-usage ring shows the last-known values right after a reload
+		for (const id in allThreads) {
+			const t = allThreads[id]
+			if (t?.latestUsage) this.latestUsageOfThreadId[id] = t.latestUsage
 		}
 
 		// always be in a thread
@@ -487,9 +499,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	// updates per-thread latest usage and re-uses the streamState emitter so existing
-	// listeners (and the React mirror in services.tsx) re-read without extra plumbing
+	// listeners (and the React mirror in services.tsx) re-read without extra plumbing.
+	// Also persists on the thread so the ring shows the last-known value after a reload.
 	private _setLatestUsage(threadId: string, usage: LLMUsage) {
 		this.latestUsageOfThreadId[threadId] = usage
+		const thread = this.state.allThreads[threadId]
+		if (thread) {
+			thread.latestUsage = usage
+			this._storeAllThreads(this.state.allThreads)
+		}
 		this._onDidChangeStreamState.fire({ threadId })
 	}
 
