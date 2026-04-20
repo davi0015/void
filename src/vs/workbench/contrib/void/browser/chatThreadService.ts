@@ -30,7 +30,7 @@ import { IEditCodeService } from './editCodeServiceInterface.js';
 import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
-import { THREAD_STORAGE_KEY } from '../common/storageKeys.js';
+import { PINNED_THREADS_STORAGE_KEY, THREAD_STORAGE_KEY } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
@@ -156,6 +156,12 @@ type ChatThreads = {
 export type ThreadsState = {
 	allThreads: ChatThreads;
 	currentThreadId: string; // intended for internal use only
+
+	// Ordered list of thread ids shown as tabs in the chat sidebar header.
+	// Entirely a UI-pin concept — removing an id from here does NOT delete the
+	// thread (it remains accessible via the history list). Persisted under
+	// PINNED_THREADS_STORAGE_KEY (see storageKeys.ts).
+	pinnedThreadIds: string[];
 }
 
 export type IsRunningType =
@@ -250,6 +256,10 @@ export interface IChatThreadService {
 	deleteThread(threadId: string): void;
 	duplicateThread(threadId: string): void;
 
+	// tab-strip pinning (does not affect existence — only the chat-header tab row)
+	pinThread(threadId: string): void;
+	unpinThread(threadId: string): void;
+
 	// exposed getters/setters
 	// these all apply to current thread
 	getCurrentMessageState: (messageIdx: number) => UserMessageState
@@ -336,14 +346,20 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IMCPService private readonly _mcpService: IMCPService,
 	) {
 		super()
-		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // default state
+		this.state = { allThreads: {}, currentThreadId: null as unknown as string, pinnedThreadIds: [] } // default state
 
 		const readThreads = this._readAllThreads() || {}
+
+		// Restore pinned ids, filtering any that refer to threads that no longer
+		// exist (e.g. deleted on another machine, storage corruption, etc.) so
+		// we never render a "ghost" tab.
+		const readPinned = (this._readPinnedThreadIds() || []).filter(id => !!readThreads[id])
 
 		const allThreads = readThreads
 		this.state = {
 			allThreads: allThreads,
 			currentThreadId: null as unknown as string, // gets set in startNewThread()
+			pinnedThreadIds: readPinned,
 		}
 
 		// hydrate in-memory latestUsage map from the persisted threads so the
@@ -400,7 +416,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._onDidChangeCurrentThread.fire()
 	}
 	resetState = () => {
-		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // see constructor
+		this.state = { allThreads: {}, currentThreadId: null as unknown as string, pinnedThreadIds: [] } // see constructor
+		this._storePinnedThreadIds([])
 		this.openNewThread()
 		this._onDidChangeCurrentThread.fire()
 	}
@@ -431,6 +448,26 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._storageService.store(
 			THREAD_STORAGE_KEY,
 			serializedThreads,
+			StorageScope.APPLICATION,
+			StorageTarget.USER
+		);
+	}
+
+	private _readPinnedThreadIds(): string[] | null {
+		const s = this._storageService.get(PINNED_THREADS_STORAGE_KEY, StorageScope.APPLICATION);
+		if (!s) return null;
+		try {
+			const parsed = JSON.parse(s);
+			return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : null;
+		} catch {
+			return null;
+		}
+	}
+
+	private _storePinnedThreadIds(ids: string[]) {
+		this._storageService.store(
+			PINNED_THREADS_STORAGE_KEY,
+			JSON.stringify(ids),
 			StorageScope.APPLICATION,
 			StorageTarget.USER
 		);
@@ -1650,7 +1687,17 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 	switchToThread(threadId: string) {
-		this._setState({ currentThreadId: threadId })
+		// Auto-pin on switch so that jumping to a thread from the history list
+		// surfaces it in the tab strip (user can remove with the × on the tab).
+		// Silently no-op if already pinned.
+		const alreadyPinned = this.state.pinnedThreadIds.includes(threadId)
+		if (alreadyPinned) {
+			this._setState({ currentThreadId: threadId })
+		} else {
+			const newPinned = [...this.state.pinnedThreadIds, threadId]
+			this._storePinnedThreadIds(newPinned)
+			this._setState({ currentThreadId: threadId, pinnedThreadIds: newPinned })
+		}
 	}
 
 
@@ -1667,13 +1714,17 @@ We only need to do it for files that were edited since `from`, ie files between 
 		// otherwise, start a new thread
 		const newThread = newThreadObject()
 
-		// update state
+		// update state — also auto-pin so it becomes the active tab
 		const newThreads: ChatThreads = {
 			...currentThreads,
 			[newThread.id]: newThread
 		}
+		const newPinned = this.state.pinnedThreadIds.includes(newThread.id)
+			? this.state.pinnedThreadIds
+			: [...this.state.pinnedThreadIds, newThread.id]
 		this._storeAllThreads(newThreads)
-		this._setState({ allThreads: newThreads, currentThreadId: newThread.id })
+		this._storePinnedThreadIds(newPinned)
+		this._setState({ allThreads: newThreads, currentThreadId: newThread.id, pinnedThreadIds: newPinned })
 	}
 
 
@@ -1684,9 +1735,13 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const newThreads = { ...currentThreads };
 		delete newThreads[threadId];
 
+		// drop from the tab strip too (no point showing a tab for a deleted thread)
+		const newPinned = this.state.pinnedThreadIds.filter(id => id !== threadId)
+		if (newPinned.length !== this.state.pinnedThreadIds.length) this._storePinnedThreadIds(newPinned)
+
 		// store the updated threads
 		this._storeAllThreads(newThreads);
-		this._setState({ ...this.state, allThreads: newThreads })
+		this._setState({ ...this.state, allThreads: newThreads, pinnedThreadIds: newPinned })
 	}
 
 	duplicateThread(threadId: string) {
@@ -1701,8 +1756,45 @@ We only need to do it for files that were edited since `from`, ie files between 
 			...currentThreads,
 			[newThread.id]: newThread,
 		}
+		// Pin the duplicate right after the original, so the new tab appears
+		// next to the source tab (natural position). Fall back to append if the
+		// source wasn't pinned.
+		const srcIdx = this.state.pinnedThreadIds.indexOf(threadId)
+		const newPinned = [...this.state.pinnedThreadIds]
+		if (srcIdx === -1) newPinned.push(newThread.id)
+		else newPinned.splice(srcIdx + 1, 0, newThread.id)
+
 		this._storeAllThreads(newThreads)
-		this._setState({ allThreads: newThreads })
+		this._storePinnedThreadIds(newPinned)
+		this._setState({ allThreads: newThreads, pinnedThreadIds: newPinned })
+	}
+
+	pinThread(threadId: string): void {
+		if (!this.state.allThreads[threadId]) return
+		if (this.state.pinnedThreadIds.includes(threadId)) return
+		const newPinned = [...this.state.pinnedThreadIds, threadId]
+		this._storePinnedThreadIds(newPinned)
+		this._setState({ pinnedThreadIds: newPinned })
+	}
+
+	unpinThread(threadId: string): void {
+		if (!this.state.pinnedThreadIds.includes(threadId)) return
+		const newPinned = this.state.pinnedThreadIds.filter(id => id !== threadId)
+		this._storePinnedThreadIds(newPinned)
+
+		// If the user removed the tab they're currently looking at, jump to a
+		// neighboring pinned tab so the chat pane doesn't show stale content.
+		// If no tabs remain, open a fresh thread (which also pins itself).
+		if (this.state.currentThreadId === threadId) {
+			if (newPinned.length > 0) {
+				this._setState({ pinnedThreadIds: newPinned, currentThreadId: newPinned[newPinned.length - 1] })
+			} else {
+				this._setState({ pinnedThreadIds: newPinned })
+				this.openNewThread()
+			}
+		} else {
+			this._setState({ pinnedThreadIds: newPinned })
+		}
 	}
 
 

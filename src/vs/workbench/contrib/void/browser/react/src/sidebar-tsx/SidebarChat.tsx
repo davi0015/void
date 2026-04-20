@@ -15,7 +15,7 @@ import { IDisposable } from '../../../../../../../base/common/lifecycle.js';
 import { ErrorDisplay } from './ErrorDisplay.js';
 import { BlockCode, TextAreaFns, VoidCustomDropdownBox, VoidInputBox2, VoidSlider, VoidSwitch, VoidDiffEditor } from '../util/inputs.js';
 import { ModelDropdown, } from '../void-settings-tsx/ModelDropdown.js';
-import { PastThreadsList } from './SidebarThreadSelector.js';
+import { PastThreadsList, SidebarThreadTabs } from './SidebarThreadSelector.js';
 import { VOID_CTRL_L_ACTION_ID } from '../../../actionIDs.js';
 import { VOID_OPEN_SETTINGS_ACTION_ID } from '../../../voidSettingsPane.js';
 import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled } from '../../../../../../../workbench/contrib/void/common/voidSettingsTypes.js';
@@ -3268,6 +3268,12 @@ export const SidebarChat = () => {
 		ref={sidebarRef}
 		className='w-full h-full max-h-full flex flex-col overflow-auto px-4'
 	>
+		{/* Tab strip also rendered on the landing page so users can jump between
+			existing pinned threads without needing to scroll down to the
+			PastThreadsList below. Hidden implicitly when there are no pinned tabs. */}
+		<ErrorBoundary>
+			<SidebarThreadTabs />
+		</ErrorBoundary>
 		<ErrorBoundary>
 			{landingPageInput}
 		</ErrorBoundary>
@@ -3303,7 +3309,9 @@ export const SidebarChat = () => {
 		ref={sidebarRef}
 		className='w-full h-full flex flex-col overflow-hidden'
 	>
-
+		<ErrorBoundary>
+			<SidebarThreadTabs />
+		</ErrorBoundary>
 		<ErrorBoundary>
 			{messagesHTML}
 		</ErrorBoundary>

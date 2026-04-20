@@ -3,11 +3,11 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { CopyButton, IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
 import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useFullChatThreadsStreamState, useSettingsState } from '../util/services.js';
 import { IconX } from './SidebarChat.js';
-import { Check, Copy, Icon, LoaderCircle, MessageCircleQuestion, Trash2, UserCheck, X } from 'lucide-react';
+import { Check, Copy, Icon, LoaderCircle, MessageCircleQuestion, Plus, Trash2, UserCheck, X } from 'lucide-react';
 import { IsRunningType, ThreadType } from '../../../chatThreadService.js';
 
 
@@ -275,4 +275,118 @@ const PastThreadElement = ({ pastThread, idx, hoveredIdx, setHoveredIdx, isRunni
 			</div>
 		</div>
 	</div>
+}
+
+
+
+// Horizontal scrollable tab strip of pinned chat threads, shown at the top of
+// the chat sidebar. Tabs are pure UI pins — `unpinThread` never deletes the
+// underlying thread (it stays reachable via PastThreadsList / history). Users
+// add tabs implicitly by starting a new thread (`+`) or switching to one from
+// history; they remove tabs via the × on the tab itself.
+export const SidebarThreadTabs = () => {
+	const accessor = useAccessor()
+	const chatThreadsService = accessor.get('IChatThreadService')
+
+	const threadsState = useChatThreadsState()
+	const streamState = useFullChatThreadsStreamState()
+
+	const { allThreads, currentThreadId, pinnedThreadIds } = threadsState
+
+	// Defensive filter: only render tabs whose thread still exists. Stale ids
+	// are pruned at load time too (see ChatThreadService constructor), but this
+	// guards against any in-memory drift between deleteThread and a re-render.
+	const tabs = (pinnedThreadIds ?? []).filter(id => !!allThreads[id])
+
+	// Keep the active tab in view when threads are switched from outside the
+	// strip (e.g. landing-page history click), otherwise long tab rows can
+	// silently hide the current selection offscreen.
+	const activeTabRef = useRef<HTMLDivElement | null>(null)
+	useEffect(() => {
+		activeTabRef.current?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' })
+	}, [currentThreadId])
+
+	// Nothing meaningful to render if there are no pinned threads. The `+`
+	// button below still shows so the user can always start a new chat, even
+	// if they unpinned everything (edge case; unpinThread auto-opens a new
+	// thread in that situation anyway).
+	const showNothing = tabs.length === 0
+
+	return (
+		<div
+			className='flex items-center gap-0.5 px-1 py-1 border-b border-void-border-2 overflow-x-auto overflow-y-hidden flex-shrink-0'
+			// Translate vertical wheel events to horizontal scroll so the strip
+			// is usable with a regular mouse wheel (touchpads already scroll
+			// horizontally natively).
+			onWheel={(e) => {
+				if (e.deltaY !== 0 && e.deltaX === 0) {
+					e.currentTarget.scrollLeft += e.deltaY
+				}
+			}}
+		>
+			{showNothing ? null : tabs.map(id => {
+				const t = allThreads[id]!
+				const isActive = id === currentThreadId
+				const isRunning = streamState[id]?.isRunning
+
+				// Label source of truth matches PastThreadsList: first user
+				// message's displayContent, truncated. Empty threads get a
+				// neutral "New Chat" label so the tab isn't blank.
+				const firstUser = t.messages.find(m => m.role === 'user')
+				const label = firstUser && firstUser.role === 'user' && firstUser.displayContent
+					? firstUser.displayContent
+					: 'New Chat'
+
+				return (
+					<div
+						key={id}
+						ref={isActive ? activeTabRef : undefined}
+						onClick={() => chatThreadsService.switchToThread(id)}
+						// Middle-click closes, matching conventional tab UX
+						// (VS Code editor tabs, browsers, etc).
+						onMouseDown={(e) => {
+							if (e.button === 1) {
+								e.preventDefault()
+								chatThreadsService.unpinThread(id)
+							}
+						}}
+						className={`
+							group flex items-center gap-1 px-2 py-0.5 rounded text-xs cursor-pointer flex-shrink-0 max-w-[110px] min-w-0 select-none
+							${isActive
+								? 'bg-zinc-700/10 dark:bg-zinc-300/10 text-void-fg-1'
+								: 'text-void-fg-3 opacity-80 hover:opacity-100 hover:bg-zinc-700/5 dark:hover:bg-zinc-300/5'}
+						`}
+						data-tooltip-id='void-tooltip'
+						data-tooltip-content={label}
+						data-tooltip-place='bottom'
+					>
+						{isRunning === 'LLM' || isRunning === 'tool' || isRunning === 'idle'
+							? <LoaderCircle className='animate-spin shrink-0' size={10} />
+							: isRunning === 'awaiting_user'
+								? <MessageCircleQuestion className='shrink-0' size={10} />
+								: null}
+						<span className='truncate min-w-0'>{label}</span>
+						<button
+							onClick={(e) => { e.stopPropagation(); chatThreadsService.unpinThread(id); }}
+							className='ml-0.5 opacity-0 group-hover:opacity-100 shrink-0 rounded hover:bg-black/10 dark:hover:bg-white/10 flex items-center justify-center'
+							data-tooltip-id='void-tooltip'
+							data-tooltip-content='Remove from tabs (thread stays in history)'
+							data-tooltip-place='bottom'
+						>
+							<X size={10} />
+						</button>
+					</div>
+				)
+			})}
+			<button
+				onClick={() => chatThreadsService.openNewThread()}
+				className='shrink-0 ml-0.5 p-1 rounded text-void-fg-3 opacity-70 hover:opacity-100 hover:bg-zinc-700/10 dark:hover:bg-zinc-300/10'
+				data-tooltip-id='void-tooltip'
+				data-tooltip-content='New chat'
+				data-tooltip-place='bottom'
+			>
+				<Plus size={12} />
+			</button>
+		</div>
+	)
 }
