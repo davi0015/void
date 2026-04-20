@@ -1,0 +1,23 @@
+---
+description: Scope guardrails and validation policy for the Void project
+alwaysApply: true
+---
+
+# Scope & Validation
+
+## Modification Scope
+
+**Never** modify files outside `src/vs/workbench/contrib/void` without consulting with the user first.
+
+If a change appears to require touching files in other parts of the repo (e.g. core VSCode files, build configs, other contribs), pause and ask before editing.
+
+## Validation Policy
+
+Do **not** run anything to validate your changes. This includes:
+- `npm run`, `yarn`, `pnpm` build/test/lint scripts
+- `tsc`, `eslint`, or any type-checker / linter directly
+- Launching the app
+
+Instead, **tell the user what to run** to validate the changes, e.g.:
+
+> To validate, please run `npm run watch` and reload the Extension Host window.

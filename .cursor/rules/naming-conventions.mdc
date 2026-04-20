@@ -1,0 +1,25 @@
+---
+description: Naming conventions for value mappings in the Void project
+alwaysApply: true
+---
+
+# Naming Conventions
+
+## Mapping Types: `bOfA`
+
+All types/variables that map from a value **A** to a value **B** should be named **`bOfA`**.
+
+Examples:
+- A hashmap from `toolId` to `toolName` → `toolNameOfToolId`
+- A map from `userId` to `userEmail` → `userEmailOfUserId`
+- A map from `fileUri` to `fileContent` → `fileContentOfFileUri`
+
+```typescript
+// BAD
+const toolMap: Record<string, string> = {};
+const idToName = new Map<ToolId, ToolName>();
+
+// GOOD
+const toolNameOfToolId: Record<ToolId, ToolName> = {};
+const userEmailOfUserId = new Map<UserId, Email>();
+```

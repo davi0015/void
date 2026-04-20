@@ -1,0 +1,12 @@
+---
+description: Project context for the Void repo (a VSCode fork)
+alwaysApply: true
+---
+
+# Void Project Context
+
+This is a fork of the VSCode repo called **Void**.
+
+- Most code we care about lives in `src/vs/workbench/contrib/void`.
+- You may often need to explore the full repo to find relevant parts of code.
+- Look for existing services and built-in functions you might need to reuse instead of re-implementing functionality.
