@@ -75,6 +75,7 @@ export interface IVoidSettingsService {
 	toggleModelHidden(providerName: ProviderName, modelName: string): void;
 	addModel(providerName: ProviderName, modelName: string): void;
 	deleteModel(providerName: ProviderName, modelName: string): boolean;
+	reorderCustomModel(providerName: ProviderName, modelName: string, targetModelName: string, position: 'before' | 'after'): boolean;
 
 	addMCPUserStateOfNames(userStateOfName: MCPUserStateOfName): Promise<void>;
 	removeMCPUserStateOfNames(serverNames: string[]): Promise<void>;
@@ -557,6 +558,35 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 
 		this._metricsService.capture('Delete Model', { providerName, modelName })
 
+		return true
+	}
+
+	// Reorders a custom model so that it sits immediately before/after `targetModelName`.
+	// Both source and target must be custom models of the same provider. Non-custom
+	// models (default/autodetected) are not moved because their order is managed by
+	// _modelsWithSwappedInNewModels and gets reset on provider refresh.
+	reorderCustomModel(providerName: ProviderName, modelName: string, targetModelName: string, position: 'before' | 'after'): boolean {
+		if (modelName === targetModelName) return false
+
+		const { models } = this.state.settingsOfProvider[providerName]
+		const fromIdx = models.findIndex(m => m.modelName === modelName)
+		const toIdx = models.findIndex(m => m.modelName === targetModelName)
+		if (fromIdx === -1 || toIdx === -1) return false
+		if (models[fromIdx].type !== 'custom' || models[toIdx].type !== 'custom') return false
+
+		const moving = models[fromIdx]
+		const without = [...models.slice(0, fromIdx), ...models.slice(fromIdx + 1)]
+		// targetModelName's index shifts left by one if it was after fromIdx, so recompute
+		const targetAfterRemoval = without.findIndex(m => m.modelName === targetModelName)
+		const insertAt = position === 'before' ? targetAfterRemoval : targetAfterRemoval + 1
+		const newModels = [
+			...without.slice(0, insertAt),
+			moving,
+			...without.slice(insertAt),
+		]
+		this.setSettingOfProvider(providerName, 'models', newModels)
+
+		this._metricsService.capture('Reorder Custom Model', { providerName, modelName, targetModelName, position })
 		return true
 	}
 
