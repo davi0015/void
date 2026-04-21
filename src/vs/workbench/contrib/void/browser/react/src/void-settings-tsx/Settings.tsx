@@ -227,9 +227,17 @@ const SimpleModelSettingsDialog = ({
 	const currentOverrides = settingsState.overridesOfModel?.[providerName]?.[modelName] ?? undefined;
 	const { recognizedModelName, isUnrecognizedModel } = defaultModelCapabilities
 
-	// Create the placeholder with the default values for allowed keys
+	// Create the placeholder with the default values for allowed keys.
+	// `specialToolFormat` is intentionally excluded: it's now auto-applied per
+	// provider (see `defaultSpecialToolFormat` in modelCapabilities.ts), the
+	// status line above already tells the user which format will be used, and
+	// the preset buttons below offer one-click switching. Including it here
+	// would just suggest the user has to type it themselves.
 	const partialDefaults: Partial<ModelOverrides> = {};
-	for (const k of modelOverrideKeys) { if (defaultModelCapabilities[k]) partialDefaults[k] = defaultModelCapabilities[k] as any; }
+	for (const k of modelOverrideKeys) {
+		if (k === 'specialToolFormat') continue;
+		if (defaultModelCapabilities[k]) partialDefaults[k] = defaultModelCapabilities[k] as any;
+	}
 	const placeholder = JSON.stringify(partialDefaults, null, 2);
 
 	const [overrideEnabled, setOverrideEnabled] = useState<boolean>(() => !!currentOverrides);
@@ -319,11 +327,23 @@ const SimpleModelSettingsDialog = ({
 					</button>
 				</div>
 
-				{/* Display model recognition status */}
+				{/* Display model recognition status. For unrecognized models we surface the
+					tool-calling format Void auto-picked based on the provider's wire protocol,
+					so the user knows what to expect (and what to override if their model needs
+					a different format). */}
 				<div className="text-sm text-void-fg-3 mb-4">
-					{type === 'default' ? `${modelName} comes packaged with Void, so you shouldn't need to change these settings.`
+					{type === 'default'
+						? `${modelName} comes packaged with Void, so you shouldn't need to change these settings.`
 						: isUnrecognizedModel
-							? `Model not recognized by Void.`
+							? (() => {
+								const fmt = defaultModelCapabilities.specialToolFormat
+								const fmtLabel = fmt === 'openai-style' ? 'OpenAI-style'
+									: fmt === 'anthropic-style' ? 'Anthropic-style'
+										: fmt === 'gemini-style' ? 'Gemini-style'
+											: 'XML-in-prompt (fallback)'
+								const providerLabel = displayInfoOfProviderName(providerName).title
+								return `Model not recognized by Void. Defaulting to ${fmtLabel} tool calling based on the ${providerLabel} provider — override below if your model needs a different format.`
+							})()
 							: `Void recognizes ${modelName} ("${recognizedModelName}").`}
 				</div>
 
@@ -334,10 +354,13 @@ const SimpleModelSettingsDialog = ({
 					<span className="text-void-fg-3 text-sm">Override model defaults</span>
 				</div>
 
-				{/* Informational link */}
-				{overrideEnabled && <div className="text-sm text-void-fg-3 mb-4">
-					<ChatMarkdownRender string={`See the [sourcecode](${sourcecodeOverridesLink}) for a reference on how to set this JSON (advanced).`} chatMessageLocation={undefined} />
-				</div>}
+				{/* Informational link. Shown unconditionally so users can discover the
+					full set of overridable fields (contextWindow, reasoningCapabilities,
+					supportsSystemMessage, etc.) before deciding whether to enable
+					overrides. */}
+				<div className="text-sm text-void-fg-3 mb-4">
+					<ChatMarkdownRender string={`Advanced — see the [sourcecode](${sourcecodeOverridesLink}) for the full list of fields you can override (e.g. \`contextWindow\`, \`reasoningCapabilities\`, \`supportsSystemMessage\`).`} chatMessageLocation={undefined} />
+				</div>
 
 				<textarea
 					key={overrideEnabled + ''}

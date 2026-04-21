@@ -237,6 +237,11 @@ type VoidStaticProviderInfo = { // doesn't change (not stateful)
 	providerReasoningIOSettings?: ProviderReasoningIOSettings; // input/output settings around thinking (allowed to be empty) - only applied if the model supports reasoning output
 	modelOptions: { [key: string]: VoidStaticModelInfo };
 	modelOptionsFallback: (modelName: string, fallbackKnownValues?: Partial<VoidStaticModelInfo>) => (VoidStaticModelInfo & { modelName: string, recognizedModelName: string }) | null;
+	// Tool format used when neither the per-model entry nor the fallback specifies one.
+	// If unset, `getModelCapabilities` defaults to 'openai-style' since the vast majority
+	// of provider endpoints speak the OpenAI tools API. Only providers whose endpoint
+	// uses a different native format (e.g. anthropic, gemini) need to override this.
+	defaultSpecialToolFormat?: VoidStaticModelInfo['specialToolFormat'];
 }
 
 
@@ -570,6 +575,7 @@ const anthropicModelOptions = {
 } as const satisfies { [s: string]: VoidStaticModelInfo }
 
 const anthropicSettings: VoidStaticProviderInfo = {
+	defaultSpecialToolFormat: 'anthropic-style',
 	providerReasoningIOSettings: {
 		input: {
 			includeInPayload: (reasoningInfo) => {
@@ -918,6 +924,7 @@ const geminiModelOptions = { // https://ai.google.dev/gemini-api/docs/pricing
 } as const satisfies { [s: string]: VoidStaticModelInfo }
 
 const geminiSettings: VoidStaticProviderInfo = {
+	defaultSpecialToolFormat: 'gemini-style',
 	modelOptions: geminiModelOptions,
 	modelOptionsFallback: (modelName) => { return null },
 }
@@ -1491,25 +1498,36 @@ export const getModelCapabilities = (
 
 	const lowercaseModelName = modelName.toLowerCase()
 
-	const { modelOptions, modelOptionsFallback } = modelSettingsOfProvider[providerName]
+	const { modelOptions, modelOptionsFallback, defaultSpecialToolFormat } = modelSettingsOfProvider[providerName]
 
 	// Get any override settings for this model
 	const overrides = overridesOfModel?.[providerName]?.[modelName];
+
+	// Fill in `specialToolFormat` when neither the per-model entry, the fallback, nor
+	// the user override specified one. Most provider endpoints speak the OpenAI tools
+	// API, so 'openai-style' is the global default; providers like anthropic/gemini
+	// opt out via `defaultSpecialToolFormat` on their settings. Without this, an
+	// unrecognized model would silently fall back to brittle XML-in-prompt tools.
+	const providerToolFormatDefault = defaultSpecialToolFormat ?? 'openai-style'
+	const applyProviderToolFormatDefault = <T extends { specialToolFormat?: VoidStaticModelInfo['specialToolFormat'] }>(obj: T): T => {
+		if (!obj.specialToolFormat) obj.specialToolFormat = providerToolFormatDefault
+		return obj
+	}
 
 	// search model options object directly first
 	for (const modelName_ in modelOptions) {
 		const lowercaseModelName_ = modelName_.toLowerCase()
 		if (lowercaseModelName === lowercaseModelName_) {
-			return { ...modelOptions[modelName], ...overrides, modelName, recognizedModelName: modelName, isUnrecognizedModel: false };
+			return applyProviderToolFormatDefault({ ...modelOptions[modelName], ...overrides, modelName, recognizedModelName: modelName, isUnrecognizedModel: false });
 		}
 	}
 
 	const result = modelOptionsFallback(modelName)
 	if (result) {
-		return { ...result, ...overrides, modelName: result.modelName, isUnrecognizedModel: false };
+		return applyProviderToolFormatDefault({ ...result, ...overrides, modelName: result.modelName, isUnrecognizedModel: false });
 	}
 
-	return { modelName, ...defaultModelOptions, ...overrides, isUnrecognizedModel: true };
+	return applyProviderToolFormatDefault({ modelName, ...defaultModelOptions, ...overrides, isUnrecognizedModel: true });
 }
 
 // non-model settings
