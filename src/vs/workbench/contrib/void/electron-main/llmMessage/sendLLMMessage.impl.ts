@@ -365,11 +365,17 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 				}
 
 
-				// reasoning
+				// reasoning — nameOfFieldInDelta may be a single field or a list of candidates
+				// (some gateways like OpenRouter use `reasoning`, others like DeepSeek use
+				// `reasoning_content`). Take the first non-empty one this chunk provides.
 				let newReasoning = ''
 				if (nameOfReasoningFieldInDelta) {
-					// @ts-ignore
-					newReasoning = (chunk.choices[0]?.delta?.[nameOfReasoningFieldInDelta] || '') + ''
+					const fields = Array.isArray(nameOfReasoningFieldInDelta) ? nameOfReasoningFieldInDelta : [nameOfReasoningFieldInDelta]
+					for (const f of fields) {
+						// @ts-ignore
+						const val = (chunk.choices[0]?.delta?.[f] || '') + ''
+						if (val) { newReasoning = val; break }
+					}
 					fullReasoningSoFar += newReasoning
 				}
 
