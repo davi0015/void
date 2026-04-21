@@ -1515,12 +1515,23 @@ const ReasoningWrapper = ({ isDoneReasoning, isStreaming, children }: { isDoneRe
 	const isDone = isDoneReasoning || !isStreaming
 	const isWriting = !isDone
 	const [isOpen, setIsOpen] = useState(isWriting)
+	const scrollRef = useRef<HTMLDivElement>(null)
 	useEffect(() => {
 		if (!isWriting) setIsOpen(false) // if just finished reasoning, close
 	}, [isWriting])
+	// While streaming, keep the box pinned to the bottom so the user sees the
+	// latest thoughts without having to scroll. Once done, respect user scroll.
+	useEffect(() => {
+		if (!isWriting || !isOpen) return
+		const el = scrollRef.current
+		if (el) el.scrollTop = el.scrollHeight
+	}, [children, isWriting, isOpen])
 	return <ToolHeaderWrapper title='Reasoning' desc1={isWriting ? <IconLoading /> : ''} isOpen={isOpen} onClick={() => setIsOpen(v => !v)}>
 		<ToolChildrenWrapper>
-			<div className='!select-text cursor-auto'>
+			<div
+				ref={scrollRef}
+				className='!select-text cursor-auto max-h-60 overflow-y-auto'
+			>
 				{children}
 			</div>
 		</ToolChildrenWrapper>

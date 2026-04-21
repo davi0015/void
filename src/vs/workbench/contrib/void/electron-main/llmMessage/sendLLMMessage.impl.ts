@@ -821,9 +821,19 @@ const sendGeminiChat = async ({
 
 			// Process the stream
 			for await (const chunk of stream) {
-				// message
-				const newText = chunk.text ?? ''
-				fullTextSoFar += newText
+				// message — split thought-tagged parts from answer parts.
+				// Gemini 2.5 Pro / Gemma 4 route internal reasoning through parts with
+				// `thought: true`; the visible answer lives in plain text parts. Using
+				// `chunk.text` (SDK shortcut) would concatenate both, polluting the
+				// chat view and the stored message history.
+				const parts = chunk.candidates?.[0]?.content?.parts
+				if (parts) {
+					for (const part of parts) {
+						if (typeof part.text !== 'string') continue // skip functionCall / inlineData / etc.
+						if (part.thought === true) fullReasoningSoFar += part.text
+						else fullTextSoFar += part.text
+					}
+				}
 
 				// tool call
 				const functionCalls = chunk.functionCalls
@@ -834,17 +844,21 @@ const sendGeminiChat = async ({
 					toolId = functionCall.id ?? ''
 				}
 
-				// (do not handle reasoning yet)
-
 				// usage (Gemini exposes promptTokenCount / candidatesTokenCount / totalTokenCount /
-				// thoughtsTokenCount via usageMetadata). Only update when the chunk reports it.
+				// thoughtsTokenCount / cachedContentTokenCount via usageMetadata). Multiple
+				// chunks can carry usageMetadata during a stream, and the field set is NOT
+				// consistent across chunks — notably, cachedContentTokenCount often appears
+				// on an early chunk and is absent from the final summary. Merge per-field
+				// with `??` so we preserve the best value seen so far instead of flickering
+				// to `undefined` when Google stops reporting a field.
 				const usageMetadata = chunk.usageMetadata
 				if (usageMetadata) {
 					latestUsage = {
-						inputTokens: usageMetadata.promptTokenCount,
-						outputTokens: usageMetadata.candidatesTokenCount,
-						totalTokens: usageMetadata.totalTokenCount,
-						reasoningTokens: usageMetadata.thoughtsTokenCount,
+						inputTokens: usageMetadata.promptTokenCount ?? latestUsage?.inputTokens,
+						outputTokens: usageMetadata.candidatesTokenCount ?? latestUsage?.outputTokens,
+						totalTokens: usageMetadata.totalTokenCount ?? latestUsage?.totalTokens,
+						reasoningTokens: usageMetadata.thoughtsTokenCount ?? latestUsage?.reasoningTokens,
+						cachedInputTokens: usageMetadata.cachedContentTokenCount ?? latestUsage?.cachedInputTokens,
 					}
 				}
 
