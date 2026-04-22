@@ -252,7 +252,10 @@ const rawToolCallObjOfParamsStr = (name: string, toolParamsStr: string, id: stri
 	if (typeof input !== 'object') return null
 
 	const rawParams: RawToolParamsObj = input
-	return { id, name, rawParams, doneParams: Object.keys(rawParams), isDone: true }
+	// Preserve the original argument string exactly as the model emitted it. On replay
+	// we'll send this back verbatim inside `tool_calls[].function.arguments` so the
+	// provider sees byte-identical content and the prefix cache stays warm.
+	return { id, name, rawParams, rawParamsStr: toolParamsStr, doneParams: Object.keys(rawParams), isDone: true }
 }
 
 

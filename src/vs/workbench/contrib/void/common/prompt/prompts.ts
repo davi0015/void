@@ -425,17 +425,25 @@ const systemToolsXMLPrompt = (chatMode: ChatMode, mcpTools: InternalToolInfo[] |
 // ======================================================== chat (normal, gather, agent) ========================================================
 
 
-export const chat_systemMessage = ({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode: mode, mcpTools, includeXMLToolDefinitions }: { workspaceFolders: string[], directoryStr: string, openedURIs: string[], activeURI: string | undefined, persistentTerminalIDs: string[], chatMode: ChatMode, mcpTools: InternalToolInfo[] | undefined, includeXMLToolDefinitions: boolean }) => {
-	const header = (`You are an expert coding ${mode === 'agent' ? 'agent' : 'assistant'} whose job is \
-${mode === 'agent' ? `to help the user develop, run, and make changes to their codebase.`
-			: mode === 'gather' ? `to search, understand, and reference files in the user's codebase.`
-				: mode === 'normal' ? `to assist the user with their coding tasks.`
-					: ''}
-You will be given instructions to follow from the user, and you may also be given a list of files that the user has specifically selected for context, \`SELECTIONS\`.
-Please assist the user with their query.`)
+// Shared input type between the stable system message and the volatile context.
+// Kept together so callers can compute the workspace snapshot once and feed both.
+export type ChatPromptContext = {
+	workspaceFolders: string[]
+	directoryStr: string
+	openedURIs: string[]
+	activeURI: string | undefined
+	persistentTerminalIDs: string[]
+	chatMode: ChatMode
+	mcpTools: InternalToolInfo[] | undefined
+	includeXMLToolDefinitions: boolean
+}
 
 
-
+// Returns the volatile runtime-grounding block as a standalone string. Callers
+// should prepend this to the latest user message (Phase B caching layout) rather
+// than embed it in the system message — keeping it out of the system message lets
+// the stable prefix and the full conversation history be prefix-cached across turns.
+export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode: mode }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'persistentTerminalIDs' | 'chatMode'>) => {
 	const sysInfo = (`Here is the user's system information:
 <system_info>
 - ${os}
@@ -457,6 +465,29 @@ ${openedURIs.join('\n') || 'NO OPENED FILES'}${''/* separator */}${mode === 'age
 <files_overview>
 ${directoryStr}
 </files_overview>`)
+
+
+	// XML tag is self-describing; no narration prefix. Keep field order stable
+	// so that on turns where volatile fields happen to match the previous turn,
+	// the cache can extend further into the prefix.
+	return (`<volatile_context>
+Today's date is ${new Date().toDateString()}.
+
+${sysInfo}
+
+${fsInfo}
+</volatile_context>`)
+}
+
+
+export const chat_systemMessage = ({ chatMode: mode, mcpTools, includeXMLToolDefinitions }: Pick<ChatPromptContext, 'chatMode' | 'mcpTools' | 'includeXMLToolDefinitions'>) => {
+	const header = (`You are an expert coding ${mode === 'agent' ? 'agent' : 'assistant'} whose job is \
+${mode === 'agent' ? `to help the user develop, run, and make changes to their codebase.`
+			: mode === 'gather' ? `to search, understand, and reference files in the user's codebase.`
+				: mode === 'normal' ? `to assist the user with their coding tasks.`
+					: ''}
+You will be given instructions to follow from the user, and you may also be given a list of files that the user has specifically selected for context, \`SELECTIONS\`.
+Please assist the user with their query.`)
 
 
 	const toolDefinitions = includeXMLToolDefinitions ? systemToolsXMLPrompt(mode, mcpTools) : null
@@ -510,29 +541,17 @@ Here's an example of a good code block:\n${chatSuggestionDiffExample}`)
 	const importantDetails = (`Important notes:
 ${details.map((d, i) => `${i + 1}. ${d}`).join('\n\n')}`)
 
-	// Volatile content is intentionally emitted last so that the stable prefix
-	// above (persona + rules + tool definitions) can be prefix-cached by the
-	// provider across turns. Anything that changes between messages — active
-	// file, open tabs, terminal IDs, directory listing, today's date — must
-	// live in this volatile tail. Keep it in a predictable order so that, on
-	// turns where the volatile bits happen to match the previous turn, the
-	// cache can extend further.
-	const volatileContext = (`Here is context that may change between turns:
-<volatile_context>
-Today's date is ${new Date().toDateString()}.
-
-${sysInfo}
-
-${fsInfo}
-</volatile_context>`)
-
-
-	// return answer
+	// System message contains ONLY stable content (persona, rules, tool definitions)
+	// so the entire system prefix is eligible for cross-turn prefix caching. Anything
+	// that can change between turns (active file, open tabs, today's date, directory
+	// listing, terminal IDs) lives in `chat_volatileContext` and is baked into each
+	// user message's stored content at thread-creation time by chatThreadService.
+	// That keeps historical turns byte-identical across subsequent requests so the
+	// provider's prefix cache stays warm as the conversation grows.
 	const ansStrs: string[] = []
 	ansStrs.push(header)
 	ansStrs.push(importantDetails)
 	if (toolDefinitions) ansStrs.push(toolDefinitions)
-	ansStrs.push(volatileContext)
 
 	const fullSystemMsgStr = ansStrs
 		.join('\n\n\n')

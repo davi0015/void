@@ -84,6 +84,12 @@ export type RawToolParamsObj = {
 export type RawToolCallObj = {
 	name: ToolName;
 	rawParams: RawToolParamsObj;
+	// Original serialized `arguments` string as the model emitted it (OpenAI-compatible
+	// path only — Anthropic/Gemini deliver tool input as structured JSON with no raw
+	// source string). Preserved so that on replay we can send byte-identical content
+	// back to the provider, which keeps the prefix cache warm past the tool call.
+	// Absent/undefined when not available; callers should fall back to JSON.stringify(rawParams).
+	rawParamsStr?: string;
 	doneParams: ToolParamName<ToolName>[];
 	id: string;
 	isDone: boolean;

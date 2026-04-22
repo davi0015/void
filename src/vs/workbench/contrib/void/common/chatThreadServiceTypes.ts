@@ -13,6 +13,10 @@ export type ToolMessage<T extends ToolName> = {
 	content: string; // give this result to LLM (string of value)
 	id: string;
 	rawParams: RawToolParamsObj;
+	// Original serialized `arguments` string from the model's tool call (when available
+	// from the provider stream — OpenAI-compatible only). Used on replay to send
+	// byte-identical tool_calls back, preserving the provider's prefix cache.
+	rawParamsStr?: string;
 	mcpServerName: string | undefined; // the server name at the time of the call
 } & (
 		// in order of events:
