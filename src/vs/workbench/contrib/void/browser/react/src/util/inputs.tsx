@@ -1582,7 +1582,9 @@ const normalizeIndentation = (code: string): string => {
 
 const modelOfEditorId: { [id: string]: ITextModel | undefined } = {}
 export type BlockCodeProps = { initValue: string, language?: string, maxHeight?: number, showScrollbars?: boolean }
-export const BlockCode = ({ initValue, language, maxHeight, showScrollbars }: BlockCodeProps) => {
+// Not exported: the only call-site is LazyBlockCode below. Using this directly re-introduces
+// the tab-switch/long-chat perf regression we fixed in Perf 1 Fix C — always go through LazyBlockCode.
+const BlockCode = ({ initValue, language, maxHeight, showScrollbars }: BlockCodeProps) => {
 
 	initValue = normalizeIndentation(initValue)
 
@@ -1716,6 +1718,34 @@ export const BlockCode = ({ initValue, language, maxHeight, showScrollbars }: Bl
 }
 
 
+// Module-level scheduler that mounts at most one Monaco editor per animation frame.
+// When a user scrolls fast through a long chat, many LazyBlockCode placeholders cross
+// the IntersectionObserver threshold in quick succession. Without a queue they would
+// all call setIsVisible(true) in the same React batch, mounting N Monaco editors
+// synchronously on the main thread — visible as scroll jank. The queue rate-limits
+// those mounts so scroll stays smooth, at the cost of a small staggered reveal.
+const lazyMountQueue: Array<() => void> = []
+let lazyMountFlushScheduled = false
+const flushLazyMountQueue = () => {
+	lazyMountFlushScheduled = false
+	const next = lazyMountQueue.shift()
+	if (next) {
+		try { next() } catch (err) { console.error('[LazyBlockCode] mount callback failed', err) }
+	}
+	if (lazyMountQueue.length > 0) {
+		lazyMountFlushScheduled = true
+		requestAnimationFrame(flushLazyMountQueue)
+	}
+}
+const scheduleLazyMount = (cb: () => void) => {
+	lazyMountQueue.push(cb)
+	if (!lazyMountFlushScheduled) {
+		lazyMountFlushScheduled = true
+		requestAnimationFrame(flushLazyMountQueue)
+	}
+}
+
+
 // Lazy wrapper around BlockCode that defers mounting the heavy Monaco CodeEditorWidget
 // until the block is close to the viewport. Rendering dozens of Monaco editors per chat
 // thread is the dominant cost on tab switches / long chats (disposable churn, TextMate
@@ -1723,7 +1753,9 @@ export const BlockCode = ({ initValue, language, maxHeight, showScrollbars }: Bl
 // <pre><code> placeholder with the same container styling while off-screen, then upgrade
 // in-place to the real BlockCode when the IntersectionObserver fires. Upgrade is
 // monotonic: once mounted, Monaco stays mounted — the expensive work is the mount itself,
-// not the continued existence.
+// not the continued existence. Mounts are also funneled through a per-frame queue
+// (`scheduleLazyMount`) so a burst of IO fires during fast scrolling staggers instead
+// of piling onto a single frame.
 export const LazyBlockCode = ({ initValue, language, maxHeight, showScrollbars }: BlockCodeProps) => {
 	const wrapperRef = useRef<HTMLDivElement | null>(null)
 	const [isVisible, setIsVisible] = useState(false)
@@ -1736,14 +1768,22 @@ export const LazyBlockCode = ({ initValue, language, maxHeight, showScrollbars }
 			setIsVisible(true)
 			return
 		}
+		let cancelled = false
 		const io = new IntersectionObserver((entries) => {
+			if (cancelled) return
 			if (entries.some(e => e.isIntersecting)) {
-				setIsVisible(true)
 				io.disconnect()
+				scheduleLazyMount(() => {
+					if (cancelled) return
+					setIsVisible(true)
+				})
 			}
 		}, { rootMargin: '500px 0px' })
 		io.observe(el)
-		return () => io.disconnect()
+		return () => {
+			cancelled = true
+			io.disconnect()
+		}
 	}, [isVisible])
 
 	if (isVisible) {
