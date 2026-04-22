@@ -3,8 +3,32 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import React, { JSX, useMemo, useState } from 'react'
+import React, { JSX, useState } from 'react'
 import { marked, MarkedToken, Token } from 'marked'
+
+// Module-level content-keyed cache for marked.lexer output. Every tab switch / every
+// re-render of a bubble otherwise re-lexes the entire message from scratch, even
+// though the content is identical to the previous lex. Cache survives component
+// unmount/remount. Bounded with a rough LRU on insertion-order (JS Map preserves it)
+// so a long chat session doesn't leak unbounded memory.
+const LEXER_CACHE_MAX = 500
+const lexerCache = new Map<string, Token[]>()
+const cachedLex = (raw: string): Token[] => {
+	const hit = lexerCache.get(raw)
+	if (hit !== undefined) {
+		// refresh recency
+		lexerCache.delete(raw)
+		lexerCache.set(raw, hit)
+		return hit
+	}
+	const tokens = marked.lexer(raw)
+	if (lexerCache.size >= LEXER_CACHE_MAX) {
+		const oldest = lexerCache.keys().next().value
+		if (oldest !== undefined) lexerCache.delete(oldest)
+	}
+	lexerCache.set(raw, tokens)
+	return tokens
+}
 
 import { convertToVscodeLang, detectLanguage } from '../../../../common/helpers/languageHelpers.js'
 import { BlockCodeApplyWrapper } from './ApplyBlockHoverButtons.js'
@@ -12,7 +36,7 @@ import { useAccessor } from '../util/services.js'
 import { URI } from '../../../../../../../base/common/uri.js'
 import { isAbsolute } from '../../../../../../../base/common/path.js'
 import { separateOutFirstLine } from '../../../../common/helpers/util.js'
-import { BlockCode } from '../util/inputs.js'
+import { LazyBlockCode } from '../util/inputs.js'
 import { CodespanLocationLink } from '../../../../common/chatThreadServiceTypes.js'
 import { getBasename, getRelative, voidOpenFileFn } from '../sidebar-tsx/SidebarChat.js'
 
@@ -323,14 +347,14 @@ const RenderToken = ({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ..
 				language={language}
 				uri={uri || 'current'}
 			>
-				<BlockCode
+				<LazyBlockCode
 					initValue={contents.trimEnd()} // \n\n adds a permanent newline which creates a flash
 					language={language}
 				/>
 			</BlockCodeApplyWrapper>
 		}
 
-		return <BlockCode
+		return <LazyBlockCode
 			initValue={contents}
 			language={language}
 		/>
@@ -545,7 +569,7 @@ const RenderToken = ({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ..
 
 export const ChatMarkdownRender = ({ string, inPTag = false, chatMessageLocation, ...options }: { string: string, inPTag?: boolean, codeURI?: URI, chatMessageLocation: ChatMessageLocation | undefined } & RenderTokenOptions) => {
 	string = string.replaceAll('\n•', '\n\n•')
-	const tokens = marked.lexer(string); // https://marked.js.org/using_pro#renderer
+	const tokens = cachedLex(string); // https://marked.js.org/using_pro#renderer
 	return (
 		<>
 			{tokens.map((token, index) => (
