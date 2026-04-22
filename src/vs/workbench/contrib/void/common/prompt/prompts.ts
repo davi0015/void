@@ -527,22 +527,61 @@ You will be given instructions from the user, and may also receive a list of fil
 	}
 
 	if (mode === 'agent') {
+		// A3 — Agent loop framing. Explicit phase structure the model can
+		// self-check against, instead of the implicit "do everything in some
+		// order" shape. Helps weaker models (Nemotron) not skip steps and gives
+		// stronger models (MiniMax) a natural exit point ("we're in verify,
+		// stop adding steps") to curb post-A1+A2 over-iteration. The phases
+		// are a self-check, not required output — we deliberately do NOT ask
+		// the model to announce which phase it's in.
+		details.push(`Follow this loop on every task: understand the user's intent → investigate the relevant code → diagnose the actual problem → act with focused changes → verify the change worked. Use the loop as a self-check: don't act without investigating first, and don't keep investigating after you've already acted and verified.`)
+
 		details.push('ALWAYS use tools (edit, terminal, etc) to take actions and implement changes. For example, if you would like to edit a file, you MUST use a tool.')
-		details.push('Prioritize taking as many steps as you need to complete your request over stopping early.')
-		details.push(`You will OFTEN need to gather context before making a change. Do not immediately make a change unless you have ALL relevant context.`)
-		details.push(`ALWAYS have maximal certainty in a change BEFORE you make it. If you need more information about a file, variable, function, or type, you should inspect it, search it, or take all required actions to maximize your certainty that your change is correct.`)
+
+		// A4 — Rebalance over-iteration. Replaces three compounding rules
+		// ("maximal certainty BEFORE" + "OFTEN need to gather context" +
+		// "prioritize as many steps as needed over stopping early") that
+		// produced "read everything, deliberate forever" behavior. A1+A2 eval
+		// data: Nemotron +90% tokens, MiniMax +18%; user-reported "long
+		// interactions for one console.log". Safety intent is preserved, but
+		// certainty and step count are scaled to reversibility — high
+		// certainty for hard-to-undo work, act-and-verify for low-stakes.
+		details.push(`Gather *enough* context to be confident, not maximal context. A senior engineer reads what they need and stops. If the answer is obvious from what you've already read this turn, don't keep searching.`)
+		details.push(`Take as many steps as the task genuinely requires — but don't pad. If you can finish in two tool calls, finish in two. Don't re-read files you've already read this turn, and don't run redundant verification commands.`)
+		details.push(`Have *high* certainty before changes that are hard to undo (file rewrites, deletes, terminal commands that modify state, git operations). For low-stakes changes (adding a log line, tweaking one expression, small edits to fresh code), act and verify with a quick test rather than deliberating up front.`)
+
 		details.push(`NEVER modify a file outside the user's workspace without permission from the user.`)
 	}
 
 	if (mode === 'gather') {
-		details.push(`You are in Gather mode, so you MUST use tools be to gather information, files, and context to help the user answer their query.`)
-		details.push(`You should extensively read files, types, content, etc, gathering full context to solve the problem.`)
+		details.push(`You are in Gather mode, so you MUST use tools to gather information, files, and context to help the user answer their query.`)
+		// Softened from "extensively read ... gathering full context" — that
+		// maximalist framing encouraged re-reading and reading-past-the-answer.
+		// Breadth intent is kept, but scoped to what the question needs.
+		details.push(`Read broadly and follow references across files, but stop once you have enough to answer the question with confidence. Don't re-read files you've already read this turn, and don't chase tangents unrelated to the user's query.`)
+		// Lightweight loop — no "act" or "verify" phase since gather can't
+		// edit or run code. Keeps the self-check benefit without forcing a
+		// shape the mode can't execute.
+		details.push(`On each question: understand what the user is actually asking → investigate the relevant code → form a grounded answer. Use this as a self-check that you're answering the question, not just dumping context.`)
 	}
 
-	details.push(`If you write any code blocks to the user (wrapped in triple backticks), please use this format:
+	if (mode === 'agent') {
+		// Trimmed from the universal format rule: "FULL PATH as first line" +
+		// "contents of the file should proceed as usual" describe the shape of
+		// an edit-via-code-block, which is only meaningful in gather/normal
+		// (where code blocks ARE the edit mechanism). In agent mode those
+		// bullets compete with `ALWAYS use tools` and empirically caused Gemma
+		// to emit inline <<<< ORIGINAL / >>>> UPDATED diffs instead of calling
+		// edit_file (A3+A4 eval, Tests 1 Before + 2 After). Keeping only the
+		// generally-useful language-tag rule.
+		details.push(`If you write any code blocks to the user (wrapped in triple backticks), include a language tag (e.g. \`typescript\`, \`shell\`). Terminal commands should have the language \`shell\`.`)
+	}
+	else {
+		details.push(`If you write any code blocks to the user (wrapped in triple backticks), please use this format:
 - Include a language if possible. Terminal should have the language 'shell'.
 - The first line of the code block must be the FULL PATH of the related file if known (otherwise omit).
 - The remaining contents of the file should proceed as usual.`)
+	}
 
 	if (mode === 'gather' || mode === 'normal') {
 
