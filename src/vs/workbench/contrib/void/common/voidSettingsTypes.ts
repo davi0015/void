@@ -5,7 +5,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import { defaultModelsOfProvider, defaultProviderSettings, ModelOverrides } from './modelCapabilities.js';
-import { ToolApprovalType } from './toolsServiceTypes.js';
+import { AutoApproveMode, ToolApprovalType } from './toolsServiceTypes.js';
 import { VoidSettingsState } from './voidSettingsService.js'
 
 
@@ -446,7 +446,12 @@ export type GlobalSettings = {
 	syncSCMToChat: boolean;
 	enableFastApply: boolean;
 	chatMode: ChatMode;
-	autoApprove: { [approvalType in ToolApprovalType]?: boolean };
+	// Per-tier auto-approve configuration. Stored as the tri-state `AutoApproveMode`
+	// ('off' | 'workspace' | 'all'). For backward compatibility with settings files written before
+	// the tri-state was introduced, a legacy `boolean` value is also accepted at read time and
+	// normalized via `normalizeAutoApproveMode` in `toolsServiceTypes` (true → 'workspace',
+	// false → 'off'). All code reading this field should go through `normalizeAutoApproveMode`.
+	autoApprove: { [approvalType in ToolApprovalType]?: AutoApproveMode | boolean };
 	showInlineSuggestions: boolean;
 	includeToolLintErrors: boolean;
 	isOnboardingComplete: boolean;

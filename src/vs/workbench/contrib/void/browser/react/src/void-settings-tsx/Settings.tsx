@@ -6,7 +6,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
 import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName } from '../../../../common/voidSettingsTypes.js'
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js'
-import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js'
+import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSegmentedControl, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js'
 import { useAccessor, useIsDark, useIsOptedOut, useRefreshModelListener, useRefreshModelState, useSettingsState } from '../util/services.js'
 import { X, RefreshCw, Loader2, Check, Asterisk, Plus, GripVertical } from 'lucide-react'
 import { URI } from '../../../../../../../base/common/uri.js'
@@ -15,7 +15,7 @@ import { ChatMarkdownRender } from '../markdown/ChatMarkdownRender.js'
 import { WarningBox } from './WarningBox.js'
 import { os } from '../../../../common/helpers/systemInfo.js'
 import { IconLoading } from '../sidebar-tsx/SidebarChat.js'
-import { ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js'
+import { AutoApproveMode, approvalIsWorkspaceScoped, normalizeAutoApproveMode, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js'
 import Severity from '../../../../../../../base/common/severity.js'
 import { getModelCapabilities, modelOverrideKeys, ModelOverrides } from '../../../../common/modelCapabilities.js';
 import { TransferEditorType, TransferFilesInfo } from '../../../extensionTransferTypes.js';
@@ -1107,25 +1107,55 @@ const RedoOnboardingButton = ({ className }: { className?: string }) => {
 
 
 
+// Renders the auto-approve control for a given tool tier. For workspace-scoped tiers
+// ('edits', 'delete') this is a 3-way segmented control (Off / Workspace / Everywhere). For
+// unscoped tiers ('terminal', 'MCP tools'), where workspace scoping has no meaning, we keep the
+// original compact on/off `VoidSwitch` — the extra radio options would just be UI noise. Under
+// the hood the tri-state storage is preserved so the check in `chatThreadService` can be uniform:
+// the switch maps Off → 'off' and On → 'all'.
 export const ToolApprovalTypeSwitch = ({ approvalType, size, desc }: { approvalType: ToolApprovalType, size: "xxs" | "xs" | "sm" | "sm+" | "md", desc: string }) => {
 	const accessor = useAccessor()
 	const voidSettingsService = accessor.get('IVoidSettingsService')
 	const voidSettingsState = useSettingsState()
 	const metricsService = accessor.get('IMetricsService')
 
-	const onToggleAutoApprove = useCallback((approvalType: ToolApprovalType, newValue: boolean) => {
+	const writeMode = useCallback((newMode: AutoApproveMode) => {
 		voidSettingsService.setGlobalSetting('autoApprove', {
 			...voidSettingsService.state.globalSettings.autoApprove,
-			[approvalType]: newValue
+			[approvalType]: newMode,
 		})
-		metricsService.capture('Tool Auto-Accept Toggle', { enabled: newValue })
-	}, [voidSettingsService, metricsService])
+		metricsService.capture('Tool Auto-Accept Toggle', { enabled: newMode !== 'off', mode: newMode, tier: approvalType })
+	}, [voidSettingsService, metricsService, approvalType])
+
+	const currentMode = normalizeAutoApproveMode(voidSettingsState.globalSettings.autoApprove[approvalType])
+	const isScoped = approvalIsWorkspaceScoped(approvalType)
+
+	if (!isScoped) {
+		// Unscoped tier (terminal, MCP tools): simple boolean switch. Store Off→'off', On→'all'.
+		return <>
+			<VoidSwitch
+				size={size}
+				value={currentMode !== 'off'}
+				onChange={(newVal) => writeMode(newVal ? 'all' : 'off')}
+			/>
+			<span className="text-void-fg-3 text-xs">{desc}</span>
+		</>
+	}
+
+	// Workspace-scoped tier (edits, delete): tri-state radio.
+	const segSize: 'xxs' | 'xs' | 'sm' = size === 'xxs' ? 'xxs' : size === 'sm' || size === 'sm+' || size === 'md' ? 'sm' : 'xs'
+	const options: { value: AutoApproveMode; label: string; title?: string }[] = [
+		{ value: 'off', label: 'Off', title: 'Always ask for permission' },
+		{ value: 'workspace', label: 'Workspace', title: 'Auto-approve only when the file is inside an open workspace folder' },
+		{ value: 'all', label: 'Everywhere', title: 'Auto-approve regardless of path (including outside workspace)' },
+	]
 
 	return <>
-		<VoidSwitch
-			size={size}
-			value={voidSettingsState.globalSettings.autoApprove[approvalType] ?? false}
-			onChange={(newVal) => onToggleAutoApprove(approvalType, newVal)}
+		<VoidSegmentedControl
+			size={segSize}
+			value={currentMode}
+			onChange={writeMode}
+			options={options}
 		/>
 		<span className="text-void-fg-3 text-xs">{desc}</span>
 	</>

@@ -1,0 +1,69 @@
+# .cursorignore — paths excluded from Cursor's indexing / @-mentions / semantic search.
+# Keep this list tight: anything here won't be searchable or available for AI context.
+# Rule of thumb: exclude large generated/vendored content, keep source + real tests.
+
+# -------- Dependencies (~1.4 GB) --------
+node_modules/
+build/node_modules/
+remote/node_modules/
+
+# -------- Build outputs --------
+# Top-level VSCode build artifacts (/out*/ pattern from .gitignore)
+out/
+out-build/
+out-vscode/
+out-vscode-min/
+out-vscode-web/
+out-vscode-web-min/
+.build/
+
+# Void scratch / dev-mode user data
+.tmp/
+.tmp2/
+.vscode-test/
+
+# Coverage / test outputs (sources stay indexable)
+coverage/
+test-results/
+test-results.xml
+test/smoke/out/
+test/unit/out/
+test/integration/out/
+test_data/
+.profile-oss
+
+# -------- Void React bundle (generated) --------
+# `react/src2/` is scope-tailwind's generated copy of `react/src/`.
+# `react/out/` is the esbuild bundle. Indexing src/ (the real source) is enough.
+src/vs/workbench/contrib/void/browser/react/src2/
+src/vs/workbench/contrib/void/browser/react/out/
+
+# -------- Extension build outputs --------
+.vscode/extensions/**/out/
+extensions/**/out/
+extensions/**/dist/
+dist/
+
+# -------- CLI / native builds --------
+cli/target/
+cli/openssl/
+
+# -------- Generated / minified (noise in search) --------
+*.min.js
+*.map
+*.tsbuildinfo
+*.snap.actual
+vscode.lsif
+vscode.db
+product.overrides.json
+
+# -------- OS / editor junk --------
+.DS_Store
+Thumbs.db
+npm-debug.log
+*.log
+.cache
+
+# -------- Local notes (optional: keep indexed if you want Cursor to see them) --------
+# Uncomment to hide from Cursor search:
+# mynote.md

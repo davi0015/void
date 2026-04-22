@@ -16,7 +16,7 @@ import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, Raw
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
-import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
+import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, normalizeAutoApproveMode, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { IToolsService } from './toolsService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
@@ -862,7 +862,27 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 			const approvalType = isBuiltInTool ? approvalTypeOfBuiltinToolName[toolName] : 'MCP tools'
 			if (approvalType) {
-				const autoApprove = this._settingsService.state.globalSettings.autoApprove[approvalType]
+				const mode = normalizeAutoApproveMode(this._settingsService.state.globalSettings.autoApprove[approvalType])
+				// Tri-state resolution:
+				//   'off'       → always prompt
+				//   'all'       → skip prompt
+				//   'workspace' → skip prompt iff target URI is inside an open workspace folder.
+				//                 For non-workspace-scoped tiers ('terminal', 'MCP tools'),
+				//                 'workspace' is semantically equivalent to 'all' — commands/MCPs
+				//                 don't have a single target URI to scope against and can
+				//                 legitimately operate outside the workspace.
+				let autoApprove = false
+				if (mode === 'all') {
+					autoApprove = true
+				} else if (mode === 'workspace') {
+					if (approvalIsWorkspaceScoped(approvalType) && isBuiltInTool) {
+						const targetUri = (toolParams as { uri?: URI } | undefined)?.uri
+						autoApprove = !!targetUri && this._workspaceContextService.isInsideWorkspace(targetUri)
+					} else {
+						autoApprove = true
+					}
+				}
+
 				// add a tool_request because we use it for UI if a tool is loading (this should be improved in the future)
 				this._addMessageToThread(threadId, { role: 'tool', type: 'tool_request', content: '(Awaiting user permission...)', result: null, name: toolName, params: toolParams, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
 				if (!autoApprove) {
