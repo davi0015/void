@@ -1716,6 +1716,51 @@ export const BlockCode = ({ initValue, language, maxHeight, showScrollbars }: Bl
 }
 
 
+// Lazy wrapper around BlockCode that defers mounting the heavy Monaco CodeEditorWidget
+// until the block is close to the viewport. Rendering dozens of Monaco editors per chat
+// thread is the dominant cost on tab switches / long chats (disposable churn, TextMate
+// worker attach/detach, scrollbar+sash+hover provider allocation). We render a plain
+// <pre><code> placeholder with the same container styling while off-screen, then upgrade
+// in-place to the real BlockCode when the IntersectionObserver fires. Upgrade is
+// monotonic: once mounted, Monaco stays mounted — the expensive work is the mount itself,
+// not the continued existence.
+export const LazyBlockCode = ({ initValue, language, maxHeight, showScrollbars }: BlockCodeProps) => {
+	const wrapperRef = useRef<HTMLDivElement | null>(null)
+	const [isVisible, setIsVisible] = useState(false)
+
+	useEffect(() => {
+		if (isVisible) return
+		const el = wrapperRef.current
+		if (!el) return
+		if (typeof IntersectionObserver === 'undefined') {
+			setIsVisible(true)
+			return
+		}
+		const io = new IntersectionObserver((entries) => {
+			if (entries.some(e => e.isIntersecting)) {
+				setIsVisible(true)
+				io.disconnect()
+			}
+		}, { rootMargin: '500px 0px' })
+		io.observe(el)
+		return () => io.disconnect()
+	}, [isVisible])
+
+	if (isVisible) {
+		return <BlockCode initValue={initValue} language={language} maxHeight={maxHeight} showScrollbars={showScrollbars} />
+	}
+
+	const normalized = normalizeIndentation(initValue)
+	return (
+		<div ref={wrapperRef} className='relative z-0 px-2 py-1 bg-void-bg-3'>
+			<pre className='m-0 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto text-void-fg-2'>
+				<code>{normalized}</code>
+			</pre>
+		</div>
+	)
+}
+
+
 export const VoidButtonBgDarken = ({ children, disabled, onClick, className }: { children: React.ReactNode; disabled?: boolean; onClick: () => void; className?: string }) => {
 	return <button disabled={disabled}
 		className={`px-3 py-1 bg-black/10 dark:bg-white/10 rounded-sm overflow-hidden whitespace-nowrap flex items-center justify-center ${className || ''}`}

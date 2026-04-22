@@ -13,7 +13,7 @@ import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markd
 import { URI } from '../../../../../../../base/common/uri.js';
 import { IDisposable } from '../../../../../../../base/common/lifecycle.js';
 import { ErrorDisplay } from './ErrorDisplay.js';
-import { BlockCode, TextAreaFns, VoidCustomDropdownBox, VoidInputBox2, VoidSlider, VoidSwitch, VoidDiffEditor } from '../util/inputs.js';
+import { LazyBlockCode, TextAreaFns, VoidCustomDropdownBox, VoidInputBox2, VoidSlider, VoidSwitch, VoidDiffEditor } from '../util/inputs.js';
 import { ModelDropdown, } from '../void-settings-tsx/ModelDropdown.js';
 import { PastThreadsList, SidebarThreadTabs } from './SidebarThreadSelector.js';
 import { VOID_CTRL_L_ACTION_ID } from '../../../actionIDs.js';
@@ -2011,7 +2011,7 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 
 		componentParams.children = <ToolChildrenWrapper className='whitespace-pre text-nowrap overflow-auto text-sm'>
 			<div className='!select-text cursor-auto'>
-				<BlockCode initValue={`${msg.trim()}`} language='shellscript' />
+				<LazyBlockCode initValue={`${msg.trim()}`} language='shellscript' />
 			</div>
 		</ToolChildrenWrapper>
 	}
@@ -3137,6 +3137,15 @@ export const SidebarChat = () => {
 
 	}, [chatThreadsState, threadId, textAreaRef, scrollContainerRef, isResolved])
 
+	// Land-at-bottom on thread switch. Previously this was a side-effect of
+	// `key={'messages' + threadId}` force-remounting `ScrollToBottomContainer`,
+	// which fired its mount-time "scroll to bottom" effect. We removed that key
+	// to make tab-switching fast (no tear-down + rebuild of all bubbles), so we
+	// need an explicit effect to preserve the same landing behavior.
+	useEffect(() => {
+		scrollToBottom(scrollContainerRef)
+	}, [threadId, scrollContainerRef])
+
 
 
 
@@ -3186,8 +3195,12 @@ export const SidebarChat = () => {
 			: null
 		: null
 
+	// NOTE: no `key={...currentThreadId}` here. Keeping the container mounted
+	// across thread switches lets React reconcile in place instead of tearing
+	// down and rebuilding every message bubble, which was the dominant cause
+	// of the tab-switch lag. Scroll-to-bottom on switch is now handled by an
+	// explicit effect above that fires on `threadId` change.
 	const messagesHTML = <ScrollToBottomContainer
-		key={'messages' + chatThreadsState.currentThreadId} // force rerender on all children if id changes
 		scrollContainerRef={scrollContainerRef}
 		className={`
 			flex flex-col

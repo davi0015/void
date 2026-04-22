@@ -12,7 +12,7 @@ import { useAccessor } from '../util/services.js'
 import { URI } from '../../../../../../../base/common/uri.js'
 import { isAbsolute } from '../../../../../../../base/common/path.js'
 import { separateOutFirstLine } from '../../../../common/helpers/util.js'
-import { BlockCode } from '../util/inputs.js'
+import { LazyBlockCode } from '../util/inputs.js'
 import { CodespanLocationLink } from '../../../../common/chatThreadServiceTypes.js'
 import { getBasename, getRelative, voidOpenFileFn } from '../sidebar-tsx/SidebarChat.js'
 
@@ -323,14 +323,14 @@ const RenderToken = ({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ..
 				language={language}
 				uri={uri || 'current'}
 			>
-				<BlockCode
+				<LazyBlockCode
 					initValue={contents.trimEnd()} // \n\n adds a permanent newline which creates a flash
 					language={language}
 				/>
 			</BlockCodeApplyWrapper>
 		}
 
-		return <BlockCode
+		return <LazyBlockCode
 			initValue={contents}
 			language={language}
 		/>
