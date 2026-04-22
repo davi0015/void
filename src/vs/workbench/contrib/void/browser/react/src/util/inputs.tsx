@@ -1217,6 +1217,69 @@ export const VoidSwitch = ({
 
 
 
+// N-way segmented control used for tri-state (or bi-state) settings like the tool auto-approve
+// tier mode (off / workspace / all). Renders as a row of individually-rounded pill buttons with
+// visible gaps between them, so each option reads as a distinct clickable target. The active pill
+// fills with a high-contrast color (matching VoidSwitch's active state) and the inactive pills
+// have a subtle bordered look so they're visible against the panel background.
+//
+// Uses explicit zinc-* Tailwind colors rather than theme variables for the active fill, because
+// `void-*` color variables can be subtle in some themes and we want consistent high contrast.
+export const VoidSegmentedControl = <T extends string>({
+	value,
+	onChange,
+	options,
+	size = 'xs',
+	disabled = false,
+}: {
+	value: T;
+	onChange: (value: T) => void;
+	options: { value: T; label: string; title?: string }[];
+	size?: 'xxs' | 'xs' | 'sm';
+	disabled?: boolean;
+}) => {
+	// Bigger padding + slightly larger font than VoidSwitch because labels are text, not a dot.
+	const btnPad =
+		size === 'xxs' ? 'px-2 py-0.5 text-xs' :
+			size === 'xs' ? 'px-3 py-1 text-sm' :
+				'px-3.5 py-1.5 text-sm'
+
+	return (
+		<div
+			role="radiogroup"
+			className={`inline-flex items-center gap-1 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}
+		>
+			{options.map((opt) => {
+				const active = opt.value === value
+				return (
+					<button
+						key={opt.value}
+						type="button"
+						role="radio"
+						aria-checked={active}
+						title={opt.title ?? opt.label}
+						onClick={() => !disabled && !active && onChange(opt.value)}
+						className={`
+							${btnPad}
+							rounded
+							leading-none
+							whitespace-nowrap
+							transition-colors duration-75
+							border
+							${active
+								? 'bg-zinc-900 text-white border-zinc-900 dark:bg-white dark:text-zinc-900 dark:border-white font-medium'
+								: 'bg-transparent text-void-fg-3 border-void-border-2 hover:text-void-fg-1 hover:border-void-fg-3 hover:bg-void-bg-2-hover cursor-pointer'}
+						`}
+					>
+						{opt.label}
+					</button>
+				)
+			})}
+		</div>
+	)
+}
+
+
 export const VoidCheckBox = ({ label, value, onClick, className }: { label: string, value: boolean, onClick: (checked: boolean) => void, className?: string }) => {
 	const divRef = useRef<HTMLDivElement | null>(null)
 	const instanceRef = useRef<Checkbox | null>(null)

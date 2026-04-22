@@ -18,9 +18,19 @@ export type ShallowDirectoryItem = {
 }
 
 
-export const approvalTypeOfBuiltinToolName: Partial<{ [T in BuiltinToolName]?: 'edits' | 'terminal' | 'MCP tools' }> = {
+// Approval tiers for built-in tools. Kept separate so users can opt into auto-approve at different
+// safety levels:
+//   - 'edits'    = reversible changes (edit_file always revertable via checkpoint, create/rewrite
+//                  likewise). Workspace-scoped when auto-approved (see chatThreadService).
+//   - 'delete'   = irreversible destructive ops (delete_file_or_folder). Split out from 'edits' so
+//                  auto-approving normal edits doesn't silently enable auto-delete. Also workspace-
+//                  scoped when auto-approved.
+//   - 'terminal' = run_command and persistent terminal ops. NOT workspace-scoped (commands can
+//                  legitimately operate outside the workspace, e.g. `brew install`).
+//   - 'MCP tools'= all MCP tools; unscoped.
+export const approvalTypeOfBuiltinToolName: Partial<{ [T in BuiltinToolName]?: 'edits' | 'delete' | 'terminal' | 'MCP tools' }> = {
 	'create_file_or_folder': 'edits',
-	'delete_file_or_folder': 'edits',
+	'delete_file_or_folder': 'delete',
 	'rewrite_file': 'edits',
 	'edit_file': 'edits',
 	'run_command': 'terminal',
@@ -37,6 +47,31 @@ export const toolApprovalTypes = new Set<ToolApprovalType>([
 	...Object.values(approvalTypeOfBuiltinToolName),
 	'MCP tools',
 ])
+
+
+// Auto-approve mode per tier. Tri-state:
+//   'off'       — always prompt
+//   'workspace' — auto-approve when the target is inside an open workspace folder; prompt otherwise
+//   'all'       — auto-approve regardless of path
+// For tiers that don't have a meaningful workspace scope ('terminal', 'MCP tools'), 'workspace'
+// is rendered in UI as a simple on/off and stored as 'all' when enabled. See
+// `approvalIsWorkspaceScoped` below.
+export type AutoApproveMode = 'off' | 'workspace' | 'all'
+
+// Returns true if the tier's behavior differs between a workspace-internal vs external path.
+// Only file-modification tiers are workspace-scoped today: `edits` and `delete`.
+export const approvalIsWorkspaceScoped = (t: ToolApprovalType): boolean =>
+	t === 'edits' || t === 'delete'
+
+// Normalizes stored auto-approve values to the tri-state enum. Accepts the legacy boolean shape
+// that was written before the tri-state was introduced:
+//   true  → 'workspace' (safe default — opt into 'all' explicitly via the radio)
+//   false → 'off'
+export const normalizeAutoApproveMode = (raw: AutoApproveMode | boolean | undefined): AutoApproveMode => {
+	if (raw === undefined) return 'off'
+	if (typeof raw === 'boolean') return raw ? 'workspace' : 'off'
+	return raw
+}
 
 
 
