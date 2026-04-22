@@ -1504,6 +1504,23 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 	const isEmpty = !chatMessage.displayContent && !chatMessage.reasoning
 	if (isEmpty) return null
 
+	// Show a truncation warning when the provider reported a non-clean stream end.
+	// Only rendered on committed messages (so we don't flash a scary banner mid-stream —
+	// the `finish_reason` is set on the final chunk, but until we've taken the round-
+	// trip through `onFinalMessage` + `_addMessageToThread`, we don't trust it).
+	// Empty/undefined reason → no warning (Anthropic/Gemini paths, or any OAI-compatible
+	// server that doesn't report finish_reason).
+	const finishReason = chatMessage.finishReason
+	const showTruncationWarning = isCommitted
+		&& !!finishReason
+		&& finishReason !== 'stop'
+		&& finishReason !== 'tool_calls'
+		&& finishReason !== 'function_call'
+	const truncationWarningText =
+		finishReason === 'length' ? 'Response truncated — model hit its output-token limit (finish_reason: length).' :
+			finishReason === 'content_filter' ? 'Response blocked — provider content filter (finish_reason: content_filter).' :
+				`Response ended unexpectedly (finish_reason: ${finishReason}).`
+
 	return <>
 		{/* reasoning token */}
 		{hasReasoning &&
@@ -1532,6 +1549,12 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 						isLinkDetectionEnabled={true}
 					/>
 				</ProseWrapper>
+			</div>
+		}
+
+		{showTruncationWarning &&
+			<div className={`${isCheckpointGhost ? 'opacity-50' : ''} mt-1`}>
+				<WarningBox text={truncationWarningText} />
 			</div>
 		}
 	</>
