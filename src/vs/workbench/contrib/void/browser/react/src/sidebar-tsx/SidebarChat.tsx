@@ -1621,8 +1621,20 @@ const titleOfBuiltinToolName = {
 } as const satisfies Record<BuiltinToolName, { done: any, proposed: any, running: any }>
 
 
-const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name' | 'type' | 'mcpServerName'>): React.ReactNode => {
+// Prefix like "(1/2) " when this tool is part of a multi-tool batch emitted in one
+// assistant turn. The prefix is purely decorative (helps the user see that one reply
+// contains multiple tools and track how many are done) and is omitted for solo tools
+// or when the message predates parallel tool support (batchIndex/batchSize undefined).
+const batchPrefix = (m: Pick<ChatMessage & { role: 'tool' }, 'batchIndex' | 'batchSize'>): string => {
+	if (m.batchIndex === undefined || m.batchSize === undefined) return ''
+	if (m.batchSize <= 1) return ''
+	// batchIndex is 0-based internally but we render as 1-based for humans.
+	return `(${m.batchIndex + 1}/${m.batchSize}) `
+}
+
+const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name' | 'type' | 'mcpServerName' | 'batchIndex' | 'batchSize'>): React.ReactNode => {
 	const t = toolMessage
+	const prefix = batchPrefix(t)
 
 	// non-built-in title
 	if (!builtinToolNames.includes(t.name as BuiltinToolName)) {
@@ -1637,7 +1649,7 @@ const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name' | 'ty
 									: 'Call'
 
 
-		const title = `${descriptor} ${toolMessage.mcpServerName || 'MCP'}`
+		const title = `${prefix}${descriptor} ${toolMessage.mcpServerName || 'MCP'}`
 		if (t.type === 'running_now' || t.type === 'tool_request')
 			return loadingTitleWrapper(title)
 		return title
@@ -1646,9 +1658,11 @@ const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name' | 'ty
 	// built-in title
 	else {
 		const toolName = t.name as BuiltinToolName
-		if (t.type === 'success') return titleOfBuiltinToolName[toolName].done
-		if (t.type === 'running_now') return titleOfBuiltinToolName[toolName].running
-		return titleOfBuiltinToolName[toolName].proposed
+		const base =
+			t.type === 'success' ? titleOfBuiltinToolName[toolName].done
+				: t.type === 'running_now' ? titleOfBuiltinToolName[toolName].running
+					: titleOfBuiltinToolName[toolName].proposed
+		return prefix ? `${prefix}${base}` : base
 	}
 }
 
@@ -2699,6 +2713,12 @@ type ChatBubbleProps = {
 	threadId: string,
 	currCheckpointIdx: number | undefined,
 	_scrollToBottom: (() => void) | null,
+	// Index of the message that currently owns the approve/reject prompt (the earliest
+	// tool_request in the consecutive trailing batch). When a multi-tool batch is
+	// pre-added, all queued tool_requests share the same status but only the first one
+	// should render the buttons; the others are "waiting their turn". undefined = no
+	// pending approval anywhere in the thread.
+	firstPendingToolRequestIdx?: number,
 }
 
 const ChatBubble = (props: ChatBubbleProps) => {
@@ -2707,7 +2727,7 @@ const ChatBubble = (props: ChatBubbleProps) => {
 	</ErrorBoundary>
 }
 
-const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, messageIdx, chatIsRunning, _scrollToBottom }: ChatBubbleProps) => {
+const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, messageIdx, chatIsRunning, _scrollToBottom, firstPendingToolRequestIdx }: ChatBubbleProps) => {
 	const role = chatMessage.role
 
 	const isCheckpointGhost = messageIdx > (currCheckpointIdx ?? Infinity) && !chatIsRunning // whether to show as gray (if chat is running, for good measure just dont show any ghosts)
@@ -2751,7 +2771,7 @@ const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, me
 						threadId={threadId}
 					/>
 				</div>
-				{chatMessage.type === 'tool_request' ?
+				{chatMessage.type === 'tool_request' && messageIdx === firstPendingToolRequestIdx ?
 					<div className={`${isCheckpointGhost ? 'opacity-50 pointer-events-none' : ''}`}>
 						<ToolRequestAcceptRejectButtons toolName={chatMessage.name} />
 					</div> : null}
@@ -3102,8 +3122,14 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 	const streamState = useChatThreadsStreamState(threadId)
 	const isRunning = streamState?.isRunning
 	const latestError = streamState?.error
-	const { displayContentSoFar, toolCallSoFar, reasoningSoFar } = streamState?.llmInfo ?? {}
-	const toolIsGenerating = toolCallSoFar && !toolCallSoFar.isDone
+	const { displayContentSoFar, toolCallsSoFar, reasoningSoFar } = streamState?.llmInfo ?? {}
+	// During streaming the "currently being written" tool is the last one in the array
+	// (indices are emitted in order). Earlier tools in the batch may already be complete
+	// (their argument JSON fully streamed) but their persisted tool_request rows only
+	// show up in `thread.messages` once onFinalMessage fires and the batch is committed.
+	// For the live preview here we just show the latest in-flight tool.
+	const currentInFlightTool = toolCallsSoFar && toolCallsSoFar.length > 0 ? toolCallsSoFar[toolCallsSoFar.length - 1] : undefined
+	const toolIsGenerating = currentInFlightTool && !currentInFlightTool.isDone
 
 	const currCheckpointIdx = thread?.state?.currCheckpointIdx ?? undefined
 
@@ -3118,6 +3144,22 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 		}
 	}, [isActive, scrollContainerRef])
 
+	// Index of the "currently awaiting approval" tool request — the earliest of the
+	// consecutive trailing tool_request messages. Matches _getPendingBatchTools() in
+	// the service. For a solo tool call this is just the last message (same as the
+	// pre-batch behavior). For a multi-tool batch, it's the first pending one; later
+	// queued tool_requests render as stacked progress rows without approve/reject
+	// buttons.
+	const firstPendingToolRequestIdx = useMemo(() => {
+		let earliest: number | undefined
+		for (let i = previousMessages.length - 1; i >= 0; i--) {
+			const m = previousMessages[i]
+			if (m.role === 'tool' && m.type === 'tool_request') earliest = i
+			else break
+		}
+		return earliest
+	}, [previousMessages])
+
 	const previousMessagesHTML = useMemo(() => {
 		return previousMessages.map((message, i) => {
 			return <ChatBubble
@@ -3129,9 +3171,10 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 				chatIsRunning={isRunning}
 				threadId={threadId}
 				_scrollToBottom={() => scrollToBottom(scrollContainerRef)}
+				firstPendingToolRequestIdx={firstPendingToolRequestIdx}
 			/>
 		})
-	}, [previousMessages, threadId, currCheckpointIdx, isRunning, scrollContainerRef])
+	}, [previousMessages, threadId, currCheckpointIdx, isRunning, scrollContainerRef, firstPendingToolRequestIdx])
 
 	const streamingChatIdx = previousMessagesHTML.length
 	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
@@ -3151,10 +3194,10 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 			_scrollToBottom={null}
 		/> : null
 
-	const generatingTool = toolIsGenerating ?
-		toolCallSoFar.name === 'edit_file' || toolCallSoFar.name === 'rewrite_file' ? <EditToolSoFar
+	const generatingTool = toolIsGenerating && currentInFlightTool ?
+		currentInFlightTool.name === 'edit_file' || currentInFlightTool.name === 'rewrite_file' ? <EditToolSoFar
 			key={'curr-streaming-tool'}
-			toolCallSoFar={toolCallSoFar}
+			toolCallSoFar={currentInFlightTool}
 		/>
 			: null
 		: null
@@ -3230,10 +3273,13 @@ export const SidebarChat = () => {
 	const currThreadStreamState = useChatThreadsStreamState(chatThreadsState.currentThreadId)
 	const isRunning = currThreadStreamState?.isRunning
 	const latestError = currThreadStreamState?.error
-	const { displayContentSoFar, toolCallSoFar, reasoningSoFar } = currThreadStreamState?.llmInfo ?? {}
+	const { displayContentSoFar, toolCallsSoFar, reasoningSoFar } = currThreadStreamState?.llmInfo ?? {}
+	// See ThreadMessagesView comment: the last tool in the array is the one still
+	// being streamed; earlier batch siblings may already have complete argument JSON.
+	const currentInFlightTool = toolCallsSoFar && toolCallsSoFar.length > 0 ? toolCallsSoFar[toolCallsSoFar.length - 1] : undefined
 
 	// this is just if it's currently being generated, NOT if it's currently running
-	const toolIsGenerating = toolCallSoFar && !toolCallSoFar.isDone // show loading for slow tools (right now just edit)
+	const toolIsGenerating = currentInFlightTool && !currentInFlightTool.isDone // show loading for slow tools (right now just edit)
 
 	// ----- SIDEBAR CHAT state (local) -----
 

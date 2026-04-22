@@ -85,22 +85,35 @@ const prepareMessages_openai_tools = (messages: SimpleLLMMessage[]): AnthropicOr
 			continue
 		}
 
-		// edit previous assistant message to have called the tool
-		const prevMsg = 0 <= i - 1 && i - 1 <= newMessages.length ? newMessages[i - 1] : undefined
-		if (prevMsg?.role === 'assistant') {
+		// Walk back through newMessages to find the assistant that called this tool. For a
+		// solo tool this is always the immediately-prior message; for a batched response
+		// (N parallel tool calls) we need to append to the same assistant across N tool
+		// messages — the previous implementation overwrote tool_calls each time and only
+		// the LAST tool in a batch survived, corrupting replay bytes + the provider's cache.
+		let assistantIdx = -1
+		for (let j = newMessages.length - 1; j >= 0; j--) {
+			const m = newMessages[j]
+			if (m.role === 'assistant') { assistantIdx = j; break }
+			// Stop at any non-tool, non-assistant message (should never happen since we only
+			// push assistant/tool/user through here in order, but keep the safety rail).
+			if (m.role !== 'tool') break
+		}
+		if (assistantIdx >= 0) {
+			const asstMsg = newMessages[assistantIdx] as OpenAILLMChatMessage & { role: 'assistant' }
 			// Prefer the model's original serialized argument string when we have it
 			// (OpenAI-compatible providers expose it in the streaming delta). Sending
 			// byte-identical bytes back preserves the provider's prefix cache past the
 			// tool call. Fall back to re-serializing when the raw string is unavailable
 			// (e.g. conversations from before this field existed, or non-OpenAI provenance).
-			prevMsg.tool_calls = [{
-				type: 'function',
+			const newCall = {
+				type: 'function' as const,
 				id: currMsg.id,
 				function: {
 					name: currMsg.name,
 					arguments: currMsg.rawParamsStr ?? JSON.stringify(currMsg.rawParams)
 				}
-			}]
+			}
+			asstMsg.tool_calls = [...(asstMsg.tool_calls ?? []), newCall]
 		}
 
 		// add the tool
@@ -181,13 +194,27 @@ const prepareMessages_anthropic_tools = (messages: SimpleLLMMessage[], supportsA
 		}
 
 		if (currMsg.role === 'tool') {
-			// add anthropic tools
-			const prevMsg = 0 <= i - 1 && i - 1 <= newMessages.length ? newMessages[i - 1] : undefined
-
-			// make it so the assistant called the tool
-			if (prevMsg?.role === 'assistant') {
-				if (typeof prevMsg.content === 'string') prevMsg.content = [{ type: 'text', text: prevMsg.content }]
-				prevMsg.content.push({ type: 'tool_use', id: currMsg.id, name: currMsg.name, input: currMsg.rawParams })
+			// Walk back to the assistant that owned this tool call. For a batched turn
+			// (multiple parallel tool calls on one assistant), each tool message appends
+			// its own `tool_use` block to the same assistant's content array, and Anthropic
+			// sees the full batch as one assistant turn. Previously only the first tool
+			// was attached (prevMsg check) and the rest silently orphaned, which made
+			// replay of batched turns fail validation.
+			let assistantIdx = -1
+			for (let j = i - 1; j >= 0; j--) {
+				const m = newMessages[j]
+				if (!m) continue
+				if (m.role === 'assistant') { assistantIdx = j; break }
+				// Skip over previously-converted tool rows (now user messages with tool_result);
+				// anything else means we walked past the batch boundary.
+				if (m.role !== 'user') break
+				const isToolResultUser = Array.isArray(m.content) && m.content.some(c => c.type === 'tool_result')
+				if (!isToolResultUser) break
+			}
+			if (assistantIdx >= 0) {
+				const asstMsg = newMessages[assistantIdx] as AnthropicLLMChatMessage & { role: 'assistant' }
+				if (typeof asstMsg.content === 'string') asstMsg.content = [{ type: 'text', text: asstMsg.content }]
+				asstMsg.content.push({ type: 'tool_use', id: currMsg.id, name: currMsg.name, input: currMsg.rawParams })
 			}
 
 			// turn each tool into a user message with tool results at the end
@@ -214,12 +241,20 @@ const prepareMessages_XML_tools = (messages: SimpleLLMMessage[], supportsAnthrop
 		const next = 0 <= i + 1 && i + 1 <= messages.length - 1 ? messages[i + 1] : null
 
 		if (c.role === 'assistant') {
-			// if called a tool (message after it), re-add its XML to the message
-			// alternatively, could just hold onto the original output, but this way requires less piping raw strings everywhere
+			// Re-serialize every consecutive tool message after this assistant as XML and
+			// concatenate them back onto the assistant content. Multi-tool batches may land
+			// in history (e.g. if the user switches from a native-tool-calling model into a
+			// grammar-based one); only appending `next` would lose tool calls 2..N.
 			let content: AnthropicOrOpenAILLMMessage['content'] = c.content
-			if (next?.role === 'tool') {
-				content = `${content}\n\n${reParsedToolXMLString(next.name, next.rawParams)}`
+			for (let k = i + 1; k < messages.length; k++) {
+				const followUp = messages[k]
+				if (followUp.role !== 'tool') break
+				content = `${content}\n\n${reParsedToolXMLString(followUp.name, followUp.rawParams)}`
 			}
+			// For backward compatibility of the void-format assumption we keep `next` only
+			// reference intact below (it's still used by the batch-rebuild loop at the
+			// tool-result step).
+			void next
 
 			// anthropic reasoning
 			if (c.anthropicReasoning && supportsAnthropicReasoning) {
@@ -454,7 +489,13 @@ const prepareOpenAIOrAnthropicMessages = ({
 type GeminiUserPart = (GeminiLLMChatMessage & { role: 'user' })['parts'][0]
 type GeminiModelPart = (GeminiLLMChatMessage & { role: 'model' })['parts'][0]
 const prepareGeminiMessages = (messages: AnthropicLLMChatMessage[]) => {
-	let latestToolName: ToolName | undefined = undefined
+	// Map tool_use id → tool name, populated as we encounter `tool_use` parts on
+	// assistant turns. functionResponse entries later (on user turns) look their name up
+	// by id so batched turns resolve each response to the correct call. Previously a
+	// single `latestToolName` was tracked, which broke when one assistant emitted N
+	// parallel tools: the Nth name won, and all earlier functionResponse parts were
+	// mislabeled (Gemini rejects these with "function name mismatch").
+	const toolNameById = new Map<string, ToolName>()
 	const messages2: GeminiLLMChatMessage[] = messages.map((m): GeminiLLMChatMessage | null => {
 		if (m.role === 'assistant') {
 			if (typeof m.content === 'string') {
@@ -466,7 +507,7 @@ const prepareGeminiMessages = (messages: AnthropicLLMChatMessage[]) => {
 						return { text: c.text }
 					}
 					else if (c.type === 'tool_use') {
-						latestToolName = c.name
+						toolNameById.set(c.id, c.name)
 						return { functionCall: { id: c.id, name: c.name, args: c.input } }
 					}
 					else return null
@@ -484,8 +525,9 @@ const prepareGeminiMessages = (messages: AnthropicLLMChatMessage[]) => {
 						return { text: c.text }
 					}
 					else if (c.type === 'tool_result') {
-						if (!latestToolName) return null
-						return { functionResponse: { id: c.tool_use_id, name: latestToolName, response: { output: c.content } } }
+						const resolvedName = toolNameById.get(c.tool_use_id)
+						if (!resolvedName) return null
+						return { functionResponse: { id: c.tool_use_id, name: resolvedName, response: { output: c.content } } }
 					}
 					else return null
 				}).filter(m => !!m)

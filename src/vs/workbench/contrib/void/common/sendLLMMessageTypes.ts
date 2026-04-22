@@ -112,7 +112,12 @@ export type LLMUsage = {
 	cachedInputTokens?: number;
 }
 
-export type OnText = (p: { fullText: string; fullReasoning: string; toolCall?: RawToolCallObj; usage?: LLMUsage }) => void
+// `toolCalls` is an ordered list. Providers that support parallel/batched tool calling
+// (OpenAI, Anthropic, Gemini) may emit multiple tools in a single assistant turn. A
+// single-tool response is represented as a length-1 array; no tools as an empty array
+// (or `undefined` for brevity). The ordering is preserved from the provider — Void
+// executes them serially in that order.
+export type OnText = (p: { fullText: string; fullReasoning: string; toolCalls?: RawToolCallObj[]; usage?: LLMUsage }) => void
 
 // `finishReason` is the provider's own reason for ending the stream. OpenAI-compatible
 // servers return one of `stop` / `tool_calls` / `function_call` / `length` / `content_filter`
@@ -122,7 +127,9 @@ export type OnText = (p: { fullText: string; fullReasoning: string; toolCall?: R
 // clips against `max_tokens`, but also `content_filter` or unknown gateway-specific values).
 // Populated only by OAI-compatible providers right now — Anthropic / Gemini paths leave this
 // undefined, which renders as "no warning" (the same as before this was added).
-export type OnFinalMessage = (p: { fullText: string; fullReasoning: string; toolCall?: RawToolCallObj; anthropicReasoning: AnthropicReasoning[] | null; usage?: LLMUsage; finishReason?: string }) => void // id is tool_use_id
+//
+// `toolCalls` — see `OnText` above. Empty/undefined on pure-text responses.
+export type OnFinalMessage = (p: { fullText: string; fullReasoning: string; toolCalls?: RawToolCallObj[]; anthropicReasoning: AnthropicReasoning[] | null; usage?: LLMUsage; finishReason?: string }) => void
 export type OnError = (p: { message: string; fullError: Error | null }) => void
 export type OnAbort = () => void
 export type AbortRef = { current: (() => void) | null }

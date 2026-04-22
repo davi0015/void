@@ -18,6 +18,14 @@ export type ToolMessage<T extends ToolName> = {
 	// byte-identical tool_calls back, preserving the provider's prefix cache.
 	rawParamsStr?: string;
 	mcpServerName: string | undefined; // the server name at the time of the call
+	// Position of this tool within its assistant-turn batch. When a model emits multiple
+	// parallel tool calls in one response, each tool message stores its 0-based index
+	// (`batchIndex`) and the total count (`batchSize`). The UI uses these to render a
+	// "(1/2)"-style prefix so the user can see tool grouping at a glance. Both are
+	// optional — legacy single-tool responses and persisted history from before this
+	// field existed simply omit them (UI treats that as a solo call, no prefix shown).
+	batchIndex?: number;
+	batchSize?: number;
 } & (
 		// in order of events:
 		| { type: 'invalid_params', result: null, name: T, }
