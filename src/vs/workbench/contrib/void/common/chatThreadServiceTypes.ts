@@ -18,8 +18,34 @@ import { ToolCallParams, ToolName, ToolResult } from './toolsServiceTypes.js';
 // Cumulative variants of this type are built by `_addCompaction` (same semantics as
 // LLMUsage cumulative — per-turn resets on new user message, per-thread persists).
 export type CompactionInfo = {
-	trimmedCount: number   // number of tool_result messages whose body we replaced with a marker
-	savedChars: number     // sum of (originalBody.length - trimmedBody.length) across those messages
+	// Totals across BOTH compaction paths (Light tier + emergency trim). These
+	// are what the UI's primary "History compaction" line reads from, and what
+	// summed cumulative counters (`cumulativeCompactionThisTurn/Thread`) carry.
+	trimmedCount: number   // # messages whose body we replaced or truncated
+	savedChars: number     // sum of (originalBody.length - trimmedBody.length)
+	// Approximate saved tokens, computed at compaction time using the model's
+	// calibrated chars/token ratio (see `recordTokenUsageCalibration` in
+	// `ConvertToLLMMessageService`). Stored pre-computed instead of divided
+	// client-side so the UI doesn't have to duplicate the ratio logic, and so
+	// we use the ratio that was current *when* the compaction ran — not the
+	// current ratio at render time (they can drift as more requests land).
+	savedTokens: number
+
+	// Breakdown attributable to the *emergency trim* path (the last-resort
+	// truncation inside `prepareOpenAIOrAnthropicMessages` that fires when a
+	// request would otherwise overflow the context window — it slashes the
+	// heaviest-weight messages to 120 chars). Tracked separately because
+	// emergency trim is more destructive than Light tier (can affect user
+	// messages / assistant replies, not just tool result bodies) and its firing
+	// is itself diagnostic info: if it's firing, Perf 2's `sizeTriggerRatio` is
+	// too loose for this model/workload. Light-tier breakdown isn't tracked
+	// separately because Light = total - emergency (and "Light tier triggered"
+	// is the expected, boring case — no need to highlight it).
+	// All fields optional so persisted threads from before this breakdown was
+	// added hydrate cleanly (treated as "all Light, no emergency").
+	emergencyTrimmedCount?: number
+	emergencySavedChars?: number
+	emergencySavedTokens?: number
 }
 
 export type ToolMessage<T extends ToolName> = {

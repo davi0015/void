@@ -44,8 +44,28 @@ type SimpleLLMMessage = {
 
 
 
-const CHARS_PER_TOKEN = 4 // assume abysmal chars per token
+// Fallback chars-per-token ratio when we have no calibration data yet (first
+// request against a new model, or right after startup). Kept intentionally
+// pessimistic at 4 so that size-based decisions err on the side of "assume
+// worse density than reality" — we'd rather compact/trim a bit too early than
+// overflow the context window.
+const CHARS_PER_TOKEN = 4
 const TRIM_TO_LEN = 120
+
+// Calibration policy — `ConvertToLLMMessageService` observes the provider's
+// reported `inputTokens` after each request and derives an actual chars/token
+// ratio from what we sent. Consumers (Perf 2 compaction gate, emergency trim,
+// CompactionInfo.savedTokens) read the calibrated ratio instead of the
+// hardcoded 4 so their math matches the real tokenizer for the active model.
+//
+// EMA smoothing prevents a single atypical request (e.g. lots of JSON vs. lots
+// of code) from yanking the ratio around. Clamp bounds are a defensive guard
+// against garbage inputs — no real tokenizer produces ratios outside [2, 8].
+const CALIBRATION_POLICY = {
+	emaAlpha: 0.3,      // weight of new observation; 1.0 = replace, 0.0 = ignore
+	minRatio: 2,        // clamp lower bound (very dense: CJK, base64, minified code)
+	maxRatio: 8,        // clamp upper bound (very sparse: ASCII with lots of whitespace)
+} as const
 
 
 // ======================================================================================
@@ -193,15 +213,30 @@ const _computeProtectionBoundary = (messages: SimpleLLMMessage[]): number => {
 // happened this request (size gate not met, or no trim-eligible messages).
 const compactToolResultsForRequest = (
 	messages: SimpleLLMMessage[],
-	{ contextWindow }: { contextWindow: number },
+	{ contextWindow, charsPerToken, priorContentTokens }: { contextWindow: number, charsPerToken: number, priorContentTokens?: number },
 ): { messages: SimpleLLMMessage[], info: CompactionInfo | null } => {
 	// Gate 0 — size-based. Don't trim anything on small requests; the cache break
-	// cost would outweigh the savings. Trigger is expressed as a fraction of the
-	// model's context window, converted to chars via the same CHARS_PER_TOKEN ratio
-	// the emergency trim uses (so both policies reason in a consistent unit).
-	const sizeTriggerChars = contextWindow * CHARS_PER_TOKEN * COMPACTION_POLICY.sizeTriggerRatio
+	// cost would outweigh the savings. Reasoned in tokens (not chars) so the
+	// threshold means the same thing across models with different tokenizers.
+	//
+	// Estimate current-request tokens as the max of:
+	//   (a) `priorContentTokens` = the previous request's `inputTokens + outputTokens`
+	//       — the provider's exact tokenizer output for everything that was in
+	//       play at the end of the last request. Every one of those tokens is
+	//       also in THIS request's input (append-only history within a turn).
+	//   (b) `totalChars / calibratedRatio` — ratio-based estimate over the full
+	//       current message array, which *does* cover the delta (new tool
+	//       results, new user message) that (a) doesn't know about.
+	//
+	// Max is the safe compromise: in the common agent-loop case where the delta
+	// is small, (a) wins and we use exact numbers; when a big new tool result
+	// lands, (b)'s estimate exceeds (a) and covers the jump; on a model switch
+	// (a) is stale from a different tokenizer — larger-of-two is still the safer
+	// (over-trim, not under-trim) side.
 	const totalChars = _totalContentChars(messages)
-	if (totalChars < sizeTriggerChars) return { messages, info: null }
+	const estimatedTokens = Math.max(priorContentTokens ?? 0, totalChars / charsPerToken)
+	const sizeTriggerTokens = contextWindow * COMPACTION_POLICY.sizeTriggerRatio
+	if (estimatedTokens < sizeTriggerTokens) return { messages, info: null }
 
 	// Gate 1 — structural. Compute the protection boundary (larger of the two
 	// policies, see `_computeProtectionBoundary`). If nothing sits before the
@@ -237,13 +272,16 @@ ${tail}`
 
 	if (trimmedCount === 0) return { messages, info: null }
 
+	const savedTokens = Math.round(savedChars / charsPerToken)
+
 	// Best-effort diagnostics so the user can see compaction firing in the dev console
-	// when they're tuning thresholds.
+	// when they're tuning thresholds. Uses the same calibrated ratio that the
+	// CompactionInfo reports, so log and tooltip numbers match.
 	try {
-		console.log(`[void compaction] trimmed ${trimmedCount} stale tool result(s); saved ~${savedChars.toLocaleString()} chars (~${Math.round(savedChars / CHARS_PER_TOKEN).toLocaleString()} tokens); boundary=${boundaryIdx}/${messages.length}`)
+		console.log(`[void compaction] trimmed ${trimmedCount} stale tool result(s); saved ~${savedChars.toLocaleString()} chars (~${savedTokens.toLocaleString()} tokens @ ${charsPerToken.toFixed(2)} chars/tok); boundary=${boundaryIdx}/${messages.length}`)
 	} catch { }
 
-	return { messages: out, info: { trimmedCount, savedChars } }
+	return { messages: out, info: { trimmedCount, savedChars, savedTokens } }
 }
 
 
@@ -493,6 +531,8 @@ const prepareOpenAIOrAnthropicMessages = ({
 	supportsAnthropicReasoning,
 	contextWindow,
 	reservedOutputTokenSpace,
+	charsPerToken,
+	priorContentTokens,
 }: {
 	messages: SimpleLLMMessage[],
 	systemMessage: string,
@@ -502,7 +542,19 @@ const prepareOpenAIOrAnthropicMessages = ({
 	supportsAnthropicReasoning: boolean,
 	contextWindow: number,
 	reservedOutputTokenSpace: number | null | undefined,
-}): { messages: AnthropicOrOpenAILLMMessage[], separateSystemMessage: string | undefined } => {
+	charsPerToken: number,
+	priorContentTokens?: number,
+}): {
+	messages: AnthropicOrOpenAILLMMessage[],
+	separateSystemMessage: string | undefined,
+	// Populated only when the emergency trim loop actually truncated one or more
+	// messages (rare in practice, since Perf 2 Light-tier normally keeps us
+	// under budget). Consumed by `prepareLLMChatMessages` and merged into the
+	// returned `CompactionInfo` so the tooltip can surface a dedicated
+	// "Emergency trim: …" line. `undefined` when the destructive path didn't
+	// run, distinct from `{…count:0}` for cheaper caller checks.
+	emergencyInfo?: { emergencyTrimmedCount: number, emergencySavedChars: number, emergencySavedTokens: number },
+} => {
 
 	reservedOutputTokenSpace = Math.max(
 		contextWindow * 1 / 2, // reserve at least 1/4 of the token window length
@@ -571,10 +623,31 @@ const prepareOpenAIOrAnthropicMessages = ({
 
 	let totalLen = 0
 	for (const m of messages) { totalLen += m.content.length }
-	const charsNeedToTrim = totalLen - Math.max(
-		(contextWindow - reservedOutputTokenSpace) * CHARS_PER_TOKEN, // can be 0, in which case charsNeedToTrim=everything, bad
-		5_000 // ensure we don't trim at least 5k chars (just a random small value)
-	)
+
+	// TWO-STAGE DECISION:
+	//
+	// Stage 1 — "Do we need to trim?" — answered in TOKENS using the max of
+	//   (a) `priorContentTokens` (= last request's inputTokens + outputTokens =
+	//       exact token count of everything in the conversation at the moment
+	//       the last request completed — all of which is also in THIS request's
+	//       input since history is append-only), and
+	//   (b) `totalLen / calibratedRatio` — ratio-based estimate over the full
+	//       current message array, which covers the per-turn delta (new tool
+	//       results / user message) that (a) doesn't know about.
+	// Same reasoning as the compaction size gate in `compactToolResultsForRequest`.
+	const budgetTokens = contextWindow - reservedOutputTokenSpace
+	const estimatedTokens = Math.max(priorContentTokens ?? 0, totalLen / charsPerToken)
+	const willOverflow = estimatedTokens > budgetTokens
+
+	// Stage 2 — "How many chars to cut?" — answered in chars because the trim
+	// loop below operates on strings. Target remaining chars = budget-in-tokens
+	// × calibrated ratio, floored at 5_000 to guard against pathological
+	// budgets (malformed/zero contextWindow) causing us to trim everything.
+	// The ratio conversion here is unavoidable — you can only cut strings by
+	// character count, not by token count.
+	const charsNeedToTrim = willOverflow
+		? totalLen - Math.max(budgetTokens * charsPerToken, 5_000)
+		: 0
 
 
 	// <----------------------------------------->
@@ -585,24 +658,55 @@ const prepareOpenAIOrAnthropicMessages = ({
 	let remainingCharsToTrim = charsNeedToTrim
 	let i = 0
 
+	// Track what the emergency trim actually did so we can surface it in the
+	// CompactionInfo returned alongside the messages. Emergency trim is more
+	// destructive than Light tier (can truncate user messages / assistant replies
+	// to 120 chars, not just tool result bodies), so when it fires the user
+	// should see it in the tooltip — both for trust and for diagnostics (if this
+	// keeps firing, Perf 2's `sizeTriggerRatio` is too loose for this model).
+	let emergencyTrimmedCount = 0
+	let emergencySavedChars = 0
+
 	while (remainingCharsToTrim > 0) {
 		i += 1
 		if (i > 100) break
 
 		const trimIdx = _findLargestByWeight(messages)
 		const m = messages[trimIdx]
+		const origLen = m.content.length
 
 		// if can finish here, do
 		const numCharsWillTrim = m.content.length - TRIM_TO_LEN
 		if (numCharsWillTrim > remainingCharsToTrim) {
 			// trim remainingCharsToTrim + '...'.length chars
 			m.content = m.content.slice(0, m.content.length - remainingCharsToTrim - '...'.length).trim() + '...'
+			emergencyTrimmedCount += 1
+			emergencySavedChars += origLen - m.content.length
 			break
 		}
 
 		remainingCharsToTrim -= numCharsWillTrim
 		m.content = m.content.substring(0, TRIM_TO_LEN - '...'.length) + '...'
+		emergencyTrimmedCount += 1
+		emergencySavedChars += origLen - m.content.length
 		alreadyTrimmedIdxes.add(trimIdx)
+	}
+
+	// Token count is computed here with the calibrated ratio so the reported
+	// value matches how the compaction size gate / token-usage tooltip reason
+	// about tokens everywhere else. Deliberately NOT derived client-side from
+	// savedChars so cumulative counters preserve per-request accuracy (ratio can
+	// drift as more requests land and the EMA updates).
+	const emergencySavedTokens = Math.round(emergencySavedChars / charsPerToken)
+
+	if (emergencyTrimmedCount > 0) {
+		// Dev diagnostic — user-visible feedback goes through the tooltip, but
+		// logging here too helps when investigating "why did emergency trim fire
+		// despite Perf 2 being on?" — usually the answer is `sizeTriggerRatio`
+		// is too loose for this particular model's real context window.
+		try {
+			console.log(`[void emergency-trim] truncated ${emergencyTrimmedCount} message(s); saved ~${emergencySavedChars.toLocaleString()} chars (~${emergencySavedTokens.toLocaleString()} tokens @ ${charsPerToken.toFixed(2)} chars/tok)`)
+		} catch { }
 	}
 
 	// ================ system message hack ================
@@ -676,9 +780,16 @@ const prepareOpenAIOrAnthropicMessages = ({
 		}
 	}
 
+	// Return emergency info only when it actually fired so callers can cheaply
+	// check `if (emergencyInfo)` rather than comparing zeros.
+	const emergencyInfo = emergencyTrimmedCount > 0
+		? { emergencyTrimmedCount, emergencySavedChars, emergencySavedTokens }
+		: undefined
+
 	return {
 		messages: llmMessages,
 		separateSystemMessage: separateSystemMessageStr,
+		emergencyInfo,
 	} as const
 }
 
@@ -750,8 +861,17 @@ const prepareMessages = (params: {
 	supportsAnthropicReasoning: boolean,
 	contextWindow: number,
 	reservedOutputTokenSpace: number | null | undefined,
-	providerName: ProviderName
-}): { messages: LLMChatMessage[], separateSystemMessage: string | undefined } => {
+	providerName: ProviderName,
+	charsPerToken: number,
+	priorContentTokens?: number,
+}): {
+	messages: LLMChatMessage[],
+	separateSystemMessage: string | undefined,
+	// Forwarded from `prepareOpenAIOrAnthropicMessages` so `prepareLLMChatMessages`
+	// can merge emergency-trim counts into the returned CompactionInfo. Undefined
+	// when emergency trim didn't fire (the common / expected case).
+	emergencyInfo?: { emergencyTrimmedCount: number, emergencySavedChars: number, emergencySavedTokens: number },
+} => {
 
 	const specialFormat = params.specialToolFormat // this is just for ts stupidness
 
@@ -760,7 +880,7 @@ const prepareMessages = (params: {
 		const res = prepareOpenAIOrAnthropicMessages({ ...params, specialToolFormat: specialFormat === 'gemini-style' ? 'anthropic-style' : undefined })
 		const messages = res.messages as AnthropicLLMChatMessage[]
 		const messages2 = prepareGeminiMessages(messages)
-		return { messages: messages2, separateSystemMessage: res.separateSystemMessage }
+		return { messages: messages2, separateSystemMessage: res.separateSystemMessage, emergencyInfo: res.emergencyInfo }
 	}
 
 	return prepareOpenAIOrAnthropicMessages({ ...params, specialToolFormat: specialFormat })
@@ -772,7 +892,21 @@ const prepareMessages = (params: {
 export interface IConvertToLLMMessageService {
 	readonly _serviceBrand: undefined;
 	prepareLLMSimpleMessages: (opts: { simpleMessages: SimpleLLMMessage[], systemMessage: string, modelSelection: ModelSelection | null, featureName: FeatureName }) => { messages: LLMChatMessage[], separateSystemMessage: string | undefined }
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null }>
+	// prepareLLMChatMessages also returns `sentChars` — the character count we
+	// measured on the final messages array — so the caller (chatThreadService)
+	// can feed it back into `recordTokenUsageCalibration` once the provider
+	// reports `inputTokens`, closing the calibration loop.
+	//
+	// `priorContentTokens` is the token count of everything that was in play at
+	// the end of the *previous* request on this thread: `inputTokens` (what the
+	// last request sent) + `outputTokens` (the assistant reply that was generated
+	// and is now in history). Together they're the exact token count of the
+	// conversation state at the moment the last request completed — every one of
+	// those tokens is also in THIS request's input (history is append-only within
+	// a turn). The only thing we're still estimating is the delta added since
+	// (new tool results, new user message), which the chars/ratio floor covers.
+	// Undefined on the first request of a thread.
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 	// Called by chat creation paths to snapshot runtime grounding (date, open files,
 	// active URI, directory listing, terminal IDs) into a user message at storage time.
@@ -780,6 +914,14 @@ export interface IConvertToLLMMessageService {
 	// keeps prior turns byte-identical across requests so the provider's prefix cache
 	// stays warm turn-over-turn.
 	generateChatVolatileContext: (opts: { chatMode: ChatMode }) => Promise<string>
+
+	// Called by `chatThreadService` after each LLM response resolves with a
+	// reported `inputTokens`. Updates the per-model chars/token ratio via EMA
+	// so subsequent compaction and emergency-trim decisions use data from the
+	// actual tokenizer instead of the hardcoded 4 fallback. Silently no-ops on
+	// missing/invalid inputs so callers can pass what they have without
+	// guarding every field.
+	recordTokenUsageCalibration(opts: { providerName: string, modelName: string, sentChars: number, reportedInputTokens: number | undefined }): void
 }
 
 export const IConvertToLLMMessageService = createDecorator<IConvertToLLMMessageService>('ConvertToLLMMessageService');
@@ -787,6 +929,12 @@ export const IConvertToLLMMessageService = createDecorator<IConvertToLLMMessageS
 
 class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMessageService {
 	_serviceBrand: undefined;
+
+	// Calibrated chars/token ratio, keyed by `${providerName}:${modelName}`.
+	// Populated by `recordTokenUsageCalibration`. Not persisted across reloads
+	// (first request after startup uses the fallback 4; ratio converges within
+	// 2-3 requests thanks to EMA weighting).
+	private readonly _charsPerTokenByModel = new Map<string, number>()
 
 	constructor(
 		@IModelService private readonly modelService: IModelService,
@@ -799,6 +947,46 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		@IMCPService private readonly mcpService: IMCPService,
 	) {
 		super()
+	}
+
+	private _calibrationKey(providerName: string, modelName: string): string {
+		return `${providerName}:${modelName}`
+	}
+
+	// Returns the calibrated chars/token ratio for the given model, falling back
+	// to the conservative `CHARS_PER_TOKEN` default if we haven't observed a
+	// request against this model yet in the current session.
+	private _getCharsPerToken(providerName: string, modelName: string): number {
+		return this._charsPerTokenByModel.get(this._calibrationKey(providerName, modelName)) ?? CHARS_PER_TOKEN
+	}
+
+	recordTokenUsageCalibration: IConvertToLLMMessageService['recordTokenUsageCalibration'] = ({ providerName, modelName, sentChars, reportedInputTokens }) => {
+		// Defensive: skip garbage inputs. `reportedInputTokens` is optional upstream
+		// (some providers don't send usage). Tiny `sentChars` (<1k) yields noisy
+		// ratios — skip until we have meaningful data to average over.
+		if (!reportedInputTokens || reportedInputTokens <= 0) return
+		if (sentChars < 1_000) return
+
+		const observed = sentChars / reportedInputTokens
+		// Defensive clamp against outliers (compression bugs, encoding surprises,
+		// provider double-counting). Real tokenizers sit in ~[2.5, 6].
+		const clamped = Math.max(CALIBRATION_POLICY.minRatio, Math.min(CALIBRATION_POLICY.maxRatio, observed))
+
+		const key = this._calibrationKey(providerName, modelName)
+		const prev = this._charsPerTokenByModel.get(key)
+		// First observation = adopt-as-is; subsequent observations blend with EMA.
+		// Blending prevents a single outlier request (e.g. a turn dominated by
+		// base64-encoded content) from permanently warping the ratio.
+		const next = prev === undefined
+			? clamped
+			: CALIBRATION_POLICY.emaAlpha * clamped + (1 - CALIBRATION_POLICY.emaAlpha) * prev
+		this._charsPerTokenByModel.set(key, next)
+
+		// Dev diagnostic — helpful when debugging "why did compaction fire at
+		// different sizes on different models". Low volume (one log per request).
+		try {
+			console.log(`[void calibration] ${key}: observed=${observed.toFixed(2)} (clamped=${clamped.toFixed(2)}) → ratio=${next.toFixed(2)} chars/token`)
+		} catch { }
 	}
 
 	// Read .voidrules files from workspace folders
@@ -925,11 +1113,12 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			contextWindow,
 			reservedOutputTokenSpace,
 			providerName,
+			charsPerToken: this._getCharsPerToken(providerName, modelName),
 		})
 		return { messages, separateSystemMessage };
 	}
-	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection }) => {
-		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined, compactionInfo: null }
+	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens }) => {
+		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined, compactionInfo: null, sentChars: 0 }
 
 		const { overridesOfModel } = this.voidSettingsService.state
 
@@ -950,6 +1139,12 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		const aiInstructions = this._getCombinedAIInstructions();
 		const isReasoningEnabled = getIsReasoningEnabledState('Chat', providerName, modelName, modelSelectionOptions, overridesOfModel)
 		const reservedOutputTokenSpace = getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
+		// Model-calibrated chars/token ratio for the active model. Shared across
+		// compaction gate, emergency trim, and savedTokens display so all three
+		// agree on what "a token" means for this specific model. First request
+		// against a new model falls back to 4; subsequent requests use EMA-smoothed
+		// observations (see `recordTokenUsageCalibration`).
+		const charsPerToken = this._getCharsPerToken(providerName, modelName)
 		// Volatile context is baked into user messages at thread-creation time
 		// (see `chatThreadService._addUserMessageAndStreamResponse`). At send time
 		// the stored content is passed through verbatim so each past turn is
@@ -963,9 +1158,9 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// so short threads keep a pristine prefix cache. Keeps envelopes
 		// (tool_call_id linking) intact so protocol replay stays valid; UI
 		// continues to show originals.
-		const { messages: llmMessages, info: compactionInfo } = compactToolResultsForRequest(llmMessagesRaw, { contextWindow })
+		const { messages: llmMessages, info: compactionInfo } = compactToolResultsForRequest(llmMessagesRaw, { contextWindow, charsPerToken, priorContentTokens })
 
-		const { messages, separateSystemMessage } = prepareMessages({
+		const { messages, separateSystemMessage, emergencyInfo } = prepareMessages({
 			messages: llmMessages,
 			systemMessage,
 			aiInstructions,
@@ -975,8 +1170,58 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			contextWindow,
 			reservedOutputTokenSpace,
 			providerName,
+			charsPerToken,
+			priorContentTokens,
 		})
-		return { messages, separateSystemMessage, compactionInfo };
+
+		// Measure sentChars on the final prepared messages so the calibration loop
+		// uses the same unit the emergency trim and compaction gate already reason in
+		// (content.length sums). Doesn't include provider-added wrapping (tool schema,
+		// system prompt formatting) — that biases the observed ratio slightly low
+		// which makes `savedTokens` over-estimate by ~3-5%. Accept as "good enough".
+		// Handles all three message shapes: OpenAI/Anthropic use `content`
+		// (string | part[]), Gemini uses `parts`. Only counts text payloads —
+		// structural fields (role, ids, function names) are ignored since they're
+		// small and constant-per-message.
+		let sentChars = 0
+		for (const m of messages) {
+			if ('content' in m) {
+				const c = m.content
+				if (typeof c === 'string') { sentChars += c.length }
+				else if (Array.isArray(c)) {
+					for (const p of c) {
+						if ('text' in p && typeof p.text === 'string') sentChars += p.text.length
+						else if ('content' in p && typeof p.content === 'string') sentChars += p.content.length  // anthropic tool_result
+					}
+				}
+			}
+			else if ('parts' in m) {
+				for (const p of m.parts) {
+					if ('text' in p && typeof p.text === 'string') sentChars += p.text.length
+				}
+			}
+		}
+
+		// Merge Light-tier compaction info with emergency-trim info into one
+		// CompactionInfo so downstream (chatThreadService / UI) only has to carry
+		// one object. Totals are summed so the "Last request: N results" line in
+		// the tooltip covers both paths; emergency-specific fields are kept on
+		// the side so the UI can surface a second "Emergency trim: …" line when
+		// the destructive path fired (and only then).
+		let mergedCompactionInfo: CompactionInfo | null = compactionInfo
+		if (emergencyInfo) {
+			const base = compactionInfo ?? { trimmedCount: 0, savedChars: 0, savedTokens: 0 }
+			mergedCompactionInfo = {
+				trimmedCount: base.trimmedCount + emergencyInfo.emergencyTrimmedCount,
+				savedChars: base.savedChars + emergencyInfo.emergencySavedChars,
+				savedTokens: base.savedTokens + emergencyInfo.emergencySavedTokens,
+				emergencyTrimmedCount: emergencyInfo.emergencyTrimmedCount,
+				emergencySavedChars: emergencyInfo.emergencySavedChars,
+				emergencySavedTokens: emergencyInfo.emergencySavedTokens,
+			}
+		}
+
+		return { messages, separateSystemMessage, compactionInfo: mergedCompactionInfo, sentChars };
 	}
 
 

@@ -696,9 +696,36 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	private _addCompaction(a: CompactionInfo | undefined, b: CompactionInfo | undefined): CompactionInfo | undefined {
 		if (!a) return b ? { ...b } : undefined
 		if (!b) return { ...a }
+		// Coerce every field through a finite-number guard before summing.
+		// `?? 0` is not enough — it only traps `undefined`/`null`, but once a
+		// counter has been poisoned with `NaN` (possible with older builds that
+		// did `undefined + number`), that NaN gets written back to disk and the
+		// next session loads it as `NaN`, for which `NaN ?? 0 === NaN`. So
+		// `Number.isFinite` is the only guard that self-heals a previously
+		// poisoned persisted counter on the next sum.
+		const safe = (n: number | undefined) => (typeof n === 'number' && Number.isFinite(n)) ? n : 0
+		const aEmTrim = safe(a.emergencyTrimmedCount)
+		const bEmTrim = safe(b.emergencyTrimmedCount)
+		const aEmChars = safe(a.emergencySavedChars)
+		const bEmChars = safe(b.emergencySavedChars)
+		const aEmTok = safe(a.emergencySavedTokens)
+		const bEmTok = safe(b.emergencySavedTokens)
+		const mergedEmTrim = aEmTrim + bEmTrim
 		return {
-			trimmedCount: a.trimmedCount + b.trimmedCount,
-			savedChars: a.savedChars + b.savedChars,
+			trimmedCount: safe(a.trimmedCount) + safe(b.trimmedCount),
+			savedChars: safe(a.savedChars) + safe(b.savedChars),
+			// Sum pre-computed savedTokens rather than re-deriving from savedChars:
+			// each CompactionInfo was computed with the calibrated ratio *at the
+			// time it ran*, and summing preserves that per-request accuracy.
+			// Legacy undefined / NaN sides fall through to 0 here; the UI's
+			// `approxTokens` fallback (savedChars/4) still renders a number
+			// when the summed savedTokens genuinely underreports vs. savedChars.
+			savedTokens: safe(a.savedTokens) + safe(b.savedTokens),
+			...(mergedEmTrim > 0 ? {
+				emergencyTrimmedCount: mergedEmTrim,
+				emergencySavedChars: aEmChars + bEmChars,
+				emergencySavedTokens: aEmTok + bEmTok,
+			} : {}),
 		}
 	}
 
@@ -1219,16 +1246,49 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor })
 
 			const chatMessages = this.state.allThreads[threadId]?.messages ?? []
-			const { messages, separateSystemMessage, compactionInfo } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
+			// Pass the previous request's total content size (input + output tokens)
+			// so `prepareLLMChatMessages` can reason in tokens using the provider's
+			// real tokenizer output instead of estimating everything from chars.
+			//
+			// The sum is the exact token count of the conversation at the moment
+			// the last request completed: `inputTokens` = what the last request
+			// sent, `outputTokens` = the assistant reply that was generated and is
+			// now in history. Every one of those tokens is also in THIS request's
+			// input (history is append-only within a turn) — so the sum is a
+			// tight, exact lower bound on the current request's input tokens.
+			// The only thing still estimated is the delta (new tool results, new
+			// user message), which the chars/ratio floor inside prepareLLMChatMessages
+			// covers via Math.max.
+			//
+			// Why `inputTokens + outputTokens` and not `totalTokens`?
+			//   - Anthropic path doesn't populate `totalTokens` at all (would give `undefined`).
+			//   - Gemini's `totalTokens = promptTokenCount + candidatesTokenCount + thoughtsTokenCount`.
+			//     Thought parts are filtered out before replay (see Gemini `thought: true` split),
+			//     so `totalTokens` overcounts by `thoughtsTokenCount` — `inputTokens + outputTokens`
+			//     excludes reasoning on Gemini and is tighter.
+			//   - OpenAI path: `totalTokens == inputTokens + outputTokens`, so they're equivalent here.
+			// Net: the manual sum is defined in more cases and equal-or-tighter everywhere else.
+			//
+			// Undefined on the first request of a thread (no prior usage) — the
+			// chars/ratio estimate handles that case alone.
+			const lastUsage = this.latestUsageOfThreadId[threadId]
+			const priorContentTokens = lastUsage ? (lastUsage.inputTokens ?? 0) + (lastUsage.outputTokens ?? 0) : undefined
+			const { messages, separateSystemMessage, compactionInfo, sentChars } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages,
 				modelSelection,
-				chatMode
+				chatMode,
+				priorContentTokens,
 			})
 			// Surface any Perf 2 compaction that fired for this request so the
 			// TokenUsageRing tooltip can show "compacted N results / saved ~Xk tokens".
 			// null means "no trimming this request" — still recorded, so "Last request"
 			// in the tooltip correctly reflects the most recent LLM call.
 			this._recordCompaction(threadId, compactionInfo)
+			// Snapshot of what we're about to send for this specific request; fed
+			// back into calibration on onFinalMessage below. Captured per-iteration
+			// (not lifted out of the while loop) because the agent loop fires
+			// multiple sequential requests and each one has its own sentChars.
+			const sentCharsThisRequest = sentChars
 
 			if (interruptedWhenIdle) {
 				this._setStreamState(threadId, undefined)
@@ -1267,6 +1327,23 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						// Lock in this request's usage so the next loop iteration's
 						// running total is added to (not replacing) what we already counted.
 						this._lockInCurrentRequestUsage(threadId)
+						// Feed the provider-reported input-token count back into the
+						// calibration loop. Next time `prepareLLMChatMessages` runs for
+						// this model, the chars/token ratio reflects what the tokenizer
+						// actually does, which tightens the emergency trim's overflow
+						// threshold and makes `savedTokens` in the tooltip more accurate.
+						// Guarded on modelSelection because the _runChatAgent signature
+						// allows null, even though we'd have bailed out of prepareLLMChatMessages
+						// with 0 sentChars in that case (recordTokenUsageCalibration would
+						// no-op anyway, but narrowing avoids the TS error).
+						if (modelSelection) {
+							this._convertToLLMMessagesService.recordTokenUsageCalibration({
+								providerName: modelSelection.providerName,
+								modelName: modelSelection.modelName,
+								sentChars: sentCharsThisRequest,
+								reportedInputTokens: usage?.inputTokens,
+							})
+						}
 						resMessageIsDonePromise({ type: 'llmDone', toolCalls: toolCalls ?? [], info: { fullText, fullReasoning, anthropicReasoning, finishReason } }) // resolve with tool calls
 					},
 					onError: async (error) => {
