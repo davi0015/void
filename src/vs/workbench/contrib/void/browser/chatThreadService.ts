@@ -199,7 +199,11 @@ export type ThreadStreamState = {
 		llmInfo: {
 			displayContentSoFar: string;
 			reasoningSoFar: string;
-			toolCallSoFar: RawToolCallObj | null;
+			// Ordered list of tool calls being streamed from the LLM. Most turns have
+			// length 0 (pure text) or 1 (single tool call). Providers that support
+			// parallel tool calling (OpenAI, Anthropic, Gemini) may emit multiple.
+			// Tools are executed serially by the agent loop in this order.
+			toolCallsSoFar: RawToolCallObj[];
 		};
 		toolInfo?: undefined;
 		interrupt: Promise<() => void>; // calling this should have no effect on state - would be too confusing. it just cancels the tool
@@ -714,55 +718,150 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 
 
-	private _swapOutLatestStreamingToolWithResult = (threadId: string, tool: ChatMessage & { role: 'tool' }) => {
-		const messages = this.state.allThreads[threadId]?.messages
-		if (!messages) return false
-		const lastMsg = messages[messages.length - 1]
-		if (!lastMsg) return false
-
-		if (lastMsg.role === 'tool' && lastMsg.type !== 'invalid_params') {
-			this._editMessageInThread(threadId, messages.length - 1, tool)
-			return true
-		}
-		return false
-	}
+	/**
+	 * Transitions a tool message (by id) to a new state in the thread. Before parallel tool
+	 * calling this just swapped the last message, which worked because a tool was always
+	 * the most recent message at every transition. With batches, tool i may be followed
+	 * in the thread by pre-added tool_requests for tools i+1, i+2..., so we search by id.
+	 *
+	 * If no matching tool is found we append (preserves the original behavior for fresh
+	 * tool_request additions by `_runToolCall`'s non-batch path). When a match exists,
+	 * we preserve batchIndex/batchSize from the existing row so the UI's (i/N) prefix
+	 * doesn't drop across state transitions (tool_request → running_now → success).
+	 */
 	private _updateLatestTool = (threadId: string, tool: ChatMessage & { role: 'tool' }) => {
-		const swapped = this._swapOutLatestStreamingToolWithResult(threadId, tool)
-		if (swapped) return
+		const messages = this.state.allThreads[threadId]?.messages
+		if (!messages) { this._addMessageToThread(threadId, tool); return }
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i]
+			if (m.role === 'tool' && m.id === tool.id) {
+				// Preserve batch metadata from the pre-added row — the transitional updates
+				// from `_runToolCall` don't know about batchIndex/batchSize.
+				const merged = { batchIndex: m.batchIndex, batchSize: m.batchSize, ...tool } as ChatMessage & { role: 'tool' }
+				this._editMessageInThread(threadId, i, merged)
+				return
+			}
+		}
 		this._addMessageToThread(threadId, tool)
+	}
+
+	/**
+	 * Returns consecutive trailing `tool_request` messages in the thread — these are the
+	 * not-yet-executed tools in the current batch. The user-facing "awaiting approval"
+	 * tool is always the FIRST of this list (the batch processor runs them in order, so
+	 * any tool before the paused one is already in a terminal state like `success`).
+	 */
+	private _getPendingBatchTools = (threadId: string): (ToolMessage<ToolName> & { type: 'tool_request' })[] => {
+		const messages = this.state.allThreads[threadId]?.messages ?? []
+		const pending: (ToolMessage<ToolName> & { type: 'tool_request' })[] = []
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i]
+			if (m.role === 'tool' && m.type === 'tool_request') pending.unshift(m)
+			else break
+		}
+		return pending
+	}
+
+	/**
+	 * Runs all currently-pending tool_requests at the tail of the thread, in order.
+	 * Each call to `_runToolCall` validates, checks approval, and either runs the tool
+	 * or pauses for user approval. Returns:
+	 *   - 'awaiting_user' if a tool paused for approval (remaining tools stay pending)
+	 *   - 'interrupted' if a tool was interrupted (agent should terminate)
+	 *   - 'done' if all pending tools ran to a terminal state
+	 */
+	private _tryDrainPendingBatch = async (threadId: string): Promise<'done' | 'awaiting_user' | 'interrupted'> => {
+		while (true) {
+			const pending = this._getPendingBatchTools(threadId)
+			if (pending.length === 0) return 'done'
+			const next = pending[0]
+			const { awaitingUserApproval, interrupted } = await this._runToolCall(
+				threadId, next.name, next.id, next.mcpServerName,
+				{ preapproved: false, unvalidatedToolParams: next.rawParams, rawParamsStr: next.rawParamsStr }
+			)
+			if (interrupted) return 'interrupted'
+			if (awaitingUserApproval) return 'awaiting_user'
+		}
 	}
 
 	approveLatestToolRequest(threadId: string) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
-		const lastMsg = thread.messages[thread.messages.length - 1]
-		if (!(lastMsg.role === 'tool' && lastMsg.type === 'tool_request')) return // should never happen
-
-		const callThisToolFirst: ToolMessage<ToolName> = lastMsg
+		// In batch mode multiple tool_requests can be pending at the tail of the thread —
+		// the one awaiting approval is the FIRST (tools that already ran have transitioned
+		// away from tool_request state). Pre-batch code grabbed messages[-1], which silently
+		// breaks for batches because later not-yet-started tools are newer in the thread.
+		const pending = this._getPendingBatchTools(threadId)
+		if (pending.length === 0) return
+		const callThisToolFirst = pending[0]
 
 		this._wrapRunAgentToNotify(
 			this._runChatAgent({ callThisToolFirst, threadId, ...this._currentModelSelectionProps() })
 			, threadId
 		)
 	}
-	rejectLatestToolRequest(threadId: string) {
+	/**
+	 * Reject a pending tool request.
+	 *
+	 * `resumeAgent` controls what happens after the rejection:
+	 *   - true  (from UI "reject" button): mark this tool + all other pending tools in
+	 *           the same batch as `rejected` ("reject-all" semantic), then resume the
+	 *           agent loop so the LLM sees the rejections and can react (e.g. ask the
+	 *           user what to do next). This keeps the conversation alive.
+	 *   - false (from abort/hard-stop path in `abortRunning`): mark rejected and stop.
+	 *           The conversation terminates; no further LLM call is made.
+	 *
+	 * Default is true because the common case is the user clicking the UI reject button.
+	 * `abortRunning` explicitly passes false.
+	 */
+	rejectLatestToolRequest(threadId: string, resumeAgent: boolean = true) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
-		const lastMsg = thread.messages[thread.messages.length - 1]
-
-		let params: ToolCallParams<ToolName>
-		if (lastMsg.role === 'tool' && lastMsg.type !== 'invalid_params') {
-			params = lastMsg.params
+		// Reject-all semantics: if the user rejected any tool in a batch, reject all its
+		// pending siblings too. Partial execution (run 1 and 2, reject 3, continue to 4)
+		// is confusing — the model emitted the batch as an atomic plan, so we either run
+		// it or abort it as a unit. Tools that already completed (success/tool_error)
+		// retain their terminal state; only pending tool_requests are rejected.
+		const pending = this._getPendingBatchTools(threadId)
+		if (pending.length === 0) {
+			// Fallback to legacy path: last message should be a tool in a non-terminal
+			// state. Kept for safety when called from unusual contexts.
+			const lastMsg = thread.messages[thread.messages.length - 1]
+			if (!(lastMsg.role === 'tool' && lastMsg.type !== 'invalid_params')) return
+			const { name, id, rawParams, rawParamsStr, mcpServerName, params } = lastMsg
+			this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params, name, content: this.toolErrMsgs.rejected, result: null, id, rawParams, rawParamsStr, mcpServerName })
+			if (!resumeAgent) this._setStreamState(threadId, undefined)
+			return
 		}
-		else return
 
-		const { name, id, rawParams, rawParamsStr, mcpServerName } = lastMsg
+		const rejectedCount = pending.length
+		// Mark every pending tool in the batch as rejected. For the one the user actually
+		// clicked (the first pending), use the primary rejection message. For the others
+		// ("cascade rejections"), use a short explanation so the LLM can distinguish direct
+		// vs. cascade rejection when composing its response.
+		for (let i = 0; i < pending.length; i++) {
+			const p = pending[i]
+			const content = i === 0 ? this.toolErrMsgs.rejected : this.toolErrMsgs.rejectedCascade(rejectedCount)
+			this._updateLatestTool(threadId, {
+				role: 'tool', type: 'rejected',
+				params: p.params, name: p.name, content, result: null,
+				id: p.id, rawParams: p.rawParams, rawParamsStr: p.rawParamsStr, mcpServerName: p.mcpServerName,
+			})
+		}
 
-		const errorMessage = this.toolErrMsgs.rejected
-		this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: params, name: name, content: errorMessage, result: null, id, rawParams, rawParamsStr, mcpServerName })
-		this._setStreamState(threadId, undefined)
+		if (resumeAgent) {
+			// Let the LLM see the rejection(s) and respond. No callThisToolFirst —
+			// _runChatAgent will loop straight into a new LLM call with the rejected
+			// tool results in context.
+			this._wrapRunAgentToNotify(
+				this._runChatAgent({ threadId, ...this._currentModelSelectionProps() })
+				, threadId
+			)
+		} else {
+			this._setStreamState(threadId, undefined)
+		}
 	}
 
 	private _computeMCPServerOfToolName = (toolName: string) => {
@@ -775,9 +874,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// add assistant message
 		if (this.streamState[threadId]?.isRunning === 'LLM') {
-			const { displayContentSoFar, reasoningSoFar, toolCallSoFar } = this.streamState[threadId].llmInfo
+			const { displayContentSoFar, reasoningSoFar, toolCallsSoFar } = this.streamState[threadId].llmInfo
 			this._addMessageToThread(threadId, { role: 'assistant', displayContent: displayContentSoFar, reasoning: reasoningSoFar, anthropicReasoning: null })
-			if (toolCallSoFar) this._addMessageToThread(threadId, { role: 'interrupted_streaming_tool', name: toolCallSoFar.name, mcpServerName: this._computeMCPServerOfToolName(toolCallSoFar.name) })
+			// For each partially-streamed tool call interrupted mid-flight, add a decorative
+			// "interrupted_streaming_tool" marker. Pre-batch this only handled one tool;
+			// now we iterate the full list so the UI shows all tools the model was planning.
+			for (const tc of toolCallsSoFar) {
+				this._addMessageToThread(threadId, { role: 'interrupted_streaming_tool', name: tc.name, mcpServerName: this._computeMCPServerOfToolName(tc.name) })
+			}
 		}
 		// add tool that's running
 		else if (this.streamState[threadId]?.isRunning === 'tool') {
@@ -785,9 +889,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const content = content_ || this.toolErrMsgs.interrupted
 			this._updateLatestTool(threadId, { role: 'tool', name: toolName, params: toolParams, id, content, rawParams, rawParamsStr, type: 'rejected', result: null, mcpServerName })
 		}
-		// reject the tool for the user if relevant
+		// reject the tool for the user if relevant. `resumeAgent: false` — abortRunning is
+		// a hard stop from the user; we don't want to restart the LLM loop with rejection
+		// feedback (which is what the normal reject-button path does).
 		else if (this.streamState[threadId]?.isRunning === 'awaiting_user') {
-			this.rejectLatestToolRequest(threadId)
+			this.rejectLatestToolRequest(threadId, false)
 		}
 		else if (this.streamState[threadId]?.isRunning === 'idle') {
 			// do nothing
@@ -807,7 +913,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 
 	private readonly toolErrMsgs = {
-		rejected: 'Tool call was rejected by the user.',
+		// Phrased to discourage the model from immediately retrying the same tool. "Rejected"
+		// alone tends to trigger LLMs into "let me try again" behavior, which wastes tokens
+		// and annoys the user. Framing it as a signal to pause and consult the user breaks
+		// that pattern.
+		rejected: 'The user rejected this tool call. Do not retry the same action. Acknowledge the rejection, ask the user what they want you to do differently, or propose an alternative approach.',
+		// Used for the "cascade" rejections when the user rejects one tool in a multi-tool
+		// batch and reject-all semantics propagates the rejection to its siblings. Tells
+		// the model that not running the rest was a side effect of one rejection, not a
+		// per-tool decision, so it doesn't over-apologize for each.
+		rejectedCascade: (batchSize: number) => `The user rejected the tool batch (${batchSize} tools). This specific tool was skipped as part of that rejection, not individually rejected. See the primary rejection for the user's reasoning.`,
 		interrupted: 'Tool call was interrupted by the user.',
 		errWhenStringifying: (error: any) => `Tool call succeeded, but there was an error stringifying the output.\n${getErrorMessage(error)}`
 	}
@@ -851,7 +966,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			}
 			catch (error) {
 				const errorMessage = getErrorMessage(error)
-				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, rawParamsStr, result: null, name: toolName, content: errorMessage, id: toolId, mcpServerName })
+				// Use _updateLatestTool (not _addMessageToThread) so that when this tool was
+				// pre-added as a `tool_request` by the batch processor, we transition that
+				// row in place (preserving batchIndex/batchSize) instead of appending a new one.
+				this._updateLatestTool(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, rawParamsStr, result: null, name: toolName, content: errorMessage, id: toolId, mcpServerName })
 				return {}
 			}
 			// once validated, add checkpoint for edit
@@ -883,8 +1001,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					}
 				}
 
-				// add a tool_request because we use it for UI if a tool is loading (this should be improved in the future)
-				this._addMessageToThread(threadId, { role: 'tool', type: 'tool_request', content: '(Awaiting user permission...)', result: null, name: toolName, params: toolParams, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
+				// Transition (or create) the tool_request row. _updateLatestTool finds the
+				// row by id: for solo tool calls there's no pre-added row and it appends one
+				// (same as the old behavior). For batched tool calls, the batch processor
+				// pre-added a tool_request with batchIndex/batchSize, and this call now
+				// replaces its placeholder unvalidated params with the validated ones while
+				// preserving the batch metadata.
+				this._updateLatestTool(threadId, { role: 'tool', type: 'tool_request', content: '(Awaiting user permission...)', result: null, name: toolName, params: toolParams, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
 				if (!autoApprove) {
 					return { awaitingUserApproval: true }
 				}
@@ -996,12 +1119,29 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// before enter loop, call tool
 		if (callThisToolFirst) {
+			// Run the just-approved tool, then drain any remaining pending batch siblings
+			// (tools pre-added when the batch started and not yet run). Each drained tool
+			// may pause for its own approval — we stop the agent in that case and return.
 			const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, rawParamsStr: callThisToolFirst.rawParamsStr, validatedParams: callThisToolFirst.params })
 			if (interrupted) {
 				this._setStreamState(threadId, undefined)
 				this._addUserCheckpoint({ threadId })
-
+				return
 			}
+			// Drain the remaining pending batch (if there are other tools from this turn
+			// that still need to run). If any of them pauses for approval, stop here — the
+			// agent will resume when the user next approves or rejects.
+			const drainRes = await this._tryDrainPendingBatch(threadId)
+			if (drainRes === 'interrupted') {
+				this._setStreamState(threadId, undefined)
+				this._addUserCheckpoint({ threadId })
+				return
+			}
+			if (drainRes === 'awaiting_user') {
+				this._setStreamState(threadId, { isRunning: 'awaiting_user' })
+				return
+			}
+			// drainRes === 'done': fall through to the main LLM loop below.
 		}
 		this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' })  // just decorative, for clarity
 
@@ -1034,7 +1174,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				nAttempts += 1
 
 				type ResTypes =
-					| { type: 'llmDone', toolCall?: RawToolCallObj, info: { fullText: string, fullReasoning: string, anthropicReasoning: AnthropicReasoning[] | null, finishReason?: string } }
+					| { type: 'llmDone', toolCalls: RawToolCallObj[], info: { fullText: string, fullReasoning: string, anthropicReasoning: AnthropicReasoning[] | null, finishReason?: string } }
 					| { type: 'llmError', error?: { message: string; fullError: Error | null; } }
 					| { type: 'llmAborted' }
 
@@ -1050,16 +1190,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					overridesOfModel,
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
 					separateSystemMessage: separateSystemMessage,
-					onText: ({ fullText, fullReasoning, toolCall, usage }) => {
+					onText: ({ fullText, fullReasoning, toolCalls, usage }) => {
 						if (usage) this._setLatestUsage(threadId, usage)
-						this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallSoFar: toolCall ?? null }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
+						this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallsSoFar: toolCalls ?? [] }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
 					},
-					onFinalMessage: async ({ fullText, fullReasoning, toolCall, anthropicReasoning, usage, finishReason }) => {
+					onFinalMessage: async ({ fullText, fullReasoning, toolCalls, anthropicReasoning, usage, finishReason }) => {
 						if (usage) this._setLatestUsage(threadId, usage)
 						// Lock in this request's usage so the next loop iteration's
 						// running total is added to (not replacing) what we already counted.
 						this._lockInCurrentRequestUsage(threadId)
-						resMessageIsDonePromise({ type: 'llmDone', toolCall, info: { fullText, fullReasoning, anthropicReasoning, finishReason } }) // resolve with tool calls
+						resMessageIsDonePromise({ type: 'llmDone', toolCalls: toolCalls ?? [], info: { fullText, fullReasoning, anthropicReasoning, finishReason } }) // resolve with tool calls
 					},
 					onError: async (error) => {
 						resMessageIsDonePromise({ type: 'llmError', error: error })
@@ -1077,7 +1217,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					break
 				}
 
-				this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '', reasoningSoFar: '', toolCallSoFar: null }, interrupt: Promise.resolve(() => this._llmMessageService.abort(llmCancelToken)) })
+				this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '', reasoningSoFar: '', toolCallsSoFar: [] }, interrupt: Promise.resolve(() => this._llmMessageService.abort(llmCancelToken)) })
 				const llmRes = await messageIsDonePromise // wait for message to complete
 
 				// if something else started running in the meantime
@@ -1108,9 +1248,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					// error, but too many attempts
 					else {
 						const { error } = llmRes
-						const { displayContentSoFar, reasoningSoFar, toolCallSoFar } = this.streamState[threadId].llmInfo
+						const { displayContentSoFar, reasoningSoFar, toolCallsSoFar } = this.streamState[threadId].llmInfo
 						this._addMessageToThread(threadId, { role: 'assistant', displayContent: displayContentSoFar, reasoning: reasoningSoFar, anthropicReasoning: null })
-						if (toolCallSoFar) this._addMessageToThread(threadId, { role: 'interrupted_streaming_tool', name: toolCallSoFar.name, mcpServerName: this._computeMCPServerOfToolName(toolCallSoFar.name) })
+						// Record an interrupted-streaming marker for every tool the LLM was
+						// mid-way through emitting. Pre-batch this only handled the first tool.
+						for (const tc of toolCallsSoFar) {
+							this._addMessageToThread(threadId, { role: 'interrupted_streaming_tool', name: tc.name, mcpServerName: this._computeMCPServerOfToolName(tc.name) })
+						}
 
 						this._setStreamState(threadId, { isRunning: undefined, error })
 						this._addUserCheckpoint({ threadId })
@@ -1119,23 +1263,52 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				}
 
 				// llm res success
-				const { toolCall, info } = llmRes
+				const { toolCalls, info } = llmRes
 
 				this._addMessageToThread(threadId, { role: 'assistant', displayContent: info.fullText, reasoning: info.fullReasoning, anthropicReasoning: info.anthropicReasoning, finishReason: info.finishReason })
 
 				this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' }) // just decorative for clarity
 
-				// call tool if there is one
-				if (toolCall) {
+				// call tool(s) if there are any. Batched / parallel tool emissions are handled
+				// by pre-adding every tool as a `tool_request` (with batchIndex/batchSize so the
+				// UI can render "(1/N)" prefixes), then running them serially. Any tool may pause
+				// for user approval; if that happens the remaining tools in the batch stay as
+				// pending tool_requests, visible to the user as stacked progress rows.
+				if (toolCalls.length > 0) {
 					const mcpTools = this._mcpService.getMCPTools()
-					const mcpTool = mcpTools?.find(t => t.name === toolCall.name)
+					const batchSize = toolCalls.length
+					for (let i = 0; i < batchSize; i++) {
+						const tc = toolCalls[i]
+						const mcpServerName = mcpTools?.find(t => t.name === tc.name)?.mcpServerName
+						this._addMessageToThread(threadId, {
+							role: 'tool',
+							type: 'tool_request',
+							content: '(Pending...)',
+							result: null,
+							name: tc.name,
+							// Placeholder unvalidated params — `_runToolCall` will validate and
+							// replace via `_updateLatestTool` before the tool runs. The cast is
+							// safe because the UI only reads validated `params` on tool_requests
+							// once they've transitioned past the placeholder phase (which happens
+							// synchronously when `_tryDrainPendingBatch` hits this tool).
+							params: tc.rawParams as unknown as ToolCallParams<ToolName>,
+							id: tc.id,
+							rawParams: tc.rawParams,
+							rawParamsStr: tc.rawParamsStr,
+							mcpServerName,
+							// Only stamp batch metadata when there's actually more than one tool —
+							// a solo tool call shouldn't render "(1/1)" in the UI.
+							batchIndex: batchSize > 1 ? i : undefined,
+							batchSize: batchSize > 1 ? batchSize : undefined,
+						})
+					}
 
-					const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams, rawParamsStr: toolCall.rawParamsStr })
-					if (interrupted) {
+					const batchRes = await this._tryDrainPendingBatch(threadId)
+					if (batchRes === 'interrupted') {
 						this._setStreamState(threadId, undefined)
 						return
 					}
-					if (awaitingUserApproval) { isRunningWhenEnd = 'awaiting_user' }
+					if (batchRes === 'awaiting_user') { isRunningWhenEnd = 'awaiting_user' }
 					else { shouldSendAnotherMessage = true }
 
 					this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' }) // just decorative, for clarity

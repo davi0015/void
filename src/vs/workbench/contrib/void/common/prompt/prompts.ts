@@ -507,7 +507,12 @@ You will be given instructions from the user, and may also receive a list of fil
 	if (mode === 'agent' || mode === 'gather') {
 		details.push(`Only call tools if they help you accomplish the user's goal. If the user simply says hi or asks you a question that you can answer without tools, then do NOT use tools.`)
 		details.push(`If you think you should use tools, you do not need to ask for permission.`)
-		details.push('Only use ONE tool call at a time.')
+		// Parallel tool calls are OK (and encouraged) when the operations are independent
+		// — e.g. reading several files, searching several patterns. A single assistant
+		// turn that batches N reads costs one round-trip instead of N, and prefix caching
+		// stays warm across the whole batch. Keep sequential tools for dependent steps
+		// where later arguments require earlier results.
+		details.push(`You can call multiple tools in a single turn when the operations are independent (e.g. reading several files, searching several patterns). Prefer batching reads/searches together rather than issuing them one-at-a-time across turns. Use separate turns when a later tool's arguments depend on an earlier tool's result.`)
 		details.push(`NEVER say something like "I'm going to use \`tool_name\`". Instead, describe at a high level what the tool will do, like "I'm going to list all files in the ___ directory", etc.`)
 		details.push(`Many tools only work if the user has a workspace open.`)
 	}

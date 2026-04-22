@@ -15,6 +15,7 @@ import { GoogleAuth } from 'google-auth-library'
 /* eslint-enable */
 
 import { AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, type LLMUsage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js';
+import type { ToolName } from '../../common/toolsServiceTypes.js';
 import { ChatMode, displayInfoOfProviderName, ModelSelectionOptions, OverridesOfModel, ProviderName, SettingsOfProvider } from '../../common/voidSettingsTypes.js';
 import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, defaultProviderSettings, getReservedOutputTokenSpace } from '../../common/modelCapabilities.js';
 import { extractReasoningWrapper, extractXMLToolsWrapper } from './extractGrammar.js';
@@ -339,9 +340,19 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	let fullReasoningSoFar = ''
 	let fullTextSoFar = ''
 
-	let toolName = ''
-	let toolId = ''
-	let toolParamsStr = ''
+	// Tool-call buffers keyed by `tool_calls[].index` from the delta. OpenAI's streaming spec
+	// allows multiple tool calls in one assistant turn, each identified by its own numeric index,
+	// with chunks interleaved arbitrarily (index=0 chunk, index=1 chunk, index=0 chunk again...).
+	// We previously dropped everything past index 0, which silently corrupted parallel tool-call
+	// responses from GPT-4+, MiniMax, and other providers that batch. Using a Map keyed by index
+	// handles out-of-order chunks correctly. On final, we sort by index to preserve the
+	// provider's intended execution order.
+	const toolBuffers = new Map<number, { name: string; argsStr: string; id: string }>()
+	const getOrCreateToolBuffer = (index: number) => {
+		let buf = toolBuffers.get(index)
+		if (!buf) { buf = { name: '', argsStr: '', id: '' }; toolBuffers.set(index, buf) }
+		return buf
+	}
 
 	// Usage only arrives in the final chunk (and only if the server honored
 	// stream_options.include_usage). `chunk.usage` is typed as `| null` there.
@@ -374,14 +385,17 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 				const chunkFinishReason = chunk.choices[0]?.finish_reason
 				if (chunkFinishReason) lastFinishReason = chunkFinishReason
 
-				// tool call
+				// tool calls — aggregate by index. A single chunk may include deltas for multiple
+				// indices (rare but valid), and a single index's pieces may arrive across many
+				// chunks (the common case). `id` is typically present only on the first chunk
+				// for a given index; `arguments` streams incrementally.
 				for (const tool of chunk.choices[0]?.delta?.tool_calls ?? []) {
 					const index = tool.index
-					if (index !== 0) continue
-
-					toolName += tool.function?.name ?? ''
-					toolParamsStr += tool.function?.arguments ?? '';
-					toolId += tool.id ?? ''
+					if (index === undefined) continue
+					const buf = getOrCreateToolBuffer(index)
+					buf.name += tool.function?.name ?? ''
+					buf.argsStr += tool.function?.arguments ?? ''
+					buf.id += tool.id ?? ''
 				}
 
 
@@ -413,23 +427,44 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 					}
 				}
 
+				// Build the in-progress toolCalls snapshot for UI streaming. We only emit entries
+				// for buffers that have at least a name (argument-only deltas for an as-yet-
+				// unnamed tool are still accumulating). Indices are sorted so the UI's rendered
+				// order matches the provider's intended execution order.
+				const inProgressToolCalls: RawToolCallObj[] = Array.from(toolBuffers.entries())
+					.filter(([_i, buf]) => !!buf.name)
+					.sort(([a], [b]) => a - b)
+					.map(([_i, buf]) => ({ name: buf.name as ToolName, rawParams: {}, isDone: false, doneParams: [], id: buf.id }))
+
 				// call onText
 				onText({
 					fullText: fullTextSoFar,
 					fullReasoning: fullReasoningSoFar,
-					toolCall: !toolName ? undefined : { name: toolName, rawParams: {}, isDone: false, doneParams: [], id: toolId },
+					toolCalls: inProgressToolCalls.length > 0 ? inProgressToolCalls : undefined,
 					usage: latestUsage,
 				})
 
 			}
-			// on final
-			if (!fullTextSoFar && !fullReasoningSoFar && !toolName) {
+			// on final: parse each completed tool buffer. `rawToolCallObjOfParamsStr` returns
+			// null on malformed JSON or non-object inputs — we skip those rather than crashing
+			// the whole turn, but log for diagnosis.
+			const finalToolCalls: RawToolCallObj[] = Array.from(toolBuffers.entries())
+				.sort(([a], [b]) => a - b)
+				.map(([_i, buf]) => rawToolCallObjOfParamsStr(buf.name, buf.argsStr, buf.id))
+				.filter((t): t is RawToolCallObj => t !== null)
+
+			if (!fullTextSoFar && !fullReasoningSoFar && finalToolCalls.length === 0) {
 				onError({ message: 'Void: Response from model was empty.', fullError: null })
 			}
 			else {
-				const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
-				const toolCallObj = toolCall ? { toolCall } : {}
-				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, usage: latestUsage, finishReason: lastFinishReason, ...toolCallObj });
+				onFinalMessage({
+					fullText: fullTextSoFar,
+					fullReasoning: fullReasoningSoFar,
+					anthropicReasoning: null,
+					usage: latestUsage,
+					finishReason: lastFinishReason,
+					toolCalls: finalToolCalls.length > 0 ? finalToolCalls : undefined,
+				});
 			}
 		})
 		// when error/fail - this catches errors of both .create() and .then(for await)
@@ -557,15 +592,27 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 	let fullText = ''
 	let fullReasoning = ''
 
-	let fullToolName = ''
-	let fullToolParams = ''
-
+	// Tool-call buffers keyed by Anthropic's content-block `index`. Anthropic streams each
+	// tool as its own `content_block_start` (with name+id) followed by `content_block_delta`
+	// events carrying `input_json_delta` chunks — both tagged with the same numeric `index`.
+	// We previously only kept the first tool (`tools[0]` at finalMessage), silently dropping
+	// any parallel tool_use blocks. Map<index, ...> preserves ordering and the per-tool id.
+	const anthropicToolBuffers = new Map<number, { name: string; argsStr: string; id: string }>()
+	const getOrCreateAnthropicTool = (index: number) => {
+		let buf = anthropicToolBuffers.get(index)
+		if (!buf) { buf = { name: '', argsStr: '', id: '' }; anthropicToolBuffers.set(index, buf) }
+		return buf
+	}
 
 	const runOnText = () => {
+		const inProgressToolCalls: RawToolCallObj[] = Array.from(anthropicToolBuffers.entries())
+			.filter(([_i, buf]) => !!buf.name)
+			.sort(([a], [b]) => a - b)
+			.map(([_i, buf]) => ({ name: buf.name as ToolName, rawParams: {}, isDone: false, doneParams: [], id: buf.id || 'dummy' }))
 		onText({
 			fullText,
 			fullReasoning,
-			toolCall: !fullToolName ? undefined : { name: fullToolName, rawParams: {}, isDone: false, doneParams: [], id: 'dummy' },
+			toolCalls: inProgressToolCalls.length > 0 ? inProgressToolCalls : undefined,
 		})
 	}
 	// there are no events for tool_use, it comes in at the end
@@ -589,7 +636,11 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 				runOnText()
 			}
 			else if (e.content_block.type === 'tool_use') {
-				fullToolName += e.content_block.name ?? '' // anthropic gives us the tool name in the start block
+				// Anthropic gives the tool name+id in the start block and the JSON input in
+				// subsequent input_json_delta events keyed to the same `e.index`.
+				const buf = getOrCreateAnthropicTool(e.index)
+				buf.name += e.content_block.name ?? ''
+				buf.id += e.content_block.id ?? ''
 				runOnText()
 			}
 		}
@@ -605,7 +656,10 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 				runOnText()
 			}
 			else if (e.delta.type === 'input_json_delta') { // tool use
-				fullToolParams += e.delta.partial_json ?? '' // anthropic gives us the partial delta (string) here - https://docs.anthropic.com/en/api/messages-streaming
+				// partial_json is a string delta scoped to the current content block (e.index).
+				// See https://docs.anthropic.com/en/api/messages-streaming
+				const buf = getOrCreateAnthropicTool(e.index)
+				buf.argsStr += e.delta.partial_json ?? ''
 				runOnText()
 			}
 		}
@@ -614,13 +668,19 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 	// on done - (or when error/fail) - this is called AFTER last streamEvent
 	stream.on('finalMessage', (response) => {
 		const anthropicReasoning = response.content.filter(c => c.type === 'thinking' || c.type === 'redacted_thinking')
+		// Iterate ALL tool_use blocks in document order (response.content preserves ordering).
+		// Previous behavior only used `tools[0]`, which silently dropped parallel tool calls.
 		const tools = response.content.filter(c => c.type === 'tool_use')
-		// console.log('TOOLS!!!!!!', JSON.stringify(tools, null, 2))
-		// console.log('TOOLS!!!!!!', JSON.stringify(response, null, 2))
-		const toolCall = tools[0] && rawToolCallObjOfAnthropicParams(tools[0])
-		const toolCallObj = toolCall ? { toolCall } : {}
+		const finalToolCalls: RawToolCallObj[] = tools
+			.map(t => rawToolCallObjOfAnthropicParams(t))
+			.filter((t): t is RawToolCallObj => t !== null)
 
-		onFinalMessage({ fullText, fullReasoning, anthropicReasoning, ...toolCallObj })
+		onFinalMessage({
+			fullText,
+			fullReasoning,
+			anthropicReasoning,
+			toolCalls: finalToolCalls.length > 0 ? finalToolCalls : undefined,
+		})
 	})
 	// on error
 	stream.on('error', (error) => {
@@ -825,9 +885,14 @@ const sendGeminiChat = async ({
 	let fullReasoningSoFar = ''
 	let fullTextSoFar = ''
 
-	let toolName = ''
-	let toolParamsStr = ''
-	let toolId = ''
+	// Tool-call buffer — Gemini emits each functionCall as a fully-formed object (not a
+	// streamed partial like OpenAI/Anthropic), so we just accumulate them. Each chunk's
+	// `chunk.functionCalls` may contain zero or more calls. We track by (name + JSON args)
+	// to dedupe in case a later chunk repeats an earlier call (the SDK occasionally does
+	// this in the final summary chunk). Ordering is preserved by first-appearance.
+	type GeminiToolBuf = { name: string; argsStr: string; id: string }
+	const geminiToolCalls: GeminiToolBuf[] = []
+	const geminiToolSeen = new Set<string>()
 
 	// Gemini reports token usage via chunk.usageMetadata. It typically appears in the last
 	// chunk(s), but we keep the latest seen so we always forward the freshest values.
@@ -861,13 +926,20 @@ const sendGeminiChat = async ({
 					}
 				}
 
-				// tool call
+				// tool calls — iterate ALL functionCalls in the chunk. Previously we only kept
+				// `functionCalls[0]`, silently dropping any parallel tool emission (e.g. a model
+				// asking to read three files at once). Dedupe across chunks by (id || name+args).
 				const functionCalls = chunk.functionCalls
 				if (functionCalls && functionCalls.length > 0) {
-					const functionCall = functionCalls[0] // Get the first function call
-					toolName = functionCall.name ?? ''
-					toolParamsStr = JSON.stringify(functionCall.args ?? {})
-					toolId = functionCall.id ?? ''
+					for (const fc of functionCalls) {
+						const name = fc.name ?? ''
+						const argsStr = JSON.stringify(fc.args ?? {})
+						const id = fc.id ?? ''
+						const key = id || `${name}::${argsStr}`
+						if (geminiToolSeen.has(key)) continue
+						geminiToolSeen.add(key)
+						geminiToolCalls.push({ name, argsStr, id })
+					}
 				}
 
 				// usage (Gemini exposes promptTokenCount / candidatesTokenCount / totalTokenCount /
@@ -888,23 +960,43 @@ const sendGeminiChat = async ({
 					}
 				}
 
+				// Build the in-progress tool-call snapshot for UI streaming. Gemini tool calls
+				// are already complete when they appear in a chunk, but we still surface them
+				// via onText so the UI can render them as they arrive rather than only at end.
+				const inProgressToolCalls: RawToolCallObj[] = geminiToolCalls.map(buf => ({
+					name: buf.name as ToolName,
+					rawParams: {},
+					isDone: false,
+					doneParams: [],
+					id: buf.id,
+				}))
+
 				// call onText
 				onText({
 					fullText: fullTextSoFar,
 					fullReasoning: fullReasoningSoFar,
-					toolCall: !toolName ? undefined : { name: toolName, rawParams: {}, isDone: false, doneParams: [], id: toolId },
+					toolCalls: inProgressToolCalls.length > 0 ? inProgressToolCalls : undefined,
 					usage: latestUsage,
 				})
 			}
 
-			// on final
-			if (!fullTextSoFar && !fullReasoningSoFar && !toolName) {
+			// on final — parse each accumulated tool buffer into a full RawToolCallObj.
+			// Empty ids are filled with a UUID so downstream code (which keys tool-result
+			// messages by id) doesn't collide across tools. Malformed JSON args are skipped.
+			const finalToolCalls: RawToolCallObj[] = geminiToolCalls
+				.map(buf => rawToolCallObjOfParamsStr(buf.name, buf.argsStr, buf.id || generateUuid()))
+				.filter((t): t is RawToolCallObj => t !== null)
+
+			if (!fullTextSoFar && !fullReasoningSoFar && finalToolCalls.length === 0) {
 				onError({ message: 'Void: Response from model was empty.', fullError: null })
 			} else {
-				if (!toolId) toolId = generateUuid() // ids are empty, but other providers might expect an id
-				const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
-				const toolCallObj = toolCall ? { toolCall } : {}
-				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, usage: latestUsage, ...toolCallObj });
+				onFinalMessage({
+					fullText: fullTextSoFar,
+					fullReasoning: fullReasoningSoFar,
+					anthropicReasoning: null,
+					usage: latestUsage,
+					toolCalls: finalToolCalls.length > 0 ? finalToolCalls : undefined,
+				});
 			}
 		})
 		.catch(error => {

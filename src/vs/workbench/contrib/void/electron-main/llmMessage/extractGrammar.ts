@@ -334,10 +334,15 @@ export const extractXMLToolsWrapper = (
 			)
 		}
 
+		// Grammar-based tool extraction only surfaces one tool at a time (XML tags are parsed
+		// sequentially out of the text stream), so the array is always length 0 or 1 on this
+		// path. Models that use this wrapper (local models, pseudo-tool-use via text) don't
+		// produce parallel tool calls — that capability is exclusive to providers with native
+		// tool-calling (OpenAI-compatible, Anthropic, Gemini).
 		onText({
 			...params,
 			fullText,
-			toolCall: latestToolCall,
+			toolCalls: latestToolCall ? [latestToolCall] : undefined,
 		});
 	};
 
@@ -349,12 +354,7 @@ export const extractXMLToolsWrapper = (
 		fullText = fullText.trimEnd()
 		const toolCall = latestToolCall
 
-		// console.log('final message!!!', trueFullText)
-		// console.log('----- returning ----\n', fullText)
-		// console.log('----- tools ----\n', JSON.stringify(firstToolCallRef.current, null, 2))
-		// console.log('----- toolCall ----\n', JSON.stringify(toolCall, null, 2))
-
-		onFinalMessage({ ...params, fullText, toolCall: toolCall })
+		onFinalMessage({ ...params, fullText, toolCalls: toolCall ? [toolCall] : undefined })
 	}
 	return { newOnText, newOnFinalMessage };
 }
