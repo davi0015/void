@@ -113,7 +113,16 @@ export type LLMUsage = {
 }
 
 export type OnText = (p: { fullText: string; fullReasoning: string; toolCall?: RawToolCallObj; usage?: LLMUsage }) => void
-export type OnFinalMessage = (p: { fullText: string; fullReasoning: string; toolCall?: RawToolCallObj; anthropicReasoning: AnthropicReasoning[] | null; usage?: LLMUsage }) => void // id is tool_use_id
+
+// `finishReason` is the provider's own reason for ending the stream. OpenAI-compatible
+// servers return one of `stop` / `tool_calls` / `function_call` / `length` / `content_filter`
+// in `choices[0].finish_reason`. Clean completions (`stop`/`tool_calls`/`function_call`) are
+// treated as normal; the field only exists so the UI can warn the user when a stream ends
+// for a reason that silently truncates the response (primarily `length` when a provider
+// clips against `max_tokens`, but also `content_filter` or unknown gateway-specific values).
+// Populated only by OAI-compatible providers right now — Anthropic / Gemini paths leave this
+// undefined, which renders as "no warning" (the same as before this was added).
+export type OnFinalMessage = (p: { fullText: string; fullReasoning: string; toolCall?: RawToolCallObj; anthropicReasoning: AnthropicReasoning[] | null; usage?: LLMUsage; finishReason?: string }) => void // id is tool_use_id
 export type OnError = (p: { message: string; fullError: Error | null }) => void
 export type OnAbort = () => void
 export type AbortRef = { current: (() => void) | null }

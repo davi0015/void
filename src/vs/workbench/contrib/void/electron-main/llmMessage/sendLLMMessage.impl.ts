@@ -347,6 +347,15 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	// stream_options.include_usage). `chunk.usage` is typed as `| null` there.
 	let latestUsage: LLMUsage | undefined = undefined
 
+	// The provider's own termination reason. We keep the *last* non-empty value seen
+	// across the stream — every content-carrying chunk has `finish_reason: null` until
+	// the final one, which carries e.g. `'stop'`, `'tool_calls'`, `'length'`,
+	// `'content_filter'`, or a provider-specific value. Without this, a `length`
+	// truncation (common on MiniMax via OpenRouter when reasoning tokens eat the output
+	// budget) looks identical to a normal completion to the UI — spinner stops,
+	// message cuts off mid-word, no warning shown.
+	let lastFinishReason: string | undefined = undefined
+
 	openai.chat.completions
 		.create(options)
 		.then(async response => {
@@ -356,6 +365,14 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 				// message
 				const newText = chunk.choices[0]?.delta?.content ?? ''
 				fullTextSoFar += newText
+
+				// finish_reason: first choice only. Most chunks have `null`; keep what
+				// we've got if this one is null/empty, overwrite if it's set. Some gateways
+				// (OpenRouter) occasionally emit a finish_reason in a chunk that still
+				// has content, so we intentionally don't `break` — keep consuming until
+				// the stream actually ends.
+				const chunkFinishReason = chunk.choices[0]?.finish_reason
+				if (chunkFinishReason) lastFinishReason = chunkFinishReason
 
 				// tool call
 				for (const tool of chunk.choices[0]?.delta?.tool_calls ?? []) {
@@ -412,7 +429,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 			else {
 				const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
 				const toolCallObj = toolCall ? { toolCall } : {}
-				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, usage: latestUsage, ...toolCallObj });
+				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, usage: latestUsage, finishReason: lastFinishReason, ...toolCallObj });
 			}
 		})
 		// when error/fail - this catches errors of both .create() and .then(for await)

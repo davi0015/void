@@ -67,6 +67,13 @@ export type ChatMessage =
 		reasoning: string; // reasoning from the LLM, used for step-by-step thinking
 
 		anthropicReasoning: AnthropicReasoning[] | null; // anthropic reasoning
+
+		// Provider-reported reason the stream ended. Populated only for OAI-compatible
+		// providers today; others leave this undefined. Used by the UI to warn when a
+		// response was silently truncated (typically `length` on MiniMax/OpenRouter
+		// when reasoning tokens exhaust the output budget). Optional to stay backward
+		// compatible with chat history persisted before this field existed.
+		finishReason?: string;
 	}
 	| ToolMessage<ToolName>
 	| DecorativeCanceledTool
