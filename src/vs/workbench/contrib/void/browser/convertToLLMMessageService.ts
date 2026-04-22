@@ -7,7 +7,7 @@ import { IWorkspaceContextService } from '../../../../platform/workspace/common/
 import { IEditorService } from '../../../services/editor/common/editorService.js';
 import { ChatMessage } from '../common/chatThreadServiceTypes.js';
 import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities } from '../common/modelCapabilities.js';
-import { reParsedToolXMLString, chat_systemMessage } from '../common/prompt/prompts.js';
+import { reParsedToolXMLString, chat_systemMessage, chat_volatileContext } from '../common/prompt/prompts.js';
 import { AnthropicLLMChatMessage, AnthropicReasoning, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, OpenAILLMChatMessage, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { ChatMode, FeatureName, ModelSelection, ProviderName } from '../common/voidSettingsTypes.js';
@@ -29,6 +29,10 @@ type SimpleLLMMessage = {
 	id: string;
 	name: ToolName;
 	rawParams: RawToolParamsObj;
+	// Original serialized arguments string from the model's tool call (OpenAI-compat
+	// only). When present, used verbatim on replay to keep the provider's prefix cache
+	// matching across turns. Falls back to JSON.stringify(rawParams) when absent.
+	rawParamsStr?: string;
 } | {
 	role: 'user';
 	content: string;
@@ -84,12 +88,17 @@ const prepareMessages_openai_tools = (messages: SimpleLLMMessage[]): AnthropicOr
 		// edit previous assistant message to have called the tool
 		const prevMsg = 0 <= i - 1 && i - 1 <= newMessages.length ? newMessages[i - 1] : undefined
 		if (prevMsg?.role === 'assistant') {
+			// Prefer the model's original serialized argument string when we have it
+			// (OpenAI-compatible providers expose it in the streaming delta). Sending
+			// byte-identical bytes back preserves the provider's prefix cache past the
+			// tool call. Fall back to re-serializing when the raw string is unavailable
+			// (e.g. conversations from before this field existed, or non-OpenAI provenance).
 			prevMsg.tool_calls = [{
 				type: 'function',
 				id: currMsg.id,
 				function: {
 					name: currMsg.name,
-					arguments: JSON.stringify(currMsg.rawParams)
+					arguments: currMsg.rawParamsStr ?? JSON.stringify(currMsg.rawParams)
 				}
 			}]
 		}
@@ -524,6 +533,12 @@ export interface IConvertToLLMMessageService {
 	prepareLLMSimpleMessages: (opts: { simpleMessages: SimpleLLMMessage[], systemMessage: string, modelSelection: ModelSelection | null, featureName: FeatureName }) => { messages: LLMChatMessage[], separateSystemMessage: string | undefined }
 	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
+	// Called by chat creation paths to snapshot runtime grounding (date, open files,
+	// active URI, directory listing, terminal IDs) into a user message at storage time.
+	// Baking volatile into the stored content (rather than prepending at send time)
+	// keeps prior turns byte-identical across requests so the provider's prefix cache
+	// stays warm turn-over-turn.
+	generateChatVolatileContext: (opts: { chatMode: ChatMode }) => Promise<string>
 }
 
 export const IConvertToLLMMessageService = createDecorator<IConvertToLLMMessageService>('ConvertToLLMMessageService');
@@ -575,26 +590,30 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	}
 
 
-	// system message
-	private _generateChatMessagesSystemMessage = async (chatMode: ChatMode, specialToolFormat: 'openai-style' | 'anthropic-style' | 'gemini-style' | undefined) => {
-		const workspaceFolders = this.workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath)
+	// Computes the stable system message and the volatile-context block in one pass.
+	// The stable system message contains only cacheable content (persona, rules, tool
+	// definitions). The volatile block (runtime grounding: date, open files, active
+	// URI, directory listing, terminal IDs) is generated separately via
+	// `generateChatVolatileContext` and baked into the user message at storage time
+	// by the chat thread creation path — that keeps historical turns byte-identical
+	// across requests so the provider's prefix cache stays warm.
+	private _generateChatSystemMessage = (chatMode: ChatMode, specialToolFormat: 'openai-style' | 'anthropic-style' | 'gemini-style' | undefined) => {
+		const includeXMLToolDefinitions = !specialToolFormat
+		const mcpTools = this.mcpService.getMCPTools()
+		return chat_systemMessage({ chatMode, mcpTools, includeXMLToolDefinitions })
+	}
 
+	generateChatVolatileContext: IConvertToLLMMessageService['generateChatVolatileContext'] = async ({ chatMode }) => {
+		const workspaceFolders = this.workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath)
 		const openedURIs = this.modelService.getModels().filter(m => m.isAttachedToEditor()).map(m => m.uri.fsPath) || [];
 		const activeURI = this.editorService.activeEditor?.resource?.fsPath;
-
 		const directoryStr = await this.directoryStrService.getAllDirectoriesStr({
 			cutOffMessage: chatMode === 'agent' || chatMode === 'gather' ?
 				`...Directories string cut off, use tools to read more...`
 				: `...Directories string cut off, ask user for more if necessary...`
 		})
-
-		const includeXMLToolDefinitions = !specialToolFormat
-
-		const mcpTools = this.mcpService.getMCPTools()
-
 		const persistentTerminalIDs = this.terminalToolService.listPersistentTerminalIds()
-		const systemMessage = chat_systemMessage({ workspaceFolders, openedURIs, directoryStr, activeURI, persistentTerminalIDs, chatMode, mcpTools, includeXMLToolDefinitions })
-		return systemMessage
+		return chat_volatileContext({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode })
 	}
 
 
@@ -622,6 +641,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 					name: m.name,
 					id: m.id,
 					rawParams: m.rawParams,
+					rawParamsStr: m.rawParamsStr,
 				})
 			}
 			else if (m.role === 'user') {
@@ -680,7 +700,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
 		const { disableSystemMessage } = this.voidSettingsService.state.globalSettings;
-		const fullSystemMessage = await this._generateChatMessagesSystemMessage(chatMode, specialToolFormat)
+		const fullSystemMessage = this._generateChatSystemMessage(chatMode, specialToolFormat)
 		const systemMessage = disableSystemMessage ? '' : fullSystemMessage;
 
 		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
@@ -689,6 +709,11 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		const aiInstructions = this._getCombinedAIInstructions();
 		const isReasoningEnabled = getIsReasoningEnabledState('Chat', providerName, modelName, modelSelectionOptions, overridesOfModel)
 		const reservedOutputTokenSpace = getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
+		// Volatile context is baked into user messages at thread-creation time
+		// (see `chatThreadService._addUserMessageAndStreamResponse`). At send time
+		// the stored content is passed through verbatim so each past turn is
+		// byte-identical to what was sent before, keeping the provider's prefix
+		// cache warm across turns.
 		const llmMessages = this._chatMessagesToSimpleMessages(chatMessages)
 
 		const { messages, separateSystemMessage } = prepareMessages({

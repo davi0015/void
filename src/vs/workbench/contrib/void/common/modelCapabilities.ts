@@ -227,9 +227,12 @@ type ProviderReasoningIOSettings = {
 	// include this in payload to get reasoning
 	input?: { includeInPayload?: (reasoningState: SendableReasoningInfo) => null | { [key: string]: any }, };
 	// nameOfFieldInDelta: reasoning output is in response.choices[0].delta[deltaReasoningField]
+	// may be a single field name or a list of candidates tried in order (first non-empty wins) —
+	// lets one provider entry cover gateways that standardize on different field names
+	// (e.g. DeepSeek uses `reasoning_content`, OpenRouter uses `reasoning`).
 	// needsManualParse: whether we must manually parse out the <think> tags
 	output?:
-	| { nameOfFieldInDelta?: string, needsManualParse?: undefined, }
+	| { nameOfFieldInDelta?: string | string[], needsManualParse?: undefined, }
 	| { nameOfFieldInDelta?: undefined, needsManualParse?: true, };
 }
 
@@ -1254,9 +1257,12 @@ const openaiCompatible: VoidStaticProviderInfo = {
 	modelOptionsFallback: (modelName) => extensiveModelOptionsFallback(modelName),
 	modelOptions: {},
 	providerReasoningIOSettings: {
-		// reasoning: we have no idea what endpoint they used, so we can't consistently parse out reasoning
+		// reasoning: we have no idea what endpoint they used, so cover the common field names.
+		// `reasoning_content` — DeepSeek, vLLM, many self-hosted servers
+		// `reasoning`         — OpenRouter, opencode-style gateways
+		// `thinking`          — some Chinese gateways (Moonshot, Zhipu)
 		input: { includeInPayload: openAICompatIncludeInPayloadReasoning },
-		output: { nameOfFieldInDelta: 'reasoning_content' },
+		output: { nameOfFieldInDelta: ['reasoning_content', 'reasoning', 'thinking'] },
 	},
 }
 

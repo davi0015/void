@@ -38,38 +38,60 @@ const validateStr = (argName: string, value: unknown) => {
 }
 
 
-// We are NOT checking to make sure in workspace
-const validateURI = (uriStr: unknown) => {
+// Detects whether a plain path string is absolute.
+// - Unix absolute: starts with '/'
+// - Windows absolute: drive letter followed by ':\' or ':/' (e.g. 'C:\...', 'c:/...')
+// - UNC path: starts with '\\'
+const isAbsolutePathString = (s: string) => {
+	if (s.startsWith('/')) return true
+	if (s.startsWith('\\\\')) return true
+	if (/^[a-zA-Z]:[\\/]/.test(s)) return true
+	return false
+}
+
+// We are NOT checking to make sure in workspace.
+// workspaceRoot is optional; when provided, bare relative paths like "src/foo.ts" or
+// "./README.md" are resolved against it. Without it (or when no workspace is open),
+// we fall back to URI.file which resolves relative paths against the filesystem root —
+// same as the legacy behavior, but that's the pathological case we want to avoid.
+// Prefer the workspace-aware `validateURI` bound inside ToolsService; this raw
+// version is exported-by-module-scope only for internal re-use.
+const validateURIWithRoot = (uriStr: unknown, workspaceRoot?: URI | null) => {
 	if (uriStr === null) throw new Error(`Invalid LLM output: uri was null.`)
 	if (typeof uriStr !== 'string') throw new Error(`Invalid LLM output format: Provided uri must be a string, but it's a(n) ${typeof uriStr}. Full value: ${JSON.stringify(uriStr)}.`)
 
-	// Check if it's already a full URI with scheme (e.g., vscode-remote://, file://, etc.)
-	// Look for :// pattern which indicates a scheme is present
-	// Examples of supported URIs:
-	// - vscode-remote://wsl+Ubuntu/home/user/file.txt (WSL)
-	// - vscode-remote://ssh-remote+myserver/home/user/file.txt (SSH)
-	// - file:///home/user/file.txt (local file with scheme)
-	// - /home/user/file.txt (local file path, will be converted to file://)
-	// - C:\Users\file.txt (Windows local path, will be converted to file://)
+	// Scheme-qualified URI (e.g. vscode-remote://, file://, etc.) — parse as-is.
 	if (uriStr.includes('://')) {
 		try {
 			const uri = URI.parse(uriStr)
 			return uri
 		} catch (e) {
-			// If parsing fails, it's a malformed URI
 			throw new Error(`Invalid URI format: ${uriStr}. Error: ${e}`)
 		}
-	} else {
-		// No scheme present, treat as file path
-		// This handles regular file paths like /home/user/file.txt or C:\Users\file.txt
-		const uri = URI.file(uriStr)
-		return uri
 	}
+
+	// Absolute path — safe to pass to URI.file.
+	if (isAbsolutePathString(uriStr)) {
+		return URI.file(uriStr)
+	}
+
+	// Relative path (e.g. "README.md", "src/foo.ts", "./foo", "../bar").
+	// Resolve against workspace root when available. This is the critical branch:
+	// weak models naturally produce bare filenames, and without this resolution
+	// URI.file("README.md") would become file:///README.md (root of filesystem),
+	// forcing models to fall back to terminal commands.
+	if (workspaceRoot) {
+		return URI.joinPath(workspaceRoot, uriStr)
+	}
+
+	// No workspace — legacy fallback. Will resolve from filesystem root and likely fail,
+	// but preserves prior behavior for the (rare) no-workspace case.
+	return URI.file(uriStr)
 }
 
-const validateOptionalURI = (uriStr: unknown) => {
+const validateOptionalURIWithRoot = (uriStr: unknown, workspaceRoot?: URI | null) => {
 	if (isFalsy(uriStr)) return null
-	return validateURI(uriStr)
+	return validateURIWithRoot(uriStr, workspaceRoot)
 }
 
 const validateOptionalStr = (argName: string, str: unknown) => {
@@ -155,6 +177,16 @@ export class ToolsService implements IToolsService {
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
 	) {
 		const queryBuilder = instantiationService.createInstance(QueryBuilder);
+
+		// Resolve the current workspace root lazily so that multi-root / workspace-switch
+		// scenarios pick up the correct folder at call time rather than at construction time.
+		// These shadow the module-level helpers so the 11+ call sites below stay terse.
+		const getWorkspaceRoot = (): URI | null => {
+			const folders = workspaceContextService.getWorkspace().folders
+			return folders.length > 0 ? folders[0].uri : null
+		}
+		const validateURI = (uriStr: unknown) => validateURIWithRoot(uriStr, getWorkspaceRoot())
+		const validateOptionalURI = (uriStr: unknown) => validateOptionalURIWithRoot(uriStr, getWorkspaceRoot())
 
 		this.validateParams = {
 			read_file: (params: RawToolParamsObj) => {
