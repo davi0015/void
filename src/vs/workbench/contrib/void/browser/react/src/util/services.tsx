@@ -40,6 +40,7 @@ import { IMetricsService } from '../../../../../../../workbench/contrib/void/com
 import { URI } from '../../../../../../../base/common/uri.js'
 import { IChatThreadService, ThreadsState, ThreadStreamState } from '../../../chatThreadService.js'
 import { type LLMUsage } from '../../../../common/sendLLMMessageTypes.js'
+import { type CompactionInfo } from '../../../../common/chatThreadServiceTypes.js'
 import { ITerminalToolService } from '../../../terminalToolService.js'
 import { ILanguageService } from '../../../../../../../editor/common/languages/language.js'
 import { IVoidModelService } from '../../../../common/voidModelService.js'
@@ -71,6 +72,9 @@ const chatThreadsStreamStateListeners: Set<(threadId: string) => void> = new Set
 let chatThreadsLatestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 let chatThreadsCumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 let chatThreadsCumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
+let chatThreadsLatestCompactionOfThreadId: { [threadId: string]: CompactionInfo | undefined } = {}
+let chatThreadsCumulativeCompactionThisTurnOfThreadId: { [threadId: string]: CompactionInfo | undefined } = {}
+let chatThreadsCumulativeCompactionThisThreadOfThreadId: { [threadId: string]: CompactionInfo | undefined } = {}
 
 let settingsState: VoidSettingsState
 const settingsStateListeners: Set<(s: VoidSettingsState) => void> = new Set()
@@ -126,12 +130,18 @@ export const _registerServices = (accessor: ServicesAccessor) => {
 	chatThreadsLatestUsageOfThreadId = chatThreadsStateService.latestUsageOfThreadId
 	chatThreadsCumulativeUsageThisTurnOfThreadId = chatThreadsStateService.cumulativeUsageThisTurnOfThreadId
 	chatThreadsCumulativeUsageThisThreadOfThreadId = chatThreadsStateService.cumulativeUsageThisThreadOfThreadId
+	chatThreadsLatestCompactionOfThreadId = chatThreadsStateService.latestCompactionOfThreadId
+	chatThreadsCumulativeCompactionThisTurnOfThreadId = chatThreadsStateService.cumulativeCompactionThisTurnOfThreadId
+	chatThreadsCumulativeCompactionThisThreadOfThreadId = chatThreadsStateService.cumulativeCompactionThisThreadOfThreadId
 	disposables.push(
 		chatThreadsStateService.onDidChangeStreamState(({ threadId }) => {
 			chatThreadsStreamState = chatThreadsStateService.streamState
 			chatThreadsLatestUsageOfThreadId = chatThreadsStateService.latestUsageOfThreadId
 			chatThreadsCumulativeUsageThisTurnOfThreadId = chatThreadsStateService.cumulativeUsageThisTurnOfThreadId
 			chatThreadsCumulativeUsageThisThreadOfThreadId = chatThreadsStateService.cumulativeUsageThisThreadOfThreadId
+			chatThreadsLatestCompactionOfThreadId = chatThreadsStateService.latestCompactionOfThreadId
+			chatThreadsCumulativeCompactionThisTurnOfThreadId = chatThreadsStateService.cumulativeCompactionThisTurnOfThreadId
+			chatThreadsCumulativeCompactionThisThreadOfThreadId = chatThreadsStateService.cumulativeCompactionThisThreadOfThreadId
 			chatThreadsStreamStateListeners.forEach(l => l(threadId))
 		})
 	)
@@ -356,6 +366,41 @@ export const useChatThreadCumulativeUsage = (threadId: string) => {
 		return () => { chatThreadsStreamStateListeners.delete(listener) }
 	}, [su, threadId])
 	return u
+}
+
+// Perf 2 compaction telemetry. Mirrors `useChatThreadLatestUsage` /
+// `useChatThreadCumulativeUsage`:
+//   - `latest` = last request's trim summary, undefined if the last request
+//     didn't compact (tooltip renders "Compacted: none this request").
+//   - `thisTurn` / `thisThread` = running totals so users can see e.g. "this
+//     agent turn shrunk 4 tool results, saving ~8k tokens".
+// Re-uses the shared stream-state listener set so updates ride the same
+// event the token-usage hooks already subscribe to — no extra plumbing.
+export const useChatThreadCompaction = (threadId: string) => {
+	const initial = {
+		latest: chatThreadsLatestCompactionOfThreadId[threadId],
+		thisTurn: chatThreadsCumulativeCompactionThisTurnOfThreadId[threadId],
+		thisThread: chatThreadsCumulativeCompactionThisThreadOfThreadId[threadId],
+	}
+	const [c, sc] = useState<{ latest: CompactionInfo | undefined, thisTurn: CompactionInfo | undefined, thisThread: CompactionInfo | undefined }>(initial)
+	useEffect(() => {
+		sc({
+			latest: chatThreadsLatestCompactionOfThreadId[threadId],
+			thisTurn: chatThreadsCumulativeCompactionThisTurnOfThreadId[threadId],
+			thisThread: chatThreadsCumulativeCompactionThisThreadOfThreadId[threadId],
+		})
+		const listener = (threadId_: string) => {
+			if (threadId_ !== threadId) return
+			sc({
+				latest: chatThreadsLatestCompactionOfThreadId[threadId],
+				thisTurn: chatThreadsCumulativeCompactionThisTurnOfThreadId[threadId],
+				thisThread: chatThreadsCumulativeCompactionThisThreadOfThreadId[threadId],
+			})
+		}
+		chatThreadsStreamStateListeners.add(listener)
+		return () => { chatThreadsStreamStateListeners.delete(listener) }
+	}, [sc, threadId])
+	return c
 }
 
 export const useFullChatThreadsStreamState = () => {

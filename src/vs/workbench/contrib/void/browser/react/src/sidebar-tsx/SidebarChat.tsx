@@ -6,7 +6,7 @@
 import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 
-import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState, useFullChatThreadsStreamState, useChatThreadLatestUsage, useChatThreadCumulativeUsage } from '../util/services.js';
+import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState, useFullChatThreadsStreamState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction } from '../util/services.js';
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
@@ -23,7 +23,7 @@ import { ICommandService } from '../../../../../../../platform/commands/common/c
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
 import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text } from 'lucide-react';
-import { ChatMessage, CheckpointEntry, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
+import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, EditToolAcceptRejectButtonsHTML, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, StatusIndicatorForApplyButton, useApplyStreamState, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { IsRunningType } from '../../../chatThreadService.js';
@@ -313,6 +313,13 @@ interface TokenUsageRingProps {
 	contextWindow: number; // model's max input context, in tokens
 	cumulativeThisTurn?: LLMUsage | undefined;
 	cumulativeThisThread?: LLMUsage | undefined;
+	// Perf 2 compaction summary — `latestCompaction` is undefined when the last
+	// request didn't trim anything; `cumulativeCompactionThisTurn` /
+	// `cumulativeCompactionThisThread` are running totals. All three are optional
+	// so callers that don't care about compaction visibility can omit them.
+	latestCompaction?: CompactionInfo | undefined;
+	cumulativeCompactionThisTurn?: CompactionInfo | undefined;
+	cumulativeCompactionThisThread?: CompactionInfo | undefined;
 	children: React.ReactNode;
 	size?: number;
 }
@@ -334,7 +341,67 @@ const formatUsageBlock = (label: string, u: LLMUsage | undefined): (string | nul
 	]
 }
 
-const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, cumulativeThisTurn, cumulativeThisThread, children, size = 34 }) => {
+// Format one compaction block for the tooltip. `savedTokens` is pre-computed at
+// compaction time using the model's calibrated chars/token ratio (see
+// `recordTokenUsageCalibration` in ConvertToLLMMessageService) — we don't
+// re-divide here so UI numbers stay consistent with the dev-console log even
+// as the ratio updates on subsequent requests.
+// Legacy fallback: threads persisted before the `savedTokens` field existed
+// only carry `savedChars` — fall back to `savedChars/4` in that case so the
+// tooltip doesn't show `~- tokens`. 4 is the conservative default (matches the
+// `CHARS_PER_TOKEN` fallback in ConvertToLLMMessageService.ts).
+// Returns 1 or 3 lines:
+//   • Only Light tier fired (the common case): a single total line.
+//   • Emergency also fired: total + two indented sub-lines breaking Light vs.
+//     Emergency apart. Light = Total − Emergency (derived from totals — we
+//     deliberately don't persist Light separately since "Light = what didn't
+//     trigger the destructive path" is always a subtraction). The breakdown
+//     matters because the two paths have different cost/safety profiles: Light
+//     only touches whitelisted tool result bodies (safe, reversible on re-read);
+//     Emergency truncates the heaviest-weight message of any role (can chop a
+//     user message or assistant reply down to 120 chars).
+const formatCompactionBlock = (label: string, c: CompactionInfo | undefined): string[] => {
+	if (!c || c.trimmedCount === 0) return [`${label}: none`]
+	// Treat NaN as "missing" too, not just `undefined`. A thread that was
+	// persisted with a NaN-poisoned cumulative counter from an earlier build
+	// would otherwise keep rendering `~NaNM tokens` forever — falling back to
+	// savedChars/4 lets those threads self-heal on the next render.
+	const approxTokens = (t: number | undefined, chars: number) =>
+		t !== undefined && Number.isFinite(t) ? t : Math.round(chars / 4)
+	const pluralResult = (n: number) => n === 1 ? 'result' : 'results'
+	const pluralMessage = (n: number) => n === 1 ? 'message' : 'messages'
+	const rawTotalTokens = approxTokens(c.savedTokens, c.savedChars)
+	const emTrim = c.emergencyTrimmedCount ?? 0
+	const emChars = c.emergencySavedChars ?? 0
+	const emTokens = approxTokens(c.emergencySavedTokens, emChars)
+	// Invariant: Total = Light + Emergency, Light ≥ 0 → Total ≥ Emergency.
+	// If the stored total violates this (can happen on threads that were
+	// active during the NaN-poisoned `_addCompaction` build — `safe()` zeroed
+	// the corrupt `savedTokens` on load, while `emergencySavedTokens`
+	// preserved its full history across the same runs), clamp the displayed
+	// total up to Emergency so the tooltip stays internally consistent.
+	// Same clamp applied to trimmedCount in case the same drift affected it.
+	// Better than showing `Total: 309k / Emergency: 326k` which looks like a
+	// bug; still undercounted vs. reality (lost Light history can't be
+	// recovered), but the displayed numbers now satisfy the invariant and
+	// self-heal once new Light compactions push Total past Emergency naturally.
+	const totalTokens = Math.max(rawTotalTokens, emTokens)
+	const totalTrim = Math.max(c.trimmedCount, emTrim)
+	const totalLine = `${label}: ${totalTrim} ${pluralResult(totalTrim)}, saved ~${formatTokenCount(totalTokens)} tokens`
+	if (emTrim === 0) return [totalLine]
+	const lightTrim = totalTrim - emTrim
+	const lightTokens = totalTokens - emTokens
+	const emLine = `  ↳ emergency trim: ${emTrim} ${pluralMessage(emTrim)}, saved ~${formatTokenCount(emTokens)} tokens`
+	// Skip the Light sub-line when derivation collapses to zero — normal when
+	// only Emergency actually did work this request, or (historically) when
+	// the Total clamp above kicked in and erased the delta. In either case a
+	// `saved ~0 tokens` line would be misleading.
+	if (lightTrim <= 0 || lightTokens <= 0) return [totalLine, emLine]
+	const lightLine = `  ↳ light tier: ${lightTrim} ${pluralResult(lightTrim)}, saved ~${formatTokenCount(lightTokens)} tokens`
+	return [totalLine, lightLine, emLine]
+}
+
+const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, cumulativeThisTurn, cumulativeThisThread, latestCompaction, cumulativeCompactionThisTurn, cumulativeCompactionThisThread, children, size = 34 }) => {
 	const strokeWidth = 3
 	const radius = (size - strokeWidth) / 2
 	const hasData = !!usage && contextWindow > 0
@@ -365,15 +432,43 @@ const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, c
 		// The cumulative blocks are critical because agent loops issue many requests
 		// per turn — total billed tokens grow ~O(N²) while the ring only shows the
 		// last request's input.
+		// Only render the compaction section when something has ever been
+		// compacted on this thread — on short threads with no compaction this
+		// keeps the tooltip compact. We gate on cumulative-this-thread because
+		// per-turn and latest reset to undefined during quiet periods.
+		const hasAnyCompaction = !!cumulativeCompactionThisThread && cumulativeCompactionThisThread.trimmedCount > 0
+		// Each `formatCompactionBlock` returns 1–2 lines (2 when the emergency
+		// trim fired — see block comment on that fn). Flatten + indent here so
+		// the "Emergency trim" sub-line sits visually nested under its parent.
+		const indent = (lines: string[]) => lines.map(l => `  ${l}`)
+		// `cumulativeThisTurn` is in-memory only — it resets on each new user
+		// message, so persisting it would desync with the "turn boundary" logic.
+		// After a window restart there's no active turn yet, so this value is
+		// undefined even though `usage` (last request, which IS persisted) has
+		// data. Falling back to `usage` here means the "this turn" block shows
+		// at minimum the last-known request — truthful ("we know at least this
+		// much happened in the latest turn") and keeps the tooltip informative
+		// immediately after restart instead of showing a bare dash.
+		// Same reasoning for `cumulativeCompactionThisTurn`.
+		const effectiveThisTurn = cumulativeThisTurn ?? usage
+		const effectiveCompactionThisTurn = cumulativeCompactionThisTurn ?? latestCompaction
+		const compactionLines = hasAnyCompaction ? [
+			``,
+			`History compaction`,
+			...indent(formatCompactionBlock('Last request', latestCompaction)),
+			...indent(formatCompactionBlock('This turn', effectiveCompactionThisTurn)),
+			...indent(formatCompactionBlock('This thread', cumulativeCompactionThisThread)),
+		] : []
 		tooltipContent = [
 			`Context window usage`,
 			`${formatTokenCount(total)} / ${formatTokenCount(contextWindow)} (${displayPct})`,
 			``,
 			...formatUsageBlock('Last request', usage),
 			``,
-			...formatUsageBlock('Cumulative this turn', cumulativeThisTurn),
+			...formatUsageBlock('Cumulative this turn', effectiveThisTurn),
 			``,
 			...formatUsageBlock('Cumulative this thread', cumulativeThisThread),
+			...compactionLines,
 		].filter(s => s !== null).join('\n')
 
 		svgEl = (
@@ -427,6 +522,7 @@ const SubmitButtonWithUsageRing: React.FC<{ threadId: string; featureName: Featu
 	const settingsState = useSettingsState()
 	const usage = useChatThreadLatestUsage(threadId)
 	const cumulative = useChatThreadCumulativeUsage(threadId)
+	const compaction = useChatThreadCompaction(threadId)
 
 	const modelSelection = settingsState.modelSelectionOfFeature[featureName]
 	// Always render the wrapper so the send button doesn't jump sideways when
@@ -437,7 +533,15 @@ const SubmitButtonWithUsageRing: React.FC<{ threadId: string; featureName: Featu
 		: 0
 
 	return (
-		<TokenUsageRing usage={usage} contextWindow={contextWindow} cumulativeThisTurn={cumulative.thisTurn} cumulativeThisThread={cumulative.thisThread}>
+		<TokenUsageRing
+			usage={usage}
+			contextWindow={contextWindow}
+			cumulativeThisTurn={cumulative.thisTurn}
+			cumulativeThisThread={cumulative.thisThread}
+			latestCompaction={compaction.latest}
+			cumulativeCompactionThisTurn={compaction.thisTurn}
+			cumulativeCompactionThisThread={compaction.thisThread}
+		>
 			{children}
 		</TokenUsageRing>
 	)

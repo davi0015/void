@@ -513,6 +513,12 @@ You will be given instructions from the user, and may also receive a list of fil
 		// stays warm across the whole batch. Keep sequential tools for dependent steps
 		// where later arguments require earlier results.
 		details.push(`You can call multiple tools in a single turn when the operations are independent (e.g. reading several files, searching several patterns). Prefer batching reads/searches together rather than issuing them one-at-a-time across turns. Use separate turns when a later tool's arguments depend on an earlier tool's result.`)
+		// Perf 2 — trimmed tool results hint. Older data-fetching tool outputs in the
+		// conversation history may have their bodies replaced with a short marker
+		// (starting with "[trimmed — ...]"). The model needs to know this is expected
+		// behavior so it doesn't get confused by the partial content and so it knows
+		// the remedy is simply to re-run the tool if it needs the details.
+		details.push(`Older tool results in this conversation may appear with their bodies replaced by a short marker beginning with "[trimmed — ...]". This is normal — it means the full output was elided from the prompt to save context. If you need details that were removed, re-run the appropriate tool; do not assume or fabricate what the trimmed content contained.`)
 		details.push(`NEVER say something like "I'm going to use \`tool_name\`". Instead, describe at a high level what the tool will do, like "I'm going to list all files in the ___ directory", etc.`)
 		details.push(`Many tools only work if the user has a workspace open.`)
 	}
