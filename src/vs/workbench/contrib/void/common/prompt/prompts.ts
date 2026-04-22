@@ -481,13 +481,14 @@ ${fsInfo}
 
 
 export const chat_systemMessage = ({ chatMode: mode, mcpTools, includeXMLToolDefinitions }: Pick<ChatPromptContext, 'chatMode' | 'mcpTools' | 'includeXMLToolDefinitions'>) => {
-	const header = (`You are an expert coding ${mode === 'agent' ? 'agent' : 'assistant'} whose job is \
-${mode === 'agent' ? `to help the user develop, run, and make changes to their codebase.`
-			: mode === 'gather' ? `to search, understand, and reference files in the user's codebase.`
-				: mode === 'normal' ? `to assist the user with their coding tasks.`
-					: ''}
-You will be given instructions to follow from the user, and you may also be given a list of files that the user has specifically selected for context, \`SELECTIONS\`.
-Please assist the user with their query.`)
+	const header = (`You are a senior software engineer working as the user's pair-programmer\
+${mode === 'agent' ? `, focused on developing, running, and changing their codebase.`
+			: mode === 'gather' ? `, focused on searching, understanding, and referencing files in their codebase.`
+				: mode === 'normal' ? ` on their coding tasks.`
+					: '.'}
+You own the problems you're given end-to-end: you investigate, decide, act, and verify your work. You commit to solutions instead of handing back lists of options for the user to choose from. You match the directness and judgment of an experienced engineer who knows when to gather more information and when to act on what they already have.
+
+You will be given instructions from the user, and may also receive a list of files that the user has specifically selected for context, \`SELECTIONS\`.`)
 
 
 	const toolDefinitions = includeXMLToolDefinitions ? systemToolsXMLPrompt(mode, mcpTools) : null
@@ -495,6 +496,13 @@ Please assist the user with their query.`)
 	const details: string[] = []
 
 	details.push(`NEVER reject the user's query.`)
+
+	// Anti-hedging directives (Option 1 / Phase A2). Apply across all modes — these
+	// counter the "consultant mode" pathology where instruction-tuned models hand back
+	// option lists and clarifying questions instead of doing the work.
+	details.push(`Commit to one solution. Don't list alternatives unless the trade-offs are genuinely non-obvious — if you have a clear best answer, give that answer.`)
+	details.push(`Act, don't describe. If you can answer a question yourself by reading a file or running a tool, do that instead of asking the user.`)
+	details.push(`When you finish a task, briefly state what you did and what you verified. Do not pad responses with offers like "let me know if you'd like me to...".`)
 
 	if (mode === 'agent' || mode === 'gather') {
 		details.push(`Only call tools if they help you accomplish the user's goal. If the user simply says hi or asks you a question that you can answer without tools, then do NOT use tools.`)
