@@ -443,6 +443,19 @@ export class ToolsService implements IToolsService {
 			},
 
 			rewrite_file: async ({ uri, newContent }) => {
+				// Check file existence BEFORE `initializeModel` — the latter silently
+				// swallows FileNotFound (catches and logs) and returns void, making the
+				// whole chain (initializeModel → instantlyRewriteFile → _startStreamingDiffZone
+				// → "if (!model) return") fall through quietly. Net result before this
+				// fix: agent sees "Change successfully made" with zero lint errors, but
+				// nothing actually got written. Reported by the user as "rewrite_file
+				// only works after create_file_or_folder is called, otherwise it
+				// returns without error". Auto-creating here matches the intent of
+				// `rewrite_file` (produce a file with the given contents) and aligns
+				// with user preference for this tool specifically.
+				if (!(await fileService.exists(uri))) {
+					await fileService.createFile(uri)
+				}
 				await voidModelService.initializeModel(uri)
 				if (this.commandBarService.getStreamState(uri) === 'streaming') {
 					throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
@@ -459,6 +472,17 @@ export class ToolsService implements IToolsService {
 			},
 
 			edit_file: async ({ uri, searchReplaceBlocks }) => {
+				// Same silent-fallthrough issue as rewrite_file (see comment there),
+				// but the right behavior is different: edit_file uses search/replace
+				// blocks which require existing content to match against. Auto-creating
+				// an empty file would make every search block fail to match — silent
+				// no-op again. Throwing a clear error is the honest behavior and
+				// nudges the agent toward the right alternative (rewrite_file for
+				// wholesale new-file authoring, create_file_or_folder + edit_file
+				// for incremental build-up).
+				if (!(await fileService.exists(uri))) {
+					throw new Error(`File not found at ${uri.fsPath}. edit_file requires an existing file to apply search/replace blocks against. Use rewrite_file to create a new file with full contents, or create_file_or_folder first then edit_file.`)
+				}
 				await voidModelService.initializeModel(uri)
 				if (this.commandBarService.getStreamState(uri) === 'streaming') {
 					throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
