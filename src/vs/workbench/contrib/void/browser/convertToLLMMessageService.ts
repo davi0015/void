@@ -48,6 +48,202 @@ const CHARS_PER_TOKEN = 4 // assume abysmal chars per token
 const TRIM_TO_LEN = 120
 
 
+// ======================================================================================
+// Perf 2 — Light-tier history compaction
+// ======================================================================================
+//
+// Bodies of old data-fetching tool results (read_file / grep / ls_dir / run_command / …)
+// are the single biggest source of request bloat in long agent threads. We trim those
+// bodies in-place on the outgoing simple-message array *before* provider-specific
+// conversion runs — keeping the tool_call envelope intact (so tool_call_id linking
+// stays valid on replay) but replacing the big middle with a short header + first/last
+// slice so the model can still orient without carrying full file contents forward.
+//
+// Design notes:
+//   - Only applied to the chat flow (`prepareLLMChatMessages`), not to `prepareLLMSimpleMessages`
+//     (autocomplete / apply / rewrite) which don't accumulate tool-call history.
+//   - Never mutates the stored on-disk `ChatMessage[]` — operates on the in-memory
+//     SimpleLLMMessage[] copy; the UI always shows the original content.
+//   - Write-side tools (edit_file / rewrite_file / create / delete) are NOT trimmed:
+//     their results are small event records, and they're important for continuity.
+//   - MCP tools are NOT trimmed (unknown semantics; safer to leave alone until we have
+//     per-server whitelisting).
+//   - Two-trigger design:
+//       Gate 0 (size): skip entirely on small requests — the cache-break cost from
+//       trimming isn't worth it until the request is large enough that request-size
+//       reduction actually matters. Tied to `contextWindow * sizeTriggerRatio`.
+//       Gate 1 (structural): compute a protection boundary as the larger of
+//       "last N user turns" and "last N messages". The message-count fallback is
+//       critical for agent-mode threads (single user message, long tool burst)
+//       where user-turn protection alone would protect nothing.
+//
+// See Perf 2 entry in mynote.md for the full rationale and deferred Heavy-tier plan.
+
+const TRIMMABLE_TOOL_NAMES: ReadonlySet<string> = new Set<string>([
+	'read_file',
+	'ls_dir',
+	'get_dir_tree',
+	'search_pathnames_only',
+	'search_for_files',
+	'search_in_file',
+	'read_lint_errors',
+	'run_command',
+	'run_persistent_command',
+])
+
+const COMPACTION_POLICY = {
+	// --- When compaction runs at all -----------------------------------------------
+	// Size gate — skip compaction entirely on small/medium requests. Expressed as a
+	// fraction of the model's context window (converted to chars via CHARS_PER_TOKEN).
+	// Rationale: trimming breaks the provider's prefix cache at the trim point, so on
+	// short threads where the cache is working well and we're nowhere near the cliff,
+	// the rebuild cost outweighs the token savings. Only pay that cost once the thread
+	// is big enough that reducing request size actually matters. 0.5 == "kick in once
+	// roughly half the context is used" — stays well clear of MiniMax's 160k cache
+	// cliff on a ~250k model while preserving the common-case fast path on short chats.
+	sizeTriggerRatio: 0.5,
+
+	// --- Protection zone (what we keep full-fidelity) ------------------------------
+	// Two independent protections; the larger (more inclusive) one wins. Combined,
+	// they correctly handle both chat-heavy threads (many user turns) AND agent-mode
+	// threads (a single user message followed by long tool bursts).
+	//
+	//   protectRecentTurns    — last N user-message boundaries; the "conversation"
+	//                           working memory on chat-style threads.
+	//   protectLastMessages   — last N total messages regardless of role; the
+	//                           "in-progress agent burst" safety net. Critical for
+	//                           single-user agent flows where `protectRecentTurns`
+	//                           alone would leave the entire history trimmable.
+	protectRecentTurns: 5,
+	protectLastMessages: 30,
+
+	// --- Trim shape (per message) --------------------------------------------------
+	// When a tool body is trimmed, keep this many lines from the start (imports /
+	// top-of-file context) and the end (exports / last-modified region). Tuned so
+	// a typical source file still gives the model enough shape to orient.
+	keepFirstLines: 30,
+	keepLastLines: 10,
+
+	// --- Per-message eligibility ---------------------------------------------------
+	// Don't bother trimming bodies smaller than BOTH thresholds — the saved tokens
+	// don't justify the extra bytes the marker itself costs. These gates keep short
+	// `ls_dir`, single-line `grep`, and tiny file reads fully intact.
+	minBodyLinesToTrim: 60,
+	minBodyCharsToTrim: 2_000,
+} as const
+
+// Pick a short, model-useful label for the trim header (e.g. `read_file src/foo.ts`).
+// Falls back to just the tool name when no obvious identifying param exists.
+const _labelForTrimHeader = (toolName: string, rawParams: RawToolParamsObj | undefined): string => {
+	if (!rawParams) return toolName
+	const rp = rawParams as { [k: string]: unknown }
+	const candidate =
+		(typeof rp.uri === 'string' && rp.uri) ||
+		(typeof rp.path === 'string' && rp.path) ||
+		(typeof rp.pattern === 'string' && rp.pattern) ||
+		(typeof rp.query === 'string' && rp.query) ||
+		(typeof rp.command === 'string' && rp.command) ||
+		''
+	return candidate ? `${toolName} ${candidate}` : toolName
+}
+
+// Total content-char count for the request, used by the size gate.
+const _totalContentChars = (messages: SimpleLLMMessage[]): number => {
+	let total = 0
+	for (const m of messages) total += m.content?.length ?? 0
+	return total
+}
+
+// Protection boundary: any message at index < boundary is trim-eligible (subject to
+// role/name/size checks); any message at index >= boundary is kept full-fidelity.
+// We compute two boundaries and return the MORE trim-eligible (larger index) one,
+// so both chat-style and agent-style threads are protected correctly.
+const _computeProtectionBoundary = (messages: SimpleLLMMessage[]): number => {
+	// 1) "Last N user turns" — walk back from the end, stop once we've seen N user
+	//    messages; the index of the N-th is the user-turn boundary.
+	let userCount = 0
+	let userTurnBoundary = 0
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i].role === 'user') {
+			userCount++
+			if (userCount >= COMPACTION_POLICY.protectRecentTurns) {
+				userTurnBoundary = i
+				break
+			}
+		}
+	}
+	// Fewer than N user messages in the whole thread → fallback to 0 (no user-turn
+	// protection) and let the message-count policy below carry the weight. This is
+	// the case that was silently broken before: single-user agent-mode threads.
+	if (userCount < COMPACTION_POLICY.protectRecentTurns) userTurnBoundary = 0
+
+	// 2) "Last N messages" — simple index-based protection. Critical for single-user
+	//    agent bursts where the user-turn policy alone would protect nothing.
+	const messageCountBoundary = Math.max(0, messages.length - COMPACTION_POLICY.protectLastMessages)
+
+	// Take the LARGER (more trim-eligible) — whichever policy wants to protect less
+	// of the tail is the binding one for this request.
+	return Math.max(userTurnBoundary, messageCountBoundary)
+}
+
+// Returns a new array with old, trimmable tool bodies replaced by a short trim marker.
+// Pure function — does not mutate the input.
+const compactToolResultsForRequest = (
+	messages: SimpleLLMMessage[],
+	{ contextWindow }: { contextWindow: number },
+): SimpleLLMMessage[] => {
+	// Gate 0 — size-based. Don't trim anything on small requests; the cache break
+	// cost would outweigh the savings. Trigger is expressed as a fraction of the
+	// model's context window, converted to chars via the same CHARS_PER_TOKEN ratio
+	// the emergency trim uses (so both policies reason in a consistent unit).
+	const sizeTriggerChars = contextWindow * CHARS_PER_TOKEN * COMPACTION_POLICY.sizeTriggerRatio
+	const totalChars = _totalContentChars(messages)
+	if (totalChars < sizeTriggerChars) return messages
+
+	// Gate 1 — structural. Compute the protection boundary (larger of the two
+	// policies, see `_computeProtectionBoundary`). If nothing sits before the
+	// boundary, there's nothing to trim.
+	const boundaryIdx = _computeProtectionBoundary(messages)
+	if (boundaryIdx <= 0) return messages
+
+	let trimmed = 0
+	const out = messages.map((m, idx): SimpleLLMMessage => {
+		if (idx >= boundaryIdx) return m
+		if (m.role !== 'tool') return m
+		if (!TRIMMABLE_TOOL_NAMES.has(m.name)) return m
+		const body = m.content
+		if (!body) return m
+
+		const lines = body.split('\n')
+		if (lines.length < COMPACTION_POLICY.minBodyLinesToTrim && body.length < COMPACTION_POLICY.minBodyCharsToTrim) return m
+
+		const head = lines.slice(0, COMPACTION_POLICY.keepFirstLines).join('\n')
+		const tail = lines.slice(-COMPACTION_POLICY.keepLastLines).join('\n')
+		const label = _labelForTrimHeader(m.name, m.rawParams)
+		const newContent = `[trimmed — ${label}, originally ${lines.length} lines / ${body.length} chars. Re-run the tool if you need the full content.]
+First ${COMPACTION_POLICY.keepFirstLines} lines:
+${head}
+... (content trimmed) ...
+Last ${COMPACTION_POLICY.keepLastLines} lines:
+${tail}`
+		trimmed++
+		return { ...m, content: newContent }
+	})
+
+	// Best-effort diagnostics so the user can see compaction firing in the dev console
+	// when they're tuning thresholds. Guarded behind a tiny counter so we don't spam
+	// on turns where nothing was trimmed.
+	if (trimmed > 0) {
+		try {
+			const totalCharsAfter = _totalContentChars(out)
+			const savedChars = totalChars - totalCharsAfter
+			console.log(`[void compaction] trimmed ${trimmed} stale tool result(s); saved ~${savedChars.toLocaleString()} chars (~${Math.round(savedChars / CHARS_PER_TOKEN).toLocaleString()} tokens); boundary=${boundaryIdx}/${messages.length}`)
+		} catch { }
+	}
+	return out
+}
+
+
 
 
 // convert messages as if about to send to openai
@@ -756,7 +952,15 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// the stored content is passed through verbatim so each past turn is
 		// byte-identical to what was sent before, keeping the provider's prefix
 		// cache warm across turns.
-		const llmMessages = this._chatMessagesToSimpleMessages(chatMessages)
+		const llmMessagesRaw = this._chatMessagesToSimpleMessages(chatMessages)
+		// Perf 2 — Light-tier history compaction. Trims bodies of old data-fetching
+		// tool results (read_file / grep / ls_dir / run_command / …) outside the
+		// protection zone (larger of "last 5 user turns" and "last 30 messages").
+		// Only fires once the request crosses `sizeTriggerRatio * contextWindow`
+		// so short threads keep a pristine prefix cache. Keeps envelopes
+		// (tool_call_id linking) intact so protocol replay stays valid; UI
+		// continues to show originals.
+		const llmMessages = compactToolResultsForRequest(llmMessagesRaw, { contextWindow })
 
 		const { messages, separateSystemMessage } = prepareMessages({
 			messages: llmMessages,
