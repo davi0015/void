@@ -6,7 +6,7 @@
 import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 
-import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState, useFullChatThreadsStreamState, useChatThreadLatestUsage } from '../util/services.js';
+import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState, useFullChatThreadsStreamState, useChatThreadLatestUsage, useChatThreadCumulativeUsage } from '../util/services.js';
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
@@ -311,10 +311,30 @@ interface TokenUsageRingProps {
 	// ring is drawn — this prevents the send button from shifting once usage arrives
 	usage: LLMUsage | undefined;
 	contextWindow: number; // model's max input context, in tokens
+	cumulativeThisTurn?: LLMUsage | undefined;
+	cumulativeThisThread?: LLMUsage | undefined;
 	children: React.ReactNode;
 	size?: number;
 }
-const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, children, size = 34 }) => {
+
+// Format a single LLMUsage block for the tooltip. Returns an array of plain
+// text lines (no HTML — react-tooltip's html mode is blocked by Trusted Types).
+const formatUsageBlock = (label: string, u: LLMUsage | undefined): (string | null)[] => {
+	if (!u) return [`${label}: -`]
+	const total = u.totalTokens ?? ((u.inputTokens ?? 0) + (u.outputTokens ?? 0) + (u.reasoningTokens ?? 0))
+	const inputLine = u.cachedInputTokens !== undefined
+		? `  Input: ${formatTokenCount(u.inputTokens)} (${formatTokenCount(u.cachedInputTokens)} cached)`
+		: `  Input: ${formatTokenCount(u.inputTokens)}`
+	return [
+		`${label}:`,
+		inputLine,
+		`  Output: ${formatTokenCount(u.outputTokens)}`,
+		u.reasoningTokens !== undefined ? `  Reasoning: ${formatTokenCount(u.reasoningTokens)}` : null,
+		`  Total: ${formatTokenCount(total)}`,
+	]
+}
+
+const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, cumulativeThisTurn, cumulativeThisThread, children, size = 34 }) => {
 	const strokeWidth = 3
 	const radius = (size - strokeWidth) / 2
 	const hasData = !!usage && contextWindow > 0
@@ -337,17 +357,23 @@ const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, c
 		// prompt cache (OpenAI `prompt_tokens_details.cached_tokens`, mirrored by OpenRouter,
 		// DeepSeek, etc.). Only show the line when the server actually reported a value —
 		// an undefined field means the server doesn't expose it, which is different from 0.
-		const inputLine = usage.cachedInputTokens !== undefined
-			? `Input: ${formatTokenCount(usage.inputTokens)} (${formatTokenCount(usage.cachedInputTokens)} cached)`
-			: `Input: ${formatTokenCount(usage.inputTokens)}`
+		// Tooltip layout:
+		//   1. Context-window ring summary (per-request, drives the ring color)
+		//   2. Last request breakdown (the per-request snapshot the ring is based on)
+		//   3. Cumulative this turn (sum across all loop iterations of the current user turn)
+		//   4. Cumulative this thread (lifetime sum across the whole chat history)
+		// The cumulative blocks are critical because agent loops issue many requests
+		// per turn — total billed tokens grow ~O(N²) while the ring only shows the
+		// last request's input.
 		tooltipContent = [
 			`Context window usage`,
 			`${formatTokenCount(total)} / ${formatTokenCount(contextWindow)} (${displayPct})`,
 			``,
-			inputLine,
-			`Output: ${formatTokenCount(usage.outputTokens)}`,
-			usage.reasoningTokens !== undefined ? `Reasoning: ${formatTokenCount(usage.reasoningTokens)}` : null,
-			`Total: ${formatTokenCount(total)}`,
+			...formatUsageBlock('Last request', usage),
+			``,
+			...formatUsageBlock('Cumulative this turn', cumulativeThisTurn),
+			``,
+			...formatUsageBlock('Cumulative this thread', cumulativeThisThread),
 		].filter(s => s !== null).join('\n')
 
 		svgEl = (
@@ -400,6 +426,7 @@ const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, c
 const SubmitButtonWithUsageRing: React.FC<{ threadId: string; featureName: FeatureName; children: React.ReactNode }> = ({ threadId, featureName, children }) => {
 	const settingsState = useSettingsState()
 	const usage = useChatThreadLatestUsage(threadId)
+	const cumulative = useChatThreadCumulativeUsage(threadId)
 
 	const modelSelection = settingsState.modelSelectionOfFeature[featureName]
 	// Always render the wrapper so the send button doesn't jump sideways when
@@ -410,7 +437,7 @@ const SubmitButtonWithUsageRing: React.FC<{ threadId: string; featureName: Featu
 		: 0
 
 	return (
-		<TokenUsageRing usage={usage} contextWindow={contextWindow}>
+		<TokenUsageRing usage={usage} contextWindow={contextWindow} cumulativeThisTurn={cumulative.thisTurn} cumulativeThisThread={cumulative.thisThread}>
 			{children}
 		</TokenUsageRing>
 	)

@@ -124,6 +124,14 @@ export type ThreadType = {
 	// after the user sends a new message).
 	latestUsage?: LLMUsage;
 
+	// Sum of `LLMUsage` across every API request ever made on this thread.
+	// In an agent loop with N tool calls, the loop fires N sequential requests
+	// each carrying the full history + accumulated tool results — total billed
+	// tokens are O(N²) while `latestUsage` only shows the latest request (O(N)).
+	// This field surfaces the real cumulative cost so the user can see actual
+	// billing impact, not just the last sample. Persisted alongside latestUsage.
+	cumulativeUsageThisThread?: LLMUsage;
+
 	// Model used to send the most recent user message on this thread. Captured
 	// on send, restored on `switchToThread` (writes to settings' `Chat` model
 	// selection). `null` means "no message was sent on this thread yet"; if the
@@ -252,6 +260,15 @@ export interface IChatThreadService {
 	readonly state: ThreadsState;
 	readonly streamState: ThreadStreamState; // not persistent
 	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined }; // hydrated from persisted threads on startup; updated as the model streams
+	// Cumulative usage across all requests in the *current* user turn (reset
+	// when a new user message is sent or a thread is opened/switched-to fresh).
+	// Only lives in memory — not persisted, since "this turn" doesn't survive
+	// a reload anyway.
+	readonly cumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined };
+	// Cumulative usage across the entire thread history. Hydrated from the
+	// persisted thread on startup so the user can see lifetime cost across
+	// reloads.
+	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined };
 
 	onDidChangeCurrentThread: Event<void>;
 	onDidChangeStreamState: Event<{ threadId: string }>
@@ -330,6 +347,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	readonly streamState: ThreadStreamState = {}
 	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
+	readonly cumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
+	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	state: ThreadsState // allThreads is persisted, currentThread is not
 
 	// used in checkpointing
@@ -375,6 +394,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		for (const id in allThreads) {
 			const t = allThreads[id]
 			if (t?.latestUsage) this.latestUsageOfThreadId[id] = t.latestUsage
+			if (t?.cumulativeUsageThisThread) this.cumulativeUsageThisThreadOfThreadId[id] = t.cumulativeUsageThisThread
 		}
 
 		// always be in a thread
@@ -576,11 +596,67 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// Also persists on the thread so the ring shows the last-known value after a reload.
 	private _setLatestUsage(threadId: string, usage: LLMUsage) {
 		this.latestUsageOfThreadId[threadId] = usage
+
+		// Cumulative = (cumulative locked-in from prior finalized requests in this
+		// turn/thread) + (this request's running total). Always recompute from the
+		// baseline so streaming updates (which carry the per-request running total,
+		// not a delta) don't double-count.
+		this.cumulativeUsageThisTurnOfThreadId[threadId] = this._addUsage(this._cumulativeThisTurnBaselineOfThreadId[threadId], usage)
+		this.cumulativeUsageThisThreadOfThreadId[threadId] = this._addUsage(this._cumulativeThisThreadBaselineOfThreadId[threadId], usage)
+
 		const thread = this.state.allThreads[threadId]
 		if (thread) {
 			thread.latestUsage = usage
+			thread.cumulativeUsageThisThread = this.cumulativeUsageThisThreadOfThreadId[threadId]
 			this._storeAllThreads(this.state.allThreads)
 		}
+		this._onDidChangeStreamState.fire({ threadId })
+	}
+
+	// Baseline = cumulative usage from previously-finalized requests in this
+	// turn/thread. The current request's running total gets added on top in
+	// `_setLatestUsage`. Moved forward by `_lockInCurrentRequestUsage` once a
+	// request finishes, so the next request starts counting from where we
+	// left off.
+	private readonly _cumulativeThisTurnBaselineOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
+	private readonly _cumulativeThisThreadBaselineOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
+
+	// Sum two LLMUsage values. `undefined` fields stay undefined unless one of
+	// the inputs has a defined value, in which case we fall back to the defined
+	// side (so e.g. a request that doesn't report `cachedInputTokens` doesn't
+	// erase the previously-accumulated cached count).
+	private _addUsage(a: LLMUsage | undefined, b: LLMUsage | undefined): LLMUsage | undefined {
+		if (!a) return b ? { ...b } : undefined
+		if (!b) return { ...a }
+		const add = (x: number | undefined, y: number | undefined): number | undefined => {
+			if (x === undefined && y === undefined) return undefined
+			return (x ?? 0) + (y ?? 0)
+		}
+		return {
+			inputTokens: add(a.inputTokens, b.inputTokens),
+			outputTokens: add(a.outputTokens, b.outputTokens),
+			totalTokens: add(a.totalTokens, b.totalTokens),
+			reasoningTokens: add(a.reasoningTokens, b.reasoningTokens),
+			cachedInputTokens: add(a.cachedInputTokens, b.cachedInputTokens),
+		}
+	}
+
+	// Roll the most recent per-request usage into the cumulative baselines so
+	// the next request's running total starts from a fresh zero on top of the
+	// locked-in totals. Called once per request (on `onFinalMessage`).
+	private _lockInCurrentRequestUsage(threadId: string) {
+		const lastUsage = this.latestUsageOfThreadId[threadId]
+		if (!lastUsage) return
+		this._cumulativeThisTurnBaselineOfThreadId[threadId] = this._addUsage(this._cumulativeThisTurnBaselineOfThreadId[threadId], lastUsage)
+		this._cumulativeThisThreadBaselineOfThreadId[threadId] = this._addUsage(this._cumulativeThisThreadBaselineOfThreadId[threadId], lastUsage)
+	}
+
+	// Reset the "this turn" counter and its baseline. Called when a new user
+	// message starts a fresh turn. Does NOT touch "this thread" — that's
+	// lifetime accumulation.
+	private _resetCumulativeThisTurn(threadId: string) {
+		this.cumulativeUsageThisTurnOfThreadId[threadId] = undefined
+		this._cumulativeThisTurnBaselineOfThreadId[threadId] = undefined
 		this._onDidChangeStreamState.fire({ threadId })
 	}
 
@@ -960,6 +1036,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					},
 					onFinalMessage: async ({ fullText, fullReasoning, toolCall, anthropicReasoning, usage }) => {
 						if (usage) this._setLatestUsage(threadId, usage)
+						// Lock in this request's usage so the next loop iteration's
+						// running total is added to (not replacing) what we already counted.
+						this._lockInCurrentRequestUsage(threadId)
 						resMessageIsDonePromise({ type: 'llmDone', toolCall, info: { fullText, fullReasoning, anthropicReasoning } }) // resolve with tool calls
 					},
 					onError: async (error) => {
@@ -1384,6 +1463,11 @@ We only need to do it for files that were edited since `from`, ie files between 
 		if (this.streamState[threadId]?.isRunning) {
 			await this.abortRunning(threadId)
 		}
+
+		// A new user message starts a new "turn" — zero out this-turn cumulative
+		// before any LLM requests fire. Lifetime/this-thread cumulative keeps
+		// accumulating across turns.
+		this._resetCumulativeThisTurn(threadId)
 
 		// add dummy before this message to keep checkpoint before user message idea consistent
 		if (thread.messages.length === 0) {

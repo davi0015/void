@@ -69,6 +69,8 @@ let chatThreadsStreamState: ThreadStreamState
 const chatThreadsStreamStateListeners: Set<(threadId: string) => void> = new Set()
 
 let chatThreadsLatestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
+let chatThreadsCumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
+let chatThreadsCumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 
 let settingsState: VoidSettingsState
 const settingsStateListeners: Set<(s: VoidSettingsState) => void> = new Set()
@@ -122,10 +124,14 @@ export const _registerServices = (accessor: ServicesAccessor) => {
 	// same service, different state
 	chatThreadsStreamState = chatThreadsStateService.streamState
 	chatThreadsLatestUsageOfThreadId = chatThreadsStateService.latestUsageOfThreadId
+	chatThreadsCumulativeUsageThisTurnOfThreadId = chatThreadsStateService.cumulativeUsageThisTurnOfThreadId
+	chatThreadsCumulativeUsageThisThreadOfThreadId = chatThreadsStateService.cumulativeUsageThisThreadOfThreadId
 	disposables.push(
 		chatThreadsStateService.onDidChangeStreamState(({ threadId }) => {
 			chatThreadsStreamState = chatThreadsStateService.streamState
 			chatThreadsLatestUsageOfThreadId = chatThreadsStateService.latestUsageOfThreadId
+			chatThreadsCumulativeUsageThisTurnOfThreadId = chatThreadsStateService.cumulativeUsageThisTurnOfThreadId
+			chatThreadsCumulativeUsageThisThreadOfThreadId = chatThreadsStateService.cumulativeUsageThisThreadOfThreadId
 			chatThreadsStreamStateListeners.forEach(l => l(threadId))
 		})
 	)
@@ -316,6 +322,35 @@ export const useChatThreadLatestUsage = (threadId: string) => {
 		const listener = (threadId_: string) => {
 			if (threadId_ !== threadId) return
 			su(chatThreadsLatestUsageOfThreadId[threadId])
+		}
+		chatThreadsStreamStateListeners.add(listener)
+		return () => { chatThreadsStreamStateListeners.delete(listener) }
+	}, [su, threadId])
+	return u
+}
+
+// Cumulative token usage across all LLM requests fired in the current user turn
+// (this-turn) and across the entire thread history (this-thread). In an agent
+// loop with N tool calls each request resends the full history, so total billed
+// tokens grow ~O(N²) — these counters expose that real cost vs. `latestUsage`'s
+// per-request snapshot.
+export const useChatThreadCumulativeUsage = (threadId: string) => {
+	const initial = {
+		thisTurn: chatThreadsCumulativeUsageThisTurnOfThreadId[threadId],
+		thisThread: chatThreadsCumulativeUsageThisThreadOfThreadId[threadId],
+	}
+	const [u, su] = useState<{ thisTurn: LLMUsage | undefined, thisThread: LLMUsage | undefined }>(initial)
+	useEffect(() => {
+		su({
+			thisTurn: chatThreadsCumulativeUsageThisTurnOfThreadId[threadId],
+			thisThread: chatThreadsCumulativeUsageThisThreadOfThreadId[threadId],
+		})
+		const listener = (threadId_: string) => {
+			if (threadId_ !== threadId) return
+			su({
+				thisTurn: chatThreadsCumulativeUsageThisTurnOfThreadId[threadId],
+				thisThread: chatThreadsCumulativeUsageThisThreadOfThreadId[threadId],
+			})
 		}
 		chatThreadsStreamStateListeners.add(listener)
 		return () => { chatThreadsStreamStateListeners.delete(listener) }
