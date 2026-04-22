@@ -20,7 +20,7 @@ import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCa
 import { IToolsService } from './toolsService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
-import { ChatMessage, CheckpointEntry, CodespanLocationLink, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js';
+import { ChatMessage, CheckpointEntry, CodespanLocationLink, CompactionInfo, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js';
 import { Position } from '../../../../editor/common/core/position.js';
 import { IMetricsService } from '../common/metricsService.js';
 import { shorten } from '../../../../base/common/labels.js';
@@ -131,6 +131,16 @@ export type ThreadType = {
 	// This field surfaces the real cumulative cost so the user can see actual
 	// billing impact, not just the last sample. Persisted alongside latestUsage.
 	cumulativeUsageThisThread?: LLMUsage;
+
+	// Perf 2 — compaction visibility. Populated by `_recordCompaction` whenever
+	// `compactToolResultsForRequest` fires for a request on this thread. `latestCompaction`
+	// reflects the most recent request's trim summary (undefined if the last request
+	// did not trim anything); `cumulativeCompactionThisThread` is the lifetime sum
+	// so users can see how much prompt-size pressure was relieved across the whole chat.
+	// Persisted alongside latestUsage so the TokenUsageRing tooltip keeps its compaction
+	// badge after a reload.
+	latestCompaction?: CompactionInfo;
+	cumulativeCompactionThisThread?: CompactionInfo;
 
 	// Model used to send the most recent user message on this thread. Captured
 	// on send, restored on `switchToThread` (writes to settings' `Chat` model
@@ -274,6 +284,15 @@ export interface IChatThreadService {
 	// reloads.
 	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined };
 
+	// Perf 2 compaction telemetry — same shape as the usage maps above. `latest…`
+	// reflects the most recent request only (undefined if it didn't compact);
+	// `cumulative…` sums every compaction that fired on the thread. Consumed by
+	// the TokenUsageRing tooltip to show a "compacted N results / saved ~Xk tokens"
+	// badge so users can see when the prompt was shrunk server-side.
+	readonly latestCompactionOfThreadId: { [threadId: string]: CompactionInfo | undefined };
+	readonly cumulativeCompactionThisTurnOfThreadId: { [threadId: string]: CompactionInfo | undefined };
+	readonly cumulativeCompactionThisThreadOfThreadId: { [threadId: string]: CompactionInfo | undefined };
+
 	onDidChangeCurrentThread: Event<void>;
 	onDidChangeStreamState: Event<{ threadId: string }>
 
@@ -353,6 +372,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
+	readonly latestCompactionOfThreadId: { [threadId: string]: CompactionInfo | undefined } = {}
+	readonly cumulativeCompactionThisTurnOfThreadId: { [threadId: string]: CompactionInfo | undefined } = {}
+	readonly cumulativeCompactionThisThreadOfThreadId: { [threadId: string]: CompactionInfo | undefined } = {}
 	state: ThreadsState // allThreads is persisted, currentThread is not
 
 	// used in checkpointing
@@ -399,6 +421,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const t = allThreads[id]
 			if (t?.latestUsage) this.latestUsageOfThreadId[id] = t.latestUsage
 			if (t?.cumulativeUsageThisThread) this.cumulativeUsageThisThreadOfThreadId[id] = t.cumulativeUsageThisThread
+			if (t?.latestCompaction) this.latestCompactionOfThreadId[id] = t.latestCompaction
+			if (t?.cumulativeCompactionThisThread) this.cumulativeCompactionThisThreadOfThreadId[id] = t.cumulativeCompactionThisThread
 		}
 
 		// always be in a thread
@@ -661,6 +685,45 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	private _resetCumulativeThisTurn(threadId: string) {
 		this.cumulativeUsageThisTurnOfThreadId[threadId] = undefined
 		this._cumulativeThisTurnBaselineOfThreadId[threadId] = undefined
+		// Mirror the reset for compaction so the tooltip's "this turn" block
+		// matches the token-usage "this turn" block semantically.
+		this.cumulativeCompactionThisTurnOfThreadId[threadId] = undefined
+		this._onDidChangeStreamState.fire({ threadId })
+	}
+
+	// Sum two CompactionInfo values. Unlike `_addUsage` there are no optional
+	// fields to reconcile — both counters are plain numbers — so we just add.
+	private _addCompaction(a: CompactionInfo | undefined, b: CompactionInfo | undefined): CompactionInfo | undefined {
+		if (!a) return b ? { ...b } : undefined
+		if (!b) return { ...a }
+		return {
+			trimmedCount: a.trimmedCount + b.trimmedCount,
+			savedChars: a.savedChars + b.savedChars,
+		}
+	}
+
+	// Called once per outbound LLM request, right after `prepareLLMChatMessages`
+	// reports whether compaction fired. Unlike `_setLatestUsage` (which is
+	// re-invoked every streamed token and relies on baseline subtraction),
+	// compaction is a one-shot event so we can simply `latest=info` and
+	// `cumulative += info`.
+	//
+	// When `info` is null (no compaction this request) we clear `latest…` so the
+	// tooltip shows "Last request: no compaction", matching how `latestUsage`
+	// reflects the most recent request rather than the last request that had
+	// data. Cumulative counters keep their running totals.
+	private _recordCompaction(threadId: string, info: CompactionInfo | null) {
+		this.latestCompactionOfThreadId[threadId] = info ?? undefined
+		if (info) {
+			this.cumulativeCompactionThisTurnOfThreadId[threadId] = this._addCompaction(this.cumulativeCompactionThisTurnOfThreadId[threadId], info)
+			this.cumulativeCompactionThisThreadOfThreadId[threadId] = this._addCompaction(this.cumulativeCompactionThisThreadOfThreadId[threadId], info)
+		}
+		const thread = this.state.allThreads[threadId]
+		if (thread) {
+			thread.latestCompaction = this.latestCompactionOfThreadId[threadId]
+			thread.cumulativeCompactionThisThread = this.cumulativeCompactionThisThreadOfThreadId[threadId]
+			this._storeAllThreads(this.state.allThreads)
+		}
 		this._onDidChangeStreamState.fire({ threadId })
 	}
 
@@ -1156,11 +1219,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor })
 
 			const chatMessages = this.state.allThreads[threadId]?.messages ?? []
-			const { messages, separateSystemMessage } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
+			const { messages, separateSystemMessage, compactionInfo } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages,
 				modelSelection,
 				chatMode
 			})
+			// Surface any Perf 2 compaction that fired for this request so the
+			// TokenUsageRing tooltip can show "compacted N results / saved ~Xk tokens".
+			// null means "no trimming this request" — still recorded, so "Last request"
+			// in the tooltip correctly reflects the most recent LLM call.
+			this._recordCompaction(threadId, compactionInfo)
 
 			if (interruptedWhenIdle) {
 				this._setStreamState(threadId, undefined)

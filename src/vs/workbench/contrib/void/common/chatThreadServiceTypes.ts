@@ -8,6 +8,20 @@ import { VoidFileSnapshot } from './editCodeServiceTypes.js';
 import { AnthropicReasoning, RawToolParamsObj } from './sendLLMMessageTypes.js';
 import { ToolCallParams, ToolName, ToolResult } from './toolsServiceTypes.js';
 
+
+// Summary of one round of Perf 2 Light-tier history compaction — the data used to
+// surface "compacted N results / saved ~Xk tokens" in the TokenUsageRing tooltip.
+// Populated once per outbound LLM request by `compactToolResultsForRequest`; `null`
+// for requests where compaction did not fire (size gate not met, or no trim-eligible
+// tool results outside the protection zone).
+//
+// Cumulative variants of this type are built by `_addCompaction` (same semantics as
+// LLMUsage cumulative — per-turn resets on new user message, per-thread persists).
+export type CompactionInfo = {
+	trimmedCount: number   // number of tool_result messages whose body we replaced with a marker
+	savedChars: number     // sum of (originalBody.length - trimmedBody.length) across those messages
+}
+
 export type ToolMessage<T extends ToolName> = {
 	role: 'tool';
 	content: string; // give this result to LLM (string of value)

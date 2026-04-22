@@ -6,7 +6,7 @@
 import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 
-import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState, useFullChatThreadsStreamState, useChatThreadLatestUsage, useChatThreadCumulativeUsage } from '../util/services.js';
+import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState, useFullChatThreadsStreamState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction } from '../util/services.js';
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
@@ -23,7 +23,7 @@ import { ICommandService } from '../../../../../../../platform/commands/common/c
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
 import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text } from 'lucide-react';
-import { ChatMessage, CheckpointEntry, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
+import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, EditToolAcceptRejectButtonsHTML, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, StatusIndicatorForApplyButton, useApplyStreamState, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { IsRunningType } from '../../../chatThreadService.js';
@@ -313,6 +313,13 @@ interface TokenUsageRingProps {
 	contextWindow: number; // model's max input context, in tokens
 	cumulativeThisTurn?: LLMUsage | undefined;
 	cumulativeThisThread?: LLMUsage | undefined;
+	// Perf 2 compaction summary — `latestCompaction` is undefined when the last
+	// request didn't trim anything; `cumulativeCompactionThisTurn` /
+	// `cumulativeCompactionThisThread` are running totals. All three are optional
+	// so callers that don't care about compaction visibility can omit them.
+	latestCompaction?: CompactionInfo | undefined;
+	cumulativeCompactionThisTurn?: CompactionInfo | undefined;
+	cumulativeCompactionThisThread?: CompactionInfo | undefined;
 	children: React.ReactNode;
 	size?: number;
 }
@@ -334,7 +341,19 @@ const formatUsageBlock = (label: string, u: LLMUsage | undefined): (string | nul
 	]
 }
 
-const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, cumulativeThisTurn, cumulativeThisThread, children, size = 34 }) => {
+// Format one compaction block for the tooltip. Chars→tokens uses the same 4:1
+// ratio that `compactToolResultsForRequest` reasons in when enforcing the
+// size-trigger gate, so numbers here line up with the dev-console log.
+// Returns a single line (compaction has only 2 metrics, unlike LLMUsage's 4).
+const COMPACTION_CHARS_PER_TOKEN = 4
+const formatCompactionBlock = (label: string, c: CompactionInfo | undefined): string => {
+	if (!c || c.trimmedCount === 0) return `${label}: none`
+	const approxTokens = Math.round(c.savedChars / COMPACTION_CHARS_PER_TOKEN)
+	const plural = c.trimmedCount === 1 ? 'result' : 'results'
+	return `${label}: ${c.trimmedCount} ${plural}, saved ~${formatTokenCount(approxTokens)} tokens`
+}
+
+const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, cumulativeThisTurn, cumulativeThisThread, latestCompaction, cumulativeCompactionThisTurn, cumulativeCompactionThisThread, children, size = 34 }) => {
 	const strokeWidth = 3
 	const radius = (size - strokeWidth) / 2
 	const hasData = !!usage && contextWindow > 0
@@ -365,6 +384,18 @@ const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, c
 		// The cumulative blocks are critical because agent loops issue many requests
 		// per turn — total billed tokens grow ~O(N²) while the ring only shows the
 		// last request's input.
+		// Only render the compaction section when something has ever been
+		// compacted on this thread — on short threads with no compaction this
+		// keeps the tooltip compact. We gate on cumulative-this-thread because
+		// per-turn and latest reset to undefined during quiet periods.
+		const hasAnyCompaction = !!cumulativeCompactionThisThread && cumulativeCompactionThisThread.trimmedCount > 0
+		const compactionLines = hasAnyCompaction ? [
+			``,
+			`History compaction`,
+			`  ${formatCompactionBlock('Last request', latestCompaction)}`,
+			`  ${formatCompactionBlock('This turn', cumulativeCompactionThisTurn)}`,
+			`  ${formatCompactionBlock('This thread', cumulativeCompactionThisThread)}`,
+		] : []
 		tooltipContent = [
 			`Context window usage`,
 			`${formatTokenCount(total)} / ${formatTokenCount(contextWindow)} (${displayPct})`,
@@ -374,6 +405,7 @@ const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, c
 			...formatUsageBlock('Cumulative this turn', cumulativeThisTurn),
 			``,
 			...formatUsageBlock('Cumulative this thread', cumulativeThisThread),
+			...compactionLines,
 		].filter(s => s !== null).join('\n')
 
 		svgEl = (
@@ -427,6 +459,7 @@ const SubmitButtonWithUsageRing: React.FC<{ threadId: string; featureName: Featu
 	const settingsState = useSettingsState()
 	const usage = useChatThreadLatestUsage(threadId)
 	const cumulative = useChatThreadCumulativeUsage(threadId)
+	const compaction = useChatThreadCompaction(threadId)
 
 	const modelSelection = settingsState.modelSelectionOfFeature[featureName]
 	// Always render the wrapper so the send button doesn't jump sideways when
@@ -437,7 +470,15 @@ const SubmitButtonWithUsageRing: React.FC<{ threadId: string; featureName: Featu
 		: 0
 
 	return (
-		<TokenUsageRing usage={usage} contextWindow={contextWindow} cumulativeThisTurn={cumulative.thisTurn} cumulativeThisThread={cumulative.thisThread}>
+		<TokenUsageRing
+			usage={usage}
+			contextWindow={contextWindow}
+			cumulativeThisTurn={cumulative.thisTurn}
+			cumulativeThisThread={cumulative.thisThread}
+			latestCompaction={compaction.latest}
+			cumulativeCompactionThisTurn={compaction.thisTurn}
+			cumulativeCompactionThisThread={compaction.thisThread}
+		>
 			{children}
 		</TokenUsageRing>
 	)

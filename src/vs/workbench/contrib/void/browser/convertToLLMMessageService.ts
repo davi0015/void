@@ -5,7 +5,7 @@ import { registerSingleton, InstantiationType } from '../../../../platform/insta
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IEditorService } from '../../../services/editor/common/editorService.js';
-import { ChatMessage } from '../common/chatThreadServiceTypes.js';
+import { ChatMessage, CompactionInfo } from '../common/chatThreadServiceTypes.js';
 import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities } from '../common/modelCapabilities.js';
 import { reParsedToolXMLString, chat_systemMessage, chat_volatileContext } from '../common/prompt/prompts.js';
 import { AnthropicLLMChatMessage, AnthropicReasoning, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, OpenAILLMChatMessage, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
@@ -186,27 +186,31 @@ const _computeProtectionBoundary = (messages: SimpleLLMMessage[]): number => {
 	return Math.max(userTurnBoundary, messageCountBoundary)
 }
 
-// Returns a new array with old, trimmable tool bodies replaced by a short trim marker.
-// Pure function — does not mutate the input.
+// Returns a new message array with old, trimmable tool bodies replaced by a short
+// trim marker, plus a summary of what was done (surfaced in the TokenUsageRing
+// tooltip so the user has visibility into when/why requests shrunk).
+// Pure function — does not mutate the input. `info === null` means no compaction
+// happened this request (size gate not met, or no trim-eligible messages).
 const compactToolResultsForRequest = (
 	messages: SimpleLLMMessage[],
 	{ contextWindow }: { contextWindow: number },
-): SimpleLLMMessage[] => {
+): { messages: SimpleLLMMessage[], info: CompactionInfo | null } => {
 	// Gate 0 — size-based. Don't trim anything on small requests; the cache break
 	// cost would outweigh the savings. Trigger is expressed as a fraction of the
 	// model's context window, converted to chars via the same CHARS_PER_TOKEN ratio
 	// the emergency trim uses (so both policies reason in a consistent unit).
 	const sizeTriggerChars = contextWindow * CHARS_PER_TOKEN * COMPACTION_POLICY.sizeTriggerRatio
 	const totalChars = _totalContentChars(messages)
-	if (totalChars < sizeTriggerChars) return messages
+	if (totalChars < sizeTriggerChars) return { messages, info: null }
 
 	// Gate 1 — structural. Compute the protection boundary (larger of the two
 	// policies, see `_computeProtectionBoundary`). If nothing sits before the
 	// boundary, there's nothing to trim.
 	const boundaryIdx = _computeProtectionBoundary(messages)
-	if (boundaryIdx <= 0) return messages
+	if (boundaryIdx <= 0) return { messages, info: null }
 
-	let trimmed = 0
+	let trimmedCount = 0
+	let savedChars = 0
 	const out = messages.map((m, idx): SimpleLLMMessage => {
 		if (idx >= boundaryIdx) return m
 		if (m.role !== 'tool') return m
@@ -226,21 +230,20 @@ ${head}
 ... (content trimmed) ...
 Last ${COMPACTION_POLICY.keepLastLines} lines:
 ${tail}`
-		trimmed++
+		trimmedCount++
+		savedChars += body.length - newContent.length
 		return { ...m, content: newContent }
 	})
 
+	if (trimmedCount === 0) return { messages, info: null }
+
 	// Best-effort diagnostics so the user can see compaction firing in the dev console
-	// when they're tuning thresholds. Guarded behind a tiny counter so we don't spam
-	// on turns where nothing was trimmed.
-	if (trimmed > 0) {
-		try {
-			const totalCharsAfter = _totalContentChars(out)
-			const savedChars = totalChars - totalCharsAfter
-			console.log(`[void compaction] trimmed ${trimmed} stale tool result(s); saved ~${savedChars.toLocaleString()} chars (~${Math.round(savedChars / CHARS_PER_TOKEN).toLocaleString()} tokens); boundary=${boundaryIdx}/${messages.length}`)
-		} catch { }
-	}
-	return out
+	// when they're tuning thresholds.
+	try {
+		console.log(`[void compaction] trimmed ${trimmedCount} stale tool result(s); saved ~${savedChars.toLocaleString()} chars (~${Math.round(savedChars / CHARS_PER_TOKEN).toLocaleString()} tokens); boundary=${boundaryIdx}/${messages.length}`)
+	} catch { }
+
+	return { messages: out, info: { trimmedCount, savedChars } }
 }
 
 
@@ -769,7 +772,7 @@ const prepareMessages = (params: {
 export interface IConvertToLLMMessageService {
 	readonly _serviceBrand: undefined;
 	prepareLLMSimpleMessages: (opts: { simpleMessages: SimpleLLMMessage[], systemMessage: string, modelSelection: ModelSelection | null, featureName: FeatureName }) => { messages: LLMChatMessage[], separateSystemMessage: string | undefined }
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined }>
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 	// Called by chat creation paths to snapshot runtime grounding (date, open files,
 	// active URI, directory listing, terminal IDs) into a user message at storage time.
@@ -926,7 +929,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		return { messages, separateSystemMessage };
 	}
 	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection }) => {
-		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined }
+		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined, compactionInfo: null }
 
 		const { overridesOfModel } = this.voidSettingsService.state
 
@@ -960,7 +963,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// so short threads keep a pristine prefix cache. Keeps envelopes
 		// (tool_call_id linking) intact so protocol replay stays valid; UI
 		// continues to show originals.
-		const llmMessages = compactToolResultsForRequest(llmMessagesRaw, { contextWindow })
+		const { messages: llmMessages, info: compactionInfo } = compactToolResultsForRequest(llmMessagesRaw, { contextWindow })
 
 		const { messages, separateSystemMessage } = prepareMessages({
 			messages: llmMessages,
@@ -973,7 +976,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			reservedOutputTokenSpace,
 			providerName,
 		})
-		return { messages, separateSystemMessage };
+		return { messages, separateSystemMessage, compactionInfo };
 	}
 
 
