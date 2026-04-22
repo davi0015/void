@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { startTransition, useEffect, useMemo, useRef, useState } from 'react';
 import { CopyButton, IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
 import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useFullChatThreadsStreamState, useSettingsState } from '../util/services.js';
 import { IconX } from './SidebarChat.js';
@@ -236,7 +236,14 @@ const PastThreadElement = ({ pastThread, idx, hoveredIdx, setHoveredIdx, isRunni
 			py-1 px-2 rounded text-sm bg-zinc-700/5 hover:bg-zinc-700/10 dark:bg-zinc-300/5 dark:hover:bg-zinc-300/10 cursor-pointer opacity-80 hover:opacity-100
 		`}
 		onClick={() => {
-			chatThreadsService.switchToThread(pastThread.id);
+			// startTransition marks the state update (swapping the whole message list
+			// for a new thread) as low-priority / interruptible. The click responds
+			// instantly; React yields while building the new thread's tree instead of
+			// blocking the main thread for the full render + commit. Total CPU cost
+			// is unchanged — this only improves perceived latency.
+			startTransition(() => {
+				chatThreadsService.switchToThread(pastThread.id);
+			});
 		}}
 		onMouseEnter={() => setHoveredIdx(idx)}
 		onMouseLeave={() => setHoveredIdx(null)}
@@ -341,7 +348,13 @@ export const SidebarThreadTabs = () => {
 					<div
 						key={id}
 						ref={isActive ? activeTabRef : undefined}
-						onClick={() => chatThreadsService.switchToThread(id)}
+						onClick={() => {
+							// See note on PastThreadsList above — tab clicks benefit the most
+							// from the transition wrap because the swap is between two heavy threads.
+							startTransition(() => {
+								chatThreadsService.switchToThread(id)
+							})
+						}}
 						// Middle-click closes, matching conventional tab UX
 						// (VS Code editor tabs, browsers, etc).
 						onMouseDown={(e) => {
@@ -379,7 +392,15 @@ export const SidebarThreadTabs = () => {
 				)
 			})}
 			<button
-				onClick={() => chatThreadsService.openNewThread()}
+				onClick={() => {
+					// Opening a new (empty) thread is cheap to render, but the unmount of
+					// the OUTGOING heavy thread's bubbles + Monaco editors is the expensive
+					// part. Wrapping in startTransition lets that teardown happen without
+					// blocking the "+" click response.
+					startTransition(() => {
+						chatThreadsService.openNewThread()
+					})
+				}}
 				className='shrink-0 ml-0.5 p-1 rounded text-void-fg-3 opacity-70 hover:opacity-100 hover:bg-zinc-700/10 dark:hover:bg-zinc-300/10'
 				data-tooltip-id='void-tooltip'
 				data-tooltip-content='New chat'

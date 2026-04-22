@@ -3053,6 +3053,136 @@ const EditToolSoFar = ({ toolCallSoFar, }: { toolCallSoFar: RawToolCallObj }) =>
 }
 
 
+// Renders the message list + streaming state + error display for a single thread.
+// Extracted so that SidebarChat can render multiple of these in parallel (hidden
+// via the `hidden` attribute when not active), which preserves each thread's
+// React state — ChatBubble collapse toggles, tool-row open state, scroll position,
+// mounted Monaco editors — across tab switches. Returning to a recently-seen
+// thread then costs ~0ms because no remounting happens; only the `hidden` flag flips.
+//
+// Each instance owns its own scroll container ref and subscribes to its own stream
+// state, so a background thread can keep streaming while the user is looking at a
+// different one.
+const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
+	threadId: string
+	isActive: boolean
+	scrollContainerRef: React.MutableRefObject<HTMLDivElement | null>
+}) => {
+	const accessor = useAccessor()
+	const commandService = accessor.get('ICommandService')
+	const chatThreadsService = accessor.get('IChatThreadService')
+
+	const chatThreadsState = useChatThreadsState()
+	const thread = chatThreadsState.allThreads[threadId]
+	const previousMessages = thread?.messages ?? []
+
+	const streamState = useChatThreadsStreamState(threadId)
+	const isRunning = streamState?.isRunning
+	const latestError = streamState?.error
+	const { displayContentSoFar, toolCallSoFar, reasoningSoFar } = streamState?.llmInfo ?? {}
+	const toolIsGenerating = toolCallSoFar && !toolCallSoFar.isDone
+
+	const currCheckpointIdx = thread?.state?.currCheckpointIdx ?? undefined
+
+	// Scroll to bottom when this view becomes active (on initial mount AND on
+	// re-activation after being hidden). Native scrollTop is preserved while
+	// hidden, but new messages may have streamed in while the user was on
+	// another thread, so landing-at-bottom on return keeps UX consistent with
+	// the previous single-thread behavior.
+	useEffect(() => {
+		if (isActive) {
+			scrollToBottom(scrollContainerRef)
+		}
+	}, [isActive, scrollContainerRef])
+
+	const previousMessagesHTML = useMemo(() => {
+		return previousMessages.map((message, i) => {
+			return <ChatBubble
+				key={i}
+				currCheckpointIdx={currCheckpointIdx}
+				chatMessage={message}
+				messageIdx={i}
+				isCommitted={true}
+				chatIsRunning={isRunning}
+				threadId={threadId}
+				_scrollToBottom={() => scrollToBottom(scrollContainerRef)}
+			/>
+		})
+	}, [previousMessages, threadId, currCheckpointIdx, isRunning, scrollContainerRef])
+
+	const streamingChatIdx = previousMessagesHTML.length
+	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
+		<ChatBubble
+			key={'curr-streaming-msg'}
+			currCheckpointIdx={currCheckpointIdx}
+			chatMessage={{
+				role: 'assistant',
+				displayContent: displayContentSoFar ?? '',
+				reasoning: reasoningSoFar ?? '',
+				anthropicReasoning: null,
+			}}
+			messageIdx={streamingChatIdx}
+			isCommitted={false}
+			chatIsRunning={isRunning}
+			threadId={threadId}
+			_scrollToBottom={null}
+		/> : null
+
+	const generatingTool = toolIsGenerating ?
+		toolCallSoFar.name === 'edit_file' || toolCallSoFar.name === 'rewrite_file' ? <EditToolSoFar
+			key={'curr-streaming-tool'}
+			toolCallSoFar={toolCallSoFar}
+		/>
+			: null
+		: null
+
+	return (
+		<div
+			// `hidden` maps to `display: none`, which collapses the element out of
+			// layout AND causes IntersectionObserver to report intersections as
+			// false for descendants — so LazyBlockCode in hidden threads won't
+			// mount Monaco editors, keeping memory cost bounded while the thread
+			// is off-screen.
+			hidden={!isActive}
+			className='flex flex-col w-full h-full min-h-0'
+		>
+			<ScrollToBottomContainer
+				scrollContainerRef={scrollContainerRef}
+				className={`
+					flex flex-col
+					px-4 py-4 space-y-4
+					w-full h-full
+					overflow-x-hidden
+					overflow-y-auto
+					${previousMessagesHTML.length === 0 && !displayContentSoFar ? 'hidden' : ''}
+				`}
+			>
+				{previousMessagesHTML}
+				{currStreamingMessageHTML}
+				{generatingTool}
+
+				{isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating ? <ProseWrapper>
+					{<IconLoading className='opacity-50 text-sm' />}
+				</ProseWrapper> : null}
+
+				{latestError === undefined ? null :
+					<div className='px-2 my-1'>
+						<ErrorDisplay
+							message={latestError.message}
+							fullError={latestError.fullError}
+							onDismiss={() => { chatThreadsService.dismissStreamError(threadId) }}
+							showDismiss={true}
+						/>
+
+						<WarningBox className='text-sm my-2 mx-4' onClick={() => { commandService.executeCommand(VOID_OPEN_SETTINGS_ACTION_ID) }} text='Open settings' />
+					</div>
+				}
+			</ScrollToBottomContainer>
+		</div>
+	)
+}
+
+
 export const SidebarChat = () => {
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null)
 	const textAreaFnsRef = useRef<TextAreaFns | null>(null)
@@ -3091,7 +3221,56 @@ export const SidebarChat = () => {
 	const isDisabled = instructionsAreEmpty || !!isFeatureNameDisabled('Chat', settingsState)
 
 	const sidebarRef = useRef<HTMLDivElement>(null)
-	const scrollContainerRef = useRef<HTMLDivElement | null>(null)
+
+	// LRU cache of thread ids that stay mounted in the DOM. Switching between
+	// cached threads is just a `hidden` flip (near-zero cost); only the first
+	// visit to a thread pays the full render. Active thread always sits at
+	// index 0 so it's obvious which one is current. Size cap keeps memory
+	// bounded — each cached thread holds its DOM tree but no Monaco editors
+	// (LazyBlockCode doesn't mount while `hidden`).
+	const CACHED_THREADS_MAX = 5
+	const [cachedThreadIds, setCachedThreadIds] = useState<string[]>(() => [currentThread.id])
+	useEffect(() => {
+		const newId = currentThread.id
+		setCachedThreadIds(prev => {
+			const withoutCurrent = prev.filter(id => id !== newId)
+			const next = [newId, ...withoutCurrent].slice(0, CACHED_THREADS_MAX)
+			// Skip the state update if order+contents are unchanged, otherwise
+			// every re-render (stream chunks fire many) would create a new array
+			// and cascade down to the parallel-thread render list.
+			if (next.length === prev.length && next.every((id, i) => id === prev[i])) return prev
+			return next
+		})
+	}, [currentThread.id])
+
+	// Drop any cached ids for threads that have since been deleted so we don't
+	// render stale empty placeholders (allThreads[id] would be undefined).
+	const visibleCachedIds = useMemo(() =>
+		cachedThreadIds.filter(id => !!chatThreadsState.allThreads[id]),
+		[cachedThreadIds, chatThreadsState.allThreads]
+	)
+
+	// One scroll container ref per cached thread. Refs are stable objects
+	// (MutableRefObject) so React's ref assignment picks up the actual DOM
+	// element after mount. We keep the map in a ref so it survives re-renders
+	// without causing cascades; entries for evicted threads become harmless
+	// `{ current: null }` that the next thread with the same id (rare) would
+	// re-use cleanly.
+	const scrollContainerRefsMapRef = useRef(new Map<string, React.MutableRefObject<HTMLDivElement | null>>())
+	const getScrollContainerRef = useCallback((id: string) => {
+		const map = scrollContainerRefsMapRef.current
+		let ref = map.get(id)
+		if (!ref) {
+			ref = { current: null }
+			map.set(id, ref)
+		}
+		return ref
+	}, [])
+
+	// Points at the currently active thread's scroll container — used by
+	// `onSubmit` / `onAbort` / mountInfo resolver that need to scroll the
+	// active view without knowing about the LRU cache.
+	const scrollContainerRef = getScrollContainerRef(currentThread.id)
 	const onSubmit = useCallback(async (_forceSubmit?: string) => {
 
 		if (isDisabled && !_forceSubmit) return
@@ -3137,107 +3316,44 @@ export const SidebarChat = () => {
 
 	}, [chatThreadsState, threadId, textAreaRef, scrollContainerRef, isResolved])
 
-	// Land-at-bottom on thread switch. Previously this was a side-effect of
-	// `key={'messages' + threadId}` force-remounting `ScrollToBottomContainer`,
-	// which fired its mount-time "scroll to bottom" effect. We removed that key
-	// to make tab-switching fast (no tear-down + rebuild of all bubbles), so we
-	// need an explicit effect to preserve the same landing behavior.
+	// Reset the "input is empty" flag on thread switch. Previously the outer
+	// Fragment key={threadId} nuked everything including this useState, which
+	// side-effectively reset the submit button's disabled state. Now that the
+	// parallel-thread cache keeps SidebarChat mounted across switches, we have
+	// to reset this explicitly. The textarea itself is still cleared via the
+	// keyed `threadPageInput` below.
 	useEffect(() => {
-		scrollToBottom(scrollContainerRef)
-	}, [threadId, scrollContainerRef])
+		setInstructionsAreEmpty(true)
+	}, [currentThread.id])
 
-
-
-
-	const previousMessagesHTML = useMemo(() => {
-		// const lastMessageIdx = previousMessages.findLastIndex(v => v.role !== 'checkpoint')
-		// tool request shows up as Editing... if in progress
-		return previousMessages.map((message, i) => {
-			return <ChatBubble
-				key={i}
-				currCheckpointIdx={currCheckpointIdx}
-				chatMessage={message}
-				messageIdx={i}
-				isCommitted={true}
-				chatIsRunning={isRunning}
-				threadId={threadId}
-				_scrollToBottom={() => scrollToBottom(scrollContainerRef)}
-			/>
-		})
-	}, [previousMessages, threadId, currCheckpointIdx, isRunning])
-
-	const streamingChatIdx = previousMessagesHTML.length
-	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
-		<ChatBubble
-			key={'curr-streaming-msg'}
-			currCheckpointIdx={currCheckpointIdx}
-			chatMessage={{
-				role: 'assistant',
-				displayContent: displayContentSoFar ?? '',
-				reasoning: reasoningSoFar ?? '',
-				anthropicReasoning: null,
-			}}
-			messageIdx={streamingChatIdx}
-			isCommitted={false}
-			chatIsRunning={isRunning}
-
-			threadId={threadId}
-			_scrollToBottom={null}
-		/> : null
-
-
-	// the tool currently being generated
-	const generatingTool = toolIsGenerating ?
-		toolCallSoFar.name === 'edit_file' || toolCallSoFar.name === 'rewrite_file' ? <EditToolSoFar
-			key={'curr-streaming-tool'}
-			toolCallSoFar={toolCallSoFar}
-		/>
-			: null
-		: null
-
-	// NOTE: no `key={...currentThreadId}` here. Keeping the container mounted
-	// across thread switches lets React reconcile in place instead of tearing
-	// down and rebuilding every message bubble, which was the dominant cause
-	// of the tab-switch lag. Scroll-to-bottom on switch is now handled by an
-	// explicit effect above that fires on `threadId` change.
-	const messagesHTML = <ScrollToBottomContainer
-		scrollContainerRef={scrollContainerRef}
-		className={`
-			flex flex-col
-			px-4 py-4 space-y-4
-			w-full h-full
-			overflow-x-hidden
-			overflow-y-auto
-			${previousMessagesHTML.length === 0 && !displayContentSoFar ? 'hidden' : ''}
-		`}
-	>
-		{/* previous messages */}
-		{previousMessagesHTML}
-		{currStreamingMessageHTML}
-
-		{/* Generating tool */}
-		{generatingTool}
-
-		{/* loading indicator */}
-		{isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating ? <ProseWrapper>
-			{<IconLoading className='opacity-50 text-sm' />}
-		</ProseWrapper> : null}
-
-
-		{/* error message */}
-		{latestError === undefined ? null :
-			<div className='px-2 my-1'>
-				<ErrorDisplay
-					message={latestError.message}
-					fullError={latestError.fullError}
-					onDismiss={() => { chatThreadsService.dismissStreamError(currentThread.id) }}
-					showDismiss={true}
-				/>
-
-				<WarningBox className='text-sm my-2 mx-4' onClick={() => { commandService.executeCommand(VOID_OPEN_SETTINGS_ACTION_ID) }} text='Open settings' />
-			</div>
-		}
-	</ScrollToBottomContainer>
+	// Render one ThreadMessagesView per cached thread id, with only the active
+	// one visible. The hidden views preserve their full React state (bubble
+	// collapse toggles, scroll position, streaming progress) and their DOM —
+	// returning to a recently-seen thread is near-instant because no mount/
+	// unmount cycle happens; only the `hidden` attribute flips.
+	const messagesHTML = (
+		<div className='relative flex-1 min-h-0 w-full'>
+			{visibleCachedIds.map(id => (
+				<div
+					key={id}
+					// Stack all cached thread views in the same box; only the
+					// active one's `hidden=false` makes it visible. Absolute
+					// positioning lets hidden views take zero layout space
+					// while still being part of the DOM / React tree.
+					className='absolute inset-0'
+					hidden={id !== currentThread.id}
+				>
+					<ErrorBoundary>
+						<ThreadMessagesView
+							threadId={id}
+							isActive={id === currentThread.id}
+							scrollContainerRef={getScrollContainerRef(id)}
+						/>
+					</ErrorBoundary>
+				</div>
+			))}
+		</div>
+	)
 
 
 	const onChangeText = useCallback((newStr: string) => {
@@ -3372,9 +3488,15 @@ export const SidebarChat = () => {
 	</div>
 
 
+	// No `key={threadId}` here. Per-thread state that used to be reset by the
+	// full-subtree-remount this key caused (ChatBubble collapse toggles, tool-
+	// row expand state, scroll position) is now isolated by construction:
+	// every cached thread has its own `ThreadMessagesView` subtree with its
+	// own `useState` instances. SidebarChat-level state (input emptiness, the
+	// textarea DOM) is either reset explicitly (see `instructionsAreEmpty`
+	// effect above) or re-mounted via the narrower `threadPageInput` key.
 	return (
-		<Fragment key={threadId} // force rerender when change thread
-		>
+		<Fragment>
 			{isLandingPage ?
 				landingPageContent
 				: threadPageContent}
