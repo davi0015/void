@@ -154,7 +154,7 @@ export type InternalToolInfo = {
 
 
 const uriParam = (object: string) => ({
-	uri: { description: `The FULL path to the ${object}.` }
+	uri: { description: `Path to the ${object}. Can be absolute (e.g. \`/Users/you/project/src/foo.ts\`) or relative to the workspace root (e.g. \`src/foo.ts\`, \`README.md\`).` }
 })
 
 const paginationParam = {
@@ -163,7 +163,7 @@ const paginationParam = {
 
 
 
-const terminalDescHelper = `You can use this tool to run any command: sed, grep, etc. Do not edit any files with this tool; use edit_file instead. When working with git and other tools that open an editor (e.g. git diff), you should pipe to cat to get all results and not get stuck in vim.`
+const terminalDescHelper = `This tool is for shell commands that aren't available as a dedicated tool. Do NOT use it for: reading files (use \`read_file\`), listing directories (use \`ls_dir\` or \`get_dir_tree\`), finding files by name (use \`search_pathnames_only\`), searching text inside files (use \`search_in_file\` or \`search_for_files\`), or editing files (use \`edit_file\` / \`rewrite_file\`). Use it for commands like \`npm install\`, \`git status\`, \`pytest\`, build commands, or shell operations the dedicated tools don't cover. When working with tools that open an editor (e.g. \`git diff\`), pipe to \`cat\` so the command doesn't get stuck in vim.`
 
 const cwdHelper = 'Optional. The directory in which to run the command. Defaults to the first workspace folder.'
 
@@ -195,7 +195,7 @@ export const builtinTools: {
 
 	read_file: {
 		name: 'read_file',
-		description: `Returns full contents of a given file.`,
+		description: `Use this to read a file's contents when you need to inspect, quote, or reason about code. Returns the full contents of the file. Never use \`run_command\` with \`cat\` to read files — this tool is the correct choice.`,
 		params: {
 			...uriParam('file'),
 			start_line: { description: 'Optional. Do NOT fill this field in unless you were specifically given exact line numbers to search. Defaults to the beginning of the file.' },
@@ -206,9 +206,9 @@ export const builtinTools: {
 
 	ls_dir: {
 		name: 'ls_dir',
-		description: `Lists all files and folders in the given URI.`,
+		description: `Use this to list the files and folders directly inside a directory. For a recursive tree view, use \`get_dir_tree\` instead. Never use \`run_command\` with \`ls\` — this tool is the correct choice.`,
 		params: {
-			uri: { description: `Optional. The FULL path to the ${'folder'}. Leave this as empty or "" to search all folders.` },
+			uri: { description: `Optional. Path to the folder. Can be absolute (e.g. \`/Users/you/project/src\`) or relative to the workspace root (e.g. \`src/vs/workbench\`). Leave as empty or "" to list from the workspace root.` },
 			...paginationParam,
 		},
 	},
@@ -227,10 +227,10 @@ export const builtinTools: {
 
 	search_pathnames_only: {
 		name: 'search_pathnames_only',
-		description: `Returns all pathnames that match a given query (searches ONLY file names). You should use this when looking for a file with a specific name or path.`,
+		description: `Use this to find files by name or path pattern across the workspace. Searches pathnames ONLY — not file contents. For content search, use \`search_for_files\` or \`search_in_file\`. Never use \`run_command\` with \`find\` — this tool is the correct choice.`,
 		params: {
 			query: { description: `Your query for the search.` },
-			include_pattern: { description: 'Optional. Only fill this in if you need to limit your search because there were too many results.' },
+			include_pattern: { description: `Optional. Glob pattern to restrict the search (e.g. \`*.ts\` to only match TypeScript files, \`src/**\` to limit to descendants of \`src/\`). Only fill this in if you need to narrow results.` },
 			...paginationParam,
 		},
 	},
@@ -239,7 +239,7 @@ export const builtinTools: {
 
 	search_for_files: {
 		name: 'search_for_files',
-		description: `Returns a list of file names whose content matches the given query. The query can be any substring or regex.`,
+		description: `Use this to find which files contain a given string or regex pattern across the workspace. Returns a list of matching file names (not line numbers). For line-number positions within a specific file, use \`search_in_file\`. Never use \`run_command\` with \`grep\` — this tool is the correct choice.`,
 		params: {
 			query: { description: `Your query for the search.` },
 			search_in_folder: { description: 'Optional. Leave as blank by default. ONLY fill this in if your previous search with the same query was truncated. Searches descendants of this folder only.' },
@@ -251,7 +251,7 @@ export const builtinTools: {
 	// add new search_in_file tool
 	search_in_file: {
 		name: 'search_in_file',
-		description: `Returns an array of all the start line numbers where the content appears in the file.`,
+		description: `Use this to find where a pattern appears inside a specific file. Returns the start line numbers of matches. For cross-file content search, use \`search_for_files\`. Never use \`run_command\` with \`grep\` — this tool is the correct choice.`,
 		params: {
 			...uriParam('file'),
 			query: { description: 'The string or regex to search for in the file.' },
@@ -512,7 +512,7 @@ You will be given instructions from the user, and may also receive a list of fil
 		// turn that batches N reads costs one round-trip instead of N, and prefix caching
 		// stays warm across the whole batch. Keep sequential tools for dependent steps
 		// where later arguments require earlier results.
-		details.push(`You can call multiple tools in a single turn when the operations are independent (e.g. reading several files, searching several patterns). Prefer batching reads/searches together rather than issuing them one-at-a-time across turns. Use separate turns when a later tool's arguments depend on an earlier tool's result.`)
+		details.push(`You can call multiple tools in a single turn when the operations are independent (e.g. reading several files, searching several patterns). Prefer batching reads/searches together rather than issuing them one-at-a-time across turns. Use separate turns when a later tool's arguments depend on an earlier tool's result. Concrete example: when a search or list returns multiple files you want to inspect, read ALL of them in ONE turn (one assistant message with multiple \`read_file\` tool calls) — NOT one per turn. Per-turn reads compound input tokens for every subsequent call.`)
 		// Perf 2 — trimmed tool results hint. Older data-fetching tool outputs in the
 		// conversation history may have their bodies replaced with a short marker
 		// (starting with "[trimmed — ...]"). The model needs to know this is expected
@@ -527,22 +527,70 @@ You will be given instructions from the user, and may also receive a list of fil
 	}
 
 	if (mode === 'agent') {
+		// A3 — Agent loop framing. Explicit phase structure the model can
+		// self-check against, instead of the implicit "do everything in some
+		// order" shape. Helps weaker models (Nemotron) not skip steps and gives
+		// stronger models (MiniMax) a natural exit point ("we're in verify,
+		// stop adding steps") to curb post-A1+A2 over-iteration. The phases
+		// are a self-check, not required output — we deliberately do NOT ask
+		// the model to announce which phase it's in.
+		details.push(`Follow this loop on every task: understand the user's intent → investigate the relevant code → diagnose the actual problem → act with focused changes → verify the change worked. Use the loop as a self-check: don't act without investigating first, and don't keep investigating after you've already acted and verified.`)
+
 		details.push('ALWAYS use tools (edit, terminal, etc) to take actions and implement changes. For example, if you would like to edit a file, you MUST use a tool.')
-		details.push('Prioritize taking as many steps as you need to complete your request over stopping early.')
-		details.push(`You will OFTEN need to gather context before making a change. Do not immediately make a change unless you have ALL relevant context.`)
-		details.push(`ALWAYS have maximal certainty in a change BEFORE you make it. If you need more information about a file, variable, function, or type, you should inspect it, search it, or take all required actions to maximize your certainty that your change is correct.`)
+
+		// Phase C5 — Tool selection discipline. Reinforces the anti-fallback
+		// guidance that lives in each tool's description (Phase C1 + C2),
+		// placed here as a second surface because eval showed one-place rules
+		// get ignored by smaller models (Gemma's no-tables pathology in A1+A2
+		// eval; Gemma's persistent `find`-fallback after C1-only change). Rules
+		// that appear in tool descriptions AND importantDetails get followed
+		// more reliably than rules that appear in one surface only.
+		details.push(`For file and directory operations, always use the dedicated tool — never shell out via \`run_command\`: use \`read_file\` (not \`cat\`), \`ls_dir\` or \`get_dir_tree\` (not \`ls\` / \`tree\`), \`search_pathnames_only\` (not \`find\`), \`search_in_file\` or \`search_for_files\` (not \`grep\`), and \`edit_file\` or \`rewrite_file\` (not \`sed\` / \`echo >\`). \`run_command\` is for things the dedicated tools don't do — installing packages, running tests, git operations, build commands.`)
+
+		// A4 — Rebalance over-iteration. Replaces three compounding rules
+		// ("maximal certainty BEFORE" + "OFTEN need to gather context" +
+		// "prioritize as many steps as needed over stopping early") that
+		// produced "read everything, deliberate forever" behavior. A1+A2 eval
+		// data: Nemotron +90% tokens, MiniMax +18%; user-reported "long
+		// interactions for one console.log". Safety intent is preserved, but
+		// certainty and step count are scaled to reversibility — high
+		// certainty for hard-to-undo work, act-and-verify for low-stakes.
+		details.push(`Gather *enough* context to be confident, not maximal context. A senior engineer reads what they need and stops. If the answer is obvious from what you've already read this turn, don't keep searching.`)
+		details.push(`Take as many steps as the task genuinely requires — but don't pad. If you can finish in two tool calls, finish in two. Don't re-read files you've already read this turn, and don't run redundant verification commands.`)
+		details.push(`Have *high* certainty before changes that are hard to undo (file rewrites, deletes, terminal commands that modify state, git operations). For low-stakes changes (adding a log line, tweaking one expression, small edits to fresh code), act and verify with a quick test rather than deliberating up front.`)
+
 		details.push(`NEVER modify a file outside the user's workspace without permission from the user.`)
 	}
 
 	if (mode === 'gather') {
-		details.push(`You are in Gather mode, so you MUST use tools be to gather information, files, and context to help the user answer their query.`)
-		details.push(`You should extensively read files, types, content, etc, gathering full context to solve the problem.`)
+		details.push(`You are in Gather mode, so you MUST use tools to gather information, files, and context to help the user answer their query.`)
+		// Softened from "extensively read ... gathering full context" — that
+		// maximalist framing encouraged re-reading and reading-past-the-answer.
+		// Breadth intent is kept, but scoped to what the question needs.
+		details.push(`Read broadly and follow references across files, but stop once you have enough to answer the question with confidence. Don't re-read files you've already read this turn, and don't chase tangents unrelated to the user's query.`)
+		// Lightweight loop — no "act" or "verify" phase since gather can't
+		// edit or run code. Keeps the self-check benefit without forcing a
+		// shape the mode can't execute.
+		details.push(`On each question: understand what the user is actually asking → investigate the relevant code → form a grounded answer. Use this as a self-check that you're answering the question, not just dumping context.`)
 	}
 
-	details.push(`If you write any code blocks to the user (wrapped in triple backticks), please use this format:
+	if (mode === 'agent') {
+		// Trimmed from the universal format rule: "FULL PATH as first line" +
+		// "contents of the file should proceed as usual" describe the shape of
+		// an edit-via-code-block, which is only meaningful in gather/normal
+		// (where code blocks ARE the edit mechanism). In agent mode those
+		// bullets compete with `ALWAYS use tools` and empirically caused Gemma
+		// to emit inline <<<< ORIGINAL / >>>> UPDATED diffs instead of calling
+		// edit_file (A3+A4 eval, Tests 1 Before + 2 After). Keeping only the
+		// generally-useful language-tag rule.
+		details.push(`If you write any code blocks to the user (wrapped in triple backticks), include a language tag (e.g. \`typescript\`, \`shell\`). Terminal commands should have the language \`shell\`.`)
+	}
+	else {
+		details.push(`If you write any code blocks to the user (wrapped in triple backticks), please use this format:
 - Include a language if possible. Terminal should have the language 'shell'.
 - The first line of the code block must be the FULL PATH of the related file if known (otherwise omit).
 - The remaining contents of the file should proceed as usual.`)
+	}
 
 	if (mode === 'gather' || mode === 'normal') {
 
