@@ -149,6 +149,16 @@ export type ThreadType = {
 	// the user keeps whatever model is currently globally selected.
 	lastUsedModelSelection?: ModelSelection | null;
 
+	// Snapshot of `.voidrules` content as it was at the most recent user message
+	// send on this thread. Compared against the current on-disk content at send
+	// time to detect rule edits between turns; when a change is detected we flag
+	// the outgoing user message with `rulesChangedBefore: true` so the UI can
+	// render a small chip above it. Persisted so changes made while Void is
+	// closed are still detected on the next send in an existing thread. Undefined
+	// before the first message is sent on a thread (no baseline → first send
+	// doesn't flag, only subsequent sends can).
+	lastAppliedRules?: string;
+
 	// this doesn't need to go in a state object, but feels right
 	state: {
 		currCheckpointIdx: number | null; // the latest checkpoint we're at (null if not at a particular checkpoint, like if the chat is streaming, or chat just finished and we haven't clicked on a checkpt)
@@ -765,6 +775,30 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const modelSelection = this._settingsService.state.modelSelectionOfFeature[featureName]
 		const modelSelectionOptions = modelSelection ? this._settingsService.state.optionsOfModelSelection[featureName][modelSelection.providerName]?.[modelSelection.modelName] : undefined
 		return { modelSelection, modelSelectionOptions }
+	}
+
+	// Updates the per-thread `.voidrules` snapshot used for rule-change detection
+	// on the next send. Persisted so changes made while Void is closed (or in
+	// other threads) are still detected correctly when this thread resumes. No
+	// state-change event — the stored value is read back on next send and never
+	// affects anything currently rendered; the user-message `rulesChangedBefore`
+	// flag is what drives the UI chip, and that's set when the NEXT message is
+	// stored, not here.
+	private _setThreadLastAppliedRules(threadId: string, rules: string) {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return
+
+		// Skip the (persistent) write if unchanged. Same rationale as
+		// `_setThreadLastUsedModelSelection`: avoids rewriting the full threads
+		// blob every turn when rules haven't moved.
+		if (thread.lastAppliedRules === rules) return
+
+		const newThreads = {
+			...this.state.allThreads,
+			[threadId]: { ...thread, lastAppliedRules: rules },
+		}
+		this._storeAllThreads(newThreads)
+		this._setState({ allThreads: newThreads })
 	}
 
 	// Persists the given model selection on the thread so that a later
@@ -1830,8 +1864,27 @@ We only need to do it for files that were edited since `from`, ie files between 
 			? `${volatileBlock}\n\n${userMessageContent}`
 			: userMessageContent
 
-		const userHistoryElt: ChatMessage = { role: 'user', content: contentWithVolatile, displayContent: instructions, selections: currSelns, state: defaultMessageState }
+		// Detect `.voidrules` change since the last send on THIS thread. Flag is
+		// UI-only (a chip rendered above the user bubble to show where in the
+		// conversation the rules shifted). The rule CONTENT itself reaches the
+		// model via the system message in `prepareLLMChatMessages` — this flag
+		// doesn't carry any payload the LLM sees. First send on a thread doesn't
+		// flag (no baseline to compare against).
+		const currentRulesContent = await this._convertToLLMMessagesService.getCurrentVoidRulesContent()
+		const rulesChangedBefore = thread.lastAppliedRules !== undefined && thread.lastAppliedRules !== currentRulesContent
+
+		const userHistoryElt: ChatMessage = {
+			role: 'user',
+			content: contentWithVolatile,
+			displayContent: instructions,
+			selections: currSelns,
+			state: defaultMessageState,
+			// Omit the field entirely when false so persisted history stays slim
+			// and matches pre-feature shape for threads that never see a change.
+			...(rulesChangedBefore ? { rulesChangedBefore: true } : {}),
+		}
 		this._addMessageToThread(threadId, userHistoryElt)
+		this._setThreadLastAppliedRules(threadId, currentRulesContent)
 
 		this._setThreadState(threadId, { currCheckpointIdx: null }) // no longer at a checkpoint because started streaming
 
