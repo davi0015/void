@@ -22,7 +22,7 @@ import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
-import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text } from 'lucide-react';
+import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, EditToolAcceptRejectButtonsHTML, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, StatusIndicatorForApplyButton, useApplyStreamState, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
@@ -1439,19 +1439,42 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 
 	const isMsgAfterCheckpoint = currCheckpointIdx !== undefined && currCheckpointIdx === messageIdx - 1
 
-	return <div
-		// align chatbubble accoridng to role
-		className={`
+	// Rule-change chip. Rendered above the user bubble when `.voidrules` was
+	// edited between this send and the previous one on the same thread. Set by
+	// `chatThreadService._addUserMessageAndStreamResponse` at message creation
+	// time; see `getCurrentVoidRulesContent` and `thread.lastAppliedRules` for
+	// the detection logic. Dimmed along with the bubble when the message is on
+	// the far side of the current checkpoint so the visual grouping matches.
+	const rulesChangedBefore = !!chatMessage.rulesChangedBefore
+
+	return <>
+		{rulesChangedBefore &&
+			<div
+				className={`
+					self-end flex items-center gap-1 text-xs text-void-fg-3 opacity-80 mb-1 mr-1
+					${isCheckpointGhost && !isMsgAfterCheckpoint ? 'opacity-50' : ''}
+				`}
+				data-tooltip-id='void-tooltip'
+				data-tooltip-content='Your .voidrules changed before this message. The new rules apply from here onwards.'
+				data-tooltip-place='left'
+			>
+				<RefreshCw size={11} />
+				<span>.voidrules updated</span>
+			</div>
+		}
+		<div
+			// align chatbubble accoridng to role
+			className={`
         relative ml-auto
         ${mode === 'edit' ? 'w-full max-w-full'
-				: mode === 'display' ? `self-end w-fit max-w-full whitespace-pre-wrap` : '' // user words should be pre
-			}
+					: mode === 'display' ? `self-end w-fit max-w-full whitespace-pre-wrap` : '' // user words should be pre
+				}
 
         ${isCheckpointGhost && !isMsgAfterCheckpoint ? 'opacity-50 pointer-events-none' : ''}
     `}
-		onMouseEnter={() => setIsHovered(true)}
-		onMouseLeave={() => setIsHovered(false)}
-	>
+			onMouseEnter={() => setIsHovered(true)}
+			onMouseLeave={() => setIsHovered(false)}
+		>
 		<div
 			// style chatbubble according to role
 			className={`
@@ -1493,7 +1516,8 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 		</div>
 
 
-	</div>
+		</div>
+	</>
 
 }
 

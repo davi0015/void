@@ -1,6 +1,7 @@
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { IModelService } from '../../../../editor/common/services/model.js';
+import { IFileService } from '../../../../platform/files/common/files.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
@@ -922,6 +923,15 @@ export interface IConvertToLLMMessageService {
 	// missing/invalid inputs so callers can pass what they have without
 	// guarding every field.
 	recordTokenUsageCalibration(opts: { providerName: string, modelName: string, sentChars: number, reportedInputTokens: number | undefined }): void
+
+	// Returns the current combined `.voidrules` file content (all workspace
+	// folders concatenated, `\n\n` separated). Reads fresh from disk on every
+	// call — see `_getVoidRulesFileContentsFromDisk` for the rationale. Used
+	// by chatThreadService for per-thread rule-change detection so a UI chip
+	// can be rendered on user messages sent after a rule edit. The LLM
+	// already receives current rules via the system message on every
+	// request — this getter exists purely to drive the UI affordance.
+	getCurrentVoidRulesContent(): Promise<string>
 }
 
 export const IConvertToLLMMessageService = createDecorator<IConvertToLLMMessageService>('ConvertToLLMMessageService');
@@ -945,6 +955,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
 		@IVoidModelService private readonly voidModelService: IVoidModelService,
 		@IMCPService private readonly mcpService: IMCPService,
+		@IFileService private readonly fileService: IFileService,
 	) {
 		super()
 	}
@@ -989,8 +1000,55 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		} catch { }
 	}
 
-	// Read .voidrules files from workspace folders
-	private _getVoidRulesFileContents(): string {
+	// Read .voidrules files fresh from disk on every call. Previously backed by a
+	// cached ITextModel (initialized once at startup), which had two silent-failure
+	// modes: (1) if `.voidrules` didn't exist at launch the model reference was
+	// never created and creating the file later wouldn't re-init; (2) even with a
+	// live model reference, external disk edits weren't always propagated to the
+	// cached `model.getValue()` in practice. Direct file read is ~sub-ms for this
+	// tiny file and eliminates both failure modes: editing `.voidrules` mid-session
+	// is picked up by the very next request, no restart needed.
+	//
+	// Kept sync variant `_getVoidRulesFileContentsSync` below for `prepareLLMSimpleMessages`
+	// (Fast Apply / Quick Edit / SCM) which is called from sync control flow —
+	// retains prior cached-model behavior (no behavior change for those flows).
+	private _lastLoggedRulesContent: string | undefined = undefined // for change-log only, not correctness
+	private async _getVoidRulesFileContentsFromDisk(): Promise<string> {
+		const workspaceFolders = this.workspaceContextService.getWorkspace().folders;
+		const parts: string[] = [];
+		for (const folder of workspaceFolders) {
+			const uri = URI.joinPath(folder.uri, '.voidrules')
+			try {
+				if (!(await this.fileService.exists(uri))) continue
+				const content = await this.fileService.readFile(uri)
+				parts.push(content.value.toString())
+			} catch { /* unreadable — skip this folder */ }
+		}
+		const combined = parts.join('\n\n').trim()
+
+		// Dev-visible rule logging (Option A). Silent when rules are empty; logs
+		// char count on every read (for "were rules applied?"); logs a change
+		// marker when content differs from the last read (for "did my edit take?").
+		try {
+			if (combined) {
+				if (this._lastLoggedRulesContent !== undefined && this._lastLoggedRulesContent !== combined) {
+					console.log(`[void rules] .voidrules changed (was ${this._lastLoggedRulesContent.length} → ${combined.length} chars)`)
+				} else if (this._lastLoggedRulesContent === undefined) {
+					console.log(`[void rules] loaded .voidrules (${combined.length} chars)`)
+				}
+			}
+		} catch { }
+		this._lastLoggedRulesContent = combined
+
+		return combined
+	}
+
+	// Legacy sync reader — preserved for `prepareLLMSimpleMessages` call sites
+	// (Fast Apply / Quick Edit / SCM) that run from sync control flow. Uses the
+	// cached ITextModel populated by the workbench contribution at startup; picks
+	// up in-editor edits to `.voidrules` but not mid-session file-creation. The
+	// chat flow uses the async disk-read variant above which has no such caveat.
+	private _getVoidRulesFileContentsSync(): string {
 		try {
 			const workspaceFolders = this.workspaceContextService.getWorkspace().folders;
 			let voidRules = '';
@@ -1007,15 +1065,38 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		}
 	}
 
-	// Get combined AI instructions from settings and .voidrules files
-	private _getCombinedAIInstructions(): string {
+	// Async combined-instructions getter used by the chat flow. Reads `.voidrules`
+	// fresh on every request so rules edits take effect immediately on the next
+	// user message (no Void restart, no thread recreate).
+	private async _getCombinedAIInstructionsAsync(): Promise<string> {
 		const globalAIInstructions = this.voidSettingsService.state.globalSettings.aiInstructions;
-		const voidRulesFileContent = this._getVoidRulesFileContents();
+		const voidRulesFileContent = await this._getVoidRulesFileContentsFromDisk();
 
 		const ans: string[] = []
 		if (globalAIInstructions) ans.push(globalAIInstructions)
 		if (voidRulesFileContent) ans.push(voidRulesFileContent)
 		return ans.join('\n\n')
+	}
+
+	// Sync combined-instructions getter — same shape as the async version but
+	// reads `.voidrules` from the cached ITextModel. See
+	// `_getVoidRulesFileContentsSync` for the caching caveat.
+	private _getCombinedAIInstructions(): string {
+		const globalAIInstructions = this.voidSettingsService.state.globalSettings.aiInstructions;
+		const voidRulesFileContent = this._getVoidRulesFileContentsSync();
+
+		const ans: string[] = []
+		if (globalAIInstructions) ans.push(globalAIInstructions)
+		if (voidRulesFileContent) ans.push(voidRulesFileContent)
+		return ans.join('\n\n')
+	}
+
+	// Exposed so chatThreadService can compare current rules against the per-thread
+	// `lastAppliedRules` snapshot and mark a user message with `rulesChangedBefore`
+	// when content differs. Purely a UI affordance — the rule content reaches the
+	// LLM via the system message in `prepareLLMChatMessages` regardless.
+	getCurrentVoidRulesContent: IConvertToLLMMessageService['getCurrentVoidRulesContent'] = async () => {
+		return this._getVoidRulesFileContentsFromDisk();
 	}
 
 
@@ -1135,8 +1216,9 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 
 		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
-		// Get combined AI instructions
-		const aiInstructions = this._getCombinedAIInstructions();
+		// Async path reads `.voidrules` fresh from disk — picks up edits
+		// mid-session on the very next user message, no Void restart needed.
+		const aiInstructions = await this._getCombinedAIInstructionsAsync();
 		const isReasoningEnabled = getIsReasoningEnabledState('Chat', providerName, modelName, modelSelectionOptions, overridesOfModel)
 		const reservedOutputTokenSpace = getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
 		// Model-calibrated chars/token ratio for the active model. Shared across

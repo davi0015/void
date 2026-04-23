@@ -109,6 +109,19 @@ export type ChatMessage =
 			stagingSelections: StagingSelectionItem[];
 			isBeingEdited: boolean;
 		}
+
+		// UI-only metadata. Set to true when the `.voidrules` content differed
+		// from `thread.lastAppliedRules` at the moment this user message was
+		// sent — indicates rules changed since the prior turn. Renders a small
+		// chip above this message's bubble so the user can locate *where* in a
+		// conversation the rule set shifted (useful when re-reading history and
+		// noticing the agent changed style/conventions part-way through).
+		// Never sent to the LLM — rule content reaches the model via the system
+		// message on every request, so injecting a chat-level marker would be
+		// redundant and would pollute context.
+		// Optional for backward-compat with chat history persisted before this
+		// field existed (treated as "no change marker").
+		rulesChangedBefore?: boolean
 	} | {
 		role: 'assistant';
 		displayContent: string; // content received from LLM  - allowed to be '', will be replaced with (empty)

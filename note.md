@@ -19,9 +19,9 @@ Verify Clang is now 15.x or 16.x (NOT 21.x):
 clang --version
 ```
 
-#### Fix: Make Node + npm trust the Rakuten Netskope CA
+#### Fix: Make Node + npm trust a corporate MITM CA (only needed on networks doing SSL inspection)
 
-Issues: this is a Rakuten work machine with Netskope doing SSL inspection. The cert chain shows GitHub's cert is being re-signed by ca.rak.goskope.com (Netskope's Rakuten root CA). Your browser trusts this because it's in the System Keychain, but Node ships its own CA bundle and doesn't read the keychain.
+Skip this whole section if `npm install` / `electron install` already work. It applies when the machine is on a network that intercepts TLS (corporate proxy, zero-trust agent, etc.) and re-signs outbound HTTPS with a private root CA. Symptom: browsers work fine (they trust the root via the OS keychain) but `npm` / `node` / Electron fail with `self-signed certificate in certificate chain`, `unable to get local issuer certificate`, or similar — because Node ships its own bundled CA list and doesn't read the OS keychain.
 
 Step 1 — Export the corporate root CA from your keychain
 
@@ -33,11 +33,11 @@ Quickest CLI route — dump all system roots into one PEM bundle:
 security find-certificate -a -p /Library/Keychains/System.keychain > ~/.corp-ca-bundle.pem
 security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain >> ~/.corp-ca-bundle.pem
 
-Verify the Netskope/Rakuten CA is in there:
+Verify the bundle is populated and contains your corporate CA (adjust the grep terms to whatever substring identifies your org's root — e.g. part of the CA common name shown in the browser's cert details):
 
 ```sh
 grep -c "BEGIN CERTIFICATE" ~/.corp-ca-bundle.pem   # should print a number > 100
-openssl crl2pkcs7 -nocrl -certfile ~/.corp-ca-bundle.pem | openssl pkcs7 -print_certs -noout | grep -i "goskope\|rak\|netskope"
+openssl crl2pkcs7 -nocrl -certfile ~/.corp-ca-bundle.pem | openssl pkcs7 -print_certs -noout | grep -iE "<your-corp-substring>"
 ```
 
 #### Step 2 — Tell Node about it (every shell session)
@@ -46,7 +46,7 @@ Add to ~/.zshrc:
 
 ```sh
 echo '' >> ~/.zshrc
-echo '# Rakuten Netskope CA bundle for Node / Electron / npm' >> ~/.zshrc
+echo '# Corporate CA bundle for Node / Electron / npm' >> ~/.zshrc
 echo 'export NODE_EXTRA_CA_CERTS="$HOME/.corp-ca-bundle.pem"' >> ~/.zshrc
 echo 'export AWS_CA_BUNDLE="$HOME/.corp-ca-bundle.pem"' >> ~/.zshrc
 echo 'export REQUESTS_CA_BUNDLE="$HOME/.corp-ca-bundle.pem"' >> ~/.zshrc
@@ -664,12 +664,41 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 
 ~~**E1 — Revive `go_to_definition` / `go_to_usages` as LLM tools**~~ ✅ DONE — see entry in Done section above. Shipped with optional-`line` fallback scan (word-boundary match), three-surface prompt push (tool descriptions + C5 `importantDetails` bullet + redirect lines in `search_in_file` / `search_for_files`), and auto-gen parallel-tool list derived from `approvalTypeOfBuiltinToolName`. Validated empirically on a natural "where is `validateNumber` defined" prompt: **MiniMax** uses the tool in 1 call (ideal), **Gemma / Nemotron** ignore it and fall back to read/grep (same capability ceiling as C6 parallel-reads — strong models adopt prescriptive tool rules, weaker ones don't, regardless of prompt weight). Net: clear win for MiniMax users, zero regression for others, tool remains as explicit escape hatch. Stopped iterating on the prompt — further weight risks over-correction (calling LSP for free-text queries where there's no identifier to resolve).
 
-**E2 — `.cursor/rules` / `AGENTS.md` auto-loading** (~1 day, next up)
-- New service `rulesIngestionService.ts` (or fold into `convertToLLMMessageService.ts` if simpler): watches `.cursor/rules/*.mdc` and `AGENTS.md` at workspace root + per-folder. On change, parses frontmatter (`alwaysApply`, `globs`, `description`).
-- On each `chat_systemMessage` assembly, inject a new `[Workspace Rules]` section right after the per-mode block but before `importantDetails` (keeps the standing rules authoritative over workspace overrides). Rules with `alwaysApply: true` always inject; rules with `globs:` inject only when at least one attached file matches the glob.
-- Mirror Cursor's rule selection semantics: `alwaysApply` / `agentRequestable` / `glob-matched` / `manual-only`. Ignore `manual-only` for now (requires UI surface, defer).
-- Impact: stop re-editing `prompts.ts` for per-project conventions. User-defined memory across chats for free.
-- Risk: medium. Rule files can be long — need a per-file size cap (~4k tokens?) to avoid blowing the system message budget. Decision point: do we sum-cap all rules at once or cap per file?
+~~**E2 — `.cursor/rules` / `AGENTS.md` auto-loading**~~ **Reconsidered — redundant with `.voidrules`; pivoted to fixing `.voidrules` reliability + change-awareness instead.**
+- Original plan (watch `.cursor/rules/*.mdc`, parse frontmatter, mirror Cursor rule-selection semantics) was dropped after noticing Void already has `.voidrules` doing the exact same thing: workspace-root file → text → injected into the system prompt via `GUIDELINES (from the user's .voidrules file):\n{contents}` (see `prepareOpenAIOrAnthropicMessages` in `convertToLLMMessageService.ts`). Adding a second convention would just fragment the mental model. Frontmatter/glob-matching/selection semantics are a "nice-to-have" that can sit in E3's successor; daily-use pain was actually elsewhere.
+
+**E2' — `.voidrules` fix: always-fresh read + rule-change chip** ✅ DONE (user request pivot)
+- *Pain observed*: edited `.voidrules`, sent a new chat, rules weren't applied. Neither new threads nor existing threads picked up edits until a full Void restart. No UI signal either way — silent.
+- *Root cause*: `_getVoidRulesFileContents()` read rules from a cached `ITextModel` populated once at startup (or on workspace folder change) by `convertToLLMMessageWorkbenchContrib.ts → voidModelService.initializeModel()`. Two failure modes: (1) if `.voidrules` didn't exist at launch, `createModelReference` threw `FileNotFound`, the silent `catch` in `initializeModel` swallowed it, the model reference was never registered, and no watcher re-tried if the file was created later — `getModel()` returned `null` forever that session; (2) even when the model did exist, in-memory `getValue()` wasn't reliably reflecting external disk edits in practice. Symptom: "I just modified the rule and opened a thread — new thread needs to read the rule, right?"
+- *Fix* (A + B):
+  - **Direct file read on every chat request** — new `_getVoidRulesFileContentsFromDisk()` uses `IFileService.readFile(uri)` on `.voidrules` from every workspace folder, concatenated with `\n\n`. Sub-millisecond for a tiny file; bypasses the model cache entirely. Wired into a new async `_getCombinedAIInstructionsAsync()` awaited by `prepareLLMChatMessages`. The sync `_getCombinedAIInstructions()` + `_getVoidRulesFileContentsSync()` are kept for `prepareLLMSimpleMessages` (Fast Apply / Quick Edit / SCM) so those 4 sync call sites don't need to go async — those flows don't benefit meaningfully from always-fresh rules anyway, and their sync control flow would cascade a lot of refactoring otherwise.
+  - **Console log (Option A, dev-visible)** — first read this session logs `[void rules] loaded .voidrules (N chars)`; any subsequent change logs `[void rules] .voidrules changed (was N → M chars)`. Tracked via a module-level `_lastLoggedRulesContent` on the service instance, not persisted. Debug-forever for ~3 lines of code; no production impact since no UI surfaces it.
+  - **Per-thread rule-change chip (Option B, UI)** — new optional fields: `UserChatMessage.rulesChangedBefore?: boolean` + `ThreadType.lastAppliedRules?: string` (both persisted, both backward-compat). On each user-message send, `chatThreadService._addUserMessageAndStreamResponse` calls `IConvertToLLMMessageService.getCurrentVoidRulesContent()`, compares against `thread.lastAppliedRules`, and sets `rulesChangedBefore: true` on the outgoing message iff `lastAppliedRules` is defined AND differs. First message on a thread never flags (no baseline → everything would look "new"). A new `_setThreadLastAppliedRules()` helper persists the current snapshot with the usual equality-skip pattern. `SidebarChat.UserMessageComponent` renders a small self-end `🔄 .voidrules updated` chip above the bubble when the flag is set, with a tooltip explaining "Your .voidrules changed before this message. The new rules apply from here onwards." Dims with the bubble when the message is on the far side of the current checkpoint.
+- *What the agent sees*: nothing new — just the current rules, same as before, on every request via the system message. The chip is purely a user-facing affordance for "where in the conversation did my rules shift?". Deliberately NOT injected as a chat-level marker; that would pollute context and duplicate what the system message already carries.
+- *Files*: `convertToLLMMessageService.ts` (IFileService injection + async disk read + console log + `getCurrentVoidRulesContent` interface method), `chatThreadServiceTypes.ts` (`rulesChangedBefore?` on user `ChatMessage`), `chatThreadService.ts` (`lastAppliedRules?` on `ThreadType` + `_setThreadLastAppliedRules` + detection call in `_addUserMessageAndStreamResponse`), `SidebarChat.tsx` (chip render + `RefreshCw` import). `convertToLLMMessageWorkbenchContrib.ts` left as-is — still needed to pre-init the cached model for the sync path.
+- *Restart note*: full Void quit + relaunch required after upgrade (not Cmd+R) because `ConvertToLLMMessageService` is a `registerSingleton` and a new constructor dep (`IFileService`) was added.
+
+**`.voidrules` format — quick reference**
+- **Free-form text**, injected verbatim into the system message under `GUIDELINES (from the user's .voidrules file):\n{contents}`. No parser, no frontmatter, no schema. Multi-folder workspaces concatenate with `\n\n`. The global `aiInstructions` setting is prepended with `\n\n` before the file content.
+- **Markdown works best** — LLMs parse it natively. Headings (`## Code style`), bullets, numbered lists, code fences all render cleanly in the agent's context.
+- **Be concrete and scoped.** `"prefer async/await over .then()"` lands; `"write good code"` doesn't. Rules that apply repo-wide belong here; one-off task instructions belong in the chat message.
+- **Don't duplicate tool instructions.** The system prompt already covers tool usage; redefining it here just fights with the maintained version.
+- **Keep it short** if possible. Every request carries the full `.voidrules` content (no compaction, no trimming — it's part of the stable system-message prefix). 500-2000 chars is the sweet spot; multi-KB rule files inflate every turn's input tokens.
+- Example that works well:
+  ```markdown
+  ## Code style
+  - TypeScript: no `any`, prefer `unknown` + narrowing
+  - Use named exports, avoid default exports
+
+  ## When editing
+  - Never modify files under `dist/` or `node_modules/`
+  - Update tests alongside behavior changes
+
+  ## When answering
+  - Show file paths as `src/foo/bar.ts`, not absolute paths
+  - Cite line numbers when referring to existing code
+  ```
+- Mental model: `.voidrules` is a *standing system-prompt addendum*, not a chat message. Phrase it as instructions to the model, not as a note to yourself.
 
 **E3 — Expanded `@`-mentions** (~1 day split across types)
 - Two new `StagingSelectionItem` variants: `'GitDiff'` (args: `{ ref?: string }`, defaults to `HEAD`) and `'Problems'` (current diagnostics, scoped by optional folder URI). Resolver produces text content at attach-time, injected into the user message as a code block with a `[git diff @HEAD]` or `[problems in <path>]` header.
@@ -680,7 +709,7 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - Risk: low. Pure context-plumbing, no model-behavior changes. Main work is the UI picker to surface the new types.
 
 **Execution order & commit strategy**
-- E1 ✅ done (own commit). E2 and E3 remain — fully independent. Recommended order: E2 → E3 (E2 is higher ROI; it also unblocks per-project memory which will be useful when dog-fooding E3).
+- E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E3 remains.
 - After each phase, dog-food with a one-day daily-use window before committing the next. If a phase's real-world impact is smaller than projected (or reveals a different problem), the later phases can be resequenced / dropped.
 - Phase D deferred below — no observed pain to justify it.
 - Phase F (indexing) held pending Phase E daily-use data.
