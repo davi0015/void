@@ -239,7 +239,7 @@ export const builtinTools: {
 
 	search_for_files: {
 		name: 'search_for_files',
-		description: `Use this to find which files contain a given string or regex pattern across the workspace. Returns a list of matching file names (not line numbers). For line-number positions within a specific file, use \`search_in_file\`. Never use \`run_command\` with \`grep\` — this tool is the correct choice.`,
+		description: `Use this to find which files contain a given string or regex pattern across the workspace. Returns a list of matching file names (not line numbers). For line-number positions within a specific file, use \`search_in_file\`. For locating where a NAMED function / class / variable / type is defined or used, use \`go_to_definition\` / \`go_to_usages\` instead — LSP is precise where text search is noisy. Never use \`run_command\` with \`grep\` — this tool is the correct choice.`,
 		params: {
 			query: { description: `Your query for the search.` },
 			search_in_folder: { description: 'Optional. Leave as blank by default. ONLY fill this in if your previous search with the same query was truncated. Searches descendants of this folder only.' },
@@ -251,12 +251,33 @@ export const builtinTools: {
 	// add new search_in_file tool
 	search_in_file: {
 		name: 'search_in_file',
-		description: `Use this to find where a pattern appears inside a specific file. Returns the start line numbers of matches. For cross-file content search, use \`search_for_files\`. Never use \`run_command\` with \`grep\` — this tool is the correct choice.`,
+		description: `Use this to find where a pattern appears inside a specific file. Returns the start line numbers of matches. For cross-file content search, use \`search_for_files\`. For locating where a NAMED function / class / variable / type is defined or used, use \`go_to_definition\` / \`go_to_usages\` instead — LSP is precise where text search is noisy. Never use \`run_command\` with \`grep\` — this tool is the correct choice.`,
 		params: {
 			...uriParam('file'),
 			query: { description: 'The string or regex to search for in the file.' },
 			is_regex: { description: 'Optional. Default is false. Whether the query is a regex.' }
 		}
+	},
+
+	go_to_definition: {
+		name: 'go_to_definition',
+		description: `Use this to find where a symbol (function, class, variable, type) is defined, using the language's LSP (same mechanism as VS Code's "Go to Definition" / F12). Returns precise source locations — NOT text matches. This is the correct tool whenever you need to locate the source of a named identifier, whether to answer a question, inspect a function before calling it, follow an import to its real source, or resolve what a re-export actually points to. Prefer this over \`search_in_file\` or \`search_for_files\` whenever you know the symbol name: LSP resolves aliases, re-exports, and overloaded references that lexical search conflates or misses entirely. If no LSP provider is registered for the file's language, this tool returns an error telling you to fall back to \`search_in_file\` / \`search_for_files\`.`,
+		params: {
+			...uriParam('file'),
+			symbol_name: { description: `The name of the symbol you want to locate (e.g. \`validateToken\`, \`MyClass\`). Case-sensitive. Must appear somewhere in the file; the tool matches whole words only (e.g., \`foo\` will not match inside \`fooBar\`).` },
+			line: { description: `Optional — strongly recommended when you know it. The 1-indexed line number in the file where \`symbol_name\` appears. If you have just read the file or run \`search_in_file\`, pass the line you saw — this is the most reliable mode and is REQUIRED to disambiguate when the same name has multiple meanings in the same file (shadowing, re-assignment, overloaded declarations, local-vs-outer bindings). If omitted, the tool scans the file for the first whole-word occurrence of \`symbol_name\` — this is safe only when the name is distinctive enough to have a single meaning in the file (typical for unique function/class names, risky for short/common names like \`i\`, \`x\`, \`result\`, \`run\`).` },
+		},
+	},
+
+	go_to_usages: {
+		name: 'go_to_usages',
+		description: `Use this to find everywhere a symbol is referenced across the workspace, using the language's LSP (same mechanism as VS Code's "Find All References" / Shift+F12). Returns precise call sites and reference locations including the declaration itself — NOT text matches. This is the correct tool whenever you need to find who calls/uses a named identifier: before refactoring, before deleting, or to understand impact. Prefer this over \`search_for_files\` whenever you know the symbol name: LSP handles aliased imports, re-exports, and dynamic references that text search cannot disambiguate. If no LSP provider is registered for the file's language, this tool returns an error telling you to fall back to \`search_for_files\`.`,
+		params: {
+			...uriParam('file'),
+			symbol_name: { description: `The name of the symbol whose usages you want to find (e.g. \`validateToken\`, \`MyClass\`). Case-sensitive. Must appear somewhere in the file; the tool matches whole words only (e.g., \`foo\` will not match inside \`fooBar\`).` },
+			line: { description: `Optional — strongly recommended when you know it. The 1-indexed line number in the file where \`symbol_name\` appears. If you have just read the file or run \`search_in_file\`, pass the line you saw — this is the most reliable mode and is REQUIRED to disambiguate when the same name has multiple meanings in the same file (shadowing, re-assignment, overloaded declarations). If omitted, the tool scans the file for the first whole-word occurrence of \`symbol_name\` — safe for distinctive names, risky for common names.` },
+			...paginationParam,
+		},
 	},
 
 	read_lint_errors: {
@@ -337,10 +358,6 @@ export const builtinTools: {
 		description: `Interrupts and closes a persistent terminal that you opened with open_persistent_terminal.`,
 		params: { persistent_terminal_id: { description: `The ID of the persistent terminal.` } }
 	}
-
-
-	// go_to_definition
-	// go_to_usages
 
 } satisfies { [T in keyof BuiltinToolResultType]: InternalToolInfo }
 
@@ -512,7 +529,15 @@ You will be given instructions from the user, and may also receive a list of fil
 		// turn that batches N reads costs one round-trip instead of N, and prefix caching
 		// stays warm across the whole batch. Keep sequential tools for dependent steps
 		// where later arguments require earlier results.
-		details.push(`You can call multiple tools in a single turn when the operations are independent (e.g. reading several files, searching several patterns). Prefer batching reads/searches together rather than issuing them one-at-a-time across turns. Use separate turns when a later tool's arguments depend on an earlier tool's result. Concrete example: when a search or list returns multiple files you want to inspect, read ALL of them in ONE turn (one assistant message with multiple \`read_file\` tool calls) — NOT one per turn. Per-turn reads compound input tokens for every subsequent call.`)
+		// Auto-generate the read-only tool list from approvalTypeOfBuiltinToolName so this
+		// stays in sync when tools are added/removed. A tool is read-only iff it is NOT in
+		// approvalTypeOfBuiltinToolName (absence from that map is already how Void decides
+		// what's safe to auto-allow), which is the exact semantic we want here.
+		const readOnlyToolNames = builtinToolNames
+			.filter(n => approvalTypeOfBuiltinToolName[n] === undefined)
+			.map(n => `\`${n}\``)
+			.join(', ')
+		details.push(`Read-only tools (${readOnlyToolNames}) can be called in parallel in one turn when their arguments are independent — prefer batching them over issuing them one-at-a-time. Concrete example: when a search or list returns multiple files you want to inspect, call ALL the reads/lookups in ONE turn (one assistant message with multiple tool calls) — NOT one per turn. Per-turn reads compound input tokens for every subsequent call. Use separate turns only when a later tool's arguments depend on an earlier tool's result.`)
 		// Perf 2 — trimmed tool results hint. Older data-fetching tool outputs in the
 		// conversation history may have their bodies replaced with a short marker
 		// (starting with "[trimmed — ...]"). The model needs to know this is expected
@@ -545,7 +570,7 @@ You will be given instructions from the user, and may also receive a list of fil
 		// eval; Gemma's persistent `find`-fallback after C1-only change). Rules
 		// that appear in tool descriptions AND importantDetails get followed
 		// more reliably than rules that appear in one surface only.
-		details.push(`For file and directory operations, always use the dedicated tool — never shell out via \`run_command\`: use \`read_file\` (not \`cat\`), \`ls_dir\` or \`get_dir_tree\` (not \`ls\` / \`tree\`), \`search_pathnames_only\` (not \`find\`), \`search_in_file\` or \`search_for_files\` (not \`grep\`), and \`edit_file\` or \`rewrite_file\` (not \`sed\` / \`echo >\`). \`run_command\` is for things the dedicated tools don't do — installing packages, running tests, git operations, build commands.`)
+		details.push(`For file and directory operations, always use the dedicated tool — never shell out via \`run_command\`: use \`read_file\` (not \`cat\`), \`ls_dir\` or \`get_dir_tree\` (not \`ls\` / \`tree\`), \`search_pathnames_only\` (not \`find\`), \`search_in_file\` or \`search_for_files\` (not \`grep\`), and \`edit_file\` or \`rewrite_file\` (not \`sed\` / \`echo >\`). To locate a NAMED function / class / variable / type — whether to inspect its definition or find all its usages — always use \`go_to_definition\` / \`go_to_usages\`; use \`search_in_file\` / \`search_for_files\` only for free-text or conceptual queries (e.g., 'where is error handling done', 'find TODOs', 'any references to auth cookies') where there is no specific identifier to resolve. \`run_command\` is for things the dedicated tools don't do — installing packages, running tests, git operations, build commands.`)
 
 		// A4 — Rebalance over-iteration. Replaces three compounding rules
 		// ("maximal certainty BEFORE" + "OFTEN need to gather context" +
