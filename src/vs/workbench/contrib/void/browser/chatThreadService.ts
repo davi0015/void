@@ -32,6 +32,7 @@ import { INotificationService, Severity } from '../../../../platform/notificatio
 import { truncate } from '../../../../base/common/strings.js';
 import { PINNED_THREADS_STORAGE_KEY, THREAD_STORAGE_KEY } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
+import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
@@ -379,6 +380,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	readonly onDidChangeStreamState: Event<{ threadId: string }> = this._onDidChangeStreamState.event;
 
 	readonly streamState: ThreadStreamState = {}
+	// Per-thread latest LLM request id (from IRequestTelemetryService). Tool
+	// executions triggered by that request read this map to attribute themselves
+	// to the emitting rid. Ephemeral / not persisted.
+	private readonly _telemetryRidByThread = new Map<string, string>()
 	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
@@ -407,6 +412,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IDirectoryStrService private readonly _directoryStringService: IDirectoryStrService,
 		@IFileService private readonly _fileService: IFileService,
 		@IMCPService private readonly _mcpService: IMCPService,
+		@IRequestTelemetryService private readonly _requestTelemetryService: IRequestTelemetryService,
 	) {
 		super()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string, pinnedThreadIds: [] } // default state
@@ -1076,6 +1082,30 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// Check if it's a built-in tool
 		const isBuiltInTool = isABuiltinToolName(toolName)
 
+		// Per-tool telemetry scaffolding. Start-ms is wall-clock at entry so `durMs`
+		// covers validation + approval wait + execution + stringification — the full
+		// cost of the tool as the user experiences it. `rid` is pulled from the
+		// thread-keyed map populated right after `prepareLLMChatMessages` returns.
+		const telemetryToolStartMs = Date.now()
+		const telemetryRid = this._telemetryRidByThread.get(threadId)
+		const telemetryParamsLen = typeof rawParamsStr === 'string'
+			? rawParamsStr.length
+			: (() => { try { return JSON.stringify(opts.unvalidatedToolParams ?? {}).length } catch { return 0 } })()
+		const logToolTelemetry = (status: 'ok' | 'error' | 'invalid_params' | 'interrupted', resultLen?: number) => {
+			this._requestTelemetryService.logTool({
+				phase: 'tool',
+				t: new Date().toISOString(),
+				rid: telemetryRid,
+				tid: threadId,
+				name: toolName,
+				status,
+				paramsLen: telemetryParamsLen,
+				resultLen,
+				durMs: Date.now() - telemetryToolStartMs,
+				mcp: !isBuiltInTool || undefined,
+			})
+		}
+
 
 		if (!opts.preapproved) { // skip this if pre-approved
 			// 1. validate tool params
@@ -1094,6 +1124,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				// pre-added as a `tool_request` by the batch processor, we transition that
 				// row in place (preserving batchIndex/batchSize) instead of appending a new one.
 				this._updateLatestTool(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, rawParamsStr, result: null, name: toolName, content: errorMessage, id: toolId, mcpServerName })
+				logToolTelemetry('invalid_params', errorMessage.length)
 				return {}
 			}
 			// once validated, add checkpoint for edit
@@ -1181,14 +1212,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				})).result
 			}
 
-			if (interrupted) { return { interrupted: true } } // the tool result is added where we interrupt, not here
+			if (interrupted) { logToolTelemetry('interrupted'); return { interrupted: true } } // the tool result is added where we interrupt, not here
 		}
 		catch (error) {
 			resolveInterruptor(() => { }) // resolve for the sake of it
-			if (interrupted) { return { interrupted: true } } // the tool result is added where we interrupt, not here
+			if (interrupted) { logToolTelemetry('interrupted'); return { interrupted: true } } // the tool result is added where we interrupt, not here
 
 			const errorMessage = getErrorMessage(error)
 			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
+			logToolTelemetry('error', errorMessage.length)
 			return {}
 		}
 
@@ -1204,11 +1236,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		} catch (error) {
 			const errorMessage = this.toolErrMsgs.errWhenStringifying(error)
 			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
+			logToolTelemetry('error', errorMessage.length)
 			return {}
 		}
 
 		// 5. add to history and keep going
 		this._updateLatestTool(threadId, { role: 'tool', type: 'success', params: toolParams, result: toolResult, name: toolName, content: toolResultStr, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
+		logToolTelemetry('ok', toolResultStr.length)
 		return {}
 	};
 
@@ -1307,12 +1341,21 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// chars/ratio estimate handles that case alone.
 			const lastUsage = this.latestUsageOfThreadId[threadId]
 			const priorContentTokens = lastUsage ? (lastUsage.inputTokens ?? 0) + (lastUsage.outputTokens ?? 0) : undefined
-			const { messages, separateSystemMessage, compactionInfo, sentChars } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
+			const { messages, separateSystemMessage, compactionInfo, sentChars, telemetryRequestId } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages,
 				modelSelection,
 				chatMode,
 				priorContentTokens,
+				threadId,
 			})
+			// Wall-clock for the request/response round-trip. Captured right after
+			// `prepareLLMChatMessages` (which emits the "request" telemetry line) so
+			// durMs on the response line is the time from log-request → log-response.
+			const telemetryStartMs = Date.now()
+			// Expose the current rid to `_runToolCall` so per-tool telemetry events
+			// can attribute themselves to the LLM request that emitted them. Cleared
+			// when the stream ends (see _setStreamState undefined sites).
+			if (telemetryRequestId) this._telemetryRidByThread.set(threadId, telemetryRequestId)
 			// Surface any Perf 2 compaction that fired for this request so the
 			// TokenUsageRing tooltip can show "compacted N results / saved ~Xk tokens".
 			// null means "no trimming this request" — still recorded, so "Last request"
@@ -1361,6 +1404,43 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						// Lock in this request's usage so the next loop iteration's
 						// running total is added to (not replacing) what we already counted.
 						this._lockInCurrentRequestUsage(threadId)
+						// Per-request telemetry (Option A): pair with the "request" line so
+						// offline analysis can compute cache-hit rate from usage.cached,
+						// end-to-end latency from durMs, and empirical chars/token ratio.
+						if (telemetryRequestId) {
+							// Snapshot tool calls the model emitted this turn. `paramsLen`
+							// comes from the raw serialized arguments string when present
+							// (OpenAI-compat) and falls back to a JSON re-stringify so
+							// Anthropic / Gemini get comparable numbers.
+							const toolCallsForLog = (toolCalls ?? []).map(tc => {
+								let paramsLen = 0
+								try {
+									const raw = (tc as { rawParamsStr?: string }).rawParamsStr
+									paramsLen = typeof raw === 'string' ? raw.length : JSON.stringify(tc.rawParams ?? {}).length
+								} catch { paramsLen = 0 }
+								return {
+									name: tc.name,
+									paramsLen,
+									mcp: !isABuiltinToolName(tc.name) || undefined,
+								}
+							})
+							this._requestTelemetryService.logResponse({
+								phase: 'response',
+								t: new Date().toISOString(),
+								rid: telemetryRequestId,
+								tid: threadId,
+								status: 'ok',
+								finishReason,
+								durMs: Date.now() - telemetryStartMs,
+								usage: usage ? {
+									in: usage.inputTokens,
+									out: usage.outputTokens,
+									cached: usage.cachedInputTokens,
+									reasoning: usage.reasoningTokens,
+								} : undefined,
+								tools: toolCallsForLog.length > 0 ? toolCallsForLog : undefined,
+							})
+						}
 						// Feed the provider-reported input-token count back into the
 						// calibration loop. Next time `prepareLLMChatMessages` runs for
 						// this model, the chars/token ratio reflects what the tokenizer
@@ -1381,9 +1461,30 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						resMessageIsDonePromise({ type: 'llmDone', toolCalls: toolCalls ?? [], info: { fullText, fullReasoning, anthropicReasoning, finishReason } }) // resolve with tool calls
 					},
 					onError: async (error) => {
+						if (telemetryRequestId) {
+							this._requestTelemetryService.logResponse({
+								phase: 'response',
+								t: new Date().toISOString(),
+								rid: telemetryRequestId,
+								tid: threadId,
+								status: 'error',
+								durMs: Date.now() - telemetryStartMs,
+								errorMsg: error?.message?.slice(0, 200),
+							})
+						}
 						resMessageIsDonePromise({ type: 'llmError', error: error })
 					},
 					onAbort: () => {
+						if (telemetryRequestId) {
+							this._requestTelemetryService.logResponse({
+								phase: 'response',
+								t: new Date().toISOString(),
+								rid: telemetryRequestId,
+								tid: threadId,
+								status: 'aborted',
+								durMs: Date.now() - telemetryStartMs,
+							})
+						}
 						// stop the loop to free up the promise, but don't modify state (already handled by whatever stopped it)
 						resMessageIsDonePromise({ type: 'llmAborted' })
 						this._metricsService.capture('Agent Loop Done (Aborted)', { nMessagesSent, chatMode })
@@ -2330,6 +2431,14 @@ We only need to do it for files that were edited since `from`, ie files between 
 		// drop from the tab strip too (no point showing a tab for a deleted thread)
 		const newPinned = this.state.pinnedThreadIds.filter(id => id !== threadId)
 		if (newPinned.length !== this.state.pinnedThreadIds.length) this._storePinnedThreadIds(newPinned)
+
+		// release in-memory telemetry state (rid map + sysMessage snapshot used
+		// for flip detection) so neither map grows forever. The on-disk log file
+		// for the deleted thread is kept — it may still have analysis value and
+		// the user can purge the whole voidRequestLogs dir when they want to
+		// reclaim.
+		this._telemetryRidByThread.delete(threadId)
+		this._requestTelemetryService.forgetThread(threadId)
 
 		// store the updated threads
 		this._storeAllThreads(newThreads);

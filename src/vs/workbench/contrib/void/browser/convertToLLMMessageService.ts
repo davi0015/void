@@ -19,6 +19,9 @@ import { URI } from '../../../../base/common/uri.js';
 import { EndOfLinePreference } from '../../../../editor/common/model.js';
 import { ToolName } from '../common/toolsServiceTypes.js';
 import { IMCPService } from '../common/mcpService.js';
+import { IRequestTelemetryService } from './requestTelemetryService.js';
+import { generateUuid } from '../../../../base/common/uuid.js';
+import { stringHash } from '../../../../base/common/hash.js';
 
 export const EMPTY_MESSAGE = '(empty message)'
 
@@ -907,7 +910,12 @@ export interface IConvertToLLMMessageService {
 	// a turn). The only thing we're still estimating is the delta added since
 	// (new tool results, new user message), which the chars/ratio floor covers.
 	// Undefined on the first request of a thread.
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number }>
+	// `threadId` is optional only so existing callers compile — pass it whenever
+	// you have it (chat agent loop always does) so the per-request telemetry log
+	// can route the entry to the right thread file. `telemetryRequestId` in the
+	// result is the rid the caller must echo back to `IRequestTelemetryService.logResponse`
+	// so request and response lines can be paired during analysis.
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 	// Called by chat creation paths to snapshot runtime grounding (date, open files,
 	// active URI, directory listing, terminal IDs) into a user message at storage time.
@@ -956,6 +964,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		@IVoidModelService private readonly voidModelService: IVoidModelService,
 		@IMCPService private readonly mcpService: IMCPService,
 		@IFileService private readonly fileService: IFileService,
+		@IRequestTelemetryService private readonly requestTelemetryService: IRequestTelemetryService,
 	) {
 		super()
 	}
@@ -1198,7 +1207,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		})
 		return { messages, separateSystemMessage };
 	}
-	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens }) => {
+	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId }) => {
 		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined, compactionInfo: null, sentChars: 0 }
 
 		const { overridesOfModel } = this.voidSettingsService.state
@@ -1265,22 +1274,42 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// (string | part[]), Gemini uses `parts`. Only counts text payloads —
 		// structural fields (role, ids, function names) are ignored since they're
 		// small and constant-per-message.
-		let sentChars = 0
-		for (const m of messages) {
+		// Per-message char counter; reused for both sentChars totals and the
+		// history/lastMsg breakdown the telemetry log needs for cost decomposition.
+		// Handles all three message shapes (OpenAI/Anthropic `content`, Gemini `parts`).
+		const charsOfMessage = (m: LLMChatMessage): number => {
+			let n = 0
 			if ('content' in m) {
 				const c = m.content
-				if (typeof c === 'string') { sentChars += c.length }
+				if (typeof c === 'string') { n += c.length }
 				else if (Array.isArray(c)) {
 					for (const p of c) {
-						if ('text' in p && typeof p.text === 'string') sentChars += p.text.length
-						else if ('content' in p && typeof p.content === 'string') sentChars += p.content.length  // anthropic tool_result
+						if ('text' in p && typeof p.text === 'string') n += p.text.length
+						else if ('content' in p && typeof p.content === 'string') n += p.content.length  // anthropic tool_result
 					}
 				}
 			}
 			else if ('parts' in m) {
 				for (const p of m.parts) {
-					if ('text' in p && typeof p.text === 'string') sentChars += p.text.length
+					if ('text' in p && typeof p.text === 'string') n += p.text.length
 				}
+			}
+			return n
+		}
+		let sentChars = 0
+		let historyLen = 0
+		let lastMsgLen = 0
+		let lastMsgRole = ''
+		for (let i = 0; i < messages.length; i++) {
+			const m = messages[i]
+			const n = charsOfMessage(m)
+			sentChars += n
+			if (i === messages.length - 1) {
+				lastMsgLen = n
+				// Role field exists on every shape; cast is safe but defensive.
+				lastMsgRole = (m as { role?: string }).role ?? ''
+			} else {
+				historyLen += n
 			}
 		}
 
@@ -1303,7 +1332,58 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			}
 		}
 
-		return { messages, separateSystemMessage, compactionInfo: mergedCompactionInfo, sentChars };
+		// Per-request telemetry (Option A): emit a "request" line so offline analysis
+		// can spot prefix-cache leaks (sysHash changing when it shouldn't), track
+		// empirical chars/token ratios (sentChars vs usage.in on the response line),
+		// and correlate outcomes across long dogfooding sessions. We only log when
+		// the caller supplied a threadId — ephemeral/one-off callers (e.g. commit
+		// message generation) stay out of the per-thread log files.
+		let telemetryRequestId: string | undefined = undefined;
+		if (threadId) {
+			telemetryRequestId = generateUuid();
+			// Hash the system message post-rules-merge, pre-folding. If this hash
+			// changes across consecutive requests on the same thread while .voidrules
+			// is unchanged, the system prompt is not byte-stable and the provider's
+			// prefix cache will miss every turn.
+			const sysHashSource = systemMessage;
+			// Fold merged compactionInfo (Perf 2 light + emergency trim) into the
+			// telemetry shape. Omit the whole field when no trimming fired so the
+			// log only flags actual events, not "we checked and did nothing".
+			const compactionForTelemetry = mergedCompactionInfo && mergedCompactionInfo.trimmedCount > 0 ? {
+				trimmed: mergedCompactionInfo.trimmedCount,
+				savedChars: mergedCompactionInfo.savedChars,
+				savedTokens: mergedCompactionInfo.savedTokens,
+				emergencyTrimmed: mergedCompactionInfo.emergencyTrimmedCount,
+				emergencySavedChars: mergedCompactionInfo.emergencySavedChars,
+				emergencySavedTokens: mergedCompactionInfo.emergencySavedTokens,
+			} : undefined;
+			this.requestTelemetryService.logRequest({
+				phase: 'request',
+				t: new Date().toISOString(),
+				rid: telemetryRequestId,
+				tid: threadId,
+				mode: chatMode,
+				provider: providerName,
+				model: modelName,
+				sysHash: stringHash(sysHashSource, 0),
+				sysLen: sysHashSource.length,
+				rulesLen: aiInstructions.length,
+				msgCount: messages.length,
+				sentChars,
+				historyLen,
+				lastMsgLen,
+				lastMsgRole,
+				compaction: compactionForTelemetry,
+			}, {
+				// Opt-in content capture (Option B): the service keeps this string
+				// in memory only to diff against the next request. No content lands
+				// in the log unless sysHash flips — which is exactly the cache-leak
+				// scenario we're trying to debug.
+				systemMessage: sysHashSource,
+			});
+		}
+
+		return { messages, separateSystemMessage, compactionInfo: mergedCompactionInfo, sentChars, telemetryRequestId };
 	}
 
 

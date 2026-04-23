@@ -708,8 +708,40 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - Impact: stop pasting `git diff` output and TypeScript error lists into chat manually.
 - Risk: low. Pure context-plumbing, no model-behavior changes. Main work is the UI picker to surface the new types.
 
+**E4 — Per-request telemetry log (Option A, pivoted from E3)** ✅ DONE
+- *Pivot rationale*: user skipped E3 (`@git-diff`, `@problems`) after noting they never use git-diff as a mention even in Cursor. New primary goal stated: "minimise total token consumption for solving any questions." Rather than add features, we're building the instrumentation to diagnose token-waste — everything else downstream depends on being able to measure it.
+- *What it logs*: one JSONL line per phase (`request` / `response`) per LLM chat call, into `<userRoamingDataHome>/voidRequestLogs/thread-<threadId>.jsonl`. Different threads → different files (user requirement, also simplifies correlation analysis). No message bodies, tool contents, file paths, or user text — only shape and counters, so files are safe to hand to external tooling or paste into an analysis session.
+- *Four phases*:
+  - `request` — fires right before the LLM call. Shape only, no bodies.
+  - `response` — fires on `onFinalMessage` / `onError` / `onAbort`. Includes provider usage and the tool calls the model emitted.
+  - `tool` — one line per tool execution (built-in + MCP), attributed to the `rid` of the LLM request that emitted the call.
+  - `sysDiff` — fires ONLY when `sysHash` differs from the previous request on the same thread (Option B, sysDiff-on-flip). Carries a line-level diff of the two system messages so the offending bytes are visible. Zero extra bytes in the happy path. Capped at 8 KB combined content with proportional truncation on pathological flips.
+- *Request-line fields*: `t`, `rid`, `tid`, `mode`, `provider`, `model`, `sysHash` (stringHash of post-rules-merge system message — **the cache-leak detector**), `sysLen`, `rulesLen`, `msgCount`, `sentChars`, `historyLen`, `lastMsgLen`, `lastMsgRole`, `compaction?` (`{trimmed, savedChars, savedTokens, emergencyTrimmed?, emergencySavedChars?, emergencySavedTokens?}`, omitted when nothing trimmed).
+- *Response-line fields*: `t`, `rid`, `tid`, `status` (`ok` / `aborted` / `error`), `finishReason`, `durMs`, `usage.{in,out,cached,reasoning}`, `tools?` (`[{name, paramsLen, mcp?}]`, omitted when none), `errorMsg` (≤200 chars, no PII).
+- *Tool-line fields*: `t`, `rid?`, `tid`, `name`, `status` (`ok` / `error` / `invalid_params` / `interrupted`), `paramsLen`, `resultLen?`, `durMs`, `mcp?`. `durMs` covers validation + auto-approval path + execution + stringification (human approval wait NOT included — the approved-re-entry path starts its own timer).
+- *sysDiff-line fields*: `t`, `rid` (new), `prevRid?`, `tid`, `prevSysHash`, `newSysHash`, `prefixLines`, `suffixLines`, `oldLen`, `newLen`, `oldMid` (diverging lines from previous), `newMid` (diverging lines from new), `truncated?`. Emitted only on flip; carries literal prompt-section lines (non-user content in the common case, but may include `.voidrules` if that's what changed — dogfooding tag it).
+- *Key signals unlocked for analysis*:
+  - `sysHash` stable across consecutive requests on the same thread ↔ prefix-cache-friendly. If it changes when `.voidrules` didn't → system prompt has hidden volatility and every turn busts the cache. When a flip fires, the adjacent `sysDiff` line shows exactly which bytes drifted — `oldMid` / `newMid` point at the volatility source so it can be fixed at the prompt-assembly layer.
+  - `usage.cached / usage.in` over many turns → empirical cache-hit rate per provider. If 0 across many turns on models that should support it (OpenAI-compat with `prompt_tokens_details.cached_tokens`, DeepSeek, etc.) → something's wrong upstream (request ordering, headers, whitespace drift).
+  - `sentChars / usage.in` → empirical chars/token ratio per model; validates the calibration loop and the `charsPerToken` floor used by compaction/emergency-trim.
+  - **Cost decomposition per turn**: `sysLen + historyLen + lastMsgLen ≈ sentChars`. If `historyLen` dominates → compaction / summarization ROI. If `sysLen` dominates → tool-prompt / rules pruning ROI. If `lastMsgLen` dominates on `lastMsgRole='tool'` → that tool's result is oversized (cross-ref with tool-phase `resultLen` distribution).
+  - **Agent-loop depth per user send**: count request lines with `lastMsgRole='tool'` between two `lastMsgRole='user'` lines. One user message triggering 8+ LLM calls is the single biggest token multiplier; reveals over-iteration.
+  - **Tool usage profile** (aggregate tool-phase lines):
+    - frequency per `name` → which tools earn their prompt weight vs. which are noise. Candidates for prompt pruning if rarely called.
+    - distribution of `resultLen` per `name` → which tools bloat the next turn's history. Candidates for compaction policy tuning.
+    - failure rate per `name` (`status != 'ok'`) → wasted retry tokens; candidate for param-schema tightening or description clarification.
+    - `paramsLen` distribution per `name` → spots models that stuff huge arguments (e.g. pasting whole code blocks into `replace_string`).
+  - **Compaction effectiveness**: when `compaction` is present on request N, compare sysHash + sentChars on request N+1 to gauge "did compaction actually save bytes, and did it break the prefix cache?"
+  - **Output inflation**: `usage.out / usage.in` — high ratios mean the model is yapping; `reasoning` share of `out` shows invisible thinking cost on reasoning models.
+- *Rotation*: per-thread file capped at 5 MB; when exceeded, current file is moved to `thread-<id>.prev.jsonl` (overwriting any existing prev) and the live file starts fresh. Keeps ~2× cap per thread, unbounded thread count overall — delete threads or the whole folder to reclaim.
+- *Write discipline*: in-memory append + 250ms debounced flush so a burst of agent-loop iterations coalesces into one read-concat-write. I/O failures retried up to 3× with re-queued lines; after that the batch is dropped with a `console.warn` to avoid unbounded buffer growth on persistent errors (e.g. disk full).
+- *Files*: new `requestTelemetryService.ts` (interface + impl + singleton registration); `convertToLLMMessageService.ts` (inject service, accept `threadId`, emit request line, return `telemetryRequestId`); `chatThreadService.ts` (inject service, pass `threadId` through, log response line on `onFinalMessage` / `onError` / `onAbort`); `void.contribution.ts` (side-effect import to trigger registration).
+- *Ephemeral callers*: `prepareLLMChatMessages` only logs when `threadId` is supplied. Commit-message generation, Fast Apply, Quick Edit, etc. don't pass one → they stay out of the per-thread files, keeping the log thread-scoped.
+- *Restart note*: full Void quit + relaunch required (new singleton + new constructor deps on two eager services).
+- *Next step after collecting a few sessions' worth of data*: eyeball `sysHash` stability and `cached` hit rate. If we see unexpected hash flips → hunt down the volatility source (probably something in `chat_systemMessage` / `chat_volatileContext` / rules injection that looks static but isn't). If `cached` is always 0 on providers that should populate it → audit the request path for header/whitespace drift. Either finding directly informs the next concrete token-reduction change.
+
 **Execution order & commit strategy**
-- E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E3 remains.
+- E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E4 (per-request telemetry) ✅ done (own commit) — supersedes E3.
 - After each phase, dog-food with a one-day daily-use window before committing the next. If a phase's real-world impact is smaller than projected (or reveals a different problem), the later phases can be resequenced / dropped.
 - Phase D deferred below — no observed pain to justify it.
 - Phase F (indexing) held pending Phase E daily-use data.
