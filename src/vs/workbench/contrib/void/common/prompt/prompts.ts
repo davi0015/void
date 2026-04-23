@@ -163,7 +163,7 @@ const paginationParam = {
 
 
 
-const terminalDescHelper = `You can use this tool to run any command: sed, grep, etc. Do not edit any files with this tool; use edit_file instead. When working with git and other tools that open an editor (e.g. git diff), you should pipe to cat to get all results and not get stuck in vim.`
+const terminalDescHelper = `This tool is for shell commands that aren't available as a dedicated tool. Do NOT use it for: reading files (use \`read_file\`), listing directories (use \`ls_dir\` or \`get_dir_tree\`), finding files by name (use \`search_pathnames_only\`), searching text inside files (use \`search_in_file\` or \`search_for_files\`), or editing files (use \`edit_file\` / \`rewrite_file\`). Use it for commands like \`npm install\`, \`git status\`, \`pytest\`, build commands, or shell operations the dedicated tools don't cover. When working with tools that open an editor (e.g. \`git diff\`), pipe to \`cat\` so the command doesn't get stuck in vim.`
 
 const cwdHelper = 'Optional. The directory in which to run the command. Defaults to the first workspace folder.'
 
