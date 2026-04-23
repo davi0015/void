@@ -1722,6 +1722,8 @@ const titleOfBuiltinToolName = {
 
 	'read_lint_errors': { done: `Read lint errors`, proposed: 'Read lint errors', running: loadingTitleWrapper('Reading lint errors') },
 	'search_in_file': { done: 'Searched in file', proposed: 'Search in file', running: loadingTitleWrapper('Searching in file') },
+	'go_to_definition': { done: 'Found definition', proposed: 'Go to definition', running: loadingTitleWrapper('Finding definition') },
+	'go_to_usages': { done: 'Found usages', proposed: 'Go to usages', running: loadingTitleWrapper('Finding usages') },
 } as const satisfies Record<BuiltinToolName, { done: any, proposed: any, running: any }>
 
 
@@ -1875,7 +1877,23 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 				desc1: getBasename(toolParams.uri.fsPath),
 				desc1Info: getRelative(toolParams.uri, accessor),
 			}
-		}
+		},
+		'go_to_definition': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['go_to_definition']
+			const filePart = getRelative(toolParams.uri, accessor) ?? getBasename(toolParams.uri.fsPath)
+			return {
+				desc1: `"${toolParams.symbolName}"`,
+				desc1Info: toolParams.line !== null ? `${filePart}:${toolParams.line}` : filePart,
+			}
+		},
+		'go_to_usages': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['go_to_usages']
+			const filePart = getRelative(toolParams.uri, accessor) ?? getBasename(toolParams.uri.fsPath)
+			return {
+				desc1: `"${toolParams.symbolName}"`,
+				desc1Info: toolParams.line !== null ? `${filePart}:${toolParams.line}` : filePart,
+			}
+		},
 	}
 
 	try {
@@ -2529,6 +2547,86 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			}
 
 			return <ToolHeaderWrapper {...componentParams} />;
+		}
+	},
+
+	'go_to_definition': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const title = getTitle(toolMessage)
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const icon = null
+
+			if (toolMessage.type === 'tool_request') return null
+			if (toolMessage.type === 'running_now') return null
+
+			const isError = false
+			const isRejected = toolMessage.type === 'rejected'
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (toolMessage.type === 'success') {
+				const { result } = toolMessage
+				componentParams.numResults = result.locations.length
+				componentParams.children = result.locations.length === 0 ? undefined
+					: <ToolChildrenWrapper>
+						{result.locations.map((loc, i) => (<ListableToolItem key={i}
+							name={`${getBasename(loc.uri.fsPath)}:${loc.line}:${loc.column}`}
+							className='w-full overflow-auto'
+							onClick={() => { voidOpenFileFn(loc.uri, accessor, [loc.line, loc.line]) }}
+						/>))}
+					</ToolChildrenWrapper>
+			}
+			else if (toolMessage.type === 'tool_error') {
+				const { result } = toolMessage
+				componentParams.bottomChildren = <BottomChildren title='Error'>
+					<CodeChildren>
+						{result}
+					</CodeChildren>
+				</BottomChildren>
+			}
+			return <ToolHeaderWrapper {...componentParams} />
+		}
+	},
+
+	'go_to_usages': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const title = getTitle(toolMessage)
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const icon = null
+
+			if (toolMessage.type === 'tool_request') return null
+			if (toolMessage.type === 'running_now') return null
+
+			const isError = false
+			const isRejected = toolMessage.type === 'rejected'
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (toolMessage.type === 'success') {
+				const { result } = toolMessage
+				componentParams.numResults = result.locations.length
+				componentParams.hasNextPage = result.hasNextPage
+				componentParams.children = result.locations.length === 0 ? undefined
+					: <ToolChildrenWrapper>
+						{result.locations.map((loc, i) => (<ListableToolItem key={i}
+							name={`${getBasename(loc.uri.fsPath)}:${loc.line}:${loc.column}`}
+							className='w-full overflow-auto'
+							onClick={() => { voidOpenFileFn(loc.uri, accessor, [loc.line, loc.line]) }}
+						/>))}
+						{result.hasNextPage &&
+							<ListableToolItem name={`Results truncated. Call again with page_number+1 to see more.`} isSmall={true} className='w-full overflow-auto' />
+						}
+					</ToolChildrenWrapper>
+			}
+			else if (toolMessage.type === 'tool_error') {
+				const { result } = toolMessage
+				componentParams.bottomChildren = <BottomChildren title='Error'>
+					<CodeChildren>
+						{result}
+					</CodeChildren>
+				</BottomChildren>
+			}
+			return <ToolHeaderWrapper {...componentParams} />
 		}
 	},
 

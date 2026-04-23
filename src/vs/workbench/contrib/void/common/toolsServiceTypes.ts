@@ -84,6 +84,8 @@ export type BuiltinToolCallParams = {
 	'search_pathnames_only': { query: string, includePattern: string | null, pageNumber: number },
 	'search_for_files': { query: string, isRegex: boolean, searchInFolder: URI | null, pageNumber: number },
 	'search_in_file': { uri: URI, query: string, isRegex: boolean },
+	'go_to_definition': { uri: URI, symbolName: string, line: number | null },
+	'go_to_usages': { uri: URI, symbolName: string, line: number | null, pageNumber: number },
 	'read_lint_errors': { uri: URI },
 	// ---
 	'rewrite_file': { uri: URI, newContent: string },
@@ -105,6 +107,8 @@ export type BuiltinToolResultType = {
 	'search_pathnames_only': { uris: URI[], hasNextPage: boolean },
 	'search_for_files': { uris: URI[], hasNextPage: boolean },
 	'search_in_file': { lines: number[]; },
+	'go_to_definition': { locations: { uri: URI, line: number, column: number }[] },
+	'go_to_usages': { locations: { uri: URI, line: number, column: number }[], hasNextPage: boolean },
 	'read_lint_errors': { lintErrors: LintErrorItem[] | null },
 	// ---
 	'rewrite_file': Promise<{ lintErrors: LintErrorItem[] | null }>,

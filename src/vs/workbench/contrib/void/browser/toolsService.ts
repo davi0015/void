@@ -10,7 +10,10 @@ import { IEditCodeService } from './editCodeServiceInterface.js'
 import { ITerminalToolService } from './terminalToolService.js'
 import { LintErrorItem, BuiltinToolCallParams, BuiltinToolResultType, BuiltinToolName } from '../common/toolsServiceTypes.js'
 import { IVoidModelService } from '../common/voidModelService.js'
-import { EndOfLinePreference } from '../../../../editor/common/model.js'
+import { EndOfLinePreference, ITextModel } from '../../../../editor/common/model.js'
+import { Position } from '../../../../editor/common/core/position.js'
+import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js'
+import { getDefinitionsAtPosition, getReferencesAtPosition } from '../../../../editor/contrib/gotoSymbol/browser/goToSymbol.js'
 import { IVoidCommandBarService } from './voidCommandBarService.js'
 import { computeDirectoryTree1Deep, IDirectoryStrService, stringifyDirectoryTree1Deep } from '../common/directoryStrService.js'
 import { IMarkerService, MarkerSeverity } from '../../../../platform/markers/common/markers.js'
@@ -146,6 +149,36 @@ const checkIfIsFolder = (uriStr: string) => {
 	return false
 }
 
+// Scan a model for the first whole-word occurrence of `symbolName`. Whole-word
+// matching via \b prevents false positives like `validateNumber` matching inside
+// `validateNumberAbs`. Returns 1-indexed line and column, or null when the symbol
+// does not appear anywhere in the file.
+const findFirstSymbolOccurrence = (model: ITextModel, symbolName: string): { line: number, column: number } | null => {
+	const escaped = symbolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+	const regex = new RegExp(`\\b${escaped}\\b`)
+	const lineCount = model.getLineCount()
+	for (let ln = 1; ln <= lineCount; ln++) {
+		const content = model.getLineContent(ln)
+		const m = regex.exec(content)
+		if (m) return { line: ln, column: m.index + 1 }
+	}
+	return null
+}
+
+// Resolve where to point the LSP for `symbolName` in `model`.
+// Priority: explicit lineHint if the symbol is actually on that line (word-boundary);
+// otherwise fall back to first whole-word occurrence anywhere in the file.
+// Returns null only when the symbol does not appear in the file at all.
+const resolveSymbolPosition = (model: ITextModel, symbolName: string, lineHint: number | null): { line: number, column: number } | null => {
+	const lineCount = model.getLineCount()
+	if (lineHint !== null && lineHint >= 1 && lineHint <= lineCount) {
+		const escaped = symbolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+		const m = new RegExp(`\\b${escaped}\\b`).exec(model.getLineContent(lineHint))
+		if (m) return { line: lineHint, column: m.index + 1 }
+	}
+	return findFirstSymbolOccurrence(model, symbolName)
+}
+
 export interface IToolsService {
 	readonly _serviceBrand: undefined;
 	validateParams: ValidateBuiltinParams;
@@ -175,6 +208,7 @@ export class ToolsService implements IToolsService {
 		@IDirectoryStrService private readonly directoryStrService: IDirectoryStrService,
 		@IMarkerService private readonly markerService: IMarkerService,
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
+		@ILanguageFeaturesService languageFeaturesService: ILanguageFeaturesService,
 	) {
 		const queryBuilder = instantiationService.createInstance(QueryBuilder);
 
@@ -252,6 +286,25 @@ export class ToolsService implements IToolsService {
 				const query = validateStr('query', queryUnknown);
 				const isRegex = validateBoolean(isRegexUnknown, { default: false });
 				return { uri, query, isRegex };
+			},
+
+			go_to_definition: (params: RawToolParamsObj) => {
+				const { uri: uriStr, symbol_name: symbolNameUnknown, line: lineUnknown } = params
+				const uri = validateURI(uriStr)
+				const symbolName = validateStr('symbol_name', symbolNameUnknown)
+				const line = validateNumber(lineUnknown, { default: null })
+				if (line !== null && line < 1) throw new Error(`\`line\` must be 1 or greater, got ${line}.`)
+				return { uri, symbolName, line }
+			},
+
+			go_to_usages: (params: RawToolParamsObj) => {
+				const { uri: uriStr, symbol_name: symbolNameUnknown, line: lineUnknown, page_number: pageNumberUnknown } = params
+				const uri = validateURI(uriStr)
+				const symbolName = validateStr('symbol_name', symbolNameUnknown)
+				const line = validateNumber(lineUnknown, { default: null })
+				if (line !== null && line < 1) throw new Error(`\`line\` must be 1 or greater, got ${line}.`)
+				const pageNumber = validatePageNum(pageNumberUnknown)
+				return { uri, symbolName, line, pageNumber }
 			},
 
 			read_lint_errors: (params: RawToolParamsObj) => {
@@ -420,6 +473,86 @@ export class ToolsService implements IToolsService {
 				return { result: { lines } };
 			},
 
+			go_to_definition: async ({ uri, symbolName, line }) => {
+				await voidModelService.initializeModel(uri)
+				const { model } = await voidModelService.getModelSafe(uri)
+				if (model === null) throw new Error(`File does not exist: ${uri.fsPath}.`)
+
+				// Position resolution:
+				//  1. If `line` is given AND in range AND the symbol is on that line (word-boundary
+				//     match), use it. This is the most reliable mode — the agent has seen the symbol.
+				//  2. Otherwise (null / out of range / symbol not on that line), fall back to scanning
+				//     the file for the first whole-word occurrence. Safe for unique names; documented
+				//     in the tool description so agents know when this is safe.
+				//  3. If the symbol doesn't appear anywhere in the file, error.
+				const position = resolveSymbolPosition(model, symbolName, line)
+				if (position === null) throw new Error(`Symbol \`${symbolName}\` not found anywhere in ${uri.fsPath}. Check the spelling of the symbol or the file path.`)
+
+				const providers = languageFeaturesService.definitionProvider.ordered(model)
+				if (providers.length === 0) throw new Error(`No LSP definition provider is registered for ${model.getLanguageId()} files. Use \`search_in_file\` or \`search_for_files\` with \`${symbolName}\` as the query instead.`)
+
+				const links = await getDefinitionsAtPosition(
+					languageFeaturesService.definitionProvider,
+					model,
+					new Position(position.line, position.column),
+					false,
+					CancellationToken.None,
+				)
+
+				// Pre-initialize target models so the stringifier can synchronously read
+				// a preview line for each location (matching the search_in_file pattern).
+				await Promise.all(
+					[...new Set(links.map(l => l.uri.toString()))].map(s => voidModelService.initializeModel(URI.parse(s)))
+				)
+
+				const locations = links.map(link => ({
+					uri: link.uri,
+					line: link.range.startLineNumber,
+					column: link.range.startColumn,
+				}))
+				return { result: { locations } }
+			},
+
+			go_to_usages: async ({ uri, symbolName, line, pageNumber }) => {
+				await voidModelService.initializeModel(uri)
+				const { model } = await voidModelService.getModelSafe(uri)
+				if (model === null) throw new Error(`File does not exist: ${uri.fsPath}.`)
+
+				const position = resolveSymbolPosition(model, symbolName, line)
+				if (position === null) throw new Error(`Symbol \`${symbolName}\` not found anywhere in ${uri.fsPath}. Check the spelling of the symbol or the file path.`)
+
+				const providers = languageFeaturesService.referenceProvider.ordered(model)
+				if (providers.length === 0) throw new Error(`No LSP reference provider is registered for ${model.getLanguageId()} files. Use \`search_for_files\` with \`${symbolName}\` as the query instead.`)
+
+				// `compact: false` keeps declaration in the result list (matches Shift+F12);
+				// `recursive: false` matches the default VS Code "Find All References" command.
+				const links = await getReferencesAtPosition(
+					languageFeaturesService.referenceProvider,
+					model,
+					new Position(position.line, position.column),
+					false,
+					false,
+					CancellationToken.None,
+				)
+
+				// Paginate at the same page size as search_for_files / ls_dir.
+				const fromIdx = MAX_CHILDREN_URIs_PAGE * (pageNumber - 1)
+				const toIdx = MAX_CHILDREN_URIs_PAGE * pageNumber - 1
+				const pageLinks = links.slice(fromIdx, toIdx + 1)
+				const hasNextPage = (links.length - 1) - toIdx >= 1
+
+				await Promise.all(
+					[...new Set(pageLinks.map(l => l.uri.toString()))].map(s => voidModelService.initializeModel(URI.parse(s)))
+				)
+
+				const locations = pageLinks.map(link => ({
+					uri: link.uri,
+					line: link.range.startLineNumber,
+					column: link.range.startColumn,
+				}))
+				return { result: { locations, hasNextPage } }
+			},
+
 			read_lint_errors: async ({ uri }) => {
 				await timeout(1000)
 				const { lintErrors } = this._getLintErrors(uri)
@@ -555,6 +688,33 @@ export class ToolsService implements IToolsService {
 					return `Line ${n}:\n\`\`\`\n${lineContent}\n\`\`\``
 				}).join('\n\n');
 				return lines;
+			},
+			go_to_definition: (params, result) => {
+				if (result.locations.length === 0) {
+					return `No definition found for \`${params.symbolName}\` on ${params.uri.fsPath}:${params.line}. This can happen for built-in or primitive types. If you believe this is wrong, try \`search_in_file\` or \`search_for_files\` with \`${params.symbolName}\` as the query.`
+				}
+				const header = result.locations.length === 1
+					? `Found 1 definition of \`${params.symbolName}\`:`
+					: `Found ${result.locations.length} definitions of \`${params.symbolName}\`:`
+				const lines = result.locations.map((loc, i) => {
+					const { model } = voidModelService.getModel(loc.uri)
+					const preview = model ? model.getLineContent(loc.line).trim() : '<preview unavailable>'
+					return `${i + 1}. ${loc.uri.fsPath}:${loc.line}:${loc.column}  ${preview}`
+				})
+				return [header, ...lines].join('\n')
+			},
+			go_to_usages: (params, result) => {
+				if (result.locations.length === 0) {
+					return `No usages found for \`${params.symbolName}\` on ${params.uri.fsPath}:${params.line}. If you believe this is wrong, try \`search_for_files\` with \`${params.symbolName}\` as the query.`
+				}
+				const header = `Found ${result.locations.length} ${result.locations.length === 1 ? 'usage' : 'usages'} of \`${params.symbolName}\`${result.hasNextPage ? ' (more on next page)' : ''}:`
+				const lines = result.locations.map((loc, i) => {
+					const { model } = voidModelService.getModel(loc.uri)
+					const preview = model ? model.getLineContent(loc.line).trim() : '<preview unavailable>'
+					return `${i + 1}. ${loc.uri.fsPath}:${loc.line}:${loc.column}  ${preview}`
+				})
+				const footer = result.hasNextPage ? '\n\n(More usages available. Call again with `page_number` incremented by 1 to see them.)' : ''
+				return [header, ...lines].join('\n') + footer
 			},
 			read_lint_errors: (params, result) => {
 				return result.lintErrors ?
