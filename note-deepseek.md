@@ -120,26 +120,27 @@ Each chunk has:
 
 ## 5. Multi-turn rules — THE critical constraint
 
-This is where Void will need careful work. The rule depends on whether tool calls occurred:
+**Empirical rule (verified Apr 2026 against live API):** every prior assistant message produced under thinking mode must replay its `reasoning_content` in subsequent requests. No exceptions. Drop it and the API returns:
 
-### Case A — assistant turn had NO tool calls
+> `400 — The reasoning_content in the thinking mode must be passed back to the API.`
 
-Across user message boundaries, you may **drop** `reasoning_content` from the prior assistant turn. If you pass it back, the API ignores it. No 400.
+This contradicts the published docs, which claim only tool-call turns require replay. **Trust the live error, not the docs.** The doc-claimed "Case A vs Case B" split was implemented as an optimisation in Void early on and triggered the 400 above on a plain multi-turn Q&A thread (no tool calls anywhere). The optimisation has been removed; we now follow the doc-recommended simple pattern of appending `response.choices[0].message` verbatim.
 
-### Case B — assistant turn HAD tool calls
+The constraint applies in both contexts:
 
-You **must** preserve `reasoning_content` on every prior assistant message that had `tool_calls`, **forever** in that thread. The exact wording from the docs:
+1. **Within an active agent loop** — every sub-turn of "model proposes tool → app executes → app returns tool result → model continues" must include all prior assistants' `reasoning_content`.
+2. **Across new user messages** — same requirement after the loop ends and the user types again. Reasoning blobs **stay in the history forever** for the lifetime of the thread.
 
-> "for turns that do perform tool calls, the `reasoning_content` must be fully passed back to the API in all subsequent requests."
->
-> "If your code does not correctly pass back `reasoning_content`, the API will return a 400 error."
+If a non-thinking-mode reply ever appears in a thread (e.g. user toggled thinking off mid-thread), that turn won't have stored `reasoningContent`, and that's fine — only assistants with stored reasoning need to replay it. The capture-side gating ensures we never invent empty `reasoning_content` strings.
 
-This applies:
+### Cost implication
 
-1. **Within an active agent loop** — every sub-turn of "model proposes tool → app executes → app returns tool result → model continues" must include the prior assistant messages' full `reasoning_content` so the model can continue its CoT chain.
-2. **After a new user message** — even after the agent loop ended and the user typed something new, if any earlier assistant turn in the thread had tool calls, those reasoning blobs **stay in the history forever**.
+Reasoning blobs are typically 5–10× the visible `content` size. A long thread accumulates them indefinitely. Two mitigations are in place:
 
-The recommended pattern from the docs is the simplest: append `response.choices[0].message` verbatim, which carries `content`, `reasoning_content`, and `tool_calls` together. The non-tool-call cleanup (Case A) becomes a separate optional pass.
+- DeepSeek's prefix cache: `reasoning_content` bytes stay byte-identical turn-to-turn (we never normalise/whitespace-strip), so the cached-input rate (50× cheaper than miss on flash) covers most of the replay cost.
+- `compactToolResultsForRequest` light-tier compaction trims tool-result bodies, preserving reasoning.
+
+But emergency trim is still reasoning-blind — see §6.6 for the deferred TODO.
 
 ## 6. What Void does today
 
@@ -166,20 +167,20 @@ All five integration items are landed. Summary of where each lives so future edi
 
 `reasoning_content` streams in via the existing `providerReasoningIOSettings.output.nameOfFieldInDelta: 'reasoning_content'` plumbing — no change needed. The streaming reader gates on provider-level config independently of model-level `reasoningCapabilities`, so capture works for any DeepSeek model name on this provider, including custom ones a user types in.
 
-### 6.5 History round-trip — Case B compliance
+### 6.5 History round-trip — replay every prior reasoning blob
 
-This was the audit risk in the original plan. It's resolved end-to-end:
+End-to-end:
 
 1. `ChatMessage.reasoning` (already persisted by the chat thread) gets forwarded into `SimpleLLMMessage.reasoningContent` in `_chatMessagesToSimpleMessages` (`browser/convertToLLMMessageService.ts`).
 2. `OpenAILLMChatMessage` (`common/sendLLMMessageTypes.ts`) gained an optional `reasoning_content` field on the assistant variant.
-3. `prepareMessages_openai_tools` takes a `supportsOAICompatReasoningContent` flag (true only for `providerName === 'deepseek'`) and emits `reasoning_content` on assistant turns **only if that turn called tools** — detected by lookahead for an immediately-following `role: 'tool'` message in the well-formed Simple message stream.
+3. `prepareMessages_openai_tools` takes a `supportsOAICompatReasoningContent` flag (true only for `providerName === 'deepseek'`) and emits `reasoning_content` on **every** assistant turn that has stored reasoning, regardless of tool calls.
 
-The lookahead is the optimisation we agreed on: drop `reasoning_content` from non-tool assistant turns (Case A — API ignores it, saves input tokens) and keep it forever on tool-call assistant turns (Case B — API requires it). The more aggressive "only the latest tool call needs reasoning" idea was rejected because docs explicitly say "all subsequent requests" must include it for every prior tool-call turn.
+We previously had a lookahead optimisation that dropped reasoning on non-tool turns ("Case A" per the docs). The live API rejected that with 400 on plain Q&A threads, so the optimisation was removed — see §5. The current implementation matches DeepSeek's recommended pattern (append `response.choices[0].message` verbatim).
 
 ### 6.6 Compaction interaction (latent risks documented)
 
-- **Light-tier compaction** (`compactToolResultsForRequest`) only trims tool-result bodies, never assistant messages. Assistant `reasoningContent` flows through untouched — Case B stays satisfied. Comment in-source warns future contributors that any *message-dropping* tier MUST drop the tool-call assistant + its `tool` followers as a unit (orphaning either side breaks `tool_call_id` linking AND/OR loses reasoning, both 400-triggers).
-- **Emergency trim** in `prepareOpenAIOrAnthropicMessages` is currently blind to `reasoningContent` weight. On thinking-heavy threads, reasoning blobs can be 5–10× the visible `content`, so trimming `content` to 120 chars saves nothing. TODO comment in-source describes the two future options (include reasoning in `weight()` but only for Case A turns; or drop reasoning from old Case B turns under emergency pressure, accepting the 400 risk). Deferred until telemetry shows it firing.
+- **Light-tier compaction** (`compactToolResultsForRequest`) only trims tool-result bodies, never assistant messages. Assistant `reasoningContent` flows through untouched — replay constraint stays satisfied. Comment in-source warns future contributors that any *message-dropping* tier MUST drop the tool-call assistant + its `tool` followers as a unit (orphaning either side breaks `tool_call_id` linking AND/OR loses reasoning, both 400-triggers).
+- **Emergency trim** in `prepareOpenAIOrAnthropicMessages` is currently blind to `reasoningContent` weight. On thinking-heavy threads, reasoning blobs can be 5–10× the visible `content`, so trimming `content` to 120 chars saves nothing. TODO comment in-source describes the future option: include `reasoningContent.length` in `weight()` and trim it directly. Note that *any* trim of `reasoning_content` on a prior assistant turn risks a 400 — DeepSeek requires byte-exact replay (see §5). The pragmatic stance is "trim and accept the 400; the user retries"; that's a deliberate degradation under context pressure, not a bug. Deferred until telemetry shows the trim firing.
 
 ## 7. Settings UI behaviour
 
@@ -193,7 +194,7 @@ Few UI gotchas worth knowing, surfaced while testing the V4 rollout:
 ## 8. Cost / telemetry notes
 
 - DeepSeek's `prompt_tokens_details.cached_tokens` populates the same way OpenAI does — Void's existing telemetry capture path works unchanged.
-- Cache pricing is significant on V4 (cache hit is ~50× cheaper than miss on flash). Prefix-cache hygiene we already track via `sysHash` matters more here than on most providers; Case B's "send reasoning_content byte-identically every turn" rule is incidentally great for cache stability — don't normalize/strip whitespace from it on the wire.
+- Cache pricing is significant on V4 (cache hit is ~50× cheaper than miss on flash). Prefix-cache hygiene we already track via `sysHash` matters more here than on most providers; the §5 "replay reasoning_content byte-identically every turn" rule is incidentally great for cache stability — don't normalize/strip whitespace from it on the wire.
 - Output tokens charge in dollars not cents — `deepseek-v4-pro` output at $3.48/M is in the same neighbourhood as Sonnet. Easy to misread the table; don't.
 
 ## 9. Open questions to confirm against real traffic
@@ -202,5 +203,5 @@ This laptop has no DeepSeek access; everything below is best-effort against docs
 
 - **`prompt_tokens_details.cached_tokens` populated for V4?** Docs imply yes; first V4 request in the telemetry log will tell us. If not, the cached-token panel will under-count for DeepSeek specifically.
 - **`reasoning_effort: "max"` cost/latency impact.** Docs hint complex agent loops auto-bump to `max` server-side. Currently we don't expose effort for V4 (sliderless toggle), but if telemetry shows wide latency variance even with thinking on, the server-side auto-bump is the likely cause.
-- **Case B reasoning_content size growth.** A long agent loop with many tool calls accumulates reasoning blobs forever. Watch for emergency-trim hits on DeepSeek threads — see §6.6. If real, escalate the TODO into a real implementation.
+- **`reasoning_content` size growth.** Every thinking-mode turn keeps its reasoning blob in history forever (§5). A long thread or agent loop accumulates these without bound. Watch for emergency-trim hits on DeepSeek threads — see §6.6. If real, escalate the TODO into a real implementation.
 - **Stream chunk ordering on parallel tool calls.** Docs say `reasoning_content` precedes `content`; not specified what happens with `tool_calls` deltas relative to either. Our reader handles them as independent streams so it shouldn't matter, but worth eyeballing the first multi-tool turn.
