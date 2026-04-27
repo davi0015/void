@@ -735,6 +735,24 @@ export const messageOfSelection = async (
 		const contentStr = [folderStructure, ...strOfFiles].join('\n\n')
 		return contentStr
 	}
+	else if (s.type === 'Terminal') {
+		// Header carries the structured metadata (command, cwd, exitCode) so the
+		// model can reason about success/failure without parsing the body. We
+		// emit only fields we have — selection-mode captures usually lack
+		// command/exitCode/cwd, and including empty `cwd: ` lines just trains
+		// the model to expect them.
+		const headerParts: string[] = []
+		if (s.command) headerParts.push(`command: ${s.command}`)
+		if (s.cwd) headerParts.push(`cwd: ${s.cwd}`)
+		if (typeof s.exitCode === 'number') headerParts.push(`exit code: ${s.exitCode}`)
+		const header = s.command
+			? `Terminal output (${headerParts.join(', ')})`
+			: headerParts.length > 0
+				? `Terminal selection (${headerParts.join(', ')})`
+				: `Terminal selection`
+		const body = `${tripleTick[0]}${s.language}\n${s.text}\n${tripleTick[1]}`
+		return `${header}:\n${body}`
+	}
 	else
 		return ''
 

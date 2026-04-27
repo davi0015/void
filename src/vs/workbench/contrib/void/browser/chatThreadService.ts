@@ -50,8 +50,16 @@ const RETRY_DELAY = 2500
 const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | undefined, newSelection: StagingSelectionItem): number | null => {
 	if (!currentSelections) return null
 
+	// Terminal snapshots are deliberately never deduped — each capture is a
+	// distinct point in time, even if the user attaches the same `npm test` twice.
+	// The synthetic URI is unique per snapshot so the fsPath check below would
+	// already not match, but exit early to avoid relying on that detail.
+	if (newSelection.type === 'Terminal') return null
+
 	for (let i = 0; i < currentSelections.length; i += 1) {
 		const s = currentSelections[i]
+
+		if (s.type === 'Terminal') continue
 
 		if (s.uri.fsPath !== newSelection.uri.fsPath) continue
 

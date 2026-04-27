@@ -158,6 +158,21 @@ export type StagingSelectionItem = {
 	uri: URI;
 	language?: undefined;
 	state?: undefined;
+} | {
+	// A snapshot of terminal output (selection or last finished command).
+	// Snapshots are NEVER deduped — each capture is a distinct point in time,
+	// hence the synthetic per-snapshot URI scheme `void-terminal:/snapshot/<uuid>`.
+	// `text` is already truncated to TERMINAL_SNIPPET_MAX_BYTES at capture time
+	// so chat persistence stays bounded.
+	type: 'Terminal';
+	uri: URI;
+	language: 'shellscript';
+	text: string;
+	command?: string;
+	cwd?: string;
+	exitCode?: number;
+	label: string; // shown in the staging chip, e.g. `npm test · exit 1`
+	state: { wasAddedAsCurrentFile: false };
 }
 
 
