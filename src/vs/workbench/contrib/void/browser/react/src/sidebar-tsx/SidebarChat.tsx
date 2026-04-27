@@ -1583,31 +1583,74 @@ prose-table:text-[13px]
 	</div>
 }
 
+// Main assistant-message wrapper. Mirrors SmallProseWrapper's tightening pass:
+// explicit body size, capped heading sizes (only ~1px above body so `**bold**`
+// + `### Heading` don't visually dominate the chat), tightened paragraph/list
+// margins. Without these overrides, `prose prose-sm` defaults render h1 at
+// ~21px and h2 at ~20px against ~14px body, which felt oversized in a narrow
+// sidebar. Keep `text-void-fg-2` (vs. SmallProseWrapper's fg-4) so the main
+// reply still reads as primary content.
 const ProseWrapper = ({ children }: { children: React.ReactNode }) => {
 	return <div className='
 text-void-fg-2
 prose
 prose-sm
 break-words
+max-w-none
+text-[13px]
+leading-snug
+
+[&>:first-child]:!mt-0
+[&>:last-child]:!mb-0
+
+prose-h1:text-[14px]
+prose-h1:my-3
+prose-h1:font-semibold
+
+prose-h2:text-[13px]
+prose-h2:my-3
+prose-h2:font-semibold
+
+prose-h3:text-[13px]
+prose-h3:my-2
+prose-h3:font-semibold
+
+prose-h4:text-[13px]
+prose-h4:my-2
+prose-h4:font-semibold
+
+prose-p:my-1.5
+prose-p:leading-snug
 prose-p:block
-prose-hr:my-4
-prose-pre:my-2
-marker:text-inherit
-prose-ol:list-outside
-prose-ol:list-decimal
+
+prose-ul:my-1.5
+prose-ul:pl-4
 prose-ul:list-outside
 prose-ul:list-disc
+prose-ul:leading-snug
+
+prose-ol:my-1.5
+prose-ol:pl-4
+prose-ol:list-outside
+prose-ol:list-decimal
+prose-ol:leading-snug
+
 prose-li:my-0
+prose-li:leading-snug
+
+prose-strong:font-semibold
+
+prose-blockquote:pl-2
+prose-blockquote:my-2
+
+prose-hr:my-3
+prose-pre:my-2
+
+prose-code:text-[12px]
 prose-code:before:content-none
 prose-code:after:content-none
-prose-headings:prose-sm
-prose-headings:font-bold
 
-prose-p:leading-normal
-prose-ol:leading-normal
-prose-ul:leading-normal
-
-max-w-none
+marker:text-inherit
 '
 	>
 		{children}
