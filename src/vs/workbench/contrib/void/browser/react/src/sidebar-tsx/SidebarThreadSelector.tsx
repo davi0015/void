@@ -344,6 +344,22 @@ export const SidebarThreadTabs = () => {
 					? firstUser.displayContent
 					: 'New Chat'
 
+				// Truncate the tooltip body. The visible tab label is already clipped
+				// by `truncate` CSS (the on-screen tab is at most ~110px wide), but the
+				// tooltip contents render the full string verbatim — so a thread whose
+				// first user message is a 50KB pasted blob would lay out the entire
+				// blob inside the tooltip portal on hover, stalling the main thread.
+				// Cap at ~240 chars: enough to show the gist and disambiguate tabs,
+				// short enough to render and reflow instantly. Whitespace is collapsed
+				// so a paste of "\n\n\n…\n\n\nactual text" doesn't waste the budget on
+				// blank lines.
+				const TOOLTIP_LABEL_MAX = 240
+				const tooltipLabel = (() => {
+					const collapsed = label.replace(/\s+/g, ' ').trim()
+					if (collapsed.length <= TOOLTIP_LABEL_MAX) return collapsed
+					return collapsed.slice(0, TOOLTIP_LABEL_MAX) + '…'
+				})()
+
 				return (
 					<div
 						key={id}
@@ -370,7 +386,7 @@ export const SidebarThreadTabs = () => {
 								: 'text-void-fg-3 opacity-80 hover:opacity-100 hover:bg-zinc-700/5 dark:hover:bg-zinc-300/5'}
 						`}
 						data-tooltip-id='void-tooltip'
-						data-tooltip-content={label}
+						data-tooltip-content={tooltipLabel}
 						data-tooltip-place='bottom'
 					>
 						{isRunning === 'LLM' || isRunning === 'tool' || isRunning === 'idle'
