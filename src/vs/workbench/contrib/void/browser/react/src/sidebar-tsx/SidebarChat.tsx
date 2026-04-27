@@ -1779,7 +1779,14 @@ const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name' | 'ty
 									: 'Call'
 
 
-		const title = `${prefix}${descriptor} ${toolMessage.mcpServerName || 'MCP'}`
+		// Suffix priority: real MCP server name > tool name > generic "MCP" fallback.
+		// Pre-fix this rendered "MCP" any time mcpServerName was missing, including
+		// for hallucinated/unknown tool names that were misclassified as MCP — the
+		// user just saw an opaque "Call MCP" with no clue which name the model
+		// emitted. Showing the toolName makes the dispatcher's tool_error message
+		// (see chatThreadService._runToolCall) self-explanatory in context.
+		const suffix = toolMessage.mcpServerName || toolMessage.name || 'MCP'
+		const title = `${prefix}${descriptor} ${suffix}`
 		if (t.type === 'running_now' || t.type === 'tool_request')
 			return loadingTitleWrapper(title)
 		return title

@@ -11,7 +11,7 @@ import { IStorageService, StorageScope, StorageTarget } from '../../../../platfo
 import { URI } from '../../../../base/common/uri.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
-import { chat_userMessageContent, isABuiltinToolName } from '../common/prompt/prompts.js';
+import { builtinToolNames, chat_userMessageContent, isABuiltinToolName } from '../common/prompt/prompts.js';
 import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
@@ -1081,6 +1081,40 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// Check if it's a built-in tool
 		const isBuiltInTool = isABuiltinToolName(toolName)
+
+		// Early-reject unknown tool names. Without this, any non-builtin name was
+		// silently classified as MCP further down, surfaced to the user as a "Call MCP"
+		// approval dialog, and only failed *after* approval with "MCP tool X not found".
+		// Models occasionally hallucinate tool names — especially DeepSeek thinking on
+		// off-topic / gibberish input, or models that were trained against a different
+		// tool set (e.g. Cursor's `codebase_search`) — and the old flow forced the user
+		// to click "approve" on a call that was guaranteed to fail.
+		//
+		// Reject here means: no approval prompt, immediate `tool_error` row in the UI,
+		// and a structured message back to the LLM listing the names it should use.
+		// The LLM sees this as a normal tool error on its next turn and self-corrects.
+		const knownMcpToolNames = !isBuiltInTool ? (this._mcpService.getMCPTools()?.map(t => t.name) ?? []) : []
+		const isKnownMcpTool = !isBuiltInTool && knownMcpToolNames.includes(toolName)
+		if (!isBuiltInTool && !isKnownMcpTool) {
+			const validNames = [...builtinToolNames, ...knownMcpToolNames]
+			const errorMessage = `Unknown tool: \`${toolName}\`. This tool is not available in this workspace and will not be retried. Valid tool names are: ${validNames.map(n => `\`${n}\``).join(', ') || '(none)'}. Continue without calling tools, or use one of the valid names above.`
+			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: opts.preapproved ? opts.validatedParams : opts.unvalidatedToolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
+			this._requestTelemetryService.logTool({
+				phase: 'tool',
+				t: new Date().toISOString(),
+				rid: this._telemetryRidByThread.get(threadId),
+				tid: threadId,
+				name: toolName,
+				status: 'error',
+				paramsLen: typeof rawParamsStr === 'string'
+					? rawParamsStr.length
+					: (() => { try { return JSON.stringify(opts.unvalidatedToolParams ?? {}).length } catch { return 0 } })(),
+				resultLen: errorMessage.length,
+				durMs: 0,
+				mcp: undefined,
+			})
+			return {}
+		}
 
 		// Per-tool telemetry scaffolding. Start-ms is wall-clock at entry so `durMs`
 		// covers validation + approval wait + execution + stringification — the full
