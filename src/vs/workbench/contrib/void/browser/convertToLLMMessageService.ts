@@ -44,6 +44,13 @@ type SimpleLLMMessage = {
 	role: 'assistant';
 	content: string;
 	anthropicReasoning: AnthropicReasoning[] | null;
+	// Plain-text reasoning captured during the assistant turn (DeepSeek V4's
+	// `reasoning_content`, OpenRouter's `reasoning`, etc.). Carried through
+	// here so OpenAI-compat providers that require replay on tool-call turns
+	// (DeepSeek V4 — see note-deepseek.md §5) can emit it on the wire.
+	// Optional for backward-compat with chat history persisted before this
+	// field existed (treated as "no reasoning was captured").
+	reasoningContent?: string;
 }
 
 
@@ -252,6 +259,14 @@ const compactToolResultsForRequest = (
 	let savedChars = 0
 	const out = messages.map((m, idx): SimpleLLMMessage => {
 		if (idx >= boundaryIdx) return m
+		// IMPORTANT for DeepSeek thinking + tools: this stage trims tool-RESULT bodies
+		// only — assistant messages (and their `reasoningContent`) flow through
+		// untouched, so the Case B requirement that tool-call assistants keep their
+		// `reasoning_content` forever stays satisfied. If a future tier ever DROPS
+		// historical messages (not just trims content), it MUST drop the tool-call
+		// assistant + its `tool` followers as a unit — orphaning the tool messages
+		// alone would break tool_call_id linking AND lose reasoning_content, both of
+		// which are 400-triggers on DeepSeek V4. See note-deepseek.md §5 Case B.
 		if (m.role !== 'tool') return m
 		if (!TRIMMABLE_TOOL_NAMES.has(m.name)) return m
 		const body = m.content
@@ -314,12 +329,48 @@ openai on developer system message - https://cdn.openai.com/spec/model-spec-2024
 */
 
 
-const prepareMessages_openai_tools = (messages: SimpleLLMMessage[]): AnthropicOrOpenAILLMMessage[] => {
+const prepareMessages_openai_tools = (
+	messages: SimpleLLMMessage[],
+	// Emit `reasoning_content` on assistant messages that captured it. DeepSeek V4
+	// thinking mode REQUIRES this on every prior assistant turn that had `tool_calls`
+	// (otherwise: 400). Other OpenAI-compat providers don't consume the field and
+	// might surface it as "unknown property" warnings, so we only opt in by provider.
+	// See note-deepseek.md §5 Case B for the exact constraint.
+	supportsOAICompatReasoningContent: boolean,
+): AnthropicOrOpenAILLMMessage[] => {
 
 	const newMessages: OpenAILLMChatMessage[] = [];
 
 	for (let i = 0; i < messages.length; i += 1) {
 		const currMsg = messages[i]
+
+		if (currMsg.role === 'assistant') {
+			// Push a fresh shape (don't carry SimpleLLMMessage-only fields like
+			// `anthropicReasoning` onto the wire). `tool_calls` is added later in
+			// the tool-walk below if this assistant called any tools.
+			const out: OpenAILLMChatMessage & { role: 'assistant' } = {
+				role: 'assistant',
+				content: currMsg.content,
+			}
+			if (supportsOAICompatReasoningContent && currMsg.reasoningContent) {
+				// DeepSeek V4 §5 cases:
+				//   Case A — assistant had NO tool_calls: API silently ignores
+				//     reasoning_content. Drop it from the wire to save input
+				//     tokens (the UI still shows it from the stored ChatMessage).
+				//   Case B — assistant HAD tool_calls: API REQUIRES reasoning_content
+				//     on this turn forever (every subsequent request) or returns 400.
+				// Detect which case via lookahead: SimpleLLMMessage stream is
+				// well-formed, so a tool-call assistant is always immediately
+				// followed by one or more `tool` messages (one per parallel call).
+				// If the next message isn't a tool, this assistant didn't call any.
+				const hadToolCalls = messages[i + 1]?.role === 'tool'
+				if (hadToolCalls) {
+					out.reasoning_content = currMsg.reasoningContent
+				}
+			}
+			newMessages.push(out)
+			continue
+		}
 
 		if (currMsg.role !== 'tool') {
 			newMessages.push(currMsg)
@@ -537,6 +588,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 	reservedOutputTokenSpace,
 	charsPerToken,
 	priorContentTokens,
+	providerName,
 }: {
 	messages: SimpleLLMMessage[],
 	systemMessage: string,
@@ -548,6 +600,10 @@ const prepareOpenAIOrAnthropicMessages = ({
 	reservedOutputTokenSpace: number | null | undefined,
 	charsPerToken: number,
 	priorContentTokens?: number,
+	// Threaded through so `prepareMessages_openai_tools` can opt-in to
+	// `reasoning_content` round-trip on assistant messages (DeepSeek V4 only,
+	// today). See `prepareMessages_openai_tools` for the gate.
+	providerName?: ProviderName,
 }): {
 	messages: AnthropicOrOpenAILLMMessage[],
 	separateSystemMessage: string | undefined,
@@ -668,6 +724,19 @@ const prepareOpenAIOrAnthropicMessages = ({
 	// to 120 chars, not just tool result bodies), so when it fires the user
 	// should see it in the tooltip — both for trust and for diagnostics (if this
 	// keeps firing, Perf 2's `sizeTriggerRatio` is too loose for this model).
+	//
+	// TODO(deepseek-thinking): emergency trim is NOT aware of `reasoningContent`
+	// weight on assistant messages. On thinking-mode agent threads, reasoning_content
+	// can be 5-10× larger than the visible `content` text, so trimming `content` to
+	// 120 chars saves almost nothing while the reasoning blob keeps the request over
+	// budget. Two future-options when we hit this:
+	//   1. Include `reasoningContent.length` in `weight()` and trim it on the chosen
+	//      message — but only safe on Case A (non-tool) turns; on Case B (tool-call)
+	//      turns this would re-trigger DeepSeek's 400.
+	//   2. Drop reasoning_content entirely from old tool-call turns under emergency
+	//      pressure (the "only the latest tool call needs reasoning" idea). Risks
+	//      the docs-described 400 but might be preferable to a guaranteed overflow.
+	// Defer until telemetry shows this firing — see note-deepseek.md §5/§6.
 	let emergencyTrimmedCount = 0
 	let emergencySavedChars = 0
 
@@ -728,7 +797,13 @@ const prepareOpenAIOrAnthropicMessages = ({
 		llmChatMessages = prepareMessages_anthropic_tools(messages as SimpleLLMMessage[], supportsAnthropicReasoning)
 	}
 	else if (specialToolFormat === 'openai-style') {
-		llmChatMessages = prepareMessages_openai_tools(messages as SimpleLLMMessage[])
+		// Per-provider opt-in for `reasoning_content` round-trip on assistant messages.
+		// Today: DeepSeek V4 (required for thinking + tools — see note-deepseek.md §5).
+		// Other providers may need it later (e.g. OpenRouter routes that proxy to
+		// DeepSeek); extend this set rather than making it a model-level capability
+		// so we can flip whole providers at once.
+		const supportsOAICompatReasoningContent = providerName === 'deepseek'
+		llmChatMessages = prepareMessages_openai_tools(messages as SimpleLLMMessage[], supportsOAICompatReasoningContent)
 	}
 	const llmMessages = llmChatMessages
 
@@ -1151,6 +1226,12 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 					role: m.role,
 					content: m.displayContent,
 					anthropicReasoning: m.anthropicReasoning,
+					// Pass the persisted `reasoning` text through to the conversion layer.
+					// `prepareMessages_openai_tools` decides per-provider whether to actually
+					// emit it on the wire (today: only DeepSeek). Non-empty check keeps
+					// older history (no reasoning captured) clean — `undefined` is the
+					// "didn't capture" signal, empty string would still serialize.
+					reasoningContent: m.reasoning ? m.reasoning : undefined,
 				})
 			}
 			else if (m.role === 'tool') {

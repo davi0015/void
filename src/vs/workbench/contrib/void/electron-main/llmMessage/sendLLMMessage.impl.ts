@@ -299,8 +299,11 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		{ tools: potentialTools } as const
 		: {}
 
-	// instance
-	const openai: OpenAI = await newOpenAICompatibleSDK({ providerName, settingsOfProvider, includeInPayload })
+	// instance — `includeInPayload` is intentionally NOT passed to the SDK constructor.
+	// Constructor `ClientOptions` is a closed set (apiKey, baseURL, defaultHeaders, etc.);
+	// arbitrary fields like `reasoning_effort` / `thinking` are silently dropped there.
+	// They belong in the per-request body below alongside `additionalOpenAIPayload`.
+	const openai: OpenAI = await newOpenAICompatibleSDK({ providerName, settingsOfProvider })
 	if (providerName === 'microsoftAzure') {
 		// Required to select the model
 		(openai as AzureOpenAI).deploymentName = modelName;
@@ -313,13 +316,17 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		// trailing chunk with `choices: []` and a populated `usage`. Most OAI-compatible
 		// servers (DeepSeek, OpenRouter, Groq, vLLM, LM Studio, LiteLLM, etc.) honor this;
 		// ones that don't just ignore the field and we get no usage, same as before.
-		// Declared before the spreads so `additionalOpenAIPayload` can override if a
-		// particular model/provider needs a different setting.
+		// Declared before the spreads so `additionalOpenAIPayload` / `includeInPayload`
+		// can override if a particular model/provider needs a different setting.
 		stream_options: { include_usage: true },
 		...nativeToolsObj,
-		...additionalOpenAIPayload
+		...additionalOpenAIPayload,
+		// Reasoning-related body fields (e.g. DeepSeek's `thinking: { type: 'enabled' }`,
+		// OpenAI's `reasoning_effort`) come from the model's `providerReasoningIOSettings.input.includeInPayload`
+		// and MUST land in the request body, not the SDK constructor.
+		...includeInPayload,
 		// max_completion_tokens: maxTokens,
-	}
+	} as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming
 
 	// open source models - manually parse think tokens
 	const { needsManualParse: needsManualReasoningParse, nameOfFieldInDelta: nameOfReasoningFieldInDelta } = providerReasoningIOSettings?.output ?? {}

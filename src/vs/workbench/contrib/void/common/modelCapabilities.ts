@@ -106,8 +106,8 @@ export const defaultModelsOfProvider = {
 		'gemini-2.5-pro-preview-05-06',
 	],
 	deepseek: [ // https://api-docs.deepseek.com/quick_start/pricing
-		'deepseek-chat',
-		'deepseek-reasoner',
+		'deepseek-v4-flash',
+		'deepseek-v4-pro',
 	],
 	ollama: [ // autodetected
 	],
@@ -935,30 +935,61 @@ const geminiSettings: VoidStaticProviderInfo = {
 
 
 // ---------------- DEEPSEEK API ----------------
+//
+// DeepSeek V4 (deepseek-v4-flash, deepseek-v4-pro): see note-deepseek.md.
+// - 1M context, 384K max output, sliderless thinking toggle, OpenAI-style tools
+// - Thinking is controlled via `thinking: { type: 'enabled' | 'disabled' }` (top-level
+//   request body field). Always emit explicitly; default-on otherwise.
+// - When thinking is on AND the assistant message had tool_calls, `reasoning_content`
+//   from prior assistant turns must be replayed in subsequent requests or the API
+//   returns 400 (handled in convertToLLMMessageService.ts → prepareMessages_openai_tools).
+
+// V4 capabilities are identical across flash and pro; only price/positioning differs.
+const _deepseekV4SharedCaps = {
+	contextWindow: 1_000_000,
+	reservedOutputTokenSpace: 384_000,
+	supportsFIM: false, // FIM only available outside thinking mode; we don't expose FIM for V4 chat
+	supportsSystemMessage: 'system-role',
+	specialToolFormat: 'openai-style',
+	// Thinking is a simple on/off — no slider in the UI. SendableReasoningInfo's
+	// `enabled_no_slider` variant carries this through to `deepseekIncludeInPayloadReasoning`.
+	reasoningCapabilities: { supportsReasoning: true, canTurnOffReasoning: true, canIOReasoning: true },
+	downloadable: false,
+} as const satisfies Partial<VoidStaticModelInfo>
+
 const deepseekModelOptions = {
-	'deepseek-chat': {
-		...openSourceModelOptions_assumingOAICompat.deepseekR1,
-		contextWindow: 64_000, // https://api-docs.deepseek.com/quick_start/pricing
-		reservedOutputTokenSpace: 8_000, // 8_000,
-		cost: { cache_read: .07, input: .27, output: 1.10, },
-		downloadable: false,
+	// Pricing per 1M tokens (USD). Standard pricing only — promo rates expire and
+	// the field is informational.
+	'deepseek-v4-flash': {
+		..._deepseekV4SharedCaps,
+		cost: { cache_read: 0.0028, input: 0.14, output: 0.28 },
 	},
-	'deepseek-reasoner': {
-		...openSourceModelOptions_assumingOAICompat.deepseekCoderV2,
-		contextWindow: 64_000,
-		reservedOutputTokenSpace: 8_000, // 8_000,
-		cost: { cache_read: .14, input: .55, output: 2.19, },
-		downloadable: false,
+	'deepseek-v4-pro': {
+		..._deepseekV4SharedCaps,
+		cost: { cache_read: 0.0145, input: 1.74, output: 3.48 },
 	},
 } as const satisfies { [s: string]: VoidStaticModelInfo }
 
+
+// DeepSeek's thinking toggle is a top-level body field, not a slider value.
+// Always emit explicitly (per V4 docs §3): default-on is treacherous for
+// reproducibility, and re-sending the same field byte-identically across turns
+// keeps the prefix cache stable. `null` reasoningInfo means "user turned thinking
+// off in the UI" — emit `disabled` so we override DeepSeek's default-on.
+const deepseekIncludeInPayloadReasoning = (reasoningInfo: SendableReasoningInfo) => {
+	if (reasoningInfo?.isReasoningEnabled) {
+		return { thinking: { type: 'enabled' } }
+	}
+	return { thinking: { type: 'disabled' } }
+}
 
 const deepseekSettings: VoidStaticProviderInfo = {
 	modelOptions: deepseekModelOptions,
 	modelOptionsFallback: (modelName) => { return null },
 	providerReasoningIOSettings: {
-		// reasoning: OAICompat +  response.choices[0].delta.reasoning_content // https://api-docs.deepseek.com/guides/reasoning_model
-		input: { includeInPayload: openAICompatIncludeInPayloadReasoning },
+		// reasoning: OAICompat + response.choices[0].delta.reasoning_content
+		// https://api-docs.deepseek.com/guides/thinking_mode
+		input: { includeInPayload: deepseekIncludeInPayloadReasoning },
 		output: { nameOfFieldInDelta: 'reasoning_content' },
 	},
 }
@@ -1551,6 +1582,13 @@ export type SendableReasoningInfo = {
 	type: 'effort_slider_value',
 	isReasoningEnabled: true,
 	reasoningEffort: string,
+} | {
+	// Reasoning is on/off only — no slider exposed in the UI. Used by providers
+	// like DeepSeek V4 whose thinking mode is a simple toggle (`thinking: { type: 'enabled' }`)
+	// rather than an effort/budget value. `getSendableReasoningInfo` returns this
+	// when reasoning is enabled but the model declares no `reasoningSlider`.
+	type: 'enabled_no_slider',
+	isReasoningEnabled: true,
 } | null
 
 
@@ -1606,5 +1644,10 @@ export const getSendableReasoningInfo = (
 		return { type: 'effort_slider_value', isReasoningEnabled: isReasoningEnabled, reasoningEffort: reasoningEffort }
 	}
 
-	return null
+	// Reasoning is enabled but the model has no slider of any kind — sliderless on/off
+	// toggle. Provider-side `includeInPayload` still needs a non-null reasoning state
+	// so it can emit the right body field (e.g. DeepSeek V4's `thinking: { type: 'enabled' }`).
+	// Without this branch, those providers got `null` and never wrote any reasoning
+	// parameter, leaving thinking mode inert.
+	return { type: 'enabled_no_slider', isReasoningEnabled: isReasoningEnabled }
 }
