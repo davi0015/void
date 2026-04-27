@@ -48,9 +48,11 @@ export type OpenAILLMChatMessage = {
 	content: string | (AnthropicReasoning | { type: 'text'; text: string })[];
 	tool_calls?: { type: 'function'; id: string; function: { name: string; arguments: string; } }[];
 	// DeepSeek V4 thinking-mode requires `reasoning_content` to be replayed on
-	// every prior assistant message that had `tool_calls` (or the API returns 400).
-	// See note-deepseek.md §5 Case B. Only emitted for providers we know consume
-	// this field — for everyone else it'd be unspecified noise on the wire.
+	// every prior assistant message that produced one (or the API returns 400).
+	// Applies to all thinking-mode turns, not just tool-call ones — the published
+	// docs say otherwise but the live API rejects non-replay outright. See
+	// note-deepseek.md §5. Only emitted for providers we know consume this field
+	// — for everyone else it'd be unspecified noise on the wire.
 	reasoning_content?: string;
 } | {
 	role: 'tool',

@@ -261,12 +261,12 @@ const compactToolResultsForRequest = (
 		if (idx >= boundaryIdx) return m
 		// IMPORTANT for DeepSeek thinking + tools: this stage trims tool-RESULT bodies
 		// only — assistant messages (and their `reasoningContent`) flow through
-		// untouched, so the Case B requirement that tool-call assistants keep their
-		// `reasoning_content` forever stays satisfied. If a future tier ever DROPS
-		// historical messages (not just trims content), it MUST drop the tool-call
-		// assistant + its `tool` followers as a unit — orphaning the tool messages
-		// alone would break tool_call_id linking AND lose reasoning_content, both of
-		// which are 400-triggers on DeepSeek V4. See note-deepseek.md §5 Case B.
+		// untouched, so the §5 replay constraint (every prior assistant's
+		// reasoning_content must round-trip) stays satisfied. If a future tier ever
+		// DROPS historical messages (not just trims content), it MUST drop the
+		// tool-call assistant + its `tool` followers as a unit — orphaning the tool
+		// messages alone would break tool_call_id linking AND lose reasoning_content,
+		// both of which are 400-triggers on DeepSeek V4. See note-deepseek.md §5.
 		if (m.role !== 'tool') return m
 		if (!TRIMMABLE_TOOL_NAMES.has(m.name)) return m
 		const body = m.content
@@ -332,10 +332,12 @@ openai on developer system message - https://cdn.openai.com/spec/model-spec-2024
 const prepareMessages_openai_tools = (
 	messages: SimpleLLMMessage[],
 	// Emit `reasoning_content` on assistant messages that captured it. DeepSeek V4
-	// thinking mode REQUIRES this on every prior assistant turn that had `tool_calls`
-	// (otherwise: 400). Other OpenAI-compat providers don't consume the field and
-	// might surface it as "unknown property" warnings, so we only opt in by provider.
-	// See note-deepseek.md §5 Case B for the exact constraint.
+	// thinking mode REQUIRES this on every prior assistant turn that produced
+	// reasoning, regardless of whether the turn had tool calls (otherwise: 400).
+	// Other OpenAI-compat providers don't consume the field and might surface it
+	// as "unknown property" warnings, so we only opt in by provider.
+	// See note-deepseek.md §5 for the exact constraint and why we don't optimise
+	// non-tool turns away.
 	supportsOAICompatReasoningContent: boolean,
 ): AnthropicOrOpenAILLMMessage[] => {
 
@@ -353,20 +355,20 @@ const prepareMessages_openai_tools = (
 				content: currMsg.content,
 			}
 			if (supportsOAICompatReasoningContent && currMsg.reasoningContent) {
-				// DeepSeek V4 §5 cases:
-				//   Case A — assistant had NO tool_calls: API silently ignores
-				//     reasoning_content. Drop it from the wire to save input
-				//     tokens (the UI still shows it from the stored ChatMessage).
-				//   Case B — assistant HAD tool_calls: API REQUIRES reasoning_content
-				//     on this turn forever (every subsequent request) or returns 400.
-				// Detect which case via lookahead: SimpleLLMMessage stream is
-				// well-formed, so a tool-call assistant is always immediately
-				// followed by one or more `tool` messages (one per parallel call).
-				// If the next message isn't a tool, this assistant didn't call any.
-				const hadToolCalls = messages[i + 1]?.role === 'tool'
-				if (hadToolCalls) {
-					out.reasoning_content = currMsg.reasoningContent
-				}
+				// DeepSeek V4 thinking mode: replay reasoning_content on EVERY
+				// prior assistant turn that produced one, regardless of whether
+				// it had tool_calls. The published docs claim a "Case A vs Case B"
+				// split (only tool-call turns require it), but the live API
+				// returns 400 "The reasoning_content in the thinking mode must
+				// be passed back to the API" for non-tool turns too — observed
+				// after a couple of plain Q&A turns under thinking mode.
+				// The recommended pattern from the docs is to append
+				// `response.choices[0].message` verbatim, which carries content +
+				// reasoning_content + tool_calls together. We do exactly that.
+				// Cost trade-off: input tokens grow by the size of all stored
+				// reasoning blobs in the thread. The prefix cache mitigates this
+				// because the field bytes stay identical turn-to-turn.
+				out.reasoning_content = currMsg.reasoningContent
 			}
 			newMessages.push(out)
 			continue
@@ -726,17 +728,15 @@ const prepareOpenAIOrAnthropicMessages = ({
 	// keeps firing, Perf 2's `sizeTriggerRatio` is too loose for this model).
 	//
 	// TODO(deepseek-thinking): emergency trim is NOT aware of `reasoningContent`
-	// weight on assistant messages. On thinking-mode agent threads, reasoning_content
-	// can be 5-10× larger than the visible `content` text, so trimming `content` to
-	// 120 chars saves almost nothing while the reasoning blob keeps the request over
-	// budget. Two future-options when we hit this:
-	//   1. Include `reasoningContent.length` in `weight()` and trim it on the chosen
-	//      message — but only safe on Case A (non-tool) turns; on Case B (tool-call)
-	//      turns this would re-trigger DeepSeek's 400.
-	//   2. Drop reasoning_content entirely from old tool-call turns under emergency
-	//      pressure (the "only the latest tool call needs reasoning" idea). Risks
-	//      the docs-described 400 but might be preferable to a guaranteed overflow.
-	// Defer until telemetry shows this firing — see note-deepseek.md §5/§6.
+	// weight on assistant messages. On thinking-mode threads, reasoning_content
+	// can be 5-10× larger than the visible `content` text, so trimming `content`
+	// to 120 chars saves almost nothing while the reasoning blob keeps the request
+	// over budget. Future option when we hit this: include `reasoningContent.length`
+	// in `weight()` and trim it directly. DeepSeek requires byte-exact replay of
+	// every prior reasoning blob (note-deepseek.md §5), so any trim of an old
+	// reasoning_content WILL produce a 400. The pragmatic stance is "trim and
+	// accept the 400; the user retries" — a deliberate degradation under context
+	// pressure rather than a bug. Defer until telemetry shows this firing.
 	let emergencyTrimmedCount = 0
 	let emergencySavedChars = 0
 
