@@ -1644,7 +1644,7 @@ const normalizeIndentation = (code: string): string => {
 
 
 const modelOfEditorId: { [id: string]: ITextModel | undefined } = {}
-export type BlockCodeProps = { initValue: string, language?: string, maxHeight?: number, showScrollbars?: boolean }
+export type BlockCodeProps = { initValue: string, language?: string, maxHeight?: number, showScrollbars?: boolean, isStreaming?: boolean }
 // Not exported: the only call-site is LazyBlockCode below. Using this directly re-introduces
 // the tab-switch/long-chat perf regression we fixed in Perf 1 Fix C — always go through LazyBlockCode.
 const BlockCode = ({ initValue, language, maxHeight, showScrollbars }: BlockCodeProps) => {
@@ -1819,11 +1819,18 @@ const scheduleLazyMount = (cb: () => void) => {
 // not the continued existence. Mounts are also funneled through a per-frame queue
 // (`scheduleLazyMount`) so a burst of IO fires during fast scrolling staggers instead
 // of piling onto a single frame.
-export const LazyBlockCode = ({ initValue, language, maxHeight, showScrollbars }: BlockCodeProps) => {
+export const LazyBlockCode = ({ initValue, language, maxHeight, showScrollbars, isStreaming }: BlockCodeProps) => {
 	const wrapperRef = useRef<HTMLDivElement | null>(null)
 	const [isVisible, setIsVisible] = useState(false)
 
 	useEffect(() => {
+		// Defer Monaco mount while the parent message is still streaming. Mounting a
+		// Monaco editor costs ~10-30ms of layout/measure work per code block, and a
+		// streaming reply can incrementally produce many fenced blocks (each one
+		// re-mounting as its content grows). Rendering as plain <pre> until the
+		// message is committed avoids that thrash; the editor mounts in one shot
+		// when streaming finishes, which feels instant to the user.
+		if (isStreaming) return
 		if (isVisible) return
 		const el = wrapperRef.current
 		if (!el) return
@@ -1847,9 +1854,9 @@ export const LazyBlockCode = ({ initValue, language, maxHeight, showScrollbars }
 			cancelled = true
 			io.disconnect()
 		}
-	}, [isVisible])
+	}, [isVisible, isStreaming])
 
-	if (isVisible) {
+	if (isVisible && !isStreaming) {
 		return <BlockCode initValue={initValue} language={language} maxHeight={maxHeight} showScrollbars={showScrollbars} />
 	}
 

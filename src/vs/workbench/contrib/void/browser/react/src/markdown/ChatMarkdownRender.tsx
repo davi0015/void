@@ -289,7 +289,7 @@ const paragraphToLatexSegments = (paragraphText: string) => {
 }
 
 
-export type RenderTokenOptions = { isApplyEnabled?: boolean, isLinkDetectionEnabled?: boolean }
+export type RenderTokenOptions = { isApplyEnabled?: boolean, isLinkDetectionEnabled?: boolean, isStreaming?: boolean }
 const RenderToken = ({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ...options }: { token: Token | string, inPTag?: boolean, codeURI?: URI, chatMessageLocation?: ChatMessageLocation, tokenIdx: string, } & RenderTokenOptions): React.ReactNode => {
 	const accessor = useAccessor()
 	const languageService = accessor.get('ILanguageService')
@@ -350,6 +350,7 @@ const RenderToken = ({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ..
 				<LazyBlockCode
 					initValue={contents.trimEnd()} // \n\n adds a permanent newline which creates a flash
 					language={language}
+					isStreaming={options.isStreaming}
 				/>
 			</BlockCodeApplyWrapper>
 		}
@@ -357,6 +358,7 @@ const RenderToken = ({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ..
 		return <LazyBlockCode
 			initValue={contents}
 			language={language}
+			isStreaming={options.isStreaming}
 		/>
 	}
 
