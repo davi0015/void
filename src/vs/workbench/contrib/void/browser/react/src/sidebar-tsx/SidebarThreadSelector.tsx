@@ -7,8 +7,8 @@ import { startTransition, useEffect, useMemo, useRef, useState } from 'react';
 import { CopyButton, IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
 import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useFullChatThreadsStreamState, useSettingsState } from '../util/services.js';
 import { IconX } from './SidebarChat.js';
-import { Check, ChevronDown, ChevronRight, Copy, Icon, LoaderCircle, MessageCircleQuestion, Plus, Trash2, UserCheck, X } from 'lucide-react';
-import { IsRunningType, ThreadType } from '../../../chatThreadService.js';
+import { Check, ChevronDown, ChevronRight, Copy, Globe, Icon, LoaderCircle, Lock, MessageCircleQuestion, Plus, Trash2, UserCheck, X } from 'lucide-react';
+import { isThreadReadOnly, IsRunningType, ThreadType } from '../../../chatThreadService.js';
 
 
 const numInitialThreads = 3
@@ -450,7 +450,7 @@ export const SidebarThreadTabs = () => {
 	const threadsState = useChatThreadsState()
 	const streamState = useFullChatThreadsStreamState()
 
-	const { allThreads, currentThreadId, pinnedThreadIds } = threadsState
+	const { allThreads, currentThreadId, pinnedThreadIds, currentWorkspaceUri } = threadsState
 
 	// Defensive filter: only render tabs whose thread still exists. Stale ids
 	// are pruned at load time too (see ChatThreadService constructor), but this
@@ -495,6 +495,30 @@ export const SidebarThreadTabs = () => {
 				const t = allThreads[id]!
 				const isActive = id === currentThreadId
 				const isRunning = streamState[id]?.isRunning
+
+				// Phase E commit 5 — workspace provenance indicator. The icon
+				// slot is shared with the running-state spinner above; running
+				// always wins (transient + time-sensitive). Indicator fires
+				// only in workspaced windows: empty windows have no reference
+				// frame to call something "foreign" against.
+				//
+				//   foreign  → Lock   (same icon as the read-only banner; user
+				//                       opened it from "Other workspaces", it's
+				//                       pinned here, but mutations still gated)
+				//   unscoped → Globe  (legacy / pre-Phase-E thread; editable,
+				//                       claim-on-engagement re-tags on next send)
+				//
+				// Each indicator gets its own tooltip on the icon span — the
+				// outer tab keeps the message-preview tooltip, hovering the
+				// icon directly reveals the provenance reason.
+				const tabIsForeign = isThreadReadOnly(t, currentWorkspaceUri)
+				const tabIsUnscoped = !!currentWorkspaceUri && !t.workspaceUri
+				const foreignTooltip = tabIsForeign
+					? `Read-only — owned by ${t.workspaceLabel ?? t.workspaceUri ?? 'another workspace'}. Use Move or Copy to bring it here.`
+					: ''
+				const unscopedTooltip = tabIsUnscoped
+					? 'Not tied to a workspace yet. Sending a message will claim it for this workspace.'
+					: ''
 
 				// Label source of truth matches PastThreadsList: first user
 				// message's displayContent, truncated. Empty threads get a
@@ -553,7 +577,25 @@ export const SidebarThreadTabs = () => {
 							? <LoaderCircle className='animate-spin shrink-0' size={10} />
 							: isRunning === 'awaiting_user'
 								? <MessageCircleQuestion className='shrink-0' size={10} />
-								: null}
+								: tabIsForeign
+									? <span
+										className='shrink-0 inline-flex items-center'
+										data-tooltip-id='void-tooltip'
+										data-tooltip-content={foreignTooltip}
+										data-tooltip-place='bottom'
+									>
+										<Lock size={10} />
+									</span>
+									: tabIsUnscoped
+										? <span
+											className='shrink-0 inline-flex items-center'
+											data-tooltip-id='void-tooltip'
+											data-tooltip-content={unscopedTooltip}
+											data-tooltip-place='bottom'
+										>
+											<Globe size={10} />
+										</span>
+										: null}
 						<span className='truncate min-w-0'>{label}</span>
 						<button
 							onClick={(e) => { e.stopPropagation(); chatThreadsService.unpinThread(id); }}
