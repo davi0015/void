@@ -1739,6 +1739,7 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 							chatMessageLocation={chatMessageLocation}
 							isApplyEnabled={false}
 							isLinkDetectionEnabled={true}
+							isStreaming={!isCommitted}
 						/>
 					</SmallProseWrapper>
 				</ReasoningWrapper>
@@ -1754,6 +1755,7 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 						chatMessageLocation={chatMessageLocation}
 						isApplyEnabled={true}
 						isLinkDetectionEnabled={true}
+						isStreaming={!isCommitted}
 					/>
 				</ProseWrapper>
 			</div>
@@ -3652,24 +3654,44 @@ export const SidebarChat = () => {
 	// `onSubmit` / `onAbort` / mountInfo resolver that need to scroll the
 	// active view without knowing about the LRU cache.
 	const scrollContainerRef = getScrollContainerRef(currentThread.id)
+
+	// Synchronous reentrancy guard. The React-state-derived `isRunning`
+	// check below is necessary but NOT sufficient to prevent duplicate
+	// submissions when the user spams Enter while the renderer is busy:
+	// queued keydowns flush in a single tick after the main thread frees
+	// up, and they all see the same stale `isRunning === false` from the
+	// closure. A ref written *before* the await closes that window
+	// deterministically.
+	const isSubmittingRef = useRef(false)
+
 	const onSubmit = useCallback(async (_forceSubmit?: string) => {
 
+		if (isSubmittingRef.current) return
 		if (isDisabled && !_forceSubmit) return
 		if (isRunning) return
 
-		const threadId = chatThreadsService.state.currentThreadId
-
-		// send message to LLM
+		// Snapshot the user's text + clear the textarea SYNCHRONOUSLY
+		// before any await. The earlier ordering cleared after the await,
+		// which meant queued Enter keypresses (delivered while the prior
+		// stream was hogging the main thread) all read the same non-empty
+		// `textAreaRef.current?.value` and resubmitted it. Snapshot+clear
+		// before yielding makes any flushed-later keydowns see an empty
+		// textarea and bail via `isDisabled`.
 		const userMessage = _forceSubmit || textAreaRef.current?.value || ''
+		setSelections([]) // clear staging
+		textAreaFnsRef.current?.setValue('')
 
+		isSubmittingRef.current = true
+
+		const threadId = chatThreadsService.state.currentThreadId
 		try {
 			await chatThreadsService.addUserMessageAndStreamResponse({ userMessage, threadId })
 		} catch (e) {
 			console.error('Error while sending message in chat:', e)
+		} finally {
+			isSubmittingRef.current = false
 		}
 
-		setSelections([]) // clear staging
-		textAreaFnsRef.current?.setValue('')
 		textAreaRef.current?.focus() // focus input after submit
 
 	}, [chatThreadsService, isDisabled, isRunning, textAreaRef, textAreaFnsRef, setSelections, settingsState])

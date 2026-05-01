@@ -33,7 +33,7 @@ import { truncate } from '../../../../base/common/strings.js';
 import { PINNED_THREADS_STORAGE_KEY, THREAD_STORAGE_KEY } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IRequestTelemetryService } from './requestTelemetryService.js';
-import { timeout } from '../../../../base/common/async.js';
+import { RunOnceScheduler, timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
@@ -639,8 +639,47 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 
 	private _setStreamState(threadId: string, state: ThreadStreamState[string]) {
+		// Any non-throttled state transition (tool, idle, error, undefined, etc.)
+		// must supersede any pending throttled stream-text update for this thread,
+		// otherwise the delayed flush could overwrite the new authoritative state.
+		this._cancelPendingStreamTextUpdate(threadId)
 		this.streamState[threadId] = state
 		this._onDidChangeStreamState.fire({ threadId })
+	}
+
+	// Per-thread coalescer for streaming-text updates. LLM chunks can arrive
+	// at 30-60Hz; before this throttle, each chunk fired _onDidChangeStreamState
+	// which forced a full React re-render of the assistant bubble (full marked
+	// re-lex of the entire message + Monaco editor work for code blocks). That
+	// saturated the renderer's main thread, causing input lag (queued Enter
+	// keypresses) and visible UI freezes. We coalesce to ~20Hz here, which is
+	// indistinguishable from real-time visually but bounds per-chunk render cost.
+	private readonly _streamTextThrottle = new Map<string, { scheduler: RunOnceScheduler; pending: ThreadStreamState[string] | null }>()
+
+	private _scheduleStreamTextUpdate(threadId: string, state: ThreadStreamState[string]) {
+		let entry = this._streamTextThrottle.get(threadId)
+		if (!entry) {
+			const scheduler = new RunOnceScheduler(() => {
+				const e = this._streamTextThrottle.get(threadId)
+				if (!e || !e.pending) return
+				const pending = e.pending
+				e.pending = null
+				this.streamState[threadId] = pending
+				this._onDidChangeStreamState.fire({ threadId })
+			}, 50)
+			entry = { scheduler, pending: state }
+			this._streamTextThrottle.set(threadId, entry)
+		} else {
+			entry.pending = state
+		}
+		if (!entry.scheduler.isScheduled()) entry.scheduler.schedule()
+	}
+
+	private _cancelPendingStreamTextUpdate(threadId: string) {
+		const entry = this._streamTextThrottle.get(threadId)
+		if (!entry) return
+		entry.scheduler.cancel()
+		entry.pending = null
 	}
 
 	// updates per-thread latest usage and re-uses the streamState emitter so existing
@@ -1439,7 +1478,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					separateSystemMessage: separateSystemMessage,
 					onText: ({ fullText, fullReasoning, toolCalls, usage }) => {
 						if (usage) this._setLatestUsage(threadId, usage)
-						this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallsSoFar: toolCalls ?? [] }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
+						// Coalesced fire (see _scheduleStreamTextUpdate). Final/transition
+						// state changes go through _setStreamState which cancels any
+						// pending update, so we cannot drop a meaningful end-state.
+						this._scheduleStreamTextUpdate(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallsSoFar: toolCalls ?? [] }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
 					},
 					onFinalMessage: async ({ fullText, fullReasoning, toolCalls, anthropicReasoning, usage, finishReason }) => {
 						if (usage) this._setLatestUsage(threadId, usage)

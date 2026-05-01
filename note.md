@@ -740,8 +740,39 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - *Restart note*: full Void quit + relaunch required (new singleton + new constructor deps on two eager services).
 - *Next step after collecting a few sessions' worth of data*: eyeball `sysHash` stability and `cached` hit rate. If we see unexpected hash flips → hunt down the volatility source (probably something in `chat_systemMessage` / `chat_volatileContext` / rules injection that looks static but isn't). If `cached` is always 0 on providers that should populate it → audit the request path for header/whitespace drift. Either finding directly informs the next concrete token-reduction change.
 
+**E5 — Auto-outline `read_file` for large files** (next, ~1–2 days, highest-ROI single change)
+- *Driving observation*: comparison with Zed's agent (see "Reference — Zed agent comparison" below) showed they auto-substitute a tree-sitter symbol outline for `read_file` when the file body exceeds 16 KB. The tool description and result text both reinforce that the outline IS a successful response and the model should call `read_file` again with `start_line`/`end_line` from the outline to drill into a specific symbol. This attacks the "agent reads a whole 3,000-line file when it only needs one function" pathology directly via **behavior change** rather than via prompt rule. The biggest token-efficiency gap between Void and Zed comes from this single mechanism, not from prompt minimalism.
+- *Plan*: when `read_file` is called with no `start_line`/`end_line` AND the file body exceeds a tunable threshold, return a symbol outline (one line per top-level symbol with `[Lstart-end]` ranges + nested method/field rows) instead of the body. Wrap the response with explicit guidance: "SUCCESS: file outline retrieved. This file is too large to read in one call; use the line numbers below to read a specific symbol via `read_file` with `start_line`/`end_line`. **Do NOT retry without ranges — you will get the same outline.**" Mirror Zed's anti-loop framing word-for-word; eval evidence (Phase A4 + C6) is that anti-loop nudges in result text land where prompt-only bullets get drifted past.
+- *Implementation*:
+  - Reuse `ILanguageFeaturesService` already wired in `toolsService.ts` for E1 (`go_to_definition`/`go_to_usages`). Use `getDocumentSymbols` for the outline structure. No new service injection needed.
+  - Fallback when no symbol provider is registered for the file's language (markdown, plain text, lockfiles): return first ~1 KB of the file with a header noting "no outline available, file truncated to first N bytes — call again with `start_line`/`end_line` to read more." Matches Zed's `outline.rs:48-64` fallback shape.
+  - Add an optional `force_full: boolean` param (default false) so the agent has an escape hatch when it really does need the whole body — e.g. small generated config files that read as huge by char count but are essentially flat.
+  - Light telemetry hook: log `outlined: true/false` + `outlineLineCount` on each `read_file` invocation so post-ship analysis can answer "how often does the outline path fire, and does the agent successfully follow up with a ranged read in one turn?".
+- *Threshold tuning*: Zed uses 16,384 bytes (~4k tokens). For Void users on TypeScript-heavy codebases that's aggressive (every mid-sized service file would outline on first read; would inflate tool-call count if the agent then reads the body anyway). **Start at 30,000 bytes (~7.5k tokens)** and revisit based on E4 telemetry once we have data. The right threshold is the one where median next-action is a ranged read, not a `force_full` retry. If telemetry shows the model re-reads without ranges in agent mode > 30% of the time, threshold's too low — raise it.
+- *Adjacent prompt simplification (deferred to E6, NOT shipped with E5)*: with auto-outline doing the structural work, two A4 bullets ("don't re-read files you've already read this turn", "stop once you have enough context") become slightly less load-bearing. **Do NOT pre-emptively delete them in E5** — auto-outline handles structural over-reading, but those bullets also cover semantic over-iteration (running redundant verification, post-edit re-search). Measure first via E4 telemetry, prune in E6 only if data supports it.
+- *Risk and mitigation*:
+  - **Weak-model retry loops**: Gemma might ignore the outline and call `read_file` again without ranges. Mitigation: anti-loop wording in result text (Zed pattern); deterministic threshold so the response is predictable; `force_full` escape hatch is a single retry, not a 3-call dance.
+  - **Pagination interaction**: existing pagination at `MAX_FILE_CHARS_PAGE` (500_000 chars) is structurally orthogonal — outline runs first based on file size, pagination only kicks in if the model asks for ranges that exceed page bounds. Document this in the tool description; don't conflate the two truncation modes.
+  - **LSP-not-ready races**: monaco's symbol provider can be unready on first request after file open (E1 hit this). Use the same `getDocumentSymbols`-with-retry pattern E1 settled on; if symbols aren't available within a short timeout, fall back to the first-1KB path rather than blocking the tool call.
+- *Files*: `toolsService.ts` (extend `read_file` body to compute file size up-front, branch to outline path when over threshold and no range given; add `force_full` param wiring; new module-scope `_getFileOutline` helper), `prompts.ts` (`read_file` tool description rewrite to document the outline behavior + anti-loop guidance; add `force_full` param description), `SidebarChat.tsx` (renderer probably no change — outline returns as text; may want a visual hint that the result is structural rather than the body, low priority), optional small change to `toolsServiceTypes.ts` if `force_full` warrants schema explicitness.
+
+**E6 — Selective prompt audit vs. Zed reference** (held — evidence-driven, post-E5 telemetry)
+- *Premise*: after E5 ships and we have ~1 week of E4 telemetry showing the new `read_file` distribution, audit whether any `importantDetails` bullets have become redundant with the new behavior. The Zed reference comparison gives candidate trims; E4 telemetry tells us which trims are safe vs. which would re-open known model regressions.
+- *Three Zed-isms worth borrowing if telemetry supports it*:
+  - **Communication block** (terse: "be conversational, second-person user / first-person self, format markdown, NEVER lie, refrain from apologizing"). Compact replacement for some of the implicit tone guidance currently distributed across `importantDetails`. Zed gets ~5 lines from this where Void implicitly spends ~3 bullets.
+  - **"DO NOT use tools to access items already available in the context section."** Void doesn't have this explicitly. Pairs naturally with the staging-selection / `@`-mention surface — if the user already attached `foo.ts`, agent shouldn't `read_file` it again at turn 1. Small clear win.
+  - **Diagnostics rules**: "1–2 attempts at fixing diagnostics, then defer to the user. Never simplify code just to solve diagnostics." Pairs with `read_lint_errors`. Currently nothing in Void's prompt frames the iteration ceiling on lint-fix loops, and we've seen Nemotron + Gemma chase diagnostics into degenerate state on hard cases.
+- *Three Zed-isms NOT to borrow*:
+  - **Path-based code-block format** (`` ```path/to/file.ext#L123-456 ``). Renderer-coupled to Zed's chat UI; would break Void's existing `BlockCode` / `LazyBlockCode` rendering and the apply-button flow. Aggressive constraint with no clear payoff.
+  - **Worktree-root-name path framing** ("path should always start with name of root directory"). Zed's project model is multi-worktree by design; Void's is workspace-relative. Adopting this would force a path-translation layer for no gain.
+  - **`spawn_agent` sub-agent tool** (and the multi-agent delegation prompt section). Overkill for Void's current scope; the prompt section is non-trivial token weight; adds a whole new failure surface (sub-agent budget, isolated context, delegation scope policy).
+- *Hard guardrail*: do NOT strip Phase A1+A2 / A3+A4 / Phase C bullets without a re-run of the benchmark Tasks 0/1/3/5 on Gemma 4 / MiniMax / Nemotron. Each one was measured into existence; removing them blind is a regression risk. The Zed reference is for *additions and replacements*, not for greenfield rewriting.
+- *Out of scope*: deciding whether to merge `search_in_file` + `search_for_files` into a single `grep`-style tool (Zed's pattern). That's a tool-surface refactor with its own eval needs; track separately if the audit surfaces it as worthwhile.
+
 **Execution order & commit strategy**
 - E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E4 (per-request telemetry) ✅ done (own commit) — supersedes E3.
+- **Up next**: E5 (auto-outline `read_file`). One commit, ~1–2 days, plumbing is mostly E1's `ILanguageFeaturesService` injection; the substantive work is the outline rendering + tool description rewrite + threshold tuning.
+- **After E5**: 1-week dog-food window, then evaluate E4 telemetry data (resultLen distribution on `read_file`, follow-up-with-ranges hit rate, `force_full` invocation rate) before deciding whether E6 is worth doing.
 - After each phase, dog-food with a one-day daily-use window before committing the next. If a phase's real-world impact is smaller than projected (or reveals a different problem), the later phases can be resequenced / dropped.
 - Phase D deferred below — no observed pain to justify it.
 - Phase F (indexing) held pending Phase E daily-use data.
@@ -756,6 +787,49 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - Rough scope (to refine when this actually starts): local embeddings via Ollama's `/api/embeddings` endpoint (no external services, reuses existing Ollama infra); SQLite-backed vector store; file-watcher-driven incremental reindex with debounce; new `semantic_search` tool in `prompts.ts` alongside the lexical tools (hybrid, not replacement); `.gitignore` + `.voidignore` respect.
 - Estimated: ~1-2 weeks of focused work. Not a weekend project.
 - Decision trigger: after ~2 weeks of Phase-E-enabled daily use, if the symptom "agent fished for the right keyword via lexical search" still dominates the pain log → commit to Phase F. If Phase E subsumes it → keep deferred.
+
+### Reference — Zed agent comparison (read for inspiration, partial harvest planned via E5/E6)
+
+Audited Zed's `crates/agent` (added to workspace as `Projects/zed`) against ours in Apr 2026. The user's hypothesis going in was "Zed feels more token-efficient." Confirmed; here's where the gap actually lives.
+
+**Headline numbers**:
+| | Void | Zed |
+|---|---|---|
+| System prompt source | `prompts.ts` 1212 lines (`chat_systemMessage` ~155-line generator) | `crates/agent/src/templates/system_prompt.hbs` 233 lines |
+| Rendered system prompt (rough) | ~3–4k tokens incl. XML tool defs / ~1.5–2k stable + native tool schemas | ~700–1,200 tokens whole thing |
+| `read_file` on a 3,000-line TS file | Returns full body (paginates at 500k chars, basically never triggers) | Returns symbol outline auto-substituted at 16,384 byte threshold; tool description and result text both reinforce "use line numbers to read specific symbols, do NOT retry without ranges" |
+| Tool description style | Paragraph per tool + reinforced `importantDetails` C5 bullet + `terminalDescHelper` enumerating alternatives (Phase C three-surface pattern) | 5–15 lines per tool, no reinforcement section |
+| Sent on every turn (system + tool defs) | ~2.5–3× larger than Zed's | baseline |
+
+**Why Zed is more compact, by design choice (not laziness)**:
+- **Auto-outline-on-read replaces a prompt rule with deterministic behavior.** Their `outline.rs:10` constant (`AUTO_OUTLINE_SIZE: 16384`) does what our A4 bullet ("don't re-read files you've already read this turn") + Phase C5 ("don't shell out to `cat`") do *partially* — Zed gets it 100% by making the tool itself refuse to dump the whole body. Behavior > rules for token efficiency every time.
+- **Single `edit_file` with `mode: 'edit'|'create'|'overwrite'`** instead of three separate tools (Void: `edit_file` + `rewrite_file` + `create_file_or_folder`). One description tax instead of three.
+- **Single `grep` tool** covers what Void splits into `search_in_file` + `search_for_files` (project-wide regex with optional `include_pattern` glob). Same effective coverage, fewer descriptions.
+- **No LSP nav tools** (`go_to_definition`/`go_to_usages`); Zed relies on grep + auto-outline. They're betting strong models (Claude/GPT) figure it out from the outline; Void's E1 was earned because Gemma/Nemotron need explicit help.
+- **`update_plan` tool exists** (Phase D in Void's roadmap, deferred). Zed's planning prompt section is conditional on the tool being available, so it doesn't tax prompts where the user disabled it.
+
+**Why Zed-style minimalism would NOT just port wholesale**:
+- **Different model distribution.** Zed targets Claude/GPT primarily (their owned cloud). Void supports Gemma 4 / Nemotron / MiniMax / DeepSeek alongside the frontier models. Phase A1+A2 / A3+A4 / Phase C eval data shows Gemma-class models fall back to `grep -r` for symbol search and run redundant verification commands without the C5 + A4 bullets. Trimming to Zed's line count would re-open the regressions those phases closed. Zed presumably has the same regressions on weaker models; we just don't have data on Zed running them, and they may not care.
+- **Earned bullets, not arbitrary bullets.** Every line in `chat_systemMessage`'s `importantDetails` traces to a measured eval. The list looks bloaty until you read each entry's `note.md` rationale. Stripping based on aesthetic is a regression-machine.
+- **Phase B caching layout** (`[stable sys][history][volatile + user]`) is a Void-only optimization Zed doesn't do. Trimming `chat_systemMessage` indiscriminately could break the prefix-cache contract — anything volatile that sneaks back into the system message busts cache for the whole thread.
+- **Mode-specific guidance** (agent / gather / normal) is a Void-only structural choice. Zed has one mode. Folding modes together is a separate decision with its own eval needs; not a Zed-comparison consequence.
+
+**What's actionable to borrow** (with concrete plan):
+- **Auto-outline `read_file`** — see E5 above. Highest-ROI single change. ~1–2 days. Builds on E1's `ILanguageFeaturesService` plumbing.
+- **Communication block compactness** — extract general tone rules into a brief leading section; modest token savings; held for E6.
+- **"Don't refetch context already in conversation" rule** — explicit in Zed, implicit in Void via A4. Worth lifting verbatim in E6.
+- **Diagnostics 2-attempts-then-defer rule** — pairs with `read_lint_errors`; addresses an under-covered failure mode (lint-fix loops on hard cases). E6 candidate.
+
+**What NOT to borrow**:
+- **Path-based code-block format** (`` ```path/to/file.ext#L123-456 ``). Renderer-coupled to Zed's chat UI. Would break Void's existing apply-button + `LazyBlockCode` flow. Aggressive constraint with no clear payoff.
+- **Worktree-root-name path framing**. Zed's project model is multi-worktree; Void's is workspace-relative. Adopting this would force a path-translation layer for zero gain.
+- **`spawn_agent` sub-agent tool**. Overkill for current scope; non-trivial prompt weight; adds a delegation/budget/scope policy surface we don't need yet.
+- **Outright prompt minimalism**. Earned bullets lose model coverage on weaker models. The Zed reference is for additions and replacements, not greenfield rewriting.
+
+**Open evaluation questions (post-E5)**:
+- After E5 ships, does median `read_file` `resultLen` drop on E4 telemetry? Target: 30%+ reduction on files > threshold. If less, threshold's wrong or the agent isn't following up with ranged reads.
+- Does the agent successfully follow an outline result with a ranged read in **the next turn** (no wasted retries, no `force_full` invocations)? Watch for model × model variance: MiniMax/Claude likely yes, Gemma/Nemotron may need stronger anti-loop wording in the result text.
+- Does outline-mode adoption let us safely trim any A4 bullets in E6, or do they continue to land on semantic over-iteration (running redundant verification, post-edit re-search) that auto-outline doesn't address?
 
 ### Reference — side experiment in `/Users/david.halim/Documents/Projects/test/void` (not committed, not decided)
 
