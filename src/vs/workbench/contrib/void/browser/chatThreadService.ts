@@ -590,6 +590,51 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// surfaced during commit-2 testing.
 		this._normalizeCurrentThreadInScope()
 
+		// Phase E — multi-window state sync for the small per-workspace
+		// dicts (pins + last-active). Without these listeners, opening
+		// a thread or pinning/unpinning in window A wouldn't reach
+		// window B until B reloads — particularly visible after
+		// `moveThreadToCurrentWorkspace` re-tags a thread away from
+		// another open window, leaving a ghost tab there until reload.
+		//
+		// Deliberately not listening on `THREAD_STORAGE_KEY` (the
+		// threads blob): each window's blob write contains its own
+		// snapshot of the full map, so applying an external blob would
+		// overwrite any in-flight stream / mid-edit state in this
+		// window with a stale version of those threads. Per-thread
+		// storage would fix that, but is a much larger refactor.
+		// In practice the threads blob desyncs only matter for
+		// "see threads created in another window without reload",
+		// which users notice less than the pin/tab issue.
+		//
+		// `e.external` filter is essential — every local store call
+		// also fires the same event; without the filter we'd loop
+		// (re-read → _setState → React re-render → no real-world cost
+		// but a lot of needless work).
+		this._register(this._storageService.onDidChangeValue(StorageScope.APPLICATION, PINNED_THREADS_STORAGE_KEY, this._store)(e => {
+			if (!e.external) return
+			const fresh = this._readPinnedThreadIdsByWorkspace(this.state.allThreads)
+			for (const k of Object.keys(this._pinnedThreadIdsByWorkspace)) delete this._pinnedThreadIdsByWorkspace[k]
+			Object.assign(this._pinnedThreadIdsByWorkspace, fresh)
+			const newPins = this._pinnedThreadIdsByWorkspace[this._currentPinKey()] ?? []
+			const oldPins = this.state.pinnedThreadIds
+			const samePins = newPins.length === oldPins.length && newPins.every((id, i) => id === oldPins[i])
+			if (!samePins) this._setState({ pinnedThreadIds: newPins })
+		}))
+		this._register(this._storageService.onDidChangeValue(StorageScope.APPLICATION, LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, this._store)(e => {
+			if (!e.external) return
+			const fresh = this._readLastActiveThreadIdByWorkspace()
+			for (const k of Object.keys(this._lastActiveThreadIdByWorkspace)) delete this._lastActiveThreadIdByWorkspace[k]
+			Object.assign(this._lastActiveThreadIdByWorkspace, fresh)
+			// Intentionally not auto-switching the current thread when this
+			// changes externally. That would yank the user's focus to a
+			// different thread because another window happened to switch —
+			// jarring at best, lost-work at worst if the user was mid-typing.
+			// The map is consulted by `_normalizeCurrentThreadInScope` on
+			// reload / workspace changes, so fresh values land naturally
+			// without disrupting the in-progress session.
+		}))
+
 		// Capture live dropdown changes onto whichever thread is currently in
 		// focus, so switching tabs round-trips the chosen model even when no
 		// message was sent. Without this listener, the field is only written
