@@ -269,6 +269,26 @@ export const isThreadInWorkspaceScope = (thread: Pick<ThreadType, 'workspaceUri'
 	return thread.workspaceUri === currentWorkspaceUri
 }
 
+// Phase E — true if the thread is foreign to this window's workspace and
+// therefore must not be mutated from this window. Strict counterpart to
+// `isThreadInWorkspaceScope`: only fires for threads explicitly tagged to
+// a *different* workspace; unscoped threads are NOT read-only (they're
+// shared until Moved). Read-only doesn't apply when the current window
+// has no workspace (empty window) — there's no "foreign" reference frame
+// to compare against.
+//
+// Used as the single gating predicate for every mutation entry point on
+// `IChatThreadService` (send / edit / approve / reject / checkpoint
+// restore / staging selections). Service-level rather than UI-level so
+// the read-only invariant holds even if a future UI bug exposes a
+// disabled button as still-clickable.
+export const isThreadReadOnly = (thread: Pick<ThreadType, 'workspaceUri'> | undefined, currentWorkspaceUri: string | undefined): boolean => {
+	if (!thread) return false
+	if (!currentWorkspaceUri) return false // empty window: nothing is "foreign"
+	if (!thread.workspaceUri) return false // unscoped: shared, not foreign
+	return thread.workspaceUri !== currentWorkspaceUri
+}
+
 
 export type IsRunningType =
 	| 'LLM' // the LLM is currently streaming
@@ -1175,6 +1195,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	approveLatestToolRequest(threadId: string) {
+		if (this._isThreadMutationBlocked(threadId, 'approveLatestToolRequest')) return
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
@@ -1206,6 +1227,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	 * `abortRunning` explicitly passes false.
 	 */
 	rejectLatestToolRequest(threadId: string, resumeAgent: boolean = true) {
+		// Phase E — block user-initiated rejects on read-only foreign threads.
+		// Skip the gate when called as part of `abortRunning` cleanup
+		// (`resumeAgent === false`): an abort is allowed to terminate any
+		// stale stream that shouldn't have been started, and the alternative
+		// (leaving the run-loop alive on a thread we now refuse to mutate)
+		// is worse than letting cleanup finish.
+		if (resumeAgent && this._isThreadMutationBlocked(threadId, 'rejectLatestToolRequest')) return
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
@@ -2072,6 +2100,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	jumpToCheckpointBeforeMessageIdx({ threadId, messageIdx, jumpToUserModified }: { threadId: string, messageIdx: number, jumpToUserModified: boolean }) {
+		// Phase E — block. Checkpoint restore writes to disk (file snapshots
+		// → real workspace files), so a foreign-thread restore would clobber
+		// THIS workspace's files with snapshots taken in a different one.
+		// Definitely the most destructive entry point in the read-only set.
+		if (this._isThreadMutationBlocked(threadId, 'jumpToCheckpointBeforeMessageIdx')) return
 
 		// if null, add a new temp checkpoint so user can jump forward again
 		this._makeUsStandOnCheckpoint({ threadId })
@@ -2315,6 +2348,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 
 	async addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
+		if (this._isThreadMutationBlocked(threadId, 'addUserMessageAndStreamResponse')) return
 		const thread = this.state.allThreads[threadId];
 		if (!thread) return
 
@@ -2342,6 +2376,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 	editUserMessageAndStreamResponse: IChatThreadService['editUserMessageAndStreamResponse'] = async ({ userMessage, messageIdx, threadId }) => {
+		if (this._isThreadMutationBlocked(threadId, 'editUserMessageAndStreamResponse')) return
 
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
@@ -2782,6 +2817,31 @@ We only need to do it for files that were edited since `from`, ie files between 
 		return {}
 	}
 
+	// Phase E — gate every thread-mutating service entry point. Foreign
+	// threads (tagged to another workspace) are read-only from this
+	// window: send, edit, approve/reject, checkpoint-restore, and
+	// staging-selection writes all short-circuit when this returns true.
+	// Centralised here (instead of each method copy-pasting the predicate)
+	// so the rule stays consistent and a future change to the read-only
+	// definition only needs editing in one place.
+	//
+	// Logs a console warning when a guard fires. Not a notification —
+	// this should never happen via normal UI (commit 4's Copy/Move banner
+	// gates user actions before they reach the service). A warning here
+	// flags either a UI bug (clickable button that should have been
+	// disabled) or a programmatic caller that bypassed the UI; both worth
+	// surfacing during development.
+	private _isThreadMutationBlocked(threadId: string, op: string): boolean {
+		const thread = this.state.allThreads[threadId]
+		if (!isThreadReadOnly(thread, this.state.currentWorkspaceUri)) return false
+		console.warn(`[void/chat] blocked '${op}' on read-only foreign thread`, {
+			threadId,
+			threadWorkspace: thread?.workspaceUri,
+			currentWorkspace: this.state.currentWorkspaceUri,
+		})
+		return true
+	}
+
 	// Phase E — "claim on engagement". An unscoped thread (workspaceUri ===
 	// undefined) is otherwise visible in every workspace's list, which is
 	// confusing in practice: when the user actually engages with such a
@@ -3065,6 +3125,10 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 
 	addNewStagingSelection(newSelection: StagingSelectionItem): void {
+		// Phase E — staging selections feed into the next user-message send.
+		// Block on read-only foreign threads so the user can't queue file
+		// context that would only be discarded by the addUserMessage gate.
+		if (this._isThreadMutationBlocked(this.state.currentThreadId, 'addNewStagingSelection')) return
 
 		const focusedMessageIdx = this.getCurrentFocusedMessageIdx()
 
@@ -3098,6 +3162,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 	// Pops the staging selections from the current thread's state
 	popStagingSelections(numPops: number): void {
+		if (this._isThreadMutationBlocked(this.state.currentThreadId, 'popStagingSelections')) return
 
 		numPops = numPops ?? 1;
 

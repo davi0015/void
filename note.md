@@ -741,6 +741,37 @@ Storage migration (one-shot, runs at construction): if `chatPinnedThreadsI` valu
 
 What this changes for `switchToThread` semantics: opening a foreign or unscoped thread from history auto-pins to *current workspace's bucket only*. The other workspace's tab strip is unaffected. This is the entire fix for the "unscoped chat in both workspace tabs" symptom.
 
+**Commit 3 implementation notes (read-only mode infrastructure):**
+
+Goal: enforce "foreign threads cannot mutate" at the *service* layer, so commit 4's UI banner + Copy/Move flow can be built on top without worrying about a UI bug ever corrupting cross-workspace data. Commit 3 is unobservable in isolation (commit 2 already filtered foreign threads out of the default view; nothing in commit 3 makes them reachable yet).
+
+Why service-level instead of UI-only: a disabled button is one bug-fix away from being clickable, and every clickable mutation entry then has to be audited again. A guard at the service entry holds regardless of what the UI does, including programmatic callers (toolbar shortcuts, future extension API surfaces, etc.). UI-level disabling lands later in commit 4 alongside the banner — the visuals are wasted noise without the foreign-thread surface to apply them to.
+
+Predicate (`isThreadReadOnly`, exported next to `isThreadInWorkspaceScope`):
+- Returns true only when the thread is explicitly tagged to a *different* workspace.
+- Unscoped threads (`workspaceUri === undefined`) are NOT read-only — they're shared until claim-on-engagement or Move. This is the deliberate negation pair to `isThreadInWorkspaceScope`'s "unscoped is in scope".
+- Empty windows (`currentWorkspaceUri === undefined`) have no "foreign" reference frame — nothing is read-only. Otherwise opening Void without a workspace would lock every existing thread against editing.
+
+Centralising helper on the service: `_isThreadMutationBlocked(threadId, op)`. Returns true + logs a `console.warn` with the op name and the workspace pair when it fires. Each gated entry calls it as a one-liner. Two reasons to centralise vs. inlining:
+1. Future change to "read-only" definition (e.g. allowing edits in shared workspaces) only edits one place.
+2. The console warning is the only diagnostic we have for "UI bug let a click through" once commit 4 ships — wanted it on every entry uniformly.
+
+Gated entry points (all in `chatThreadService.ts`):
+- `addUserMessageAndStreamResponse` — primary send path. Block early before checkpoint-truncation.
+- `editUserMessageAndStreamResponse` — edit-and-resend. Same severity as send.
+- `approveLatestToolRequest` — resumes the agent loop, which appends messages to the thread.
+- `rejectLatestToolRequest` — gated only when `resumeAgent === true` (user-initiated UI button). Allowed when `resumeAgent === false` (called from `abortRunning` cleanup) — `abortRunning` itself is allowed because terminating a stream that shouldn't have started is preferable to leaving it running on a thread we now refuse to mutate.
+- `jumpToCheckpointBeforeMessageIdx` — most destructive entry in the set: writes file snapshots back to *real* disk paths in the current workspace. A foreign-thread restore would clobber THIS workspace's files with snapshots taken in a different one. Must be gated.
+- `addNewStagingSelection` / `popStagingSelections` — staging selections feed into the next user-message send. Gating them isn't strictly safety-critical (the send is gated downstream) but prevents weird "I @-referenced a file in the wrong workspace's foreign thread, then Moved it, and the staging now points at a path that doesn't exist" edge case.
+
+Not gated (with rationale):
+- `deleteThread` — list management, doesn't mutate thread *content*. Allows the user to delete trash from any workspace's history without first switching to it.
+- `duplicateThread` — creates a new thread; source isn't mutated. The duplicate inherits the source's `workspaceUri`, so it stays foreign — but Copy/Move (commit 4) is the proper claim-on-duplicate path; this is just preserving existing duplicate semantics.
+- `abortRunning` — defensive cleanup. Should never fire on a foreign thread (no stream started → nothing to abort), but if it somehow does, we want the cleanup to complete.
+- `setCurrentlyFocusedMessageIdx`, `setCurrentThreadState` (raw), `setCurrentMessageState` (raw) — UI-state mutations (focus, scroll, mountedInfo). Harmless on read-only; the truly destructive paths that flow through these (sends, etc.) are gated separately above them.
+
+Testing plan: unobservable in isolation as designed. Verification deferred to commit 4 — once foreign threads have a path to be visible/clickable, exercise each gated action and confirm (a) no thread mutation, (b) the `console.warn` fires once per attempt.
+
 ### Capability audit vs. Cursor (post-Phase-C, pre-daily-use)
 
 Asked "what brings Void to the next level?" → audited the codebase to separate "actually missing" from "assumed missing". Outcome:
