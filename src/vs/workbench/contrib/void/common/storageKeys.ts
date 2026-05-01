@@ -25,5 +25,14 @@ export const THREAD_STORAGE_KEY = 'void.chatThreadStorageII'
 export const PINNED_THREADS_STORAGE_KEY = 'void.chatPinnedThreadsI'
 
 
+// Phase E (workspace-scoped chats) — `Record<workspaceUri, threadId>` map of
+// the last thread the user was looking at within each workspace. Lets us
+// restore "where you left off" per-workspace on window open / workspace
+// switch instead of always landing on the most-recently-touched thread of
+// any workspace. APPLICATION-scoped (cross-workspace state) and intentionally
+// kept in its own storage slot so growing/pruning the map never touches the
+// (much larger) thread blob.
+export const LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY = 'void.chatLastActiveThreadByWorkspaceI'
+
 
 export const OPT_OUT_KEY = 'void.app.optOutAll'

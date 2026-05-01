@@ -120,18 +120,21 @@ Each chunk has:
 
 ## 5. Multi-turn rules — THE critical constraint
 
-**Empirical rule (verified Apr 2026 against live API):** every prior assistant message produced under thinking mode must replay its `reasoning_content` in subsequent requests. No exceptions. Drop it and the API returns:
+**Empirical rule (verified Apr–May 2026 against live API):** every prior assistant message produced under thinking mode must replay its `reasoning_content` field in subsequent requests, **including when the model emitted an empty reasoning blob for that turn**. No exceptions. Drop it and the API returns:
 
 > `400 — The reasoning_content in the thinking mode must be passed back to the API.`
 
-This contradicts the published docs, which claim only tool-call turns require replay. **Trust the live error, not the docs.** The doc-claimed "Case A vs Case B" split was implemented as an optimisation in Void early on and triggered the 400 above on a plain multi-turn Q&A thread (no tool calls anywhere). The optimisation has been removed; we now follow the doc-recommended simple pattern of appending `response.choices[0].message` verbatim.
+This contradicts the published docs, which claim only tool-call turns require replay AND that turns without stored reasoning can omit the field. **Trust the live error, not the docs.** Two separate bugs in Void were caused by reading the docs literally:
+
+1. The doc-claimed "Case A vs Case B" split was implemented as an optimisation early on and triggered the 400 on a plain multi-turn Q&A thread (no tool calls anywhere). Removed; we now emit the field on every applicable assistant turn.
+2. The "if the model didn't produce reasoning, omit the field" reading caused intermittent 400s on the **first user message after a tool round-trip** — in particular the short "Done." style follow-up reply that the model often returns post-tool with a captured-but-empty reasoning blob (`reasoning_content` arrives as a string field on the response with no `delta.reasoning_content` chunks during streaming, so the aggregator ends up with `""`). Symptom: works for the tool round itself, fails on the next turn after the user types again or after a checkpoint resume. Fixed May 2026 by changing the emission gate from a truthy check (`reasoningContent`) to a strict-undefined check (`reasoningContent !== undefined`), so an empty string round-trips as `reasoning_content: ""` instead of being silently dropped. See §6.5.
 
 The constraint applies in both contexts:
 
 1. **Within an active agent loop** — every sub-turn of "model proposes tool → app executes → app returns tool result → model continues" must include all prior assistants' `reasoning_content`.
-2. **Across new user messages** — same requirement after the loop ends and the user types again. Reasoning blobs **stay in the history forever** for the lifetime of the thread.
+2. **Across new user messages** — same requirement after the loop ends and the user types again. Reasoning blobs (including empty strings on no-reasoning turns) **stay in the history forever** for the lifetime of the thread.
 
-If a non-thinking-mode reply ever appears in a thread (e.g. user toggled thinking off mid-thread), that turn won't have stored `reasoningContent`, and that's fine — only assistants with stored reasoning need to replay it. The capture-side gating ensures we never invent empty `reasoning_content` strings.
+If a non-thinking-mode reply ever appears in a thread (e.g. user toggled thinking off mid-thread), that turn won't have a captured `reasoningContent` field at all (`undefined` at runtime, distinct from the empty-string case), and that's fine — those skip emission. Today's gate is provider-only (`providerName === 'deepseek'`) rather than per-request thinking-mode, so we *do* emit `reasoning_content: ""` on prior thinking-mode turns even when the *current* request is non-thinking. Live API has tolerated this so far; if it ever rejects, refine the gate to also depend on whether the current request has thinking enabled.
 
 ### Cost implication
 
@@ -171,11 +174,16 @@ All five integration items are landed. Summary of where each lives so future edi
 
 End-to-end:
 
-1. `ChatMessage.reasoning` (already persisted by the chat thread) gets forwarded into `SimpleLLMMessage.reasoningContent` in `_chatMessagesToSimpleMessages` (`browser/convertToLLMMessageService.ts`).
+1. `ChatMessage.reasoning` (already persisted by the chat thread, typed `string` — `""` when nothing was streamed, distinct from `undefined`/missing on legacy history) gets forwarded into `SimpleLLMMessage.reasoningContent` in `_chatMessagesToSimpleMessages` (`browser/convertToLLMMessageService.ts`). The forward is now **verbatim** (`reasoningContent: m.reasoning`) — empty strings preserved, not collapsed to `undefined`. This is load-bearing; see the bug description in §5.
 2. `OpenAILLMChatMessage` (`common/sendLLMMessageTypes.ts`) gained an optional `reasoning_content` field on the assistant variant.
-3. `prepareMessages_openai_tools` takes a `supportsOAICompatReasoningContent` flag (true only for `providerName === 'deepseek'`) and emits `reasoning_content` on **every** assistant turn that has stored reasoning, regardless of tool calls.
+3. `prepareMessages_openai_tools` takes a `supportsOAICompatReasoningContent` flag (true only for `providerName === 'deepseek'`) and emits `reasoning_content` on **every** assistant turn whose `reasoningContent !== undefined` — i.e. every turn captured under thinking mode, regardless of tool calls and regardless of whether the model produced any reasoning text. Empty strings round-trip as `reasoning_content: ""`. Only `undefined` (legacy pre-feature history, or assistant turns produced under non-thinking mode) skips emission.
 
-We previously had a lookahead optimisation that dropped reasoning on non-tool turns ("Case A" per the docs). The live API rejected that with 400 on plain Q&A threads, so the optimisation was removed — see §5. The current implementation matches DeepSeek's recommended pattern (append `response.choices[0].message` verbatim).
+Two bugs were found and fixed in this layer (both detailed in §5):
+
+- **Doc-claimed "Case A vs Case B" split** (only tool-call turns require replay) — the live API rejected this on plain Q&A threads with 400. Optimisation removed; we now follow DeepSeek's recommended pattern (append `response.choices[0].message` verbatim, which carries `reasoning_content` regardless of whether tools were called).
+- **Truthy-check on `reasoningContent`** — the original gate was `if (currMsg.reasoningContent)` which silently dropped empty-string captures. Symptom: the very first request after a tool round-trip + checkpoint failed with 400 because the post-tool "Done."-style follow-up reply (captured with `reasoning: ""`) was missing the field. Gate changed to `!== undefined`.
+
+The `_chatMessagesToSimpleMessages` truthy collapse (`m.reasoning ? m.reasoning : undefined`) was the upstream half of the same bug — it forwarded `""` as `undefined`, so even a corrected emission gate would have seen no field. Both fixed together: forward is verbatim, gate is strict-undefined.
 
 ### 6.6 Compaction interaction (latent risks documented)
 
