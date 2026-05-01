@@ -354,14 +354,21 @@ const prepareMessages_openai_tools = (
 				role: 'assistant',
 				content: currMsg.content,
 			}
-			if (supportsOAICompatReasoningContent && currMsg.reasoningContent) {
+			if (supportsOAICompatReasoningContent && currMsg.reasoningContent !== undefined) {
 				// DeepSeek V4 thinking mode: replay reasoning_content on EVERY
-				// prior assistant turn that produced one, regardless of whether
-				// it had tool_calls. The published docs claim a "Case A vs Case B"
-				// split (only tool-call turns require it), but the live API
-				// returns 400 "The reasoning_content in the thinking mode must
-				// be passed back to the API" for non-tool turns too — observed
-				// after a couple of plain Q&A turns under thinking mode.
+				// prior assistant turn captured under thinking mode, regardless
+				// of whether it had tool_calls AND regardless of whether the
+				// model actually produced any reasoning text. The published docs
+				// claim a "Case A vs Case B" split (only tool-call turns require
+				// it), but the live API returns 400 "The reasoning_content in
+				// the thinking mode must be passed back to the API" if the field
+				// is missing on ANY prior thinking-mode turn — including the
+				// short "Done."-style follow-ups that come back from the model
+				// with an empty reasoning blob after a tool round-trip.
+				// Hence the `!== undefined` gate (vs truthy): an explicit empty
+				// string means "captured, model said nothing" and must round-trip
+				// as `reasoning_content: ""`. Only `undefined` (= field never
+				// captured, e.g. legacy history or non-thinking turn) skips emit.
 				// The recommended pattern from the docs is to append
 				// `response.choices[0].message` verbatim, which carries content +
 				// reasoning_content + tool_calls together. We do exactly that.
@@ -1226,12 +1233,16 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 					role: m.role,
 					content: m.displayContent,
 					anthropicReasoning: m.anthropicReasoning,
-					// Pass the persisted `reasoning` text through to the conversion layer.
-					// `prepareMessages_openai_tools` decides per-provider whether to actually
-					// emit it on the wire (today: only DeepSeek). Non-empty check keeps
-					// older history (no reasoning captured) clean — `undefined` is the
-					// "didn't capture" signal, empty string would still serialize.
-					reasoningContent: m.reasoning ? m.reasoning : undefined,
+					// Pass the persisted `reasoning` text through verbatim, including
+					// `""`. The downstream `prepareMessages_openai_tools` gate distinguishes
+					// `undefined` (no reasoning field captured — old history from before
+					// this feature, or non-thinking-mode turns) from `""` (captured under
+					// thinking mode but the model emitted no reasoning text — common on
+					// short follow-up replies after a tool round-trip). DeepSeek V4
+					// thinking mode requires `reasoning_content` to be present on EVERY
+					// prior thinking-mode assistant message, even if empty, so we must
+					// preserve the empty-string signal here.
+					reasoningContent: m.reasoning,
 				})
 			}
 			else if (m.role === 'tool') {
