@@ -22,7 +22,7 @@ import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
-import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw } from 'lucide-react';
+import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, EditToolAcceptRejectButtonsHTML, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, StatusIndicatorForApplyButton, useApplyStreamState, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
@@ -918,13 +918,17 @@ export const SelectedFiles = (
 				const thisKey = selection.type === 'CodeSelection' ? selection.type + selection.language + selection.range + selection.state.wasAddedAsCurrentFile + selection.uri.fsPath
 					: selection.type === 'File' ? selection.type + selection.language + selection.state.wasAddedAsCurrentFile + selection.uri.fsPath
 						: selection.type === 'Folder' ? selection.type + selection.language + selection.state + selection.uri.fsPath
-							: i
+							// Terminal snapshots key off their unique synthetic URI so two
+							// captures of the same command never collapse into one chip.
+							: selection.type === 'Terminal' ? selection.type + selection.uri.path
+								: i
 
 				const SelectionIcon = (
 					selection.type === 'File' ? File
 						: selection.type === 'Folder' ? Folder
 							: selection.type === 'CodeSelection' ? Text
-								: (undefined as never)
+								: selection.type === 'Terminal' ? TerminalSquare
+									: (undefined as never)
 				)
 
 				return <div // container for summarybox and code
@@ -934,7 +938,29 @@ export const SelectedFiles = (
 					{/* tooltip for file path */}
 					<span className="truncate overflow-hidden text-ellipsis"
 						data-tooltip-id='void-tooltip'
-						data-tooltip-content={getRelative(selection.uri, accessor)}
+						data-tooltip-content={
+							// Terminal chips: hover shows command + cwd + a few preview
+							// lines so the user can recall what's inside without
+							// expanding. Cap the preview so a 10K-line capture doesn't
+							// render an oversized tooltip portal (same trick as the
+							// thread-tab tooltip cap).
+							selection.type === 'Terminal'
+								? (() => {
+									const TERMINAL_TOOLTIP_PREVIEW_LINES = 12
+									const TERMINAL_TOOLTIP_MAX_CHARS = 600
+									const headerLines: string[] = []
+									if (selection.command) headerLines.push(`$ ${selection.command}`)
+									if (selection.cwd) headerLines.push(`cwd: ${selection.cwd}`)
+									if (typeof selection.exitCode === 'number') headerLines.push(`exit ${selection.exitCode}`)
+									const previewLines = selection.text.split('\n').slice(0, TERMINAL_TOOLTIP_PREVIEW_LINES)
+									const preview = previewLines.join('\n')
+									const body = preview.length > TERMINAL_TOOLTIP_MAX_CHARS
+										? preview.slice(0, TERMINAL_TOOLTIP_MAX_CHARS) + '\n…'
+										: preview
+									return [...headerLines, body].filter(Boolean).join('\n')
+								})()
+								: getRelative(selection.uri, accessor)
+						}
 						data-tooltip-place='top'
 						data-tooltip-delay-show={3000}
 					>
@@ -980,13 +1006,23 @@ export const SelectedFiles = (
 								else if (selection.type === 'Folder') {
 									// TODO!!! reveal in tree
 								}
+								else if (selection.type === 'Terminal') {
+									// No-op for now. Terminal output is a snapshot — we
+									// don't try to scroll the source terminal back to the
+									// captured position because (a) the terminal may have
+									// been closed, (b) the buffer may have scrolled past,
+									// (c) xterm has no public "select range" API. The
+									// tooltip carries enough preview context.
+								}
 							}}
 						>
 							{<SelectionIcon size={10} />}
 
-							{ // file name and range
-								getBasename(selection.uri.fsPath)
-								+ (selection.type === 'CodeSelection' ? ` (${selection.range[0]}-${selection.range[1]})` : '')
+							{ // file name and range, or terminal label
+								selection.type === 'Terminal'
+									? selection.label
+									: getBasename(selection.uri.fsPath)
+										+ (selection.type === 'CodeSelection' ? ` (${selection.range[0]}-${selection.range[1]})` : '')
 							}
 
 							{selection.type === 'File' && selection.state.wasAddedAsCurrentFile && messageIdx === undefined && currentURI?.fsPath === selection.uri.fsPath ?
