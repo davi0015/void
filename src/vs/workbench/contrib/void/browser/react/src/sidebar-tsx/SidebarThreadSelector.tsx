@@ -3,12 +3,13 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { startTransition, useEffect, useMemo, useRef, useState } from 'react';
+import { startTransition, useEffect, useMemo, useRef, useState, KeyboardEvent } from 'react';
 import { CopyButton, IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
 import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useFullChatThreadsStreamState, useSettingsState } from '../util/services.js';
 import { IconX } from './SidebarChat.js';
 import { Check, ChevronDown, ChevronRight, Copy, Globe, Icon, LoaderCircle, Lock, MessageCircleQuestion, Plus, Trash2, UserCheck, X } from 'lucide-react';
 import { isThreadReadOnly, IsRunningType, ThreadType } from '../../../chatThreadService.js';
+import { Separator } from '../../../../../../../base/common/actions.js';
 
 
 const numInitialThreads = 3
@@ -359,14 +360,21 @@ const PastThreadElement = ({ pastThread, idx, hoveredIdx, setHoveredIdx, isRunni
 	// 	toolTipName={`Copy As Void Chat`}
 	// />
 
+	// Same label cascade as the tab strip: user-set custom title beats the
+	// auto-derived first-user-message text. Keeps the two surfaces in sync
+	// when the user renames a tab — the history entry follows.
 	let firstMsg = null;
-	const firstUserMsgIdx = pastThread.messages.findIndex((msg) => msg.role === 'user');
-
-	if (firstUserMsgIdx !== -1) {
-		const firsUsertMsgObj = pastThread.messages[firstUserMsgIdx];
-		firstMsg = firsUsertMsgObj.role === 'user' && firsUsertMsgObj.displayContent || '';
+	const customTitle = pastThread.customTitle?.trim();
+	if (customTitle) {
+		firstMsg = customTitle;
 	} else {
-		firstMsg = '""';
+		const firstUserMsgIdx = pastThread.messages.findIndex((msg) => msg.role === 'user');
+		if (firstUserMsgIdx !== -1) {
+			const firsUsertMsgObj = pastThread.messages[firstUserMsgIdx];
+			firstMsg = firsUsertMsgObj.role === 'user' && firsUsertMsgObj.displayContent || '';
+		} else {
+			firstMsg = '""';
+		}
 	}
 
 	const numMessages = pastThread.messages.filter((msg) => msg.role === 'assistant' || msg.role === 'user').length;
@@ -446,6 +454,7 @@ const PastThreadElement = ({ pastThread, idx, hoveredIdx, setHoveredIdx, isRunni
 export const SidebarThreadTabs = () => {
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
+	const contextMenuService = accessor.get('IContextMenuService')
 
 	const threadsState = useChatThreadsState()
 	const streamState = useFullChatThreadsStreamState()
@@ -473,6 +482,29 @@ export const SidebarThreadTabs = () => {
 		activeTabRef.current?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' })
 	}, [currentThreadId])
 
+	// Inline tab rename state. Only one tab can be edited at a time so a
+	// single (id, value) pair on the parent suffices — avoids per-tab
+	// useState that would re-mount on every state update. Editing is
+	// entered via double-click or the right-click context menu's "Rename".
+	const [editingThreadId, setEditingThreadId] = useState<string | null>(null)
+	const [editValue, setEditValue] = useState<string>('')
+	const startRename = (id: string, seedLabel: string) => {
+		setEditValue(seedLabel)
+		setEditingThreadId(id)
+	}
+	const commitRename = () => {
+		if (editingThreadId == null) return
+		// Pass through `setThreadCustomTitle`'s normalization — empty /
+		// whitespace clears the override (resets to first-message label).
+		chatThreadsService.setThreadCustomTitle(editingThreadId, editValue)
+		setEditingThreadId(null)
+		setEditValue('')
+	}
+	const cancelRename = () => {
+		setEditingThreadId(null)
+		setEditValue('')
+	}
+
 	// Nothing meaningful to render if there are no pinned threads. The `+`
 	// button below still shows so the user can always start a new chat, even
 	// if they unpinned everything (edge case; unpinThread auto-opens a new
@@ -480,152 +512,254 @@ export const SidebarThreadTabs = () => {
 	const showNothing = tabs.length === 0
 
 	return (
-		<div
-			className='flex items-center gap-0.5 px-1 py-1 border-b border-void-border-2 overflow-x-auto overflow-y-hidden flex-shrink-0'
-			// Translate vertical wheel events to horizontal scroll so the strip
-			// is usable with a regular mouse wheel (touchpads already scroll
-			// horizontally natively).
-			onWheel={(e) => {
-				if (e.deltaY !== 0 && e.deltaX === 0) {
-					e.currentTarget.scrollLeft += e.deltaY
-				}
-			}}
-		>
-			{showNothing ? null : tabs.map(id => {
-				const t = allThreads[id]!
-				const isActive = id === currentThreadId
-				const isRunning = streamState[id]?.isRunning
+		// The horizontal scrollbar is hidden via the "padding + negative
+		// margin + clip" technique. The inner strip gets `pb-3 -mb-3`
+		// (12px of internal padding minus 12px of layout height) so its
+		// scrollbar is painted 12px below its effective bottom edge, and
+		// this outer wrapper's `overflow-hidden` clips that stray 12px.
+		// This works reliably on macOS where Webkit's overlay scrollbar
+		// can ignore `::-webkit-scrollbar { display: none }` in recent
+		// Electron versions.
+		<div className='border-b border-void-border-2 flex-shrink-0 overflow-hidden'>
+			<div
+				className='flex items-center gap-0.5 px-1 py-1 overflow-x-auto overflow-y-hidden pb-3 -mb-3'
+				// Translate vertical wheel events to horizontal scroll so the
+				// strip is usable with a regular mouse wheel; touchpads
+				// already scroll horizontally natively.
+				onWheel={(e) => {
+					if (e.deltaY !== 0 && e.deltaX === 0) {
+						e.currentTarget.scrollLeft += e.deltaY
+					}
+				}}
+			>
+				{showNothing ? null : tabs.map(id => {
+					const t = allThreads[id]!
+					const isActive = id === currentThreadId
+					const isRunning = streamState[id]?.isRunning
 
-				// Phase E commit 5 — workspace provenance indicator. The icon
-				// slot is shared with the running-state spinner above; running
-				// always wins (transient + time-sensitive). Indicator fires
-				// only in workspaced windows: empty windows have no reference
-				// frame to call something "foreign" against.
-				//
-				//   foreign  → Lock   (same icon as the read-only banner; user
-				//                       opened it from "Other workspaces", it's
-				//                       pinned here, but mutations still gated)
-				//   unscoped → Globe  (legacy / pre-Phase-E thread; editable,
-				//                       claim-on-engagement re-tags on next send)
-				//
-				// Each indicator gets its own tooltip on the icon span — the
-				// outer tab keeps the message-preview tooltip, hovering the
-				// icon directly reveals the provenance reason.
-				const tabIsForeign = isThreadReadOnly(t, currentWorkspaceUri)
-				const tabIsUnscoped = !!currentWorkspaceUri && !t.workspaceUri
-				const foreignTooltip = tabIsForeign
-					? `Read-only — owned by ${t.workspaceLabel ?? t.workspaceUri ?? 'another workspace'}. Use Move or Copy to bring it here.`
-					: ''
-				const unscopedTooltip = tabIsUnscoped
-					? 'Not tied to a workspace yet. Sending a message will claim it for this workspace.'
-					: ''
+					// Phase E commit 5 — workspace provenance indicator. The icon
+					// slot is shared with the running-state spinner above; running
+					// always wins (transient + time-sensitive). Indicator fires
+					// only in workspaced windows: empty windows have no reference
+					// frame to call something "foreign" against.
+					//
+					//   foreign  → Lock   (same icon as the read-only banner; user
+					//                       opened it from "Other workspaces", it's
+					//                       pinned here, but mutations still gated)
+					//   unscoped → Globe  (legacy / pre-Phase-E thread; editable,
+					//                       claim-on-engagement re-tags on next send)
+					//
+					// Each indicator gets its own tooltip on the icon span — the
+					// outer tab keeps the message-preview tooltip, hovering the
+					// icon directly reveals the provenance reason.
+					const tabIsForeign = isThreadReadOnly(t, currentWorkspaceUri)
+					const tabIsUnscoped = !!currentWorkspaceUri && !t.workspaceUri
+					const foreignTooltip = tabIsForeign
+						? `Read-only — owned by ${t.workspaceLabel ?? t.workspaceUri ?? 'another workspace'}. Use Move or Copy to bring it here.`
+						: ''
+					const unscopedTooltip = tabIsUnscoped
+						? 'Not tied to a workspace yet. Sending a message will claim it for this workspace.'
+						: ''
 
-				// Label source of truth matches PastThreadsList: first user
-				// message's displayContent, truncated. Empty threads get a
-				// neutral "New Chat" label so the tab isn't blank.
-				const firstUser = t.messages.find(m => m.role === 'user')
-				const label = firstUser && firstUser.role === 'user' && firstUser.displayContent
-					? firstUser.displayContent
-					: 'New Chat'
+					// Label cascade: user-set custom title (trimmed, non-empty) wins;
+					// otherwise fall back to first user message's displayContent;
+					// otherwise "New Chat" so empty threads aren't blank. The
+					// custom title is editable via double-click or right-click →
+					// Rename. Whitespace-only customTitle resets to default.
+					const customTitle = t.customTitle?.trim()
+					const firstUser = t.messages.find(m => m.role === 'user')
+					const firstMsgLabel = firstUser && firstUser.role === 'user' && firstUser.displayContent
+						? firstUser.displayContent
+						: 'New Chat'
+					const label = customTitle || firstMsgLabel
+					const isEditingThis = editingThreadId === id
 
-				// Truncate the tooltip body. The visible tab label is already clipped
-				// by `truncate` CSS (the on-screen tab is at most ~110px wide), but the
-				// tooltip contents render the full string verbatim — so a thread whose
-				// first user message is a 50KB pasted blob would lay out the entire
-				// blob inside the tooltip portal on hover, stalling the main thread.
-				// Cap at ~240 chars: enough to show the gist and disambiguate tabs,
-				// short enough to render and reflow instantly. Whitespace is collapsed
-				// so a paste of "\n\n\n…\n\n\nactual text" doesn't waste the budget on
-				// blank lines.
-				const TOOLTIP_LABEL_MAX = 240
-				const tooltipLabel = (() => {
-					const collapsed = label.replace(/\s+/g, ' ').trim()
-					if (collapsed.length <= TOOLTIP_LABEL_MAX) return collapsed
-					return collapsed.slice(0, TOOLTIP_LABEL_MAX) + '…'
-				})()
+					// Truncate the tooltip body. The visible tab label is already clipped
+					// by `truncate` CSS (the on-screen tab is at most ~110px wide), but the
+					// tooltip contents render the full string verbatim — so a thread whose
+					// first user message is a 50KB pasted blob would lay out the entire
+					// blob inside the tooltip portal on hover, stalling the main thread.
+					// Cap at ~240 chars: enough to show the gist and disambiguate tabs,
+					// short enough to render and reflow instantly. Whitespace is collapsed
+					// so a paste of "\n\n\n…\n\n\nactual text" doesn't waste the budget on
+					// blank lines.
+					const TOOLTIP_LABEL_MAX = 240
+					const tooltipLabel = (() => {
+						const collapsed = label.replace(/\s+/g, ' ').trim()
+						if (collapsed.length <= TOOLTIP_LABEL_MAX) return collapsed
+						return collapsed.slice(0, TOOLTIP_LABEL_MAX) + '…'
+					})()
 
-				return (
-					<div
-						key={id}
-						ref={isActive ? activeTabRef : undefined}
-						onClick={() => {
-							// See note on PastThreadsList above — tab clicks benefit the most
-							// from the transition wrap because the swap is between two heavy threads.
-							startTransition(() => {
-								chatThreadsService.switchToThread(id)
-							})
-						}}
-						// Middle-click closes, matching conventional tab UX
-						// (VS Code editor tabs, browsers, etc).
-						onMouseDown={(e) => {
-							if (e.button === 1) {
+					return (
+						<div
+							key={id}
+							ref={isActive ? activeTabRef : undefined}
+							onClick={() => {
+								// Don't switch threads while editing this tab's label —
+								// the input lives inside the same div, so the click that
+								// landed inside the textbox would otherwise trigger a
+								// switch and lose unsaved input.
+								if (isEditingThis) return
+								// See note on PastThreadsList above — tab clicks benefit the most
+								// from the transition wrap because the swap is between two heavy threads.
+								startTransition(() => {
+									chatThreadsService.switchToThread(id)
+								})
+							}}
+							// Double-click → enter rename mode. Mirrors VS Code's
+							// editor-tab rename UX. Single-click switches (above);
+							// double-click is detected after the second click, so
+							// the user briefly switches to the tab before entering
+							// rename — that's intentional, gives them visual
+							// confirmation of which tab they're editing.
+							onDoubleClick={(e) => {
+								e.stopPropagation()
+								if (tabIsForeign) return // read-only foreign threads can't be renamed from this window
+								startRename(id, customTitle || firstMsgLabel)
+							}}
+							// Right-click → Rename / Reset / Unpin. Uses the VS Code
+							// platform context menu service (already in the React
+							// accessor as `IContextMenuService`) so we get native
+							// positioning, keyboard nav, and edge-flipping for free
+							// — no third-party dep, no inline portal positioning.
+							onContextMenu={(e) => {
 								e.preventDefault()
-								chatThreadsService.unpinThread(id)
-							}
-						}}
-						className={`
-							group flex items-center gap-1 px-2 py-0.5 rounded text-xs cursor-pointer flex-shrink-0 max-w-[110px] min-w-0 select-none
-							${isActive
-								? 'bg-zinc-700/10 dark:bg-zinc-300/10 text-void-fg-1'
-								: 'text-void-fg-3 opacity-80 hover:opacity-100 hover:bg-zinc-700/5 dark:hover:bg-zinc-300/5'}
-						`}
-						data-tooltip-id='void-tooltip'
-						data-tooltip-content={tooltipLabel}
-						data-tooltip-place='bottom'
-					>
-						{isRunning === 'LLM' || isRunning === 'tool' || isRunning === 'idle'
-							? <LoaderCircle className='animate-spin shrink-0' size={10} />
-							: isRunning === 'awaiting_user'
-								? <MessageCircleQuestion className='shrink-0' size={10} />
-								: tabIsForeign
-									? <span
-										className='shrink-0 inline-flex items-center'
-										data-tooltip-id='void-tooltip'
-										data-tooltip-content={foreignTooltip}
-										data-tooltip-place='bottom'
-									>
-										<Lock size={10} />
-									</span>
-									: tabIsUnscoped
+								e.stopPropagation()
+								const x = e.clientX
+								const y = e.clientY
+								contextMenuService.showContextMenu({
+									getAnchor: () => ({ x, y }),
+									getActions: () => [
+										{
+											id: 'void.tab.rename',
+											label: 'Rename',
+											tooltip: '',
+											class: undefined,
+											// Foreign tabs are read-only — service guard would
+											// no-op anyway, but disable the menu item too so the
+											// affordance matches reality.
+											enabled: !tabIsForeign,
+											run: () => startRename(id, customTitle || firstMsgLabel),
+										},
+										{
+											id: 'void.tab.resetTitle',
+											label: 'Reset to default name',
+											tooltip: '',
+											class: undefined,
+											enabled: !tabIsForeign && !!customTitle,
+											run: () => chatThreadsService.setThreadCustomTitle(id, undefined),
+										},
+										new Separator(),
+										{
+											id: 'void.tab.unpin',
+											label: 'Close tab',
+											tooltip: '',
+											class: undefined,
+											enabled: true,
+											run: () => chatThreadsService.unpinThread(id),
+										},
+									],
+								})
+							}}
+							// Middle-click closes, matching conventional tab UX
+							// (VS Code editor tabs, browsers, etc).
+							onMouseDown={(e) => {
+								if (e.button === 1) {
+									e.preventDefault()
+									chatThreadsService.unpinThread(id)
+								}
+							}}
+							className={`
+								group flex items-center gap-1 px-2 py-0.5 rounded text-xs ${isEditingThis ? '' : 'cursor-pointer'} flex-shrink-0 max-w-[110px] min-w-0 select-none
+								${isActive
+									? 'bg-zinc-700/10 dark:bg-zinc-300/10 text-void-fg-1'
+									: 'text-void-fg-3 opacity-80 hover:opacity-100 hover:bg-zinc-700/5 dark:hover:bg-zinc-300/5'}
+							`}
+							data-tooltip-id='void-tooltip'
+							data-tooltip-content={isEditingThis ? '' : tooltipLabel}
+							data-tooltip-place='bottom'
+						>
+							{isRunning === 'LLM' || isRunning === 'tool' || isRunning === 'idle'
+								? <LoaderCircle className='animate-spin shrink-0' size={10} />
+								: isRunning === 'awaiting_user'
+									? <MessageCircleQuestion className='shrink-0' size={10} />
+									: tabIsForeign
 										? <span
 											className='shrink-0 inline-flex items-center'
 											data-tooltip-id='void-tooltip'
-											data-tooltip-content={unscopedTooltip}
+											data-tooltip-content={foreignTooltip}
 											data-tooltip-place='bottom'
 										>
-											<Globe size={10} />
+											<Lock size={10} />
 										</span>
-										: null}
-						<span className='truncate min-w-0'>{label}</span>
-						<button
-							onClick={(e) => { e.stopPropagation(); chatThreadsService.unpinThread(id); }}
-							className='ml-0.5 opacity-0 group-hover:opacity-100 shrink-0 rounded hover:bg-black/10 dark:hover:bg-white/10 flex items-center justify-center'
-							data-tooltip-id='void-tooltip'
-							data-tooltip-content='Remove from tabs (thread stays in history)'
-							data-tooltip-place='bottom'
-						>
-							<X size={10} />
-						</button>
-					</div>
-				)
-			})}
-			<button
-				onClick={() => {
-					// Opening a new (empty) thread is cheap to render, but the unmount of
-					// the OUTGOING heavy thread's bubbles + Monaco editors is the expensive
-					// part. Wrapping in startTransition lets that teardown happen without
-					// blocking the "+" click response.
-					startTransition(() => {
-						chatThreadsService.openNewThread()
-					})
-				}}
-				className='shrink-0 ml-0.5 p-1 rounded text-void-fg-3 opacity-70 hover:opacity-100 hover:bg-zinc-700/10 dark:hover:bg-zinc-300/10'
-				data-tooltip-id='void-tooltip'
-				data-tooltip-content='New chat'
-				data-tooltip-place='bottom'
-			>
-				<Plus size={12} />
-			</button>
+										: tabIsUnscoped
+											? <span
+												className='shrink-0 inline-flex items-center'
+												data-tooltip-id='void-tooltip'
+												data-tooltip-content={unscopedTooltip}
+												data-tooltip-place='bottom'
+											>
+												<Globe size={10} />
+											</span>
+											: null}
+							{isEditingThis ? (
+								<input
+									type='text'
+									value={editValue}
+									autoFocus
+									onChange={(e) => setEditValue(e.target.value)}
+									onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
+										if (e.key === 'Enter') { e.preventDefault(); commitRename() }
+										else if (e.key === 'Escape') { e.preventDefault(); cancelRename() }
+										// Stop bubbling so global shortcuts (e.g. cmd+L
+										// for chat focus) don't fire mid-rename.
+										else { e.stopPropagation() }
+									}}
+									onBlur={commitRename}
+									// Defensive: clicks inside the input should never
+									// reach the parent div (which switches threads).
+									onClick={(e) => e.stopPropagation()}
+									onMouseDown={(e) => e.stopPropagation()}
+									onDoubleClick={(e) => e.stopPropagation()}
+									className='min-w-0 flex-1 bg-transparent outline-none border-b border-void-border-1 text-xs text-void-fg-1 px-0.5'
+									// onFocus selects all so users can immediately start
+									// typing to overwrite. select() runs after focus
+									// settles to ensure the selection sticks.
+									onFocus={(e) => e.currentTarget.select()}
+								/>
+							) : (
+								<span className='truncate min-w-0'>{label}</span>
+							)}
+							<button
+								onClick={(e) => { e.stopPropagation(); chatThreadsService.unpinThread(id); }}
+								className={`ml-0.5 ${isEditingThis ? 'opacity-0 pointer-events-none' : 'opacity-0 group-hover:opacity-100'} shrink-0 rounded hover:bg-black/10 dark:hover:bg-white/10 flex items-center justify-center`}
+								data-tooltip-id='void-tooltip'
+								data-tooltip-content='Remove from tabs (thread stays in history)'
+								data-tooltip-place='bottom'
+							>
+								<X size={10} />
+							</button>
+						</div>
+					)
+				})}
+				<button
+					onClick={() => {
+						// Opening a new (empty) thread is cheap to render, but the unmount of
+						// the OUTGOING heavy thread's bubbles + Monaco editors is the expensive
+						// part. Wrapping in startTransition lets that teardown happen without
+						// blocking the "+" click response.
+						startTransition(() => {
+							chatThreadsService.openNewThread()
+						})
+					}}
+					className='shrink-0 ml-0.5 p-1 rounded text-void-fg-3 opacity-70 hover:opacity-100 hover:bg-zinc-700/10 dark:hover:bg-zinc-300/10'
+					data-tooltip-id='void-tooltip'
+					data-tooltip-content='New chat'
+					data-tooltip-place='bottom'
+				>
+					<Plus size={12} />
+				</button>
+			</div>
 		</div>
 	)
 }

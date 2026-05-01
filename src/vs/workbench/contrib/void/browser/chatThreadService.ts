@@ -200,6 +200,14 @@ export type ThreadType = {
 	importedFromThreadId?: string;
 	importedAt?: number; // unix ms
 
+	// User-provided override of the auto-derived tab / history label. When
+	// non-empty, used as the display label everywhere; when undefined or
+	// whitespace-only, the UI falls back to the first user message's
+	// `displayContent` (and finally to "New Chat" for empty threads). Lets
+	// users curate their tab strip without editing message content.
+	// Persisted as part of the thread blob — no separate storage key.
+	customTitle?: string;
+
 	// this doesn't need to go in a state object, but feels right
 	state: {
 		currCheckpointIdx: number | null; // the latest checkpoint we're at (null if not at a particular checkpoint, like if the chat is streaming, or chat just finished and we haven't clicked on a checkpt)
@@ -437,6 +445,12 @@ export interface IChatThreadService {
 	// tab-strip pinning (does not affect existence — only the chat-header tab row)
 	pinThread(threadId: string): void;
 	unpinThread(threadId: string): void;
+
+	// User-editable tab label override. Pass `undefined` (or whitespace) to
+	// reset to the auto-derived first-user-message label. Gated by
+	// `_isThreadMutationBlocked` — read-only foreign threads cannot be
+	// renamed from this window (consistent with the rest of Phase E).
+	setThreadCustomTitle(threadId: string, title: string | undefined): void;
 
 	// Phase E commit 4 — claim a foreign thread into the current workspace.
 	// Both auto-pin to this workspace's tab strip on completion.
@@ -3255,6 +3269,30 @@ We only need to do it for files that were edited since `from`, ie files between 
 		}
 	}
 
+
+	setThreadCustomTitle(threadId: string, title: string | undefined): void {
+		if (this._isThreadMutationBlocked(threadId, 'setThreadCustomTitle')) return
+		const { allThreads } = this.state
+		const oldThread = allThreads[threadId]
+		if (!oldThread) return
+
+		// Normalize: empty / whitespace-only resets to default. Storing
+		// `undefined` (vs `''`) keeps the persisted JSON minimal — the
+		// field disappears from the serialized thread when reset.
+		const trimmed = title?.trim()
+		const next = trimmed && trimmed.length > 0 ? trimmed : undefined
+
+		// No-op when the value didn't actually change. Both sides
+		// normalize to `undefined` for the empty case so a rename to
+		// the same string doesn't dirty the storage blob.
+		const current = oldThread.customTitle && oldThread.customTitle.trim().length > 0 ? oldThread.customTitle : undefined
+		if (current === next) return
+
+		const newThread: ThreadType = { ...oldThread, customTitle: next, lastModified: new Date().toISOString() }
+		const newThreads = { ...allThreads, [threadId]: newThread }
+		this._storeAllThreads(newThreads)
+		this._setState({ allThreads: newThreads })
+	}
 
 	private _addMessageToThread(threadId: string, message: ChatMessage) {
 		const { allThreads } = this.state
