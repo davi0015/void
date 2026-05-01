@@ -30,7 +30,7 @@ import { IEditCodeService } from './editCodeServiceInterface.js';
 import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
-import { PINNED_THREADS_STORAGE_KEY, THREAD_STORAGE_KEY } from '../common/storageKeys.js';
+import { LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, PINNED_THREADS_STORAGE_KEY, THREAD_STORAGE_KEY } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { RunOnceScheduler, timeout } from '../../../../base/common/async.js';
@@ -238,6 +238,28 @@ export type ThreadsState = {
 	// thread (it remains accessible via the history list). Persisted under
 	// PINNED_THREADS_STORAGE_KEY (see storageKeys.ts).
 	pinnedThreadIds: string[];
+
+	// Phase E — current window's workspace identity. Resolved once at service
+	// construction (`_getCurrentWorkspaceIdentity`) and held here so React
+	// consumers can derive `isThreadInScope(thread)` without re-injecting the
+	// workspace service everywhere. Undefined for empty-window startups
+	// (no folder open) — those windows see only unscoped (`workspaceUri ===
+	// undefined`) threads in their default list. Workspace identity is treated
+	// as constant across a single window lifetime; switching workspaces opens
+	// a new window with a fresh service instance.
+	currentWorkspaceUri?: string;
+}
+
+// Phase E — true if this thread belongs in the current workspace's default
+// list. Two cases qualify: (a) the thread was tagged with the same workspace,
+// or (b) the thread is "unscoped" (legacy / pre-feature, or created in an
+// empty window) — those float across workspaces until claimed by Move. Used
+// by both the sidebar tab strip filter and the history list filter so the
+// rule lives in exactly one place.
+export const isThreadInWorkspaceScope = (thread: Pick<ThreadType, 'workspaceUri'> | undefined, currentWorkspaceUri: string | undefined): boolean => {
+	if (!thread) return false
+	if (!thread.workspaceUri) return true // unscoped → visible everywhere
+	return thread.workspaceUri === currentWorkspaceUri
 }
 
 export type IsRunningType =
@@ -477,10 +499,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const readPinned = (this._readPinnedThreadIds() || []).filter(id => !!readThreads[id])
 
 		const allThreads = readThreads
+
+		// Phase E — resolve current workspace identity once at startup. Used
+		// both as the filter key for the default thread list AND as the
+		// dictionary key for `_lastActiveThreadIdByWorkspace`. Treat as
+		// constant for the window's lifetime; multi-root folder edits are
+		// rare enough that "stale until reload" is fine.
+		const currentWorkspace = this._getCurrentWorkspaceIdentity()
+
 		this.state = {
 			allThreads: allThreads,
-			currentThreadId: null as unknown as string, // gets set in startNewThread()
+			currentThreadId: null as unknown as string, // set below by openNewThread() or restore-last-active
 			pinnedThreadIds: readPinned,
+			currentWorkspaceUri: currentWorkspace.uri,
 		}
 
 		// hydrate in-memory latestUsage map from the persisted threads so the
@@ -493,8 +524,18 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			if (t?.cumulativeCompactionThisThread) this.cumulativeCompactionThisThreadOfThreadId[id] = t.cumulativeCompactionThisThread
 		}
 
-		// always be in a thread
-		this.openNewThread()
+		// Phase E — hydrate the per-workspace "last active" map so we can
+		// restore where the user left off in *this* workspace, even when other
+		// workspaces' threads were touched more recently.
+		Object.assign(this._lastActiveThreadIdByWorkspace, this._readLastActiveThreadIdByWorkspace())
+
+		// Phase E — startup landing. `_normalizeCurrentThreadInScope` runs a
+		// 3-step cascade: per-workspace last-active (pinned & in scope) →
+		// newest pinned in-scope → openNewThread. Restricting to pinned at
+		// each pre-create step avoids "tab strip silently grows on every
+		// reload" and "active thread has no highlighted tab", both of which
+		// surfaced during commit-2 testing.
+		this._normalizeCurrentThreadInScope()
 
 		// Capture live dropdown changes onto whichever thread is currently in
 		// focus, so switching tabs round-trips the chosen model even when no
@@ -568,7 +609,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._onDidChangeCurrentThread.fire()
 	}
 	resetState = () => {
-		this.state = { allThreads: {}, currentThreadId: null as unknown as string, pinnedThreadIds: [] } // see constructor
+		this.state = {
+			allThreads: {},
+			currentThreadId: null as unknown as string, // see constructor
+			pinnedThreadIds: [],
+			currentWorkspaceUri: this.state.currentWorkspaceUri, // preserve identity across a reset
+		}
 		this._storePinnedThreadIds([])
 		this.openNewThread()
 		this._onDidChangeCurrentThread.fire()
@@ -623,6 +669,54 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			StorageScope.APPLICATION,
 			StorageTarget.USER
 		);
+	}
+
+	// Phase E — persist the per-workspace "last active thread" map. Lives in
+	// its own storage key (not bundled into THREAD_STORAGE_KEY) so this
+	// frequently-updated tiny blob never re-serializes the full thread payload.
+	private readonly _lastActiveThreadIdByWorkspace: Record<string, string> = {}
+	private _readLastActiveThreadIdByWorkspace(): Record<string, string> {
+		const s = this._storageService.get(LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, StorageScope.APPLICATION)
+		if (!s) return {}
+		try {
+			const parsed = JSON.parse(s)
+			if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+			// Defensive: keep only string→string entries. Storage corruption
+			// (or a future shape change) should degrade to "no memory of last
+			// active" rather than crash on first thread switch.
+			const out: Record<string, string> = {}
+			for (const [k, v] of Object.entries(parsed)) {
+				if (typeof k === 'string' && typeof v === 'string') out[k] = v
+			}
+			return out
+		} catch { return {} }
+	}
+
+	private _storeLastActiveThreadIdByWorkspace() {
+		this._storageService.store(
+			LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY,
+			JSON.stringify(this._lastActiveThreadIdByWorkspace),
+			StorageScope.APPLICATION,
+			StorageTarget.USER
+		)
+	}
+
+	// Phase E — drop every `lastActive[ws]` entry that currently points at
+	// `threadId`. Called from unpin / delete. Without this, the next reload
+	// would re-restore the just-unpinned thread via the normalize cascade,
+	// effectively making unpin a no-op ("I closed this thread but it
+	// always comes back"). Particularly bad for legacy unscoped threads,
+	// which pass `isThreadInWorkspaceScope` for any workspace and could
+	// otherwise be resurrected by foreign-window restores too.
+	private _clearLastActiveEntriesForThread(threadId: string): void {
+		let changed = false
+		for (const [ws, id] of Object.entries(this._lastActiveThreadIdByWorkspace)) {
+			if (id === threadId) {
+				delete this._lastActiveThreadIdByWorkspace[ws]
+				changed = true
+			}
+		}
+		if (changed) this._storeLastActiveThreadIdByWorkspace()
 	}
 
 
@@ -2060,6 +2154,15 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
+		// Phase E — claim-on-engagement. If the user is sending a message in
+		// a thread that has no `workspaceUri` (legacy / pre-Phase-E, or one
+		// that slipped through the empty-thread reuse path), tag it to the
+		// current workspace now. After this point the thread participates in
+		// the per-workspace filter normally and stops appearing in other
+		// workspaces' lists. No-op when the thread is already tagged (any
+		// workspace) or when the window has no workspace.
+		this._claimThreadForCurrentWorkspaceIfUnscoped(threadId)
+
 		// interrupt existing stream
 		if (this.streamState[threadId]?.isRunning) {
 			await this.abortRunning(threadId)
@@ -2489,9 +2592,10 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 	switchToThread(threadId: string) {
-		// Auto-pin on switch so that jumping to a thread from the history list
-		// surfaces it in the tab strip (user can remove with the × on the tab).
-		// Silently no-op if already pinned.
+		// User-initiated switch (tab click, history click, etc). Auto-pins
+		// so the thread surfaces in the tab strip. Use `_landOnThread` for
+		// non-user-initiated transitions (startup restore, normalize) where
+		// the tab strip should stay exactly as the user left it.
 		const alreadyPinned = this.state.pinnedThreadIds.includes(threadId)
 		if (alreadyPinned) {
 			this._setState({ currentThreadId: threadId })
@@ -2499,6 +2603,38 @@ We only need to do it for files that were edited since `from`, ie files between 
 			const newPinned = [...this.state.pinnedThreadIds, threadId]
 			this._storePinnedThreadIds(newPinned)
 			this._setState({ currentThreadId: threadId, pinnedThreadIds: newPinned })
+		}
+		this._afterCurrentThreadChanged(threadId)
+	}
+
+	// Phase E — set currentThreadId WITHOUT touching the pinned tab strip.
+	// The strip is a stable user-curated set; reloads / startup restoration
+	// must not silently pin previously-unpinned threads or it produces the
+	// "every refresh adds a new tab" behavior reported during commit-2
+	// testing. Same lastActive + model-restore side-effects as
+	// `switchToThread` so a reload-landing thread still gets remembered.
+	private _landOnThread(threadId: string): void {
+		if (!this.state.allThreads[threadId]) return
+		this._setState({ currentThreadId: threadId })
+		this._afterCurrentThreadChanged(threadId)
+	}
+
+	// Shared post-switch side-effects for both the pinning and non-pinning
+	// landing paths above. Updates the per-workspace last-active map and
+	// reapplies the saved per-thread model selection.
+	private _afterCurrentThreadChanged(threadId: string): void {
+		// Phase E — remember "last thread looked at in this workspace" so the
+		// next reload (or reopen of this workspace in another window) can
+		// restore the user's place. We key on the *current window's*
+		// workspace, not on the thread's tag, because a foreign-workspace
+		// thread viewed in read-only mode shouldn't be remembered as the
+		// landing thread for *its* workspace from this window.
+		const wsUri = this.state.currentWorkspaceUri
+		if (wsUri) {
+			if (this._lastActiveThreadIdByWorkspace[wsUri] !== threadId) {
+				this._lastActiveThreadIdByWorkspace[wsUri] = threadId
+				this._storeLastActiveThreadIdByWorkspace()
+			}
 		}
 
 		// Restore the dropdown to the model that was last used to send a
@@ -2545,20 +2681,138 @@ We only need to do it for files that were edited since `from`, ie files between 
 			const label = raw.replace(/\.code-workspace$/, '') || raw
 			return { uri: identifier.configPath.toString(), label }
 		}
-		// empty window — leave undefined; thread becomes "unscoped"
+		// Untitled multi-root window: the user has multiple folders in one
+		// window but hasn't saved it as a `.code-workspace`. VS Code's
+		// `toWorkspaceIdentifier` returns just `{ id }` here — no uri, no
+		// configPath. This used to fall through to "treat as empty window"
+		// and produced silently-untagged threads (the second bug found
+		// during commit-2 testing). Detect it by checking that the workspace
+		// has any folders at all, then use the synthetic workspace.id as the
+		// scoping key. The id is stable for the lifetime of the untitled
+		// workspace; saving it as a `.code-workspace` mints a new id and
+		// existing threads stay tagged to the old id (an accepted edge case
+		// — easy recovery via Move once commit 4 ships).
+		if (workspace.folders.length > 0) {
+			const firstName = resourceBasename(workspace.folders[0].uri) || workspace.folders[0].uri.toString()
+			const extra = workspace.folders.length - 1
+			const label = extra > 0 ? `${firstName} (+${extra})` : firstName
+			// Prefix the synthetic id so it can never accidentally collide
+			// with a real folder/file URI string in storage / Move actions.
+			return { uri: `void-untitled-workspace://${workspace.id}`, label }
+		}
+		// True empty window — no folders at all. Threads become unscoped.
 		return {}
 	}
 
+	// Phase E — "claim on engagement". An unscoped thread (workspaceUri ===
+	// undefined) is otherwise visible in every workspace's list, which is
+	// confusing in practice: when the user actually engages with such a
+	// thread from a workspaced window (sends a message, reuses an empty
+	// thread via `+`), they expect it to *become* this workspace's thread.
+	// This helper tags it idempotently. No-ops in three safe cases:
+	//   - thread already tagged (any workspace): never silently move it
+	//   - empty window (no current workspace): nothing to claim it for
+	//   - thread doesn't exist: defensive
+	// Returns true when a tag write actually happened so callers can decide
+	// whether to forward the new state to subscribers in their existing
+	// `_setState` calls (saves a redundant emit).
+	private _claimThreadForCurrentWorkspaceIfUnscoped(threadId: string): boolean {
+		const wsUri = this.state.currentWorkspaceUri
+		if (!wsUri) return false
+		const t = this.state.allThreads[threadId]
+		if (!t || t.workspaceUri) return false
+		const identity = this._getCurrentWorkspaceIdentity()
+		const newThreads = {
+			...this.state.allThreads,
+			[threadId]: {
+				...t,
+				workspaceUri: identity.uri,
+				workspaceLabel: identity.label,
+			},
+		}
+		this._storeAllThreads(newThreads)
+		this._setState({ allThreads: newThreads })
+		return true
+	}
+
+	// Phase E — defensive guard + startup landing logic. Snaps the current
+	// thread to a sensible in-scope choice. Used by:
+	//   - constructor end (lands on existing thread instead of creating new)
+	//   - any future code path that risks setting currentThreadId to a
+	//     foreign thread without going through the validated paths
+	// Cascade:
+	//   1. per-workspace last-active (validated for scope and existence)
+	//   2. newest in-scope thread by lastModified (any messages, fresh wins)
+	//   3. openNewThread (creates / reuses an in-scope empty thread)
+	// Works equally for empty windows (no currentWorkspaceUri): "in scope"
+	// degrades to "unscoped only" via `isThreadInWorkspaceScope`, and step 1
+	// is skipped since the per-workspace map is keyed by workspace URI.
+	private _normalizeCurrentThreadInScope(): void {
+		const wsUri = this.state.currentWorkspaceUri
+		const cur = this.state.allThreads[this.state.currentThreadId]
+		if (cur && isThreadInWorkspaceScope(cur, wsUri)) return
+		const isPinned = (id: string) => this.state.pinnedThreadIds.includes(id)
+		// (1) per-workspace last-active, but only if it points at a thread
+		//     that's both in scope AND currently pinned. Pinned-only avoids
+		//     the "land on a thread with no tab" UX; the unpin/delete paths
+		//     clear the entry already so this normally hits. Self-heal any
+		//     stale entry we find — dead thread, foreign workspace, or no
+		//     longer pinned (manual storage edits, prior-version bugs) —
+		//     so the entry doesn't keep blocking step (2) on every reload.
+		if (wsUri) {
+			const lastId = this._lastActiveThreadIdByWorkspace[wsUri]
+			if (lastId) {
+				const last = this.state.allThreads[lastId]
+				if (last && isThreadInWorkspaceScope(last, wsUri) && isPinned(lastId)) {
+					this._landOnThread(lastId)
+					return
+				}
+				delete this._lastActiveThreadIdByWorkspace[wsUri]
+				this._storeLastActiveThreadIdByWorkspace()
+			}
+		}
+		// (2) newest in-scope PINNED thread by lastModified. Iterating
+		//     `pinnedThreadIds` (instead of `allThreads`) is the bit that
+		//     guarantees we land on a tab — never on a stray unpinned
+		//     thread that would render in the body with no highlighted
+		//     entry in the strip.
+		const pinnedCandidates = this.state.pinnedThreadIds
+			.map(id => this.state.allThreads[id])
+			.filter((t): t is NonNullable<typeof t> => !!t && isThreadInWorkspaceScope(t, wsUri))
+			.sort((a, b) => (b.lastModified ?? '').localeCompare(a.lastModified ?? ''))
+		if (pinnedCandidates.length > 0) {
+			this._landOnThread(pinnedCandidates[0].id)
+			return
+		}
+		// (3) no in-scope pinned threads. `openNewThread` creates one fresh
+		//     pinned tab — correct because if you unpinned every tab in
+		//     this workspace, you need *something* to interact with on
+		//     reload, and an empty new chat is the standard "blank slate"
+		//     a user expects when they've cleared their working set.
+		this.openNewThread()
+	}
 
 	openNewThread() {
-		// if a thread with 0 messages already exists, switch to it
-		const { allThreads: currentThreads } = this.state
+		// if an empty thread already exists *in the current workspace scope*,
+		// reuse it instead of spawning yet another. We deliberately don't
+		// hijack empty threads tagged to a *different* workspace — those
+		// belong to that workspace's scope and reusing them would silently
+		// migrate them. Unscoped empty threads (legacy / pre-feature) are
+		// considered fair game and get reused as-is (Move would re-tag them
+		// later).
+		const { allThreads: currentThreads, currentWorkspaceUri } = this.state
 		for (const threadId in currentThreads) {
-			if (currentThreads[threadId]!.messages.length === 0) {
-				// switch to the existing empty thread and exit
-				this.switchToThread(threadId)
-				return
-			}
+			const t = currentThreads[threadId]
+			if (!t || t.messages.length !== 0) continue
+			if (!isThreadInWorkspaceScope(t, currentWorkspaceUri)) continue
+			// Claim BEFORE switch: if we reuse an unscoped legacy empty
+			// thread in a workspaced window, tag it so it's no longer "shared
+			// across all workspaces" the moment the user starts typing in it.
+			// Idempotent + scoped to unscoped-only, so a properly-tagged empty
+			// thread (whether for this workspace or any other) is left alone.
+			this._claimThreadForCurrentWorkspaceIfUnscoped(threadId)
+			this.switchToThread(threadId)
+			return
 		}
 		// otherwise, start a new thread, stamped with current workspace
 		const newThread = newThreadObject(this._getCurrentWorkspaceIdentity())
@@ -2595,6 +2849,13 @@ We only need to do it for files that were edited since `from`, ie files between 
 		// reclaim.
 		this._telemetryRidByThread.delete(threadId)
 		this._requestTelemetryService.forgetThread(threadId)
+
+		// Phase E — also clear any per-workspace last-active pointers to this
+		// thread so it doesn't get auto-pinned back via restore on next reload.
+		// (Restore self-heals dead refs anyway, but doing it here is cheap and
+		// makes the storage state consistent immediately, which is helpful
+		// when debugging via direct SQLite inspection.)
+		this._clearLastActiveEntriesForThread(threadId)
 
 		// store the updated threads
 		this._storeAllThreads(newThreads);
@@ -2639,12 +2900,28 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const newPinned = this.state.pinnedThreadIds.filter(id => id !== threadId)
 		this._storePinnedThreadIds(newPinned)
 
+		// Phase E — clear the per-workspace last-active map of any pointers
+		// to this thread. Otherwise the next reload resurrects it via
+		// `_restoreLastActiveThreadForCurrentWorkspace → switchToThread →
+		// auto-pin`, defeating the unpin entirely.
+		this._clearLastActiveEntriesForThread(threadId)
+
 		// If the user removed the tab they're currently looking at, jump to a
 		// neighboring pinned tab so the chat pane doesn't show stale content.
-		// If no tabs remain, open a fresh thread (which also pins itself).
+		//
+		// Phase E — only consider IN-SCOPE pinned tabs as jump targets. Without
+		// this filter, closing the only in-scope tab in workspace A could jump
+		// to a workspace-B tab still in `pinnedThreadIds` (pinning is global)
+		// — chat body then renders a foreign thread while the tab strip shows
+		// nothing, which is the exact "no title, body still visible" symptom
+		// seen during commit-2 testing. Falling through to `openNewThread()`
+		// is the right answer when no in-scope tab remains: it lands on the
+		// per-workspace last-active or mints a fresh thread tagged to the
+		// current workspace.
 		if (this.state.currentThreadId === threadId) {
-			if (newPinned.length > 0) {
-				this._setState({ pinnedThreadIds: newPinned, currentThreadId: newPinned[newPinned.length - 1] })
+			const inScope = newPinned.filter(id => isThreadInWorkspaceScope(this.state.allThreads[id], this.state.currentWorkspaceUri))
+			if (inScope.length > 0) {
+				this._setState({ pinnedThreadIds: newPinned, currentThreadId: inScope[inScope.length - 1] })
 			} else {
 				this._setState({ pinnedThreadIds: newPinned })
 				this.openNewThread()

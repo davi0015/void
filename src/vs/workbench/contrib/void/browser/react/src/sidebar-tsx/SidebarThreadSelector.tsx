@@ -8,7 +8,7 @@ import { CopyButton, IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
 import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useFullChatThreadsStreamState, useSettingsState } from '../util/services.js';
 import { IconX } from './SidebarChat.js';
 import { Check, Copy, Icon, LoaderCircle, MessageCircleQuestion, Plus, Trash2, UserCheck, X } from 'lucide-react';
-import { IsRunningType, ThreadType } from '../../../chatThreadService.js';
+import { IsRunningType, ThreadType, isThreadInWorkspaceScope } from '../../../chatThreadService.js';
 
 
 const numInitialThreads = 3
@@ -19,7 +19,7 @@ export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 	const [hoveredIdx, setHoveredIdx] = useState<number | null>(null)
 
 	const threadsState = useChatThreadsState()
-	const { allThreads } = threadsState
+	const { allThreads, currentWorkspaceUri } = threadsState
 
 	const streamState = useFullChatThreadsStreamState()
 
@@ -33,10 +33,16 @@ export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 		return <div key="error" className="p-1">{`Error accessing chat history.`}</div>;
 	}
 
-	// sorted by most recent to least recent
+	// sorted by most recent to least recent.
+	// Phase E — default history list shows only threads in the current
+	// workspace's scope (same workspace, or unscoped/legacy). Foreign-workspace
+	// threads are hidden from the default list and surfaced in the dedicated
+	// "Other workspaces" group later (commit 4 in the workspace-scoped chat
+	// plan). Empty threads stay filtered out as before.
 	const sortedThreadIds = Object.keys(allThreads ?? {})
 		.sort((threadId1, threadId2) => (allThreads[threadId1]?.lastModified ?? 0) > (allThreads[threadId2]?.lastModified ?? 0) ? -1 : 1)
 		.filter(threadId => (allThreads![threadId]?.messages.length ?? 0) !== 0)
+		.filter(threadId => isThreadInWorkspaceScope(allThreads[threadId], currentWorkspaceUri))
 
 	// Get only first 5 threads if not showing all
 	const hasMoreThreads = sortedThreadIds.length > numInitialThreads;
@@ -298,12 +304,21 @@ export const SidebarThreadTabs = () => {
 	const threadsState = useChatThreadsState()
 	const streamState = useFullChatThreadsStreamState()
 
-	const { allThreads, currentThreadId, pinnedThreadIds } = threadsState
+	const { allThreads, currentThreadId, pinnedThreadIds, currentWorkspaceUri } = threadsState
 
 	// Defensive filter: only render tabs whose thread still exists. Stale ids
 	// are pruned at load time too (see ChatThreadService constructor), but this
 	// guards against any in-memory drift between deleteThread and a re-render.
-	const tabs = (pinnedThreadIds ?? []).filter(id => !!allThreads[id])
+	//
+	// Phase E — also hide tabs for threads tagged to a *different* workspace.
+	// Pinning is global (one APPLICATION-scoped list) so without this filter
+	// the user would see every workspace's pinned threads as tabs in every
+	// window. Foreign threads are reachable via the "Other workspaces" group
+	// in the history sidebar (commit 4); they should never be pinned tabs in
+	// the wrong workspace. Unscoped threads still appear in every workspace.
+	const tabs = (pinnedThreadIds ?? [])
+		.filter(id => !!allThreads[id])
+		.filter(id => isThreadInWorkspaceScope(allThreads[id], currentWorkspaceUri))
 
 	// Keep the active tab in view when threads are switched from outside the
 	// strip (e.g. landing-page history click), otherwise long tab rows can
