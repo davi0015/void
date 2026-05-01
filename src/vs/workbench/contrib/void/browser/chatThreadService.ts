@@ -35,7 +35,8 @@ import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { RunOnceScheduler, timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
-import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
+import { IWorkspaceContextService, toWorkspaceIdentifier } from '../../../../platform/workspace/common/workspace.js';
+import { basename as resourceBasename } from '../../../../base/common/resources.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IMCPService } from '../common/mcpService.js';
@@ -168,6 +169,37 @@ export type ThreadType = {
 	// doesn't flag, only subsequent sends can).
 	lastAppliedRules?: string;
 
+	// ===== Workspace scoping (Phase E — workspace-scoped chats) =====
+	// Stable per-workspace identity captured at thread creation time. URI string
+	// of the folder (single-folder workspace) or `.code-workspace` file (multi-root).
+	// Used as the filter key in the default thread list — a thread is "yours"
+	// when `workspaceUri === currentWorkspaceUri || workspaceUri === undefined`.
+	// Undefined for: (a) legacy threads created before this field existed —
+	// remain visible in every workspace's list as "unscoped" until explicitly
+	// Moved (= claimed); (b) threads created with no folder open. Renaming a
+	// folder will break the link (accepted edge case — recovery via Move-here
+	// from the "Other workspaces" group). Storage stays APPLICATION-scoped,
+	// the workspace boundary is purely a logical filter.
+	workspaceUri?: string;
+
+	// Human-readable workspace name captured at thread creation, NOT derived
+	// dynamically from `workspaceUri` — that way a thread from a workspace whose
+	// folder has been deleted still shows a sensible label in the "Other
+	// workspaces" group instead of a raw URI. Falls back to URI basename when
+	// no friendlier name is available.
+	workspaceLabel?: string;
+
+	// Provenance — set ONLY by `copyThreadToCurrentWorkspace` (Move re-tags in
+	// place and leaves these undefined; the thread *is* the original, just
+	// relocated). Used by the tab-strip imported-icon tooltip ("Imported from
+	// workspace X on Y") and reserved for future "find original" tooling.
+	// Storing both URI and the source thread id is intentional — URI tells the
+	// user *where* the original lived; thread id lets us follow the link
+	// programmatically later if we ever build a "trace ancestry" feature.
+	importedFromWorkspaceUri?: string;
+	importedFromThreadId?: string;
+	importedAt?: number; // unix ms
+
 	// this doesn't need to go in a state object, but feels right
 	state: {
 		currCheckpointIdx: number | null; // the latest checkpoint we're at (null if not at a particular checkpoint, like if the chat is streaming, or chat just finished and we haven't clicked on a checkpt)
@@ -265,13 +297,25 @@ export type ThreadStreamState = {
 	}
 }
 
-const newThreadObject = () => {
+// Caller (always `chatThreadService`) is responsible for resolving workspace
+// identity from `IWorkspaceContextService` and passing it in. Kept as a free
+// function rather than promoted to a method so the construction shape stays
+// auditable in one place — the only legitimate creators are `openNewThread`
+// (and the Phase-E import flow once it lands). Both `workspaceUri` and
+// `workspaceLabel` are intentionally optional: empty-window / no-folder
+// startup leaves them undefined and the resulting thread becomes "unscoped"
+// (visible in every workspace's list until explicitly Moved). Importantly
+// we do NOT default to a string like "(no workspace)" — undefined is the
+// load-bearing signal that distinguishes "legacy / unscoped" from "tagged".
+const newThreadObject = (workspace?: { uri?: string, label?: string }) => {
 	const now = new Date().toISOString()
 	return {
 		id: generateUuid(),
 		createdAt: now,
 		lastModified: now,
 		messages: [],
+		workspaceUri: workspace?.uri,
+		workspaceLabel: workspace?.label,
 		state: {
 			currCheckpointIdx: null,
 			stagingSelections: [],
@@ -2478,6 +2522,34 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 
+	// Resolve the workspace identity to stamp on a freshly-created thread.
+	// Returns `{}` for empty-window / no-folder startups — the caller threads
+	// that through to `newThreadObject`, which leaves `workspaceUri/Label`
+	// undefined ("unscoped" thread, visible in every workspace's list until
+	// claimed via Move). For multi-root workspaces we use the `.code-workspace`
+	// file URI as identity (NOT individual folder URIs) — splitting/joining
+	// roots into a different `.code-workspace` is intentionally treated as a
+	// new workspace, accepted small footgun. Label = basename minus the
+	// `.code-workspace` extension for legibility.
+	private _getCurrentWorkspaceIdentity(): { uri?: string, label?: string } {
+		const workspace = this._workspaceContextService.getWorkspace()
+		const identifier = toWorkspaceIdentifier(workspace)
+		if ('uri' in identifier) {
+			// single-folder
+			const label = resourceBasename(identifier.uri) || identifier.uri.toString()
+			return { uri: identifier.uri.toString(), label }
+		}
+		if ('configPath' in identifier) {
+			// multi-root .code-workspace
+			const raw = resourceBasename(identifier.configPath) || identifier.configPath.toString()
+			const label = raw.replace(/\.code-workspace$/, '') || raw
+			return { uri: identifier.configPath.toString(), label }
+		}
+		// empty window — leave undefined; thread becomes "unscoped"
+		return {}
+	}
+
+
 	openNewThread() {
 		// if a thread with 0 messages already exists, switch to it
 		const { allThreads: currentThreads } = this.state
@@ -2488,8 +2560,8 @@ We only need to do it for files that were edited since `from`, ie files between 
 				return
 			}
 		}
-		// otherwise, start a new thread
-		const newThread = newThreadObject()
+		// otherwise, start a new thread, stamped with current workspace
+		const newThread = newThreadObject(this._getCurrentWorkspaceIdentity())
 
 		// update state — also auto-pin so it becomes the active tab
 		const newThreads: ChatThreads = {
