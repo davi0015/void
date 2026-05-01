@@ -233,10 +233,17 @@ export type ThreadsState = {
 	allThreads: ChatThreads;
 	currentThreadId: string; // intended for internal use only
 
-	// Ordered list of thread ids shown as tabs in the chat sidebar header.
-	// Entirely a UI-pin concept — removing an id from here does NOT delete the
-	// thread (it remains accessible via the history list). Persisted under
-	// PINNED_THREADS_STORAGE_KEY (see storageKeys.ts).
+	// Ordered list of thread ids shown as tabs in the chat sidebar header
+	// for THIS workspace. Entirely a UI-pin concept — removing an id from
+	// here does NOT delete the thread (it remains accessible via history).
+	//
+	// Phase E — this is a *projection* of the current workspace's bucket of
+	// `_pinnedThreadIdsByWorkspace` (the source of truth). Pins are per-
+	// workspace: the same thread can be pinned in workspace A and workspace
+	// B independently (e.g. a thread owned by A and opened read-only in B).
+	// Persisted under PINNED_THREADS_STORAGE_KEY as the full map; this
+	// state field is re-derived on every mutation via
+	// `_setPinsForCurrentWorkspace`.
 	pinnedThreadIds: string[];
 
 	// Phase E — current window's workspace identity. Resolved once at service
@@ -261,6 +268,7 @@ export const isThreadInWorkspaceScope = (thread: Pick<ThreadType, 'workspaceUri'
 	if (!thread.workspaceUri) return true // unscoped → visible everywhere
 	return thread.workspaceUri === currentWorkspaceUri
 }
+
 
 export type IsRunningType =
 	| 'LLM' // the LLM is currently streaming
@@ -493,11 +501,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		const readThreads = this._readAllThreads() || {}
 
-		// Restore pinned ids, filtering any that refer to threads that no longer
-		// exist (e.g. deleted on another machine, storage corruption, etc.) so
-		// we never render a "ghost" tab.
-		const readPinned = (this._readPinnedThreadIds() || []).filter(id => !!readThreads[id])
-
 		const allThreads = readThreads
 
 		// Phase E — resolve current workspace identity once at startup. Used
@@ -507,10 +510,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// rare enough that "stale until reload" is fine.
 		const currentWorkspace = this._getCurrentWorkspaceIdentity()
 
+		// Phase E — hydrate per-workspace pin map. Reader handles v1→v2
+		// migration, ghost-id filtering, and empty-bucket pruning.
+		Object.assign(this._pinnedThreadIdsByWorkspace, this._readPinnedThreadIdsByWorkspace(allThreads))
+		const currentPins = this._pinnedThreadIdsByWorkspace[currentWorkspace.uri ?? ''] ?? []
+
 		this.state = {
 			allThreads: allThreads,
 			currentThreadId: null as unknown as string, // set below by openNewThread() or restore-last-active
-			pinnedThreadIds: readPinned,
+			pinnedThreadIds: currentPins,
 			currentWorkspaceUri: currentWorkspace.uri,
 		}
 
@@ -615,7 +623,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			pinnedThreadIds: [],
 			currentWorkspaceUri: this.state.currentWorkspaceUri, // preserve identity across a reset
 		}
-		this._storePinnedThreadIds([])
+		// Wipe every workspace's pin bucket on reset — `resetState` is the
+		// "nuclear option" for clearing user data, scope-agnostic.
+		for (const k of Object.keys(this._pinnedThreadIdsByWorkspace)) delete this._pinnedThreadIdsByWorkspace[k]
+		this._storePinnedThreadIdsByWorkspace()
 		this.openNewThread()
 		this._onDidChangeCurrentThread.fire()
 	}
@@ -651,24 +662,88 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		);
 	}
 
-	private _readPinnedThreadIds(): string[] | null {
+	// Phase E — per-workspace pin storage. Key = workspaceUri (real folder
+	// or `.code-workspace` config path or synthetic `void-untitled-workspace://...`)
+	// — same key shape as `_lastActiveThreadIdByWorkspace`. Empty string `''`
+	// is the sentinel for empty-window pins so users can still maintain a
+	// tab strip in folder-less windows; this bucket is shared across all
+	// empty windows by design (there's no workspace identity to disambiguate).
+	//
+	// Source of truth lives here on the service; `state.pinnedThreadIds`
+	// is just a projection of this map's current-workspace bucket and gets
+	// re-derived on every mutation (see `_setPinsForCurrentWorkspace`).
+	private readonly _pinnedThreadIdsByWorkspace: Record<string, string[]> = {}
+
+	// Storage shape v1: `string[]` (single global pin list).
+	// Storage shape v2: `Record<workspaceUri, string[]>` (per-workspace).
+	// Reads tolerate both shapes; v1 is migrated by distributing each pinned
+	// id into its owning workspace's bucket, with unscoped pins dropped per
+	// the agreed migration policy (user re-pins via history click if they
+	// want them back). v1 self-heals on first interaction post-upgrade —
+	// `_storePinnedThreadIdsByWorkspace` re-serializes under the v2 shape.
+	//
+	// `allThreads` is required for both the v1 migration (ownership lookup)
+	// and the ghost-id filter applied to v2 (a pinned id whose thread was
+	// deleted on another machine never makes it into the in-memory map, so
+	// the tab strip can't render it). Empty buckets are dropped to keep
+	// storage tidy.
+	private _readPinnedThreadIdsByWorkspace(allThreads: ChatThreads): Record<string, string[]> {
 		const s = this._storageService.get(PINNED_THREADS_STORAGE_KEY, StorageScope.APPLICATION);
-		if (!s) return null;
-		try {
-			const parsed = JSON.parse(s);
-			return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : null;
-		} catch {
-			return null;
+		if (!s) return {};
+		let parsed: unknown
+		try { parsed = JSON.parse(s); } catch { return {}; }
+		const out: Record<string, string[]> = {}
+		if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+			// v2: already the right shape.
+			for (const k of Object.keys(parsed as Record<string, unknown>)) {
+				const v = (parsed as Record<string, unknown>)[k]
+				if (Array.isArray(v)) out[k] = v.filter((x): x is string => typeof x === 'string')
+			}
+		} else if (Array.isArray(parsed)) {
+			// v1 → v2: distribute by ownership. Unscoped pins are dropped.
+			for (const id of parsed) {
+				if (typeof id !== 'string') continue
+				const t = allThreads[id]
+				if (!t || !t.workspaceUri) continue
+				if (!out[t.workspaceUri]) out[t.workspaceUri] = []
+				out[t.workspaceUri].push(id)
+			}
+			console.log('[void/chat] migrated v1 pinned-thread storage to per-workspace shape', { workspaces: Object.keys(out).length, totalPins: Object.values(out).reduce((n, a) => n + a.length, 0) })
 		}
+		// Filter ghosts + drop empty buckets in a single pass.
+		for (const k of Object.keys(out)) {
+			out[k] = out[k].filter(id => !!allThreads[id])
+			if (out[k].length === 0) delete out[k]
+		}
+		return out
 	}
 
-	private _storePinnedThreadIds(ids: string[]) {
+	private _storePinnedThreadIdsByWorkspace() {
 		this._storageService.store(
 			PINNED_THREADS_STORAGE_KEY,
-			JSON.stringify(ids),
+			JSON.stringify(this._pinnedThreadIdsByWorkspace),
 			StorageScope.APPLICATION,
 			StorageTarget.USER
 		);
+	}
+
+	// The sentinel key under which empty-window pins live. Empty string keeps
+	// it visually distinct from any real URI (which always have a scheme).
+	private _currentPinKey(): string {
+		return this.state.currentWorkspaceUri ?? ''
+	}
+
+	// Single mutation entry point: updates the underlying map, reflects to
+	// state.pinnedThreadIds, and persists. All pin/unpin/reorder/delete
+	// paths funnel through this so the three-way consistency (map, state,
+	// storage) is impossible to break. Empty buckets are pruned to match
+	// the reader's empty-pruning behavior — keeps storage shape stable.
+	private _setPinsForCurrentWorkspace(newPins: string[], extraStateUpdate?: Partial<ThreadsState>) {
+		const key = this._currentPinKey()
+		if (newPins.length === 0) delete this._pinnedThreadIdsByWorkspace[key]
+		else this._pinnedThreadIdsByWorkspace[key] = newPins
+		this._storePinnedThreadIdsByWorkspace()
+		this._setState({ pinnedThreadIds: newPins, ...(extraStateUpdate ?? {}) })
 	}
 
 	// Phase E — persist the per-workspace "last active thread" map. Lives in
@@ -2593,16 +2668,19 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 	switchToThread(threadId: string) {
 		// User-initiated switch (tab click, history click, etc). Auto-pins
-		// so the thread surfaces in the tab strip. Use `_landOnThread` for
-		// non-user-initiated transitions (startup restore, normalize) where
-		// the tab strip should stay exactly as the user left it.
+		// into the *current workspace's* bucket so the thread surfaces in
+		// THIS workspace's tab strip — and only this one. A foreign thread
+		// opened from "Other workspaces" lands here too, read-only via
+		// commit 3's gating; the foreign thread's own workspace tab strip
+		// is unaffected. Use `_landOnThread` for non-user-initiated
+		// transitions (startup restore, normalize) where the tab strip
+		// should stay exactly as the user left it.
 		const alreadyPinned = this.state.pinnedThreadIds.includes(threadId)
 		if (alreadyPinned) {
 			this._setState({ currentThreadId: threadId })
 		} else {
 			const newPinned = [...this.state.pinnedThreadIds, threadId]
-			this._storePinnedThreadIds(newPinned)
-			this._setState({ currentThreadId: threadId, pinnedThreadIds: newPinned })
+			this._setPinsForCurrentWorkspace(newPinned, { currentThreadId: threadId })
 		}
 		this._afterCurrentThreadChanged(threadId)
 	}
@@ -2736,59 +2814,55 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 	// Phase E — defensive guard + startup landing logic. Snaps the current
-	// thread to a sensible in-scope choice. Used by:
+	// thread to a thread that's *pinned in this workspace*. Used by:
 	//   - constructor end (lands on existing thread instead of creating new)
-	//   - any future code path that risks setting currentThreadId to a
-	//     foreign thread without going through the validated paths
+	//   - any future code path that risks setting currentThreadId to
+	//     something not in this workspace's tab strip
 	// Cascade:
-	//   1. per-workspace last-active (validated for scope and existence)
-	//   2. newest in-scope thread by lastModified (any messages, fresh wins)
-	//   3. openNewThread (creates / reuses an in-scope empty thread)
-	// Works equally for empty windows (no currentWorkspaceUri): "in scope"
-	// degrades to "unscoped only" via `isThreadInWorkspaceScope`, and step 1
-	// is skipped since the per-workspace map is keyed by workspace URI.
+	//   1. per-workspace last-active (must exist + still pinned here)
+	//   2. newest pinned-in-workspace thread by lastModified
+	//   3. openNewThread (creates / reuses an empty thread, auto-pins)
+	//
+	// Pin storage is per-workspace, so any thread in `state.pinnedThreadIds`
+	// is by definition "in this workspace's strip" — no `isThreadInWorkspaceScope`
+	// filter needed. A foreign thread in the strip (opened from "Other
+	// workspaces" via switchToThread) is a legitimate landing target — the
+	// user pinned it here and will be locked out of mutations by commit 3's
+	// gates regardless. Empty windows fall through step 1 cleanly: the map
+	// is keyed by workspace URI; the `''` empty-window key gets its own
+	// last-active slot via the same path.
 	private _normalizeCurrentThreadInScope(): void {
-		const wsUri = this.state.currentWorkspaceUri
 		const cur = this.state.allThreads[this.state.currentThreadId]
-		if (cur && isThreadInWorkspaceScope(cur, wsUri)) return
 		const isPinned = (id: string) => this.state.pinnedThreadIds.includes(id)
-		// (1) per-workspace last-active, but only if it points at a thread
-		//     that's both in scope AND currently pinned. Pinned-only avoids
-		//     the "land on a thread with no tab" UX; the unpin/delete paths
-		//     clear the entry already so this normally hits. Self-heal any
-		//     stale entry we find — dead thread, foreign workspace, or no
-		//     longer pinned (manual storage edits, prior-version bugs) —
-		//     so the entry doesn't keep blocking step (2) on every reload.
-		if (wsUri) {
-			const lastId = this._lastActiveThreadIdByWorkspace[wsUri]
+		// Already on a thread that's in this workspace's strip? Done.
+		if (cur && isPinned(cur.id)) return
+
+		const lastActiveKey = this.state.currentWorkspaceUri
+		// (1) per-workspace last-active, validated against current pin set.
+		//     Self-heal any stale entry (dead ref / unpinned in this ws)
+		//     so it doesn't keep blocking step (2).
+		if (lastActiveKey) {
+			const lastId = this._lastActiveThreadIdByWorkspace[lastActiveKey]
 			if (lastId) {
-				const last = this.state.allThreads[lastId]
-				if (last && isThreadInWorkspaceScope(last, wsUri) && isPinned(lastId)) {
+				if (this.state.allThreads[lastId] && isPinned(lastId)) {
 					this._landOnThread(lastId)
 					return
 				}
-				delete this._lastActiveThreadIdByWorkspace[wsUri]
+				delete this._lastActiveThreadIdByWorkspace[lastActiveKey]
 				this._storeLastActiveThreadIdByWorkspace()
 			}
 		}
-		// (2) newest in-scope PINNED thread by lastModified. Iterating
-		//     `pinnedThreadIds` (instead of `allThreads`) is the bit that
-		//     guarantees we land on a tab — never on a stray unpinned
-		//     thread that would render in the body with no highlighted
-		//     entry in the strip.
+		// (2) newest pinned-in-this-workspace thread by lastModified.
 		const pinnedCandidates = this.state.pinnedThreadIds
 			.map(id => this.state.allThreads[id])
-			.filter((t): t is NonNullable<typeof t> => !!t && isThreadInWorkspaceScope(t, wsUri))
+			.filter((t): t is NonNullable<typeof t> => !!t)
 			.sort((a, b) => (b.lastModified ?? '').localeCompare(a.lastModified ?? ''))
 		if (pinnedCandidates.length > 0) {
 			this._landOnThread(pinnedCandidates[0].id)
 			return
 		}
-		// (3) no in-scope pinned threads. `openNewThread` creates one fresh
-		//     pinned tab — correct because if you unpinned every tab in
-		//     this workspace, you need *something* to interact with on
-		//     reload, and an empty new chat is the standard "blank slate"
-		//     a user expects when they've cleared their working set.
+		// (3) Empty strip in this workspace. Mint a fresh pinned thread —
+		//     standard "blank slate" so the chat pane has something to render.
 		this.openNewThread()
 	}
 
@@ -2826,8 +2900,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 			? this.state.pinnedThreadIds
 			: [...this.state.pinnedThreadIds, newThread.id]
 		this._storeAllThreads(newThreads)
-		this._storePinnedThreadIds(newPinned)
-		this._setState({ allThreads: newThreads, currentThreadId: newThread.id, pinnedThreadIds: newPinned })
+		this._setPinsForCurrentWorkspace(newPinned, { allThreads: newThreads, currentThreadId: newThread.id })
 	}
 
 
@@ -2838,9 +2911,21 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const newThreads = { ...currentThreads };
 		delete newThreads[threadId];
 
-		// drop from the tab strip too (no point showing a tab for a deleted thread)
-		const newPinned = this.state.pinnedThreadIds.filter(id => id !== threadId)
-		if (newPinned.length !== this.state.pinnedThreadIds.length) this._storePinnedThreadIds(newPinned)
+		// Drop the deleted thread from EVERY workspace's pin bucket — pins
+		// are now per-workspace, so the same thread can be pinned in multiple
+		// places. Without iterating all buckets, deleting from workspace A
+		// would leave a ghost pin in workspace B's tab strip on reload.
+		let pinMapChanged = false
+		for (const k of Object.keys(this._pinnedThreadIdsByWorkspace)) {
+			const before = this._pinnedThreadIdsByWorkspace[k]
+			const after = before.filter(id => id !== threadId)
+			if (after.length !== before.length) {
+				this._pinnedThreadIdsByWorkspace[k] = after
+				pinMapChanged = true
+			}
+		}
+		if (pinMapChanged) this._storePinnedThreadIdsByWorkspace()
+		const newPinned = this._pinnedThreadIdsByWorkspace[this._currentPinKey()] ?? []
 
 		// release in-memory telemetry state (rid map + sysMessage snapshot used
 		// for flip detection) so neither map grows forever. The on-disk log file
@@ -2875,59 +2960,60 @@ We only need to do it for files that were edited since `from`, ie files between 
 			[newThread.id]: newThread,
 		}
 		// Pin the duplicate right after the original, so the new tab appears
-		// next to the source tab (natural position). Fall back to append if the
-		// source wasn't pinned.
+		// next to the source tab (natural position). Fall back to append if
+		// the source isn't pinned in this workspace. The duplicate inherits
+		// `workspaceUri` from the source — if the source was foreign here,
+		// the duplicate is foreign too (read-only); user can Move via commit
+		// 4 if they want to claim it.
 		const srcIdx = this.state.pinnedThreadIds.indexOf(threadId)
 		const newPinned = [...this.state.pinnedThreadIds]
 		if (srcIdx === -1) newPinned.push(newThread.id)
 		else newPinned.splice(srcIdx + 1, 0, newThread.id)
 
 		this._storeAllThreads(newThreads)
-		this._storePinnedThreadIds(newPinned)
-		this._setState({ allThreads: newThreads, pinnedThreadIds: newPinned })
+		this._setPinsForCurrentWorkspace(newPinned, { allThreads: newThreads })
 	}
 
 	pinThread(threadId: string): void {
 		if (!this.state.allThreads[threadId]) return
 		if (this.state.pinnedThreadIds.includes(threadId)) return
 		const newPinned = [...this.state.pinnedThreadIds, threadId]
-		this._storePinnedThreadIds(newPinned)
-		this._setState({ pinnedThreadIds: newPinned })
+		this._setPinsForCurrentWorkspace(newPinned)
 	}
 
 	unpinThread(threadId: string): void {
 		if (!this.state.pinnedThreadIds.includes(threadId)) return
 		const newPinned = this.state.pinnedThreadIds.filter(id => id !== threadId)
-		this._storePinnedThreadIds(newPinned)
 
 		// Phase E — clear the per-workspace last-active map of any pointers
-		// to this thread. Otherwise the next reload resurrects it via
-		// `_restoreLastActiveThreadForCurrentWorkspace → switchToThread →
-		// auto-pin`, defeating the unpin entirely.
-		this._clearLastActiveEntriesForThread(threadId)
+		// to this thread *for the current workspace only*. Other workspaces
+		// may still legitimately have it pinned + last-active; their entries
+		// stand. Without this clear, the next reload of THIS workspace
+		// resurrects the thread via the restore-last-active path → auto-pin
+		// → unpin defeated.
+		const wsKey = this._currentPinKey()
+		if (wsKey && this._lastActiveThreadIdByWorkspace[wsKey] === threadId) {
+			delete this._lastActiveThreadIdByWorkspace[wsKey]
+			this._storeLastActiveThreadIdByWorkspace()
+		}
 
-		// If the user removed the tab they're currently looking at, jump to a
-		// neighboring pinned tab so the chat pane doesn't show stale content.
-		//
-		// Phase E — only consider IN-SCOPE pinned tabs as jump targets. Without
-		// this filter, closing the only in-scope tab in workspace A could jump
-		// to a workspace-B tab still in `pinnedThreadIds` (pinning is global)
-		// — chat body then renders a foreign thread while the tab strip shows
-		// nothing, which is the exact "no title, body still visible" symptom
-		// seen during commit-2 testing. Falling through to `openNewThread()`
-		// is the right answer when no in-scope tab remains: it lands on the
-		// per-workspace last-active or mints a fresh thread tagged to the
-		// current workspace.
+		// If the user removed the tab they're currently looking at, jump to
+		// a neighboring pinned tab in this workspace so the chat pane doesn't
+		// show stale content. Per-workspace pin storage means `newPinned` is
+		// already correctly scoped — no extra filter needed (commit-2's
+		// `isThreadInWorkspaceScope` filter here is now redundant). Falling
+		// through to `openNewThread()` is correct when this workspace's
+		// strip is empty: lands on per-workspace last-active or mints a
+		// fresh thread tagged to the current workspace.
 		if (this.state.currentThreadId === threadId) {
-			const inScope = newPinned.filter(id => isThreadInWorkspaceScope(this.state.allThreads[id], this.state.currentWorkspaceUri))
-			if (inScope.length > 0) {
-				this._setState({ pinnedThreadIds: newPinned, currentThreadId: inScope[inScope.length - 1] })
+			if (newPinned.length > 0) {
+				this._setPinsForCurrentWorkspace(newPinned, { currentThreadId: newPinned[newPinned.length - 1] })
 			} else {
-				this._setState({ pinnedThreadIds: newPinned })
+				this._setPinsForCurrentWorkspace(newPinned)
 				this.openNewThread()
 			}
 		} else {
-			this._setState({ pinnedThreadIds: newPinned })
+			this._setPinsForCurrentWorkspace(newPinned)
 		}
 	}
 

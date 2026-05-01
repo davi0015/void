@@ -304,21 +304,20 @@ export const SidebarThreadTabs = () => {
 	const threadsState = useChatThreadsState()
 	const streamState = useFullChatThreadsStreamState()
 
-	const { allThreads, currentThreadId, pinnedThreadIds, currentWorkspaceUri } = threadsState
+	const { allThreads, currentThreadId, pinnedThreadIds } = threadsState
 
 	// Defensive filter: only render tabs whose thread still exists. Stale ids
 	// are pruned at load time too (see ChatThreadService constructor), but this
 	// guards against any in-memory drift between deleteThread and a re-render.
 	//
-	// Phase E — also hide tabs for threads tagged to a *different* workspace.
-	// Pinning is global (one APPLICATION-scoped list) so without this filter
-	// the user would see every workspace's pinned threads as tabs in every
-	// window. Foreign threads are reachable via the "Other workspaces" group
-	// in the history sidebar (commit 4); they should never be pinned tabs in
-	// the wrong workspace. Unscoped threads still appear in every workspace.
+	// Phase E — pin storage is per-workspace at the service layer
+	// (`_pinnedThreadIdsByWorkspace`), so `pinnedThreadIds` here is already
+	// scoped to this window's workspace. No `isThreadInWorkspaceScope` filter
+	// needed: a thread can be pinned in workspace A and workspace B
+	// independently, and a foreign thread that appears here was explicitly
+	// opened by the user (read-only via commit 3's gating).
 	const tabs = (pinnedThreadIds ?? [])
 		.filter(id => !!allThreads[id])
-		.filter(id => isThreadInWorkspaceScope(allThreads[id], currentWorkspaceUri))
 
 	// Keep the active tab in view when threads are switched from outside the
 	// strip (e.g. landing-page history click), otherwise long tab rows can

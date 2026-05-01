@@ -635,6 +635,112 @@ Deferred fixes (still not shipped; re-open only if symptoms return):
 - Validated: single `rewrite_file` call on a non-existent `hello.js` now succeeds as one tool card (no preceding `create_file_or_folder`), where before today it silently no-op'd while showing "Change successfully made". File: `toolsService.ts`.
 - Deferred follow-up: consider replacing `initializeModel`'s `console.log(…)` catch with a typed rethrow that distinguishes `FileNotFound` (expected at certain call sites) from other errors (should propagate). Would surface the same class of bug earlier if it recurs on non-tool code paths (e.g. edit-preview, sticky-scroll). Low priority since the current bug is contained.
 
+**DeepSeek `reasoning_content` empty-string round-trip fix** ✅ DONE
+- Symptom: under DeepSeek V4 thinking mode, the next request after a tool round-trip + checkpoint resume failed with `400 — The reasoning_content in the thinking mode must be passed back to the API`. Reproducible on the "edit tool → checkpoint → continue" flow; intermittent because it depended on whether the model emitted a non-empty reasoning blob on the post-tool follow-up reply.
+- Root cause (two halves of the same bug): post-tool short replies (the "Done."-style follow-up that DeepSeek often returns after a tool result) arrive captured with `reasoning: ""` — the field is present in the response payload but no `delta.reasoning_content` chunks stream in, so the aggregator ends up with an empty string. Two truthy-checks in `convertToLLMMessageService.ts` then collapsed `""` to "no field": (1) `_chatMessagesToSimpleMessages` did `m.reasoning ? m.reasoning : undefined`, dropping the signal at forward time; (2) `prepareMessages_openai_tools` gated emission with `if (currMsg.reasoningContent)`, dropping it again on the wire. Result: an assistant turn that **was** captured under thinking mode replayed without `reasoning_content`, which DeepSeek's API rejects per §5 of `note-deepseek.md`.
+- Why our own §5 was wrong (and got fixed alongside the code): the prior version of `note-deepseek.md` claimed *"only assistants with stored reasoning need to replay it"*, which read "stored" as "non-empty content". The live API treats *captured under thinking mode* — including empty captures — as the constraint. Note rewritten to spell this out.
+- Fix: pass `m.reasoning` through verbatim and gate emission on `currMsg.reasoningContent !== undefined` instead of truthy. Empty strings now round-trip as `reasoning_content: ""` (DeepSeek accepts this); `undefined` (legacy pre-feature history or non-thinking turns) still skips. Two-line semantic change, large comment delta. Files: `convertToLLMMessageService.ts`. Diagnosed via temporary `[reasoning-cap]` (post-stream aggregator) + `[reasoning-emit]` (pre-wire serializer) `console.log` pairs that confirmed the empty-string drop was happening at the conversion layer, not the capture layer; logs removed before commit.
+- Open follow-up (low priority, currently working): `supportsOAICompatReasoningContent` is provider-only, so we emit `reasoning_content: ""` even when the *current* request is non-thinking but a prior turn was captured under thinking. Live API has tolerated this so far; if a non-thinking DeepSeek request ever 400s on this, refine the gate to also depend on whether the current request has `thinking: { type: 'enabled' }` in `includeInPayload`.
+
+### Next — Workspace-scoped chats (in progress, 5 commits)
+
+Goal: chat history lives "in the workspace", not as one global pile. Default thread list shows current workspace's chats + legacy unscoped; other workspaces' chats are visible as **read-only** in an "Other workspaces" group, with explicit Copy/Move actions to bring them into the current workspace.
+
+**Design decisions locked in (do NOT relitigate without revisiting):**
+
+- **Storage stays APPLICATION-scoped**, threads gain a `workspaceUri` tag. True `StorageScope.WORKSPACE` was rejected because requirement #3 (browse other workspaces' chats) is incompatible with VS Code's storage model — `IStorageService` only exposes the *current* workspace's data. Workspace boundary is therefore a logical filter, not physical separation.
+- **Default list filter**: `thread.workspaceUri === currentWorkspaceUri || thread.workspaceUri === undefined`. Legacy unscoped threads stay visible in every workspace's list until explicitly Move-d (= claimed) or Copy-ed elsewhere. No auto-tag on first-message-in-legacy-thread (rejected for predictability).
+- **Read-only mode** for cross-workspace viewing. Disables: send, edit-message, retry, abort, checkpoint restore, approve/reject on tool requests, pin button, model-selection dropdown. Read operations (scroll, expand tool result body, click file references to open) all stay enabled. Implicitly handles cross-workspace checkpoint-restore safety (no special guard needed).
+- **Copy and Move both available** in the read-only banner, Copy as primary action.
+  - **Copy** = deep clone with fresh `id`, set `workspaceUri/workspaceLabel` to current, stamp `importedFromWorkspaceUri/importedFromThreadId/importedAt`, **reset `latestUsage` / `cumulativeUsageThisThread` / `cumulativeCompactionThisThread` to undefined** (cost-of-foreign-work shouldn't count in this workspace's books). Original thread untouched.
+  - **Move** = in-place re-tag (`workspaceUri` + `workspaceLabel` only). Counters preserved, no provenance stamps (the thread *is* the original, just relocated). Source workspace loses it.
+- **Visual indicators (icons + hover tooltips, NOT title text)**: lock icon for read-only foreign threads ("From workspace X (read-only)"); imported icon for threads with `importedFromWorkspaceUri` set ("Imported from workspace X on Y"). Title text stays clean — handles "two threads with the same title" via icon distinction, not by polluting titles with "(imported from X)".
+- **Per-workspace `currentThreadId`**: `lastActiveThreadIdByWorkspace: Record<workspaceUri, threadId>`. Restored on workspace switch. Lives in its own APPLICATION-scoped storage key (separate from threads blob, no migration risk).
+- **Pinning gated on `!isReadOnly`**. Pin display also filtered by `workspaceUri` so pinned threads from workspace A don't clutter workspace B's tab strip.
+- **Workspace identity**: URI string of folder (single-folder) or `.code-workspace` file (multi-root); empty-window → undefined. Renaming a folder breaks the link (accepted edge case — recovery is one Move-here from "Other workspaces"). Workspace label captured at creation = basename, not derived dynamically (so threads from a deleted workspace still show a sensible group name).
+
+**Open follow-ups (deferred):**
+
+- Title-collision suffix on copy was rejected (use icon instead); revisit if users complain.
+- Bulk import ("import all threads from workspace X"). Skip until requested.
+- Cross-workspace search (find a thread by content across all workspaces). Skip — import picker is already a search UI over titles.
+- Export thread to JSON for cross-machine backup. Different feature, separate concern.
+- Storage growth from copies: not optimised. Threads ~50–500KB; 20 imports = ~10MB extra. Only revisit if telemetry shows ballooning.
+
+**Commit plan:**
+
+- **Commit 1 — Schema + workspace stamp at creation.** Add `workspaceUri?` / `workspaceLabel?` / `importedFromWorkspaceUri?` / `importedFromThreadId?` / `importedAt?` to `ThreadType`. `newThreadObject` accepts identity from caller; `openNewThread` reads `IWorkspaceContextService` and passes through. Legacy threads remain undefined-everywhere (backward compat). **Zero user-visible change.** No filter, no UI, no storage layout changes.
+- **Commit 2 — Default list filter + per-workspace `currentThreadId` + pin filter.** Tab strip + history sidebar + pinned-thread row filter to `workspaceUri === current || === undefined`. Add `LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY` (separate APPLICATION-scoped key); restore last-active per workspace on switch, fallback to newest editable, fallback to landing page. **First user-impacting commit** — foreign threads disappear from default view.
+- **Commit 3 — Read-only mode infrastructure.** Add `isReadOnly` derived flag (`!!thread.workspaceUri && thread.workspaceUri !== currentWorkspaceUri`). Gate every mutation in `SidebarChat.tsx` and downstream. Unobservable in isolation (no foreign threads visible until commit 4) — focused review of "did we cover every mutation point".
+- **Commit 4 — "Other workspaces" group + read-only banner + Copy/Move actions.** Foreign threads surface in history under "Other workspaces" group, sub-grouped by workspace label, all collapsed by default. Click → opens read-only with banner + Copy/Move buttons. `copyThreadToCurrentWorkspace` and `moveThreadToCurrentWorkspace` implementations. **Feature-complete commit.**
+- **Commit 5 — Visual indicators on tab strip.** Lock icon + tooltip for read-only foreign; imported icon + tooltip for threads with `importedFrom*` set. Polish-only.
+- **(Optional) Commit 6 — Roadmap entry move.** Move this section into the Done block once everything ships, with measured outcomes / any deviations from plan called out.
+
+**Currently working on: Commit 3 (read-only mode infrastructure) — code in tree, not yet committed. Commit 2 confirmed working post-debug session.**
+
+**Commit 2 implementation notes (record so the next session doesn't re-derive):**
+
+- New file: `LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY` in `storageKeys.ts` (separate slot from threads blob; small frequently-touched dict shouldn't reflate the big payload).
+- `ThreadsState` gained `currentWorkspaceUri?: string`. Resolved exactly once at service construction (`_getCurrentWorkspaceIdentity`), held in state so React consumers (`useChatThreadsState`) get it for free without re-injecting `IWorkspaceContextService` everywhere.
+- Exported helper `isThreadInWorkspaceScope(thread, currentWorkspaceUri)` is the single source of truth for the rule "same workspace OR unscoped is in scope". Used in: constructor restore-validation, `openNewThread` empty-thread reuse gate, history list filter, pinned-tab filter. Same logic lands in commit 3 (`isReadOnly` is its negation, restricted to non-undefined `thread.workspaceUri`).
+- Service gained private `_lastActiveThreadIdByWorkspace: Record<workspaceUri, threadId>` + read/write. Constructor hydrates from storage, then `_restoreLastActiveThreadForCurrentWorkspace()` validates (entry exists / thread exists / still in scope) and either calls `switchToThread` or self-heals by deleting the stale entry. On miss it falls through to the existing `openNewThread()`.
+- `switchToThread` writes `{ wsUri → threadId }` to the map and persists (skipped on empty windows; only persists when the value actually changes). This is the only place outside the constructor that touches the map.
+- `openNewThread`'s empty-thread reuse path now requires `isThreadInWorkspaceScope` — it never silently hijacks an empty thread tagged to a different workspace. Unscoped empties remain fair game for reuse.
+- React filters live in `SidebarThreadSelector.tsx`: `PastThreadsList` and `SidebarThreadTabs` both read `currentWorkspaceUri` from state and apply `isThreadInWorkspaceScope`.
+- Reload requirement: `ChatThreadService` is an instantiated singleton — its constructor only runs once per window. Restoring last-active and stamping `currentWorkspaceUri` therefore needs a window reload (Cmd+R) after pulling the change; full server restart not required because the watcher recompiles in place.
+
+**Commit 2 follow-up: claim-on-engagement (shipped in same commit, not deferred):**
+
+Initial commit-2 behavior treated unscoped threads as "visible in every workspace until Move-d". This was wrong in practice — testing showed two failure modes that both produced the same user-visible bug ("threads from workspace A appear as tabs in workspace B"):
+
+1. **Reuse-path leak**: `openNewThread` with a pre-Phase-E empty thread sitting around reuses it via `switchToThread` without ever going through `newThreadObject`, so the workspace tag never gets written. A thread the user genuinely created "in workspace A" ends up untagged → visible everywhere. Hits every existing user during the migration window.
+2. **Legacy-non-empty leak**: pre-Phase-E threads with messages already in them are untagged forever; the spec said "they show up in every workspace until Move-d via commit 4 UI". User mental model rejected this: "I made this in workspace X, why is it everywhere?".
+
+Fix: new private helper `_claimThreadForCurrentWorkspaceIfUnscoped(threadId)` on the service. Tags an unscoped thread with the current workspace's identity. No-op when the thread is already tagged (any workspace) or the window is empty-window. Wired in at two engagement points:
+
+- **`openNewThread` reuse branch** — claim before `switchToThread`, so reusing an unscoped empty thread immediately tags it. Closes failure mode 1 at the source.
+- **`_addUserMessageAndStreamResponse` top** — claim before any of the message-sending plumbing fires. Closes failure mode 2 the next time the user sends a message in a legacy thread, no migration UI required.
+
+Semantics: last-engaged wins. If you flip workspaces and send a message in an unscoped thread from workspace B, the thread becomes B's. This matches what the user was actually trying to do; no scenario where a legitimately shared thread regresses.
+
+Not wired in (decided): `editUserMessageAndStreamResponse`, `duplicateThread`, `switchToThread`, `pinThread`. Engagement was scoped to "user actively says something" (send / first interaction). Pure navigation (switch, edit-without-resend, pin) is a non-event for claim purposes — otherwise just clicking through history would silently re-tag threads.
+
+**Commit 2 follow-up (continued): untitled-multi-root window leak.**
+
+After the claim-on-engagement fix, testing turned up a *third* failure mode also producing untagged threads. VS Code's `toWorkspaceIdentifier(workspace)` returns three shapes:
+- `{ id, uri }` — single-folder workspace.
+- `{ id, configPath }` — multi-root `.code-workspace` file.
+- `{ id }` only — empty window OR **untitled multi-root** (multiple folders dragged into one window but not yet saved as a `.code-workspace`).
+
+The original `_getCurrentWorkspaceIdentity` only handled the first two and returned `{}` (treat as empty window) for the third shape. So a user creating a thread in an untitled multi-root window got `workspaceUri = undefined` even though they were clearly "in a workspace". That's how `363980c4` ("what time is it?") ended up untagged despite being created via `newThreadObject`.
+
+Fix: detect the untitled-multi-root case by checking `workspace.folders.length > 0` after both other branches miss, and synthesize a stable scoping key from `workspace.id` with a `void-untitled-workspace://` prefix (so it can't accidentally collide with a real folder URI in storage / Move actions later). Label = first folder's basename + `(+N)` if there are more.
+
+Edge case (accepted): saving an untitled multi-root window as a `.code-workspace` mints a new `id` and existing threads stay tagged to the old synthetic key. They become "foreign" to the saved workspace and can be Moved over via commit 4 UI. Cheap to live with; alternative is migrating tags on save which we haven't built.
+
+**Other open in commit 2 (resolved during debug session):**
+
+- Originally deferred: cleanup of `_lastActiveThreadIdByWorkspace` entries on `deleteThread`. Got promoted to in-scope after observing "closed threads keep reappearing on reload" — the stale entry was being honored on next startup, not self-healing. Fix shipped: `_clearLastActiveEntriesForThread` called from both `unpinThread` and `deleteThread`.
+- Startup landing strategy was rewritten end-of-session: `_normalizeCurrentThreadInScope` now prioritises *pinned* in-scope threads via `_landOnThread` (no auto-pin), only falling through to `openNewThread` (which auto-pins) when the workspace genuinely has nothing to show. Fixes "refresh creates a new chat" and "refresh creates a chat without a tab".
+
+**Commit 2 follow-up: per-workspace pin storage (model correction).**
+
+User feedback after commit-3 work surfaced a deeper modeling error: "a chat can be opened by more than 1 workspace, whether it is editable or not is another problem, whether a chat is opened or not is only scoped to that workspace". The original commit-2 implementation kept pin storage as a single global `string[]` and patched the symptom (tab strip filter applies `isThreadInWorkspaceScope`). That filter was always papering over the wrong shape — it produced the user-reported "unscoped chat opened from history appears in both workspaces' tab strips" symptom because unscoped is universally in-scope, so a single global pin necessarily renders in every workspace.
+
+Refactor (in-place to commit 2, since it's the same idea applied to the right data structure):
+
+- New private map `_pinnedThreadIdsByWorkspace: Record<workspaceUri, threadId[]>` is the source of truth. Empty-window pins live under sentinel key `''`.
+- `state.pinnedThreadIds` is now a *projection* of the current workspace's bucket. React consumers stay unchanged.
+- All pin/unpin/reorder/delete paths funnel through one helper, `_setPinsForCurrentWorkspace(newPins, extraStateUpdate?)`, that updates map + projection + storage atomically. Avoids the three-way drift bugs that're easy to introduce when each method copy-pastes the persistence triple.
+- `deleteThread` is the only operation that touches *all* buckets (thread is gone for everyone), iterating `Object.keys(_pinnedThreadIdsByWorkspace)`.
+- `unpinThread` clears the per-workspace last-active map for *current workspace only* (not all workspaces, as it did before). Other workspaces may still legitimately have the thread pinned + last-active; their state stands.
+- Tab strip filter in `SidebarThreadSelector.tsx` drops the `isThreadInWorkspaceScope` check — the per-workspace bucket is already correctly scoped by construction. A foreign thread that does appear here was explicitly opened by the user (read-only via commit 3's gates).
+- `_normalizeCurrentThreadInScope` cascade simplified: per-workspace pin storage means "in scope" check on pinned candidates is redundant. A foreign-yet-pinned thread is now a legitimate landing spot — user pinned it here, locking-out-of-mutations is commit 3's job.
+
+Storage migration (one-shot, runs at construction): if `chatPinnedThreadsI` value is the legacy array shape, distribute each id to its `thread.workspaceUri` bucket; drop unscoped pins (no obvious workspace to assign to; user's natural recovery is re-clicking from history). The next pin/unpin re-serializes under the new shape.
+
+What this changes for `switchToThread` semantics: opening a foreign or unscoped thread from history auto-pins to *current workspace's bucket only*. The other workspace's tab strip is unaffected. This is the entire fix for the "unscoped chat in both workspace tabs" symptom.
+
 ### Capability audit vs. Cursor (post-Phase-C, pre-daily-use)
 
 Asked "what brings Void to the next level?" → audited the codebase to separate "actually missing" from "assumed missing". Outcome:
