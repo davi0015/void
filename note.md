@@ -676,7 +676,7 @@ Goal: chat history lives "in the workspace", not as one global pile. Default thr
 - **Commit 5 — Visual indicators on tab strip.** Lock icon + tooltip for read-only foreign; imported icon + tooltip for threads with `importedFrom*` set. Polish-only.
 - **(Optional) Commit 6 — Roadmap entry move.** Move this section into the Done block once everything ships, with measured outcomes / any deviations from plan called out.
 
-**Currently working on: Commit 3 (read-only mode infrastructure) — code in tree, not yet committed. Commit 2 confirmed working post-debug session.**
+**Currently working on: Commit 4 ("Other workspaces" history group + read-only banner + Copy/Move) — code in tree, not yet committed. Commits 1-3 + per-workspace pin refactor confirmed working post-debug session.**
 
 **Commit 2 implementation notes (record so the next session doesn't re-derive):**
 
@@ -771,6 +771,51 @@ Not gated (with rationale):
 - `setCurrentlyFocusedMessageIdx`, `setCurrentThreadState` (raw), `setCurrentMessageState` (raw) — UI-state mutations (focus, scroll, mountedInfo). Harmless on read-only; the truly destructive paths that flow through these (sends, etc.) are gated separately above them.
 
 Testing plan: unobservable in isolation as designed. Verification deferred to commit 4 — once foreign threads have a path to be visible/clickable, exercise each gated action and confirm (a) no thread mutation, (b) the `console.warn` fires once per attempt.
+
+**Commit 4 implementation notes ("Other workspaces" history group + read-only banner + Copy/Move):**
+
+The feature-complete commit. Surfaces foreign + unscoped threads in the history sidebar under a collapsible "Other workspaces" group, adds a read-only banner with Copy/Move actions to the chat body, and implements the two service methods that actually move data between workspaces. This is the commit that makes commits 2 and 3 observable end-to-end.
+
+*History list partition* (`partitionThreadsByWorkspaceScope` in `SidebarThreadSelector.tsx`):
+- Strict equality on `workspaceUri` for the "own" bucket — *not* `isThreadInWorkspaceScope`. Unscoped threads (workspaceUri === undefined) no longer mix into the default list; they live under "Other workspaces → Unscoped" alongside foreign threads. Cleaner mental model: default = strictly current workspace, everything else is one click deeper.
+- Foreign bucket keyed by `thread.workspaceUri` (real workspace URI / `.code-workspace` configPath / synthetic `void-untitled-workspace://` from commit 2's untitled-multi-root fix). The empty-string sentinel is reused for unscoped, so the bucket key matches the same scoping key the service uses internally — nothing has to translate between display and storage.
+- `Map` (not plain object) preserves insertion order so groups render in lastModified-recency order rather than alphabetical-by-key noise.
+
+*UI state* — both expansion levels are in-memory only (no persistence). Top-level "Other workspaces" defaults collapsed each reload; per-bucket sub-groups default *expanded* once the parent opens (avoids cascade-of-clicks when you've already committed to looking under there). Decided against persisting either across reloads — the cost of one click on each session is small, and a persistent expanded state would cause flicker on first paint after restoring 50+ entries.
+
+*Copy semantics* (`copyThreadToCurrentWorkspace`):
+- Fresh `id` via `generateUuid` so source's id remains traceable.
+- Workspace stamp set to current via `_getCurrentWorkspaceIdentity()`.
+- `importedFromWorkspaceUri` / `importedFromThreadId` / `importedAt` provenance — already on `ThreadType` from commit 1, finally used.
+- Usage telemetry reset to undefined (`latestUsage`, `cumulativeUsageThisThread`, `latestCompaction`, `cumulativeCompactionThisThread`) — those numbers accrued on requests that ran in another workspace's context and would be misleading if carried over. The TokenUsageRing reads from these fields so it goes blank-then-rebuilds-on-next-send. In-memory mirror maps are also cleaned defensively.
+- Messages, checkpoints, model selection, staging selections all carry over verbatim. Copy is "give me a working duplicate to riff on", not "fresh start with the same prompt".
+- Auto-pin + switch via `switchToThread` rather than open-coding — keeps the auto-pin / lastActive / model-restore side-effects flowing through the established channel.
+
+*Move semantics* (`moveThreadToCurrentWorkspace`):
+- Re-tags `workspaceUri` + `workspaceLabel` in place. Same id, same messages, no telemetry reset (lifetime cost belongs to the user, not the workspace it accumulated in).
+- Cleans up the *origin* workspace's pin bucket and last-active pointer for this thread — once re-tagged, the thread is foreign to its origin per the new model, and a leftover pin would render an out-of-place tab in that workspace's strip on its next reload.
+- No-op + just-switch when the source already belongs to current workspace (defensive — banner shouldn't even offer Move in that case, but direct API calls might).
+
+*Banner trigger separated from read-only* (`ReadOnlyForeignThreadBanner` in `SidebarChat.tsx`):
+- Shows above `messagesHTML` whenever `shouldShowOwnershipBanner(currentThread, currentWorkspaceUri)` returns true — strict workspace mismatch (same predicate the history partition uses), so it fires for **both** foreign workspaces AND unscoped threads in a workspaced window.
+- Read-only gating uses the *narrower* `isThreadReadOnly` (foreign only, unscoped excluded). Service guards from commit 3 still gate every mutation entry on the same narrower predicate; unscoped sends + edits flow through normally and `_claimThreadForCurrentWorkspaceIfUnscoped` re-tags them on first engagement.
+- Owner label cascades: real `workspaceLabel` → `workspaceUri` string → "Unscoped" sentinel. Matches the heading used by `partitionThreadsByWorkspaceScope`, so the banner agrees with the history group the user clicked through.
+- Two visual variants based on `isUnscoped`. Foreign: lock icon, "Read-only — owned by X" + "Move here" (re-tags, source loses default-view access; input gated). Unscoped: info icon, "Not tied to a workspace yet — editable, claim to keep it here" + "Claim here" (input still works; banner is the explicit/discoverable counterpart to claim-on-send). Copy is identical in both.
+
+*Why banner ≠ read-only* (final design after iteration):
+- First draft: banner triggered on `isThreadReadOnly` and unscoped was treated as read-only. Felt symmetric, but broke unscoped editability — claim-on-send couldn't fire because the service guard ran first, and users lost the ability to keep using the empty-window-created threads they'd accumulated.
+- Final: two predicates with overlapping but distinct meanings. `shouldShowOwnershipBanner` (broad) drives the UI affordance ("this isn't yours, want to claim?"); `isThreadReadOnly` (narrow) drives the lockdown ("this is someone else's, don't touch"). Empty windows skip both — no reference frame.
+- Truth table:
+  - same workspace        → banner: no,  read-only: no  (normal)
+  - foreign workspace     → banner: yes, read-only: yes (Copy / Move; input gated)
+  - unscoped + workspaced → banner: yes, read-only: no  (Copy / Claim; input editable + claim-on-send)
+  - empty window          → banner: no,  read-only: no  (no reference frame)
+
+*In-bubble edit pencil also gated*:
+- `UserMessageComponent` renders a small Pencil button (top-right of each user message) that re-opens the message for editing. Originally always rendered when hovered. With service-level gates in place, clicking it on a foreign thread silently no-ops, which is worse UX than not showing it.
+- Threaded `threadIsReadOnly` from `ThreadMessagesView` → `ChatBubble` → `_ChatBubble` → `UserMessageComponent` (single subscription at the view level rather than per-bubble re-subscription). When true: Pencil hidden, the bubble itself loses `cursor-pointer` + the click-to-edit handler. The `<textarea>`-based edit mode is unreachable from the UI; the service guard is now defense-in-depth, not the only defense.
+
+*Why landing-page banner is unnecessary*: foreign threads opened from "Other workspaces" go through `switchToThread` which auto-pins + sets `currentThreadId`. Landing page only renders for threads with zero messages, but the partition filter excludes empty threads from "Other workspaces" entirely — so a foreign thread on the landing page is unreachable through normal navigation. Skipping that branch saves a defensive code path that has no test surface.
 
 ### Capability audit vs. Cursor (post-Phase-C, pre-daily-use)
 

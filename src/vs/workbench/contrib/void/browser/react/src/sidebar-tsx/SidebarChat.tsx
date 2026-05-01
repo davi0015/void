@@ -22,11 +22,11 @@ import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
-import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare } from 'lucide-react';
+import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, EditToolAcceptRejectButtonsHTML, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, StatusIndicatorForApplyButton, useApplyStreamState, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
-import { IsRunningType } from '../../../chatThreadService.js';
+import { IsRunningType, isThreadReadOnly, shouldShowOwnershipBanner } from '../../../chatThreadService.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
 import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_INACTIVE_TIME } from '../../../../common/prompt/prompts.js';
 import { type LLMUsage, RawToolCallObj } from '../../../../common/sendLLMMessageTypes.js';
@@ -1320,7 +1320,7 @@ const SimplifiedToolHeader = ({
 
 
 
-const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, currCheckpointIdx, _scrollToBottom }: { chatMessage: ChatMessage & { role: 'user' }, messageIdx: number, currCheckpointIdx: number | undefined, isCheckpointGhost: boolean, _scrollToBottom: (() => void) | null }) => {
+const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, currCheckpointIdx, _scrollToBottom, isReadOnly }: { chatMessage: ChatMessage & { role: 'user' }, messageIdx: number, currCheckpointIdx: number | undefined, isCheckpointGhost: boolean, _scrollToBottom: (() => void) | null, isReadOnly: boolean }) => {
 
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
@@ -1516,17 +1516,17 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 			className={`
             text-left rounded-lg max-w-full
             ${mode === 'edit' ? ''
-					: mode === 'display' ? 'p-2 flex flex-col bg-void-bg-1 text-void-fg-1 overflow-x-auto cursor-pointer' : ''
+					: mode === 'display' ? `p-2 flex flex-col bg-void-bg-1 text-void-fg-1 overflow-x-auto ${isReadOnly ? '' : 'cursor-pointer'}` : ''
 				}
         `}
-			onClick={() => { if (mode === 'display') { onOpenEdit() } }}
+			onClick={() => { if (mode === 'display' && !isReadOnly) { onOpenEdit() } }}
 		>
 			{chatbubbleContents}
 		</div>
 
 
 
-		<div
+		{!isReadOnly && <div
 			className="absolute -top-1 -right-1 translate-x-0 -translate-y-0 z-1"
 		// data-tooltip-id='void-tooltip'
 		// data-tooltip-content='Edit message'
@@ -1549,7 +1549,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 					}
 				}}
 			/>
-		</div>
+		</div>}
 
 
 		</div>
@@ -2974,6 +2974,78 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 };
 
 
+// Phase E commit 4 — banner that sits above the message list when the
+// active thread is read-only here. Two cases produce read-only:
+//   (a) thread is owned by another workspace (`isUnscoped === false`)
+//   (b) thread is unscoped — legacy, pre-Phase-E, or created in an
+//       empty window (`isUnscoped === true`)
+// Both paths offer the same two actions:
+//   - Copy: clone the thread into the current workspace (usage counters
+//     reset, importedFrom* stamped, source untouched).
+//   - Move: re-tag the thread to the current workspace in place. For
+//     foreign threads, source loses access from its origin workspace's
+//     default view. For unscoped threads, there's no "origin" to leave
+//     behind — Move just claims it.
+//
+// Either action auto-pins the resulting thread to this workspace's
+// strip and switches focus, so the user can immediately start editing.
+// Until they choose, every mutation entry on the service is gated
+// (commit 3) — the banner is the explicit user-facing path out of
+// read-only mode.
+const ReadOnlyForeignThreadBanner = ({ ownerLabel, isUnscoped, threadId }: { ownerLabel: string, isUnscoped: boolean, threadId: string }) => {
+	const accessor = useAccessor()
+	const chatThreadsService = accessor.get('IChatThreadService')
+
+	const onCopy = () => { chatThreadsService.copyThreadToCurrentWorkspace(threadId) }
+	const onMove = () => { chatThreadsService.moveThreadToCurrentWorkspace(threadId) }
+
+	// Two banner variants. Foreign = "Read-only" (input is gated). Unscoped =
+	// "Not tied to a workspace" (input still works; banner just exposes
+	// explicit Copy/Claim so the user doesn't have to learn the implicit
+	// claim-on-send pathway). Mirrors `isThreadReadOnly` vs
+	// `shouldShowOwnershipBanner` in chatThreadService.
+	const headerText = isUnscoped
+		? <>Not tied to a workspace yet — <span className='opacity-90'>editable, claim to keep it here</span></>
+		: <>Read-only — owned by <span className='opacity-90'>{ownerLabel}</span></>
+
+	const moveTooltip = isUnscoped
+		? 'Tag this thread to the current workspace. It disappears from "Other workspaces → Unscoped" and stays in this workspace going forward.'
+		: 'Re-tag this thread to this workspace. It disappears from the source workspace.'
+
+	return (
+		<div className='mx-3 my-2 px-3 py-2 rounded border border-void-stroke-1 bg-void-bg-3 text-xs flex flex-col gap-2'>
+			<div className='flex items-center gap-2 text-void-fg-3'>
+				{isUnscoped ? <Info size={12} className='flex-shrink-0' /> : <Lock size={12} className='flex-shrink-0' />}
+				<span className='truncate'>{headerText}</span>
+			</div>
+			<div className='flex items-center gap-2'>
+				<button
+					type='button'
+					className='flex items-center gap-1 px-2 py-1 rounded text-void-fg-2 hover:bg-zinc-700/10 dark:hover:bg-zinc-300/10 cursor-pointer'
+					onClick={onCopy}
+					data-tooltip-id='void-tooltip'
+					data-tooltip-place='top'
+					data-tooltip-content='Clone into this workspace. Original stays where it is; usage counters reset on the copy.'
+				>
+					<CopyIcon size={12} />
+					<span>Copy here</span>
+				</button>
+				<button
+					type='button'
+					className='flex items-center gap-1 px-2 py-1 rounded text-void-fg-2 hover:bg-zinc-700/10 dark:hover:bg-zinc-300/10 cursor-pointer'
+					onClick={onMove}
+					data-tooltip-id='void-tooltip'
+					data-tooltip-place='top'
+					data-tooltip-content={moveTooltip}
+				>
+					<MoveRight size={12} />
+					<span>{isUnscoped ? 'Claim here' : 'Move here'}</span>
+				</button>
+			</div>
+		</div>
+	)
+}
+
 const Checkpoint = ({ message, threadId, messageIdx, isCheckpointGhost, threadIsRunning }: { message: CheckpointEntry, threadId: string; messageIdx: number, isCheckpointGhost: boolean, threadIsRunning: boolean }) => {
 	const accessor = useAccessor()
 	const chatThreadService = accessor.get('IChatThreadService')
@@ -3027,6 +3099,12 @@ type ChatBubbleProps = {
 	threadId: string,
 	currCheckpointIdx: number | undefined,
 	_scrollToBottom: (() => void) | null,
+	// Phase E commit 4 — true when this thread is foreign to the current
+	// workspace and `editUserMessageAndStreamResponse` would be blocked at
+	// the service level. Threaded down to `UserMessageComponent` to hide
+	// the in-bubble edit pencil + the bubble-as-button click-to-edit path
+	// so the UI agrees with the service guard.
+	threadIsReadOnly: boolean,
 	// Index of the message that currently owns the approve/reject prompt (the earliest
 	// tool_request in the consecutive trailing batch). When a multi-tool batch is
 	// pre-added, all queued tool_requests share the same status but only the first one
@@ -3041,7 +3119,7 @@ const ChatBubble = (props: ChatBubbleProps) => {
 	</ErrorBoundary>
 }
 
-const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, messageIdx, chatIsRunning, _scrollToBottom, firstPendingToolRequestIdx }: ChatBubbleProps) => {
+const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, messageIdx, chatIsRunning, _scrollToBottom, firstPendingToolRequestIdx, threadIsReadOnly }: ChatBubbleProps) => {
 	const role = chatMessage.role
 
 	const isCheckpointGhost = messageIdx > (currCheckpointIdx ?? Infinity) && !chatIsRunning // whether to show as gray (if chat is running, for good measure just dont show any ghosts)
@@ -3053,6 +3131,7 @@ const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, me
 			currCheckpointIdx={currCheckpointIdx}
 			messageIdx={messageIdx}
 			_scrollToBottom={_scrollToBottom}
+			isReadOnly={threadIsReadOnly}
 		/>
 	}
 	else if (role === 'assistant') {
@@ -3432,6 +3511,11 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 	const chatThreadsState = useChatThreadsState()
 	const thread = chatThreadsState.allThreads[threadId]
 	const previousMessages = thread?.messages ?? []
+	// Phase E commit 4 — propagated to each user-message bubble so the in-
+	// bubble pencil and click-to-edit path agree with the input-area gating
+	// in `SidebarChat`. Computed here (rather than in `_ChatBubble`) to
+	// avoid one `useChatThreadsState` subscription per message.
+	const threadIsReadOnly = isThreadReadOnly(thread, chatThreadsState.currentWorkspaceUri)
 
 	const streamState = useChatThreadsStreamState(threadId)
 	const isRunning = streamState?.isRunning
@@ -3486,9 +3570,10 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 				threadId={threadId}
 				_scrollToBottom={() => scrollToBottom(scrollContainerRef)}
 				firstPendingToolRequestIdx={firstPendingToolRequestIdx}
+				threadIsReadOnly={threadIsReadOnly}
 			/>
 		})
-	}, [previousMessages, threadId, currCheckpointIdx, isRunning, scrollContainerRef, firstPendingToolRequestIdx])
+	}, [previousMessages, threadId, currCheckpointIdx, isRunning, scrollContainerRef, firstPendingToolRequestIdx, threadIsReadOnly])
 
 	const streamingChatIdx = previousMessagesHTML.length
 	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
@@ -3506,6 +3591,7 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 			chatIsRunning={isRunning}
 			threadId={threadId}
 			_scrollToBottom={null}
+			threadIsReadOnly={threadIsReadOnly}
 		/> : null
 
 	const generatingTool = toolIsGenerating && currentInFlightTool ?
@@ -3601,7 +3687,19 @@ export const SidebarChat = () => {
 	const initVal = ''
 	const [instructionsAreEmpty, setInstructionsAreEmpty] = useState(!initVal)
 
-	const isDisabled = instructionsAreEmpty || !!isFeatureNameDisabled('Chat', settingsState)
+	// Phase E commit 4 — read-only fires for foreign threads only.
+	// Unscoped threads stay editable (claim-on-engagement still works);
+	// they get the same banner via `shouldShowOwnershipBanner` but the
+	// input remains active. Hoisted up here (instead of computed inside
+	// `threadPageContent`) so the `isDisabled` derivation below picks it
+	// up. The `pointer-events-none` wrapper on `inputChatArea` covers
+	// mouse + touch interaction with the textarea / dropdowns; this also
+	// short-circuits the `isDisabled` path so keyboard-Enter submission
+	// can't sneak past either.
+	const isCurrentThreadReadOnly = !!currentThread && isThreadReadOnly(currentThread, chatThreadsState.currentWorkspaceUri)
+	const showCurrentThreadBanner = !!currentThread && shouldShowOwnershipBanner(currentThread, chatThreadsState.currentWorkspaceUri)
+
+	const isDisabled = instructionsAreEmpty || !!isFeatureNameDisabled('Chat', settingsState) || isCurrentThreadReadOnly
 
 	const sidebarRef = useRef<HTMLDivElement>(null)
 
@@ -3667,6 +3765,15 @@ export const SidebarChat = () => {
 	const onSubmit = useCallback(async (_forceSubmit?: string) => {
 
 		if (isSubmittingRef.current) return
+		// Phase E commit 4 — read-only foreign thread short-circuit. Belt
+		// to commit 3's service guard's suspenders: `isDisabled` already
+		// covers the keyboard-Enter path via the textarea, but
+		// `_forceSubmit` (landing-page suggested prompts) bypasses
+		// `isDisabled`. Foreign threads can't land on the landing page in
+		// practice (they always have messages, and the partition filter
+		// drops empty ones), so this is purely defensive — but it costs
+		// one branch and removes any "what if" worry.
+		if (isCurrentThreadReadOnly) return
 		if (isDisabled && !_forceSubmit) return
 		if (isRunning) return
 
@@ -3694,7 +3801,7 @@ export const SidebarChat = () => {
 
 		textAreaRef.current?.focus() // focus input after submit
 
-	}, [chatThreadsService, isDisabled, isRunning, textAreaRef, textAreaFnsRef, setSelections, settingsState])
+	}, [chatThreadsService, isDisabled, isRunning, textAreaRef, textAreaFnsRef, setSelections, settingsState, isCurrentThreadReadOnly])
 
 	const onAbort = async () => {
 		const threadId = currentThread.id
@@ -3770,32 +3877,40 @@ export const SidebarChat = () => {
 		}
 	}, [onSubmit, onAbort, isRunning])
 
-	const inputChatArea = <VoidChatArea
-		featureName='Chat'
-		onSubmit={() => onSubmit()}
-		onAbort={onAbort}
-		isStreaming={!!isRunning}
-		isDisabled={isDisabled}
-		showSelections={true}
-		// showProspectiveSelections={previousMessagesHTML.length === 0}
-		selections={selections}
-		setSelections={setSelections}
-		onClickAnywhere={() => { textAreaRef.current?.focus() }}
-		threadIdForUsageRing={chatThreadsState.currentThreadId}
-	>
-		<VoidInputBox2
-			enableAtToMention
-			className={`min-h-[81px] px-0.5 py-0.5`}
-			placeholder={`@ to mention, ${keybindingString ? `${keybindingString} to add a selection. ` : ''}Enter instructions...`}
-			onChangeText={onChangeText}
-			onKeyDown={onKeyDown}
-			onFocus={() => { chatThreadsService.setCurrentlyFocusedMessageIdx(undefined) }}
-			ref={textAreaRef}
-			fnsRef={textAreaFnsRef}
-			multiline={true}
-		/>
+	// Phase E commit 4 — when the current thread is read-only (foreign
+	// workspace), wrap the input in a `pointer-events-none opacity-60`
+	// shell so mouse / touch can't focus the textarea, click the model
+	// dropdown, etc. Keyboard `Enter` is independently blocked via
+	// `isDisabled` above. The banner above the messages explains why
+	// it's grayed out and offers Copy/Move.
+	const inputChatArea = <div className={isCurrentThreadReadOnly ? 'pointer-events-none opacity-60' : ''}>
+		<VoidChatArea
+			featureName='Chat'
+			onSubmit={() => onSubmit()}
+			onAbort={onAbort}
+			isStreaming={!!isRunning}
+			isDisabled={isDisabled}
+			showSelections={true}
+			// showProspectiveSelections={previousMessagesHTML.length === 0}
+			selections={selections}
+			setSelections={setSelections}
+			onClickAnywhere={() => { textAreaRef.current?.focus() }}
+			threadIdForUsageRing={chatThreadsState.currentThreadId}
+		>
+			<VoidInputBox2
+				enableAtToMention
+				className={`min-h-[81px] px-0.5 py-0.5`}
+				placeholder={`@ to mention, ${keybindingString ? `${keybindingString} to add a selection. ` : ''}Enter instructions...`}
+				onChangeText={onChangeText}
+				onKeyDown={onKeyDown}
+				onFocus={() => { chatThreadsService.setCurrentlyFocusedMessageIdx(undefined) }}
+				ref={textAreaRef}
+				fnsRef={textAreaFnsRef}
+				multiline={true}
+			/>
 
-	</VoidChatArea>
+		</VoidChatArea>
+	</div>
 
 
 	const isLandingPage = previousMessages.length === 0
@@ -3875,6 +3990,31 @@ export const SidebarChat = () => {
 	// 		</ErrorBoundary>
 	// 	</div>
 	// </div>
+	// Phase E commit 4 — banner shown above the message list when the active
+	// thread is "not yours" (foreign workspace OR unscoped), giving the user
+	// an explicit Copy/Move/Claim affordance. Trigger predicate is
+	// `shouldShowOwnershipBanner`, broader than `isThreadReadOnly`:
+	//   - foreign workspace → banner: yes, input gated (read-only)
+	//   - unscoped (in workspaced window) → banner: yes, input editable
+	//     (claim-on-engagement still re-tags it on send; explicit Claim
+	//     button is the discoverable counterpart)
+	// Service guards (commit 3) only catch foreign mutations; unscoped
+	// edits flow through normally. Owner label cascade: real workspace
+	// label → workspace URI string → "Unscoped" sentinel for legacy /
+	// pre-Phase-E threads. Matches the label used by
+	// `partitionThreadsByWorkspaceScope` so the banner agrees with the
+	// history group heading the user clicked through.
+	const readOnlyOwnerLabel = currentThread?.workspaceUri
+		? (currentThread.workspaceLabel ?? currentThread.workspaceUri)
+		: 'Unscoped'
+	const readOnlyBanner = (showCurrentThreadBanner && currentThread) ? (
+		<ReadOnlyForeignThreadBanner
+			ownerLabel={readOnlyOwnerLabel}
+			isUnscoped={!currentThread.workspaceUri}
+			threadId={currentThread.id}
+		/>
+	) : null
+
 	const threadPageContent = <div
 		ref={sidebarRef}
 		className='w-full h-full flex flex-col overflow-hidden'
@@ -3882,6 +4022,11 @@ export const SidebarChat = () => {
 		<ErrorBoundary>
 			<SidebarThreadTabs />
 		</ErrorBoundary>
+		{readOnlyBanner && (
+			<ErrorBoundary>
+				{readOnlyBanner}
+			</ErrorBoundary>
+		)}
 		<ErrorBoundary>
 			{messagesHTML}
 		</ErrorBoundary>

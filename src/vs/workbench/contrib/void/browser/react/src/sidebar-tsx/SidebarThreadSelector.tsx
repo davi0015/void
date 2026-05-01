@@ -7,16 +7,70 @@ import { startTransition, useEffect, useMemo, useRef, useState } from 'react';
 import { CopyButton, IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
 import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useFullChatThreadsStreamState, useSettingsState } from '../util/services.js';
 import { IconX } from './SidebarChat.js';
-import { Check, Copy, Icon, LoaderCircle, MessageCircleQuestion, Plus, Trash2, UserCheck, X } from 'lucide-react';
-import { IsRunningType, ThreadType, isThreadInWorkspaceScope } from '../../../chatThreadService.js';
+import { Check, ChevronDown, ChevronRight, Copy, Icon, LoaderCircle, MessageCircleQuestion, Plus, Trash2, UserCheck, X } from 'lucide-react';
+import { IsRunningType, ThreadType } from '../../../chatThreadService.js';
 
 
 const numInitialThreads = 3
 
+// Synthetic group label for unscoped (legacy / pre-Phase-E) threads —
+// they live under "Other workspaces" alongside foreign threads. Internal
+// constant so a real workspace named "Unscoped" wouldn't collide with
+// the bucket key (we use the literal `undefined` workspaceUri as the
+// bucket id instead — see `groupForeignByWorkspace` below).
+const UNSCOPED_LABEL = 'Unscoped'
+
+// Phase E commit 4 — partition the full thread list into:
+//   - own: threads tagged to the current workspace (strict equality)
+//   - foreign: every other non-empty thread, grouped by workspaceUri
+//
+// Strict equality (not `isThreadInWorkspaceScope`) intentionally —
+// unscoped threads now live under "Other workspaces → Unscoped" rather
+// than mixing into the default list. Cleaner mental model: the default
+// section is "this workspace's stuff" and Copy/Move is the explicit
+// path for adopting anything else.
+const partitionThreadsByWorkspaceScope = (
+	allThreads: { [id: string]: ThreadType | undefined },
+	currentWorkspaceUri: string | undefined,
+) => {
+	const own: string[] = []
+	// `Map` here (instead of plain object) preserves insertion order,
+	// which we use as a stable group ordering when rendering.
+	const foreignByKey = new Map<string, { label: string, threadIds: string[] }>()
+
+	const sortedIds = Object.keys(allThreads)
+		.sort((a, b) => ((allThreads[a]?.lastModified ?? '') > (allThreads[b]?.lastModified ?? '') ? -1 : 1))
+		.filter(id => (allThreads[id]?.messages.length ?? 0) !== 0)
+
+	for (const id of sortedIds) {
+		const t = allThreads[id]
+		if (!t) continue
+		if (t.workspaceUri === currentWorkspaceUri) {
+			own.push(id)
+			continue
+		}
+		// Bucket key: thread.workspaceUri (real or synthetic untitled-multi-root)
+		// for foreign-workspace threads, or the empty string for unscoped.
+		// This is also the lookup key the service uses internally, so
+		// nothing has to translate between display and storage scopes.
+		const key = t.workspaceUri ?? ''
+		const label = t.workspaceUri ? (t.workspaceLabel ?? t.workspaceUri) : UNSCOPED_LABEL
+		const bucket = foreignByKey.get(key)
+		if (bucket) bucket.threadIds.push(id)
+		else foreignByKey.set(key, { label, threadIds: [id] })
+	}
+
+	return { own, foreignByKey }
+}
+
 export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 	const [showAll, setShowAll] = useState(false);
-
 	const [hoveredIdx, setHoveredIdx] = useState<number | null>(null)
+	// Top-level "Other workspaces" group is collapsed by default each
+	// reload (intentional — keeps the default view focused on this
+	// workspace). Per-bucket expansion lives below; user-toggled state
+	// is in-memory only, no persistence.
+	const [foreignExpanded, setForeignExpanded] = useState(false)
 
 	const threadsState = useChatThreadsState()
 	const { allThreads, currentWorkspaceUri } = threadsState
@@ -33,50 +87,39 @@ export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 		return <div key="error" className="p-1">{`Error accessing chat history.`}</div>;
 	}
 
-	// sorted by most recent to least recent.
-	// Phase E — default history list shows only threads in the current
-	// workspace's scope (same workspace, or unscoped/legacy). Foreign-workspace
-	// threads are hidden from the default list and surfaced in the dedicated
-	// "Other workspaces" group later (commit 4 in the workspace-scoped chat
-	// plan). Empty threads stay filtered out as before.
-	const sortedThreadIds = Object.keys(allThreads ?? {})
-		.sort((threadId1, threadId2) => (allThreads[threadId1]?.lastModified ?? 0) > (allThreads[threadId2]?.lastModified ?? 0) ? -1 : 1)
-		.filter(threadId => (allThreads![threadId]?.messages.length ?? 0) !== 0)
-		.filter(threadId => isThreadInWorkspaceScope(allThreads[threadId], currentWorkspaceUri))
+	const { own, foreignByKey } = useMemo(
+		() => partitionThreadsByWorkspaceScope(allThreads, currentWorkspaceUri),
+		[allThreads, currentWorkspaceUri],
+	)
 
-	// Get only first 5 threads if not showing all
-	const hasMoreThreads = sortedThreadIds.length > numInitialThreads;
-	const displayThreads = showAll ? sortedThreadIds : sortedThreadIds.slice(0, numInitialThreads);
+	const hasMoreThreads = own.length > numInitialThreads;
+	const displayThreads = showAll ? own : own.slice(0, numInitialThreads);
+
+	const hasForeign = foreignByKey.size > 0
 
 	return (
 		<div className={`flex flex-col mb-2 gap-2 w-full text-nowrap text-void-fg-3 select-none relative ${className}`}>
-			{displayThreads.length === 0 // this should never happen
-				? <></>
-				: displayThreads.map((threadId, i) => {
-					const pastThread = allThreads[threadId];
-					if (!pastThread) {
-						return <div key={i} className="p-1">{`Error accessing chat history.`}</div>;
-					}
-
-					return (
-						<PastThreadElement
-							key={pastThread.id}
-							pastThread={pastThread}
-							idx={i}
-							hoveredIdx={hoveredIdx}
-							setHoveredIdx={setHoveredIdx}
-							isRunning={runningThreadIds[pastThread.id]}
-						/>
-					);
-				})
-			}
+			{displayThreads.map((threadId, i) => {
+				const pastThread = allThreads[threadId];
+				if (!pastThread) return <div key={i} className="p-1">{`Error accessing chat history.`}</div>;
+				return (
+					<PastThreadElement
+						key={pastThread.id}
+						pastThread={pastThread}
+						idx={i}
+						hoveredIdx={hoveredIdx}
+						setHoveredIdx={setHoveredIdx}
+						isRunning={runningThreadIds[pastThread.id]}
+					/>
+				);
+			})}
 
 			{hasMoreThreads && !showAll && (
 				<div
 					className="text-void-fg-3 opacity-80 hover:opacity-100 hover:brightness-115 cursor-pointer p-1 text-xs"
 					onClick={() => setShowAll(true)}
 				>
-					Show {sortedThreadIds.length - numInitialThreads} more...
+					Show {own.length - numInitialThreads} more...
 				</div>
 			)}
 			{hasMoreThreads && showAll && (
@@ -87,9 +130,112 @@ export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 					Show less
 				</div>
 			)}
+
+			{hasForeign && (
+				<OtherWorkspacesSection
+					foreignByKey={foreignByKey}
+					expanded={foreignExpanded}
+					onToggle={() => setForeignExpanded(v => !v)}
+					allThreads={allThreads}
+					runningThreadIds={runningThreadIds}
+					hoveredIdx={hoveredIdx}
+					setHoveredIdx={setHoveredIdx}
+				/>
+			)}
 		</div>
 	);
 };
+
+// Phase E commit 4 — collapsible "Other workspaces" section. Renders
+// foreign + unscoped threads grouped by workspace label. Each group
+// can be independently expanded; once the parent is open, groups
+// default to expanded so the user can see contents without an extra
+// click cascade.
+const OtherWorkspacesSection = ({
+	foreignByKey, expanded, onToggle,
+	allThreads, runningThreadIds, hoveredIdx, setHoveredIdx,
+}: {
+	foreignByKey: Map<string, { label: string, threadIds: string[] }>
+	expanded: boolean
+	onToggle: () => void
+	allThreads: { [id: string]: ThreadType | undefined }
+	runningThreadIds: { [threadId: string]: IsRunningType | undefined }
+	hoveredIdx: number | null
+	setHoveredIdx: (idx: number | null) => void
+}) => {
+	// Per-bucket expansion. Stored as a Set of bucket keys; absence
+	// means expanded (default). Keeps the default-open semantic without
+	// having to seed state from a derived list.
+	const [collapsedKeys, setCollapsedKeys] = useState<Set<string>>(new Set())
+	const toggleKey = (key: string) => {
+		setCollapsedKeys(prev => {
+			const next = new Set(prev)
+			if (next.has(key)) next.delete(key)
+			else next.add(key)
+			return next
+		})
+	}
+
+	const totalForeign = useMemo(() => {
+		let n = 0
+		for (const bucket of foreignByKey.values()) n += bucket.threadIds.length
+		return n
+	}, [foreignByKey])
+
+	return (
+		<div className='mt-3 flex flex-col gap-1'>
+			<div
+				className='flex items-center gap-1 cursor-pointer text-void-fg-3 opacity-70 hover:opacity-100 text-xs select-none'
+				onClick={onToggle}
+			>
+				{expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+				<span>Other workspaces</span>
+				<span className='opacity-60'>({totalForeign})</span>
+			</div>
+			{expanded && (
+				<div className='flex flex-col gap-2 pl-2'>
+					{Array.from(foreignByKey.entries()).map(([key, { label, threadIds }]) => {
+						const collapsed = collapsedKeys.has(key)
+						return (
+							<div key={key} className='flex flex-col gap-1'>
+								<div
+									className='flex items-center gap-1 cursor-pointer text-void-fg-3 opacity-70 hover:opacity-100 text-xs select-none'
+									onClick={() => toggleKey(key)}
+								>
+									{collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+									<span className='truncate'>{label}</span>
+									<span className='opacity-60'>({threadIds.length})</span>
+								</div>
+								{!collapsed && (
+									<div className='flex flex-col gap-2 pl-2'>
+										{threadIds.map((threadId, i) => {
+											const t = allThreads[threadId]
+											if (!t) return null
+											return (
+												<PastThreadElement
+													key={t.id}
+													pastThread={t}
+													// Negative idx prevents hover-row collision with the
+													// own-list's positive indices — the two share `hoveredIdx`
+													// state and we don't want hover on a foreign row to flicker
+													// the action buttons of an own row at the same numeric idx.
+													idx={-1 * (i + 1)}
+													hoveredIdx={hoveredIdx}
+													setHoveredIdx={setHoveredIdx}
+													isRunning={runningThreadIds[t.id]}
+												/>
+											)
+										})}
+									</div>
+								)}
+							</div>
+						)
+					})}
+				</div>
+			)}
+		</div>
+	)
+}
 
 
 

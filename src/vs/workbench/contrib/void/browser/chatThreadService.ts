@@ -273,9 +273,9 @@ export const isThreadInWorkspaceScope = (thread: Pick<ThreadType, 'workspaceUri'
 // therefore must not be mutated from this window. Strict counterpart to
 // `isThreadInWorkspaceScope`: only fires for threads explicitly tagged to
 // a *different* workspace; unscoped threads are NOT read-only (they're
-// shared until Moved). Read-only doesn't apply when the current window
-// has no workspace (empty window) — there's no "foreign" reference frame
-// to compare against.
+// shared, claim-on-engagement re-tags them when the user sends). Read-
+// only doesn't apply when the current window has no workspace (empty
+// window) — there's no "foreign" reference frame to compare against.
 //
 // Used as the single gating predicate for every mutation entry point on
 // `IChatThreadService` (send / edit / approve / reject / checkpoint
@@ -286,6 +286,23 @@ export const isThreadReadOnly = (thread: Pick<ThreadType, 'workspaceUri'> | unde
 	if (!thread) return false
 	if (!currentWorkspaceUri) return false // empty window: nothing is "foreign"
 	if (!thread.workspaceUri) return false // unscoped: shared, not foreign
+	return thread.workspaceUri !== currentWorkspaceUri
+}
+
+// Phase E commit 4 — true if the thread should show the "Other workspaces"
+// banner. Broader than `isThreadReadOnly`: also fires for unscoped threads
+// in workspaced windows so the user gets an explicit Copy/Claim affordance
+// without losing edit access. The two predicates together produce four
+// cases:
+//   - same workspace        → banner: no,  read-only: no  (normal)
+//   - foreign workspace     → banner: yes, read-only: yes (Copy / Move)
+//   - unscoped + workspaced → banner: yes, read-only: no  (Copy / Claim)
+//   - empty window          → banner: no,  read-only: no  (no frame)
+// Used by the SidebarChat banner placement; the partition predicate in
+// the history sidebar uses the same workspace-mismatch rule (`!==`).
+export const shouldShowOwnershipBanner = (thread: Pick<ThreadType, 'workspaceUri'> | undefined, currentWorkspaceUri: string | undefined): boolean => {
+	if (!thread) return false
+	if (!currentWorkspaceUri) return false
 	return thread.workspaceUri !== currentWorkspaceUri
 }
 
@@ -420,6 +437,14 @@ export interface IChatThreadService {
 	// tab-strip pinning (does not affect existence — only the chat-header tab row)
 	pinThread(threadId: string): void;
 	unpinThread(threadId: string): void;
+
+	// Phase E commit 4 — claim a foreign thread into the current workspace.
+	// Both auto-pin to this workspace's tab strip on completion.
+	//   copy: clone source, reset usage counters, stamp importedFrom*. Source untouched.
+	//   move: re-tag source workspaceUri to current. Source disappears from its origin workspace.
+	// Both return the id the user is now looking at (new id for copy, same id for move).
+	copyThreadToCurrentWorkspace(threadId: string): string | undefined;
+	moveThreadToCurrentWorkspace(threadId: string): string | undefined;
 
 	// exposed getters/setters
 	// these all apply to current thread
@@ -3032,6 +3057,114 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 		this._storeAllThreads(newThreads)
 		this._setPinsForCurrentWorkspace(newPinned, { allThreads: newThreads })
+	}
+
+	// Phase E commit 4 — claim a foreign thread into the current workspace by
+	// cloning. Source thread is untouched (still owned by its origin
+	// workspace). The clone gets a fresh id, the current workspace's
+	// identity, and `importedFrom*` provenance fields so a future audit can
+	// trace it back. Usage / compaction counters are reset because the
+	// "lifetime cost" of the source thread accrued in another workspace's
+	// context — carrying the totals over is misleading. Messages,
+	// checkpoints, model selection, and staging all carry over verbatim.
+	//
+	// Auto-pins the new thread + switches to it, mirroring the user's
+	// expectation that "Copy" produces something they can immediately work
+	// on. Returns the new id so the caller (banner button) can follow up
+	// with UI work if needed.
+	copyThreadToCurrentWorkspace(threadId: string): string | undefined {
+		const source = this.state.allThreads[threadId]
+		if (!source) return undefined
+		const identity = this._getCurrentWorkspaceIdentity()
+		const newId = generateUuid()
+		const cloned: ThreadType = {
+			...deepClone(source),
+			id: newId,
+			workspaceUri: identity.uri,
+			workspaceLabel: identity.label,
+			importedFromWorkspaceUri: source.workspaceUri,
+			importedFromThreadId: source.id,
+			importedAt: Date.now(),
+			lastModified: new Date().toISOString(),
+			// Reset usage telemetry: lifetime totals on the source accrued in
+			// another workspace's request stream and don't represent this
+			// thread's cost going forward. `latestUsage` is per-request so
+			// it gets refreshed on the next send anyway, but clearing keeps
+			// the TokenUsageRing accurate immediately after Copy.
+			latestUsage: undefined,
+			cumulativeUsageThisThread: undefined,
+			latestCompaction: undefined,
+			cumulativeCompactionThisThread: undefined,
+		}
+		const newThreads = { ...this.state.allThreads, [newId]: cloned }
+		this._storeAllThreads(newThreads)
+		// Drop in-memory telemetry mirrors for the new id (defensive — should
+		// be empty since the id is fresh, but keeps the maps strictly
+		// in-sync with what's persisted on the thread).
+		delete this.latestUsageOfThreadId[newId]
+		delete this.cumulativeUsageThisThreadOfThreadId[newId]
+		delete this.latestCompactionOfThreadId[newId]
+		delete this.cumulativeCompactionThisThreadOfThreadId[newId]
+
+		this._setState({ allThreads: newThreads })
+		// Use switchToThread so the auto-pin + last-active update flows
+		// through the established channels rather than open-coding them.
+		this.switchToThread(newId)
+		return newId
+	}
+
+	// Phase E commit 4 — claim a foreign thread by re-tagging in place.
+	// Source thread's `workspaceUri` flips to the current workspace's, so
+	// it disappears from its origin workspace's history and starts showing
+	// up in this one's default list. No clone, no usage reset — same
+	// thread, just a new owner. Auto-pins to current workspace's tab strip;
+	// drops it from the *origin* workspace's pin bucket if it was there.
+	//
+	// Use case: "I started this thread in workspace X by accident, fix it".
+	// The destructive bit (origin workspace loses access from default
+	// view) is the deliberate trade-off — that's why Copy is offered as
+	// the alternative.
+	moveThreadToCurrentWorkspace(threadId: string): string | undefined {
+		const source = this.state.allThreads[threadId]
+		if (!source) return undefined
+		const identity = this._getCurrentWorkspaceIdentity()
+		// No-op if it's already this workspace's (or empty-window with no
+		// identity to assign). Caller (banner) shouldn't even offer Move
+		// in those cases, but defensive check for any direct API calls.
+		if (source.workspaceUri === identity.uri) {
+			this.switchToThread(threadId)
+			return threadId
+		}
+
+		// Drop from the origin workspace's pin bucket — once re-tagged it's
+		// no longer "in scope" there per the new model, so leaving the pin
+		// would render an out-of-place tab in that workspace's strip on
+		// next reload. The current workspace's auto-pin happens via
+		// switchToThread below.
+		const originKey = source.workspaceUri ?? ''
+		if (originKey && this._pinnedThreadIdsByWorkspace[originKey]?.includes(threadId)) {
+			const filtered = this._pinnedThreadIdsByWorkspace[originKey].filter(id => id !== threadId)
+			if (filtered.length === 0) delete this._pinnedThreadIdsByWorkspace[originKey]
+			else this._pinnedThreadIdsByWorkspace[originKey] = filtered
+			this._storePinnedThreadIdsByWorkspace()
+		}
+		// Same logic for the origin workspace's last-active pointer.
+		if (originKey && this._lastActiveThreadIdByWorkspace[originKey] === threadId) {
+			delete this._lastActiveThreadIdByWorkspace[originKey]
+			this._storeLastActiveThreadIdByWorkspace()
+		}
+
+		const updated: ThreadType = {
+			...source,
+			workspaceUri: identity.uri,
+			workspaceLabel: identity.label,
+			lastModified: new Date().toISOString(),
+		}
+		const newThreads = { ...this.state.allThreads, [threadId]: updated }
+		this._storeAllThreads(newThreads)
+		this._setState({ allThreads: newThreads })
+		this.switchToThread(threadId)
+		return threadId
 	}
 
 	pinThread(threadId: string): void {
