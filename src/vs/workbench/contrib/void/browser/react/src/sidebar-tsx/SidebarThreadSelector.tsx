@@ -507,22 +507,34 @@ export const SidebarThreadTabs = () => {
 	const isEditingAny = editingThreadId !== null
 
 	// Drag-and-drop reorder. Model is "adjacent neighbor swap with a live
-	// baseline":
-	//   dragSource — threadId being dragged (null when not dragging).
-	//   liveOrder  — currently-displayed order during a drag. Starts as a
-	//                copy of `tabs` on dragStart; each swap mutates it; on
-	//                drop we commit it via the service.
-	// Each onDragOver re-reads live DOM rects, so after a swap the next
-	// event sees the new layout — no original-rect bookkeeping needed.
+	// baseline + cached layout":
+	//   dragSource    — threadId being dragged (null when not dragging).
+	//   liveOrder     — order rendered during a drag. Starts as a copy of
+	//                   `tabs` on dragStart; each swap mutates it; on drop
+	//                   we commit it via the service.
+	//   dragLayoutRef — tab widths + leftmost slot's viewport-left + gap,
+	//                   captured once at dragStart. With these we can derive
+	//                   any slot's layout-left from `liveOrder` arithmetic,
+	//                   so the swap threshold never reads `getBoundingClientRect`
+	//                   on neighbors that may be mid-FLIP-transform.
 	//
 	// Vertical-axis lock: native drag image is suppressed (1×1 invisible
 	// element via setDragImage). We render our own ghost absolute-positioned
 	// inside `stripContainerRef` and imperatively move it on the X axis
 	// only — Y is locked so the dragged tab can never leave the strip.
+	//
+	// Slide animation: a FLIP queue (`pendingFlipsRef`) animates each
+	// neighbor that gets shifted by a swap, plus the source tab's snap
+	// from the ghost's last position to its final slot on drop. All slides
+	// are 120ms ease-out. See `pendingFlipsRef` below for the mechanics.
 	const [dragSource, setDragSource] = useState<string | null>(null)
 	const [liveOrder, setLiveOrder] = useState<string[] | null>(null)
 	const stripContainerRef = useRef<HTMLDivElement | null>(null)
 	const ghostElRef = useRef<HTMLDivElement | null>(null)
+	// Set in `onDrop` so the subsequent `dragend` (fires after `drop` in
+	// the HTML5 spec) doesn't run `clearDragState` and wipe the release-
+	// FLIP we just queued. Reset by `dragend` itself for the next gesture.
+	const dropHandledRef = useRef(false)
 	const ghostMetricsRef = useRef<{
 		// Cursor's offset inside the source tab when drag started (so the
 		// ghost stays anchored to the same pixel under the cursor).
@@ -557,7 +569,85 @@ export const SidebarThreadTabs = () => {
 			el.style.height = `${m.height}px`
 		}
 	}, [dragSource])
+
+	// Layout cache populated at dragstart: each tab's DOM-order width and
+	// the viewport-left of slot 0 (the leftmost tab). Tabs aren't resized
+	// during a drag, so widths are stable; with this + the running gap
+	// between tabs we can compute any slot's LAYOUT viewport-left from its
+	// index in `liveOrder`, with zero rect reads. This keeps the swap
+	// threshold and FLIP math immune to in-flight `transform` animations
+	// on neighbors (which `getBoundingClientRect()` would otherwise return
+	// the visual, mid-transition position for).
+	const dragLayoutRef = useRef<{
+		widths: Map<string, number>
+		baseLeft: number
+		gap: number
+	} | null>(null)
+
+	// FLIP slide queue. Two callers:
+	//   - SWAP (onDragOver): each crossed-midpoint swaps the source with
+	//     ONE neighbor, but a fast drag can cross several in one event —
+	//     we accumulate a FLIP per swapped neighbor in a single handler,
+	//     all using `dx = ±(sourceWidth + gap)` (each non-source tab in
+	//     the chain shifts exactly one slot). Rect-free, so a rapid
+	//     direction-reversal never picks up the previous swap's still-
+	//     animating transform as the "from" position.
+	//   - RELEASE (onDrop): the source tab needs to slide from where the
+	//     ghost last was to its new layout slot. The "from" position is
+	//     captured as a viewport `fromLeft` from the ghost, and `dx` is
+	//     resolved at effect time as `fromLeft - newLeft` — that way it's
+	//     self-correcting whether the service-driven `tabs` update is
+	//     synchronous or batched into a later render.
+	// In both cases the animation is the same: snap to the "from"
+	// transform with no transition, force a reflow so the snap commits,
+	// then transition back to translateX(0) over 120ms.
+	type PendingFlip =
+		| { tabId: string; dx: number; fromLeft?: undefined }
+		| { tabId: string; fromLeft: number; dx?: undefined }
+	const pendingFlipsRef = useRef<PendingFlip[]>([])
+	useLayoutEffect(() => {
+		const flips = pendingFlipsRef.current
+		if (flips.length === 0) return
+		pendingFlipsRef.current = []
+		const container = stripContainerRef.current
+		if (!container) return
+		for (const flip of flips) {
+			const el = container.querySelector<HTMLElement>(`[data-tab-id="${flip.tabId}"]`)
+			if (!el) continue
+			const dx = flip.dx !== undefined
+				? flip.dx
+				: flip.fromLeft - el.getBoundingClientRect().left
+			if (Math.abs(dx) < 1) continue
+			el.style.transition = 'none'
+			el.style.transform = `translateX(${dx}px)`
+			void el.offsetWidth
+			el.style.transition = 'transform 120ms ease-out'
+			el.style.transform = 'translateX(0)'
+			const onEnd = (e: TransitionEvent) => {
+				if (e.propertyName !== 'transform') return
+				el.style.transition = ''
+				el.style.transform = ''
+				el.removeEventListener('transitionend', onEnd)
+			}
+			el.addEventListener('transitionend', onEnd)
+		}
+	})
+
 	const clearDragState = () => {
+		// Drop / Esc / off-strip exit — wipe any in-flight FLIP transform
+		// from the most recent swap so the tab settles cleanly into its
+		// final layout slot.
+		pendingFlipsRef.current = []
+		dragLayoutRef.current = null
+		const container = stripContainerRef.current
+		if (container) {
+			for (const el of Array.from(container.querySelectorAll<HTMLElement>('[data-tab-id]'))) {
+				if (el.style.transform || el.style.transition) {
+					el.style.transition = ''
+					el.style.transform = ''
+				}
+			}
+		}
 		setDragSource(null)
 		setLiveOrder(null)
 	}
@@ -611,12 +701,29 @@ export const SidebarThreadTabs = () => {
 					const mm = ghostMetricsRef.current
 					const ghostCenter = (e.clientX - mm.offsetX) + mm.width / 2
 
-					const order = liveOrder ?? tabs
-					const srcIdx = order.indexOf(dragSource)
+					const dl = dragLayoutRef.current
+					if (!dl) return
+
+					let order = liveOrder ?? tabs
+					let srcIdx = order.indexOf(dragSource)
 					if (srcIdx === -1) return
 
-					const container = stripContainerRef.current
-					if (!container) return
+					// LAYOUT viewport-left of slot `i` in `ord`, computed
+					// purely from cached widths + gap (no rect reads).
+					// Immune to in-flight FLIP transforms on neighbors.
+					const slotLeft = (i: number, ord: string[]): number => {
+						let l = dl.baseLeft
+						for (let k = 0; k < i && k < ord.length; k++) {
+							l += (dl.widths.get(ord[k]) ?? 0) + dl.gap
+						}
+						return l
+					}
+
+					const sourceWidth = dl.widths.get(dragSource) ?? 0
+					// FLIP delta is constant: each non-source tab in a swap
+					// chain shifts exactly one slot — by (sourceWidth + gap).
+					// Sign mirrors swap direction.
+					const flipDx = sourceWidth + dl.gap
 
 					// Threshold for swapping with a neighbor is the COMBINED
 					// midpoint of the source and that neighbor (treat the
@@ -625,47 +732,80 @@ export const SidebarThreadTabs = () => {
 					// `(x + y) / 2` from their combined left edge — i.e. the
 					// swap fires the moment the dragged tab has overlapped
 					// the neighbor more than it still covers its own slot.
-					// Earlier than each-tab-midpoint, more in line with how
-					// the user reads "the dragged tab has crossed past".
-					const sourceEl = container.querySelector<HTMLElement>(`[data-tab-id="${dragSource}"]`)
-					if (!sourceEl) return
-					const sourceRect = sourceEl.getBoundingClientRect()
+					//
+					// Loop the swap so a single fast `dragover` (cursor
+					// crosses several midpoints in one frame) chains all the
+					// swaps in this handler. We commit one `setLiveOrder`
+					// at the end with the cumulative result, and queue one
+					// FLIP per swapped neighbor.
+					const flipsThisEvent: PendingFlip[] = []
+					let changed = false
 
-					// Right-neighbor swap. Combined midpoint = (source.left + neighbor.right) / 2.
-					if (srcIdx < order.length - 1) {
+					// Right-side chain. Combined midpoint = (source.left + neighbor.right) / 2.
+					while (srcIdx < order.length - 1) {
 						const rightId = order[srcIdx + 1]
-						const rightEl = container.querySelector<HTMLElement>(`[data-tab-id="${rightId}"]`)
-						if (rightEl) {
-							const r = rightEl.getBoundingClientRect()
-							const combinedMid = (sourceRect.left + r.right) / 2
-							if (ghostCenter > combinedMid) {
-								const next = [...order]
-								next[srcIdx] = rightId
-								next[srcIdx + 1] = dragSource
-								setLiveOrder(next)
-								return
-							}
+						const rightWidth = dl.widths.get(rightId) ?? 0
+						const sourceLeft = slotLeft(srcIdx, order)
+						const rightRight = slotLeft(srcIdx + 1, order) + rightWidth
+						const combinedMid = (sourceLeft + rightRight) / 2
+						if (ghostCenter <= combinedMid) break
+						// Target moves leftward by flipDx, so shift it
+						// rightward (positive translateX) to start at its
+						// OLD slot visually, then animate to its NEW slot.
+						flipsThisEvent.push({ tabId: rightId, dx: flipDx })
+						const next = [...order]
+						next[srcIdx] = rightId
+						next[srcIdx + 1] = dragSource
+						order = next
+						srcIdx = srcIdx + 1
+						changed = true
+					}
+
+					// Left-side chain. Combined midpoint = (neighbor.left + source.right) / 2.
+					// `else` branch: the right loop above can only fire when
+					// the ghost moved RIGHT past at least one midpoint, so a
+					// left chain in the same handler would be physically
+					// impossible — guard with !changed to avoid the dead
+					// work.
+					if (!changed) {
+						while (srcIdx > 0) {
+							const leftId = order[srcIdx - 1]
+							const leftLeft = slotLeft(srcIdx - 1, order)
+							const sourceRight = slotLeft(srcIdx, order) + sourceWidth
+							const combinedMid = (leftLeft + sourceRight) / 2
+							if (ghostCenter >= combinedMid) break
+							flipsThisEvent.push({ tabId: leftId, dx: -flipDx })
+							const next = [...order]
+							next[srcIdx] = leftId
+							next[srcIdx - 1] = dragSource
+							order = next
+							srcIdx = srcIdx - 1
+							changed = true
 						}
 					}
-					// Left-neighbor swap. Combined midpoint = (neighbor.left + source.right) / 2.
-					if (srcIdx > 0) {
-						const leftId = order[srcIdx - 1]
-						const leftEl = container.querySelector<HTMLElement>(`[data-tab-id="${leftId}"]`)
-						if (leftEl) {
-							const r = leftEl.getBoundingClientRect()
-							const combinedMid = (r.left + sourceRect.right) / 2
-							if (ghostCenter < combinedMid) {
-								const next = [...order]
-								next[srcIdx] = leftId
-								next[srcIdx - 1] = dragSource
-								setLiveOrder(next)
-								return
-							}
-						}
+
+					if (changed) {
+						pendingFlipsRef.current.push(...flipsThisEvent)
+						setLiveOrder(order)
 					}
 				} : undefined}
 				onDrop={dragSource ? (e) => {
 					e.preventDefault()
+					// Block the per-tab `dragend` handler that fires
+					// right after this from running `clearDragState` and
+					// wiping the release-FLIP we queue below.
+					dropHandledRef.current = true
+					// Capture the ghost's last viewport-left BEFORE we
+					// tear drag state down — once `dragSource` flips to
+					// null the ghost JSX returns null and `ghostElRef`
+					// goes stale on the next render. We use this as the
+					// "from" anchor for the source tab's release-FLIP.
+					const ghostEl = ghostElRef.current
+					const releaseFromLeft = ghostEl
+						? ghostEl.getBoundingClientRect().left
+						: null
+					const sourceId = dragSource
+
 					// Translate the live order back to the service's
 					// (source, target, position) signature: place source
 					// `after` its left neighbor when it has one, else
@@ -680,6 +820,16 @@ export const SidebarThreadTabs = () => {
 						}
 					}
 					clearDragState()
+
+					// Queue the release-FLIP after `clearDragState` so it
+					// isn't immediately wiped (clearDragState resets
+					// `pendingFlipsRef`). Next render commits the source
+					// tab visible at its new layout slot; the FLIP effect
+					// then snaps it back to where the ghost was and
+					// transitions 120ms to its slot.
+					if (releaseFromLeft !== null) {
+						pendingFlipsRef.current.push({ tabId: sourceId, fromLeft: releaseFromLeft })
+					}
 				} : undefined}
 			>
 				{showNothing ? null : renderedTabs.map(id => {
@@ -740,17 +890,21 @@ export const SidebarThreadTabs = () => {
 						return collapsed.slice(0, TOOLTIP_LABEL_MAX) + '…'
 					})()
 
-					// Source tab dimmed at its current liveOrder slot so the
-					// user sees what's being dragged. The visual feedback
-					// for the drop position is the live swap itself.
+					// While being dragged, the source tab is fully transparent
+					// at its current liveOrder slot — only the cursor-following
+					// ghost is rendered. `opacity-0` (not `visibility:hidden`)
+					// keeps the drag origin alive on WebKit; layout space is
+					// preserved either way so neighbors don't reflow.
 					const isDragSource = dragSource === id
 
 					return (
 						<div
 							key={id}
 							ref={isActive ? activeTabRef : undefined}
-							// data-tab-id lets the container's onDragOver
-							// re-query live midpoints each event.
+							// data-tab-id lets the FLIP `useLayoutEffect`
+							// look up tabs by id (querySelector), and
+							// dragstart populates the layout cache by
+							// scanning all `[data-tab-id]` elements.
 							data-tab-id={id}
 							// Disabled while ANY tab is being inline-renamed so
 							// the drag doesn't steal focus / drop unsaved input.
@@ -779,9 +933,14 @@ export const SidebarThreadTabs = () => {
 
 								// Clamp horizontal travel to the first/last
 								// tab's edges so the ghost can't escape the
-								// strip. Only the first/last rects are needed
-								// here — per-event swap thresholds come from
-								// live DOM queries in the container handler.
+								// strip. Also populate `dragLayoutRef` here
+								// from the same single DOM scan: each tab's
+								// LAYOUT width and the leftmost slot's viewport-
+								// left, plus the inter-tab gap derived from the
+								// space between tabs 0 and 1. With this cache,
+								// the swap-threshold code below never reads
+								// rects again — every layout position is
+								// computed from `liveOrder` + widths.
 								let minLeft = rect.left - cLeft
 								let maxLeft = rect.left - cLeft
 								if (container) {
@@ -791,6 +950,27 @@ export const SidebarThreadTabs = () => {
 										const lastR = tabEls[tabEls.length - 1].getBoundingClientRect()
 										minLeft = firstR.left - cLeft
 										maxLeft = (lastR.right - cLeft) - rect.width
+
+										const widths = new Map<string, number>()
+										for (const el of tabEls) {
+											const tid = el.getAttribute('data-tab-id')
+											if (tid) widths.set(tid, el.getBoundingClientRect().width)
+										}
+										// Gap = first inter-tab space. If only one
+										// tab exists, `gap-0.5` resolves to 2px in
+										// Tailwind's default scale; fall back to
+										// that so single-tab edge cases still work.
+										let gap = 2
+										if (tabEls.length >= 2) {
+											const r0 = tabEls[0].getBoundingClientRect()
+											const r1 = tabEls[1].getBoundingClientRect()
+											gap = r1.left - r0.right
+										}
+										dragLayoutRef.current = {
+											widths,
+											baseLeft: firstR.left,
+											gap,
+										}
 									}
 								}
 
@@ -820,9 +1000,20 @@ export const SidebarThreadTabs = () => {
 									el.style.top = `${mm.top}px` // lock Y
 								}
 							}}
-							// Always clear on dragend so a drop outside any tab
-							// (e.g. off-strip, ESC cancel) doesn't leave stale state.
-							onDragEnd={clearDragState}
+							// `dragend` fires for every drag (after `drop` on
+							// success, or on ESC / off-strip cancel without a
+							// `drop`). On a successful drop we need to LEAVE
+							// the queued release-FLIP alone — `onDrop` set
+							// `dropHandledRef` and already tore drag state
+							// down, so this handler just resets the flag and
+							// skips. On cancel paths it does the full cleanup.
+							onDragEnd={() => {
+								if (dropHandledRef.current) {
+									dropHandledRef.current = false
+									return
+								}
+								clearDragState()
+							}}
 							onClick={() => {
 								// Don't switch threads while editing this tab's label —
 								// the input lives inside the same div, so the click that
@@ -903,8 +1094,14 @@ export const SidebarThreadTabs = () => {
 								${isActive
 									? 'bg-zinc-700/10 dark:bg-zinc-300/10 text-void-fg-1'
 									: 'text-void-fg-3 opacity-80 hover:opacity-100 hover:bg-zinc-700/5 dark:hover:bg-zinc-300/5'}
-								${isDragSource ? 'opacity-40' : ''}
 							`}
+							// Inline `opacity: 0` rather than a Tailwind class:
+							// non-active tabs already carry `opacity-80` and
+							// `hover:opacity-100`, both of which would tie or
+							// beat `opacity-0` on specificity / source order
+							// (and hover wins whenever the cursor / ghost is
+							// over the tab). Inline style sidesteps both.
+							style={isDragSource ? { opacity: 0 } : undefined}
 							data-tooltip-id='void-tooltip'
 							data-tooltip-content={isEditingThis ? '' : tooltipLabel}
 							data-tooltip-place='bottom'
