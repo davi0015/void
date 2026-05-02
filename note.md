@@ -106,6 +106,44 @@ npm run watch          # start the watcher (leave running)
 ./scripts/code.sh --user-data-dir ./.tmp/user-data --extensions-dir ./.tmp/extensions
 ```
 
+### Dev console helpers
+
+Test helpers live in `src/vs/workbench/contrib/void/browser/chatThreadDevTools.ts`.
+They are auto-registered on `globalThis` at startup (via `services.tsx`).
+
+Open the dev console in the running Void instance (Help → Toggle Developer Tools), then:
+
+```js
+// Populate the current chat tab with 15 turns of fake user/assistant messages
+// (each assistant has ~2k chars reasoning + ~2k chars display with code blocks).
+// Tests: tab switching perf, sidebar resize perf, initial render cost.
+__voidChatThreadService._populateTestThread(15)
+
+// Simulate a streaming LLM response through the real render pipeline.
+// Streams reasoning first, then display content with markdown/code/tables.
+// Tests: editor slowdown during streaming, incremental render perf.
+__voidChatThreadService._simulateStream()
+
+// Options: charsPerChunk (default 30), intervalMs (default 40), includeReasoning (default true), repetitions (default 1)
+__voidChatThreadService._simulateStream({ charsPerChunk: 50, intervalMs: 20, repetitions: 3 })
+
+// Worst case: long history + active streaming
+__voidChatThreadService._populateTestThread(15)
+__voidChatThreadService._simulateStream()
+
+// Show current chat size breakdown (chars, ~tokens, per role)
+__voidChatStats()
+```
+
+To use the helpers programmatically from other modules:
+
+```typescript
+import { buildTestMessages, getStreamContent, chatStats } from './chatThreadDevTools.js'
+
+const msgs = buildTestMessages(20)           // 20 turns of user+assistant
+const { reasoning, display } = getStreamContent({ repetitions: 3 })
+```
+
 ## Build
 
 End-to-end: build a `Void.app`, wrap it in a DMG, and hand it to teammates.

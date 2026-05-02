@@ -38,6 +38,7 @@ import { deepClone } from '../../../../base/common/objects.js';
 import { IWorkspaceContextService, toWorkspaceIdentifier } from '../../../../platform/workspace/common/workspace.js';
 import { basename as resourceBasename } from '../../../../base/common/resources.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
+import { buildTestMessages, runSimulatedStream } from './chatThreadDevTools.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IMCPService } from '../common/mcpService.js';
 import { RawMCPToolCall } from '../common/mcpServiceTypes.js';
@@ -513,6 +514,13 @@ export interface IChatThreadService {
 
 	focusCurrentChat: () => Promise<void>
 	blurCurrentChat: () => Promise<void>
+
+	// Dev-only: populate the current thread with a large fake conversation
+	// for performance testing.
+	_populateTestThread(turns?: number): void;
+	// Dev-only: simulate a streaming LLM response through the real render
+	// pipeline. Tests streaming perf (issue #3).
+	_simulateStream(opts?: { charsPerChunk?: number, intervalMs?: number, includeReasoning?: boolean, repetitions?: number }): void;
 }
 
 export const IChatThreadService = createDecorator<IChatThreadService>('voidChatThreadService');
@@ -3540,6 +3548,32 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 
+	// ── Dev-only: perf testing helpers (see chatThreadDevTools.ts) ──────
+
+	_simulateStream(opts?: { charsPerChunk?: number, intervalMs?: number, includeReasoning?: boolean, repetitions?: number }): void {
+		const threadId = this.state.currentThreadId
+		if (!this.state.allThreads[threadId]) return
+		runSimulatedStream(threadId, {
+			addMessage: (id, msg) => this._addMessageToThread(id, msg),
+			setStreamState: (id, s) => this._setStreamState(id, s),
+			scheduleStreamTextUpdate: (id, s) => this._scheduleStreamTextUpdate(id, s),
+		}, opts)
+	}
+
+	_populateTestThread(turns: number = 15): void {
+		const threadId = this.state.currentThreadId
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return
+
+		const messages = buildTestMessages(turns)
+		const newThreads = {
+			...this.state.allThreads,
+			[threadId]: { ...thread, lastModified: new Date().toISOString(), messages },
+		}
+		this._storeAllThreads(newThreads)
+		this._setState({ allThreads: newThreads })
+		console.log(`[test] Populated thread ${threadId} with ${turns} turns, ${messages.length} messages. Approx chars: ${JSON.stringify(messages).length}`)
+	}
 
 }
 

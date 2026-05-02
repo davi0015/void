@@ -56,6 +56,7 @@ import { IExtensionManagementService } from '../../../../../../../platform/exten
 import { IMCPService } from '../../../../common/mcpService.js';
 import { IStorageService, StorageScope } from '../../../../../../../platform/storage/common/storage.js'
 import { OPT_OUT_KEY } from '../../../../common/storageKeys.js'
+import { registerChatDevTools } from '../../../chatThreadDevTools.js'
 
 
 // normally to do this you'd use a useEffect that calls .onDidChangeState(), but useEffect mounts too late and misses initial state changes
@@ -100,6 +101,8 @@ export const _registerServices = (accessor: ServicesAccessor) => {
 	const disposables: IDisposable[] = []
 
 	_registerAccessor(accessor)
+
+	registerChatDevTools(accessor.get(IChatThreadService))
 
 	const stateServices = {
 		chatThreadsStateService: accessor.get(IChatThreadService),
