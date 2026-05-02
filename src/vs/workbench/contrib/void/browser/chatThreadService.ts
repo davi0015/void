@@ -782,20 +782,43 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// index key (`void.chatThreadIndex`) stores just the list of thread IDs.
 
 	/**
-	 * Persist a single thread. When the set of thread IDs changes (create or
-	 * delete), pass `updateIndex: true` so the lightweight index is rewritten.
-	 * For pure content mutations (message edits, usage counters) the index is
-	 * unchanged and we skip the extra write.
+	 * Persist a single thread. Serialization is deferred and coalesced: rapid
+	 * back-to-back writes for the same thread (usage + compaction + message
+	 * commit) only produce a single `JSON.stringify` call after a short delay,
+	 * keeping the main thread free for rendering.
+	 *
+	 * Deletes are synchronous (cheap — just removing a key).
+	 * Index writes for create/delete are also synchronous.
 	 */
+	private readonly _pendingThreadWrites = new Map<string, ThreadType>()
+	private _storeThreadFlushScheduler: RunOnceScheduler | null = null
+
 	private _storeThread(threadId: string, thread: ThreadType | undefined, updateIndex = false) {
-		const key = THREAD_KEY_PREFIX + threadId
 		if (thread === undefined) {
-			this._storageService.remove(key, StorageScope.APPLICATION)
-			updateIndex = true
-		} else {
-			this._storageService.store(key, JSON.stringify(thread), StorageScope.APPLICATION, StorageTarget.USER)
+			this._pendingThreadWrites.delete(threadId)
+			this._storageService.remove(THREAD_KEY_PREFIX + threadId, StorageScope.APPLICATION)
+			this._writeThreadIndex({ removed: threadId })
+			return
 		}
-		if (updateIndex) this._writeThreadIndex({ added: thread ? threadId : undefined, removed: thread ? undefined : threadId })
+
+		this._pendingThreadWrites.set(threadId, thread)
+		if (updateIndex) this._writeThreadIndex({ added: threadId })
+
+		if (!this._storeThreadFlushScheduler) {
+			this._storeThreadFlushScheduler = new RunOnceScheduler(() => this._flushPendingThreadWrites(), 500)
+			this._register(this._storeThreadFlushScheduler)
+		}
+		if (!this._storeThreadFlushScheduler.isScheduled()) {
+			this._storeThreadFlushScheduler.schedule()
+		}
+	}
+
+	private _flushPendingThreadWrites() {
+		if (this._pendingThreadWrites.size === 0) return
+		for (const [id, thread] of this._pendingThreadWrites) {
+			this._storageService.store(THREAD_KEY_PREFIX + id, JSON.stringify(thread), StorageScope.APPLICATION, StorageTarget.USER)
+		}
+		this._pendingThreadWrites.clear()
 	}
 
 	private _writeThreadIndex(delta?: { added?: string, removed?: string }) {

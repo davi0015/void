@@ -3559,6 +3559,9 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 		return earliest
 	}, [previousMessages])
 
+	const isRunningRef = useRef(isRunning)
+	isRunningRef.current = isRunning
+
 	const previousMessagesHTML = useMemo(() => {
 		return previousMessages.map((message, i) => {
 			return <ChatBubble
@@ -3567,14 +3570,14 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 				chatMessage={message}
 				messageIdx={i}
 				isCommitted={true}
-				chatIsRunning={isRunning}
+				chatIsRunning={isRunningRef.current}
 				threadId={threadId}
 				_scrollToBottom={() => scrollToBottom(scrollContainerRef)}
 				firstPendingToolRequestIdx={firstPendingToolRequestIdx}
 				threadIsReadOnly={threadIsReadOnly}
 			/>
 		})
-	}, [previousMessages, threadId, currCheckpointIdx, isRunning, scrollContainerRef, firstPendingToolRequestIdx, threadIsReadOnly])
+	}, [previousMessages, threadId, currCheckpointIdx, scrollContainerRef, firstPendingToolRequestIdx, threadIsReadOnly])
 
 	const streamingChatIdx = previousMessagesHTML.length
 	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
