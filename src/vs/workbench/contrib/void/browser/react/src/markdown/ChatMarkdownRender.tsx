@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import React, { JSX, useRef, useState } from 'react'
+import React, { JSX, useEffect, useRef, useState } from 'react'
 import { marked, MarkedToken, Token } from 'marked'
 
 // Module-level content-keyed cache for marked.lexer output. Every tab switch / every
@@ -63,6 +63,19 @@ class IncrementalLexer {
 
 		this._prevString = newString
 		return this._tokens
+	}
+
+	/** Seed the module-level LRU cache with the final tokens so a subsequent
+	 *  `cachedLex(string)` call (e.g. from a newly mounted committed message)
+	 *  gets an instant hit instead of re-lexing from scratch. */
+	populateCache() {
+		if (this._prevString && this._tokens.length > 0) {
+			if (lexerCache.size >= LEXER_CACHE_MAX) {
+				const oldest = lexerCache.keys().next().value
+				if (oldest !== undefined) lexerCache.delete(oldest)
+			}
+			lexerCache.set(this._prevString, this._tokens)
+		}
 	}
 
 	reset() {
@@ -619,6 +632,15 @@ export const ChatMarkdownRender = ({ string, inPTag = false, chatMessageLocation
 	const incrementalLexerRef = useRef<IncrementalLexer | null>(null)
 	const wasStreamingRef = useRef(false)
 
+	// When the streaming component unmounts (stream ends, bubble replaced by
+	// committed message), seed the LRU cache so the new committed bubble's
+	// cachedLex() call is an instant hit instead of a full re-lex.
+	useEffect(() => {
+		return () => {
+			incrementalLexerRef.current?.populateCache()
+		}
+	}, [])
+
 	let tokens: Token[]
 	if (options.isStreaming) {
 		if (!incrementalLexerRef.current) {
@@ -630,6 +652,7 @@ export const ChatMarkdownRender = ({ string, inPTag = false, chatMessageLocation
 		if (wasStreamingRef.current) {
 			// Streaming just finished — discard incremental state and populate
 			// the static LRU cache so future re-renders (tab switch etc.) are fast.
+			incrementalLexerRef.current?.populateCache()
 			incrementalLexerRef.current?.reset()
 			incrementalLexerRef.current = null
 			wasStreamingRef.current = false
