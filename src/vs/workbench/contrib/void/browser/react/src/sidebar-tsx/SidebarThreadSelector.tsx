@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { startTransition, useEffect, useMemo, useRef, useState, KeyboardEvent } from 'react';
+import { startTransition, useEffect, useLayoutEffect, useMemo, useRef, useState, KeyboardEvent } from 'react';
 import { CopyButton, IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
 import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useFullChatThreadsStreamState, useSettingsState } from '../util/services.js';
 import { IconX } from './SidebarChat.js';
@@ -504,6 +504,67 @@ export const SidebarThreadTabs = () => {
 		setEditingThreadId(null)
 		setEditValue('')
 	}
+	const isEditingAny = editingThreadId !== null
+
+	// Drag-and-drop reorder. Model is "adjacent neighbor swap with a live
+	// baseline":
+	//   dragSource — threadId being dragged (null when not dragging).
+	//   liveOrder  — currently-displayed order during a drag. Starts as a
+	//                copy of `tabs` on dragStart; each swap mutates it; on
+	//                drop we commit it via the service.
+	// Each onDragOver re-reads live DOM rects, so after a swap the next
+	// event sees the new layout — no original-rect bookkeeping needed.
+	//
+	// Vertical-axis lock: native drag image is suppressed (1×1 invisible
+	// element via setDragImage). We render our own ghost absolute-positioned
+	// inside `stripContainerRef` and imperatively move it on the X axis
+	// only — Y is locked so the dragged tab can never leave the strip.
+	const [dragSource, setDragSource] = useState<string | null>(null)
+	const [liveOrder, setLiveOrder] = useState<string[] | null>(null)
+	const stripContainerRef = useRef<HTMLDivElement | null>(null)
+	const ghostElRef = useRef<HTMLDivElement | null>(null)
+	const ghostMetricsRef = useRef<{
+		// Cursor's offset inside the source tab when drag started (so the
+		// ghost stays anchored to the same pixel under the cursor).
+		offsetX: number
+		// Ghost's locked vertical position + size — all in container-relative
+		// coords (container = outer strip wrapper, position: relative).
+		top: number
+		width: number
+		height: number
+		initialLeft: number
+		// Horizontal travel clamp: ghost can't go left of the first tab's
+		// left edge or right of the last tab's right edge.
+		minLeft: number
+		maxLeft: number
+		// Container's viewport-left, used to translate cursor.clientX into
+		// container-relative left during onDrag.
+		containerLeft: number
+	}>({
+		offsetX: 0, top: 0, width: 0, height: 0,
+		initialLeft: 0, minLeft: 0, maxLeft: 0, containerLeft: 0,
+	})
+	// Apply the captured ghost position before paint so the first frame
+	// after `dragSource` becomes set shows the ghost exactly over the
+	// source tab — no jump.
+	useLayoutEffect(() => {
+		if (dragSource && ghostElRef.current) {
+			const m = ghostMetricsRef.current
+			const el = ghostElRef.current
+			el.style.left = `${m.initialLeft}px`
+			el.style.top = `${m.top}px`
+			el.style.width = `${m.width}px`
+			el.style.height = `${m.height}px`
+		}
+	}, [dragSource])
+	const clearDragState = () => {
+		setDragSource(null)
+		setLiveOrder(null)
+	}
+
+	// During a drag, render in the live order. Outside of a drag, the
+	// service-backed `tabs` array is the source of truth.
+	const renderedTabs = liveOrder ?? tabs
 
 	// Nothing meaningful to render if there are no pinned threads. The `+`
 	// button below still shows so the user can always start a new chat, even
@@ -520,7 +581,12 @@ export const SidebarThreadTabs = () => {
 		// This works reliably on macOS where Webkit's overlay scrollbar
 		// can ignore `::-webkit-scrollbar { display: none }` in recent
 		// Electron versions.
-		<div className='border-b border-void-border-2 flex-shrink-0 overflow-hidden'>
+		// `relative` makes this the positioning context for the drag ghost
+		// (rendered as a sibling of the inner strip below). The inner strip
+		// can scroll horizontally; the ghost lives in this outer wrapper's
+		// non-scrolling coord system so its `left` doesn't slide with
+		// scroll.
+		<div ref={stripContainerRef} className='border-b border-void-border-2 flex-shrink-0 overflow-hidden relative'>
 			<div
 				className='flex items-center gap-0.5 px-1 py-1 overflow-x-auto overflow-y-hidden pb-3 -mb-3'
 				// Translate vertical wheel events to horizontal scroll so the
@@ -531,8 +597,92 @@ export const SidebarThreadTabs = () => {
 						e.currentTarget.scrollLeft += e.deltaY
 					}
 				}}
+				// Container-level handlers own all the swap + drop logic;
+				// per-tab handlers below only deal with starting the drag.
+				// dragover bubbles up from any tab the cursor crosses, so a
+				// single handler here is enough — and re-querying live DOM
+				// rects each event means we never get out of sync with the
+				// visual layout (the React re-render after each swap moves
+				// the tabs, so the next event sees fresh midpoints).
+				onDragOver={dragSource ? (e) => {
+					e.preventDefault()
+					e.dataTransfer.dropEffect = 'move'
+
+					const mm = ghostMetricsRef.current
+					const ghostCenter = (e.clientX - mm.offsetX) + mm.width / 2
+
+					const order = liveOrder ?? tabs
+					const srcIdx = order.indexOf(dragSource)
+					if (srcIdx === -1) return
+
+					const container = stripContainerRef.current
+					if (!container) return
+
+					// Threshold for swapping with a neighbor is the COMBINED
+					// midpoint of the source and that neighbor (treat the
+					// pair as one rectangle, take its center). For two tabs
+					// of widths x and y sitting adjacent, this lands at
+					// `(x + y) / 2` from their combined left edge — i.e. the
+					// swap fires the moment the dragged tab has overlapped
+					// the neighbor more than it still covers its own slot.
+					// Earlier than each-tab-midpoint, more in line with how
+					// the user reads "the dragged tab has crossed past".
+					const sourceEl = container.querySelector<HTMLElement>(`[data-tab-id="${dragSource}"]`)
+					if (!sourceEl) return
+					const sourceRect = sourceEl.getBoundingClientRect()
+
+					// Right-neighbor swap. Combined midpoint = (source.left + neighbor.right) / 2.
+					if (srcIdx < order.length - 1) {
+						const rightId = order[srcIdx + 1]
+						const rightEl = container.querySelector<HTMLElement>(`[data-tab-id="${rightId}"]`)
+						if (rightEl) {
+							const r = rightEl.getBoundingClientRect()
+							const combinedMid = (sourceRect.left + r.right) / 2
+							if (ghostCenter > combinedMid) {
+								const next = [...order]
+								next[srcIdx] = rightId
+								next[srcIdx + 1] = dragSource
+								setLiveOrder(next)
+								return
+							}
+						}
+					}
+					// Left-neighbor swap. Combined midpoint = (neighbor.left + source.right) / 2.
+					if (srcIdx > 0) {
+						const leftId = order[srcIdx - 1]
+						const leftEl = container.querySelector<HTMLElement>(`[data-tab-id="${leftId}"]`)
+						if (leftEl) {
+							const r = leftEl.getBoundingClientRect()
+							const combinedMid = (r.left + sourceRect.right) / 2
+							if (ghostCenter < combinedMid) {
+								const next = [...order]
+								next[srcIdx] = leftId
+								next[srcIdx - 1] = dragSource
+								setLiveOrder(next)
+								return
+							}
+						}
+					}
+				} : undefined}
+				onDrop={dragSource ? (e) => {
+					e.preventDefault()
+					// Translate the live order back to the service's
+					// (source, target, position) signature: place source
+					// `after` its left neighbor when it has one, else
+					// `before` its right neighbor. Either expression
+					// describes the same final position.
+					if (liveOrder) {
+						const newIdx = liveOrder.indexOf(dragSource)
+						if (newIdx > 0) {
+							chatThreadsService.reorderPinnedThread(dragSource, liveOrder[newIdx - 1], 'after')
+						} else if (newIdx === 0 && liveOrder.length > 1) {
+							chatThreadsService.reorderPinnedThread(dragSource, liveOrder[1], 'before')
+						}
+					}
+					clearDragState()
+				} : undefined}
 			>
-				{showNothing ? null : tabs.map(id => {
+				{showNothing ? null : renderedTabs.map(id => {
 					const t = allThreads[id]!
 					const isActive = id === currentThreadId
 					const isRunning = streamState[id]?.isRunning
@@ -590,10 +740,89 @@ export const SidebarThreadTabs = () => {
 						return collapsed.slice(0, TOOLTIP_LABEL_MAX) + '…'
 					})()
 
+					// Source tab dimmed at its current liveOrder slot so the
+					// user sees what's being dragged. The visual feedback
+					// for the drop position is the live swap itself.
+					const isDragSource = dragSource === id
+
 					return (
 						<div
 							key={id}
 							ref={isActive ? activeTabRef : undefined}
+							// data-tab-id lets the container's onDragOver
+							// re-query live midpoints each event.
+							data-tab-id={id}
+							// Disabled while ANY tab is being inline-renamed so
+							// the drag doesn't steal focus / drop unsaved input.
+							draggable={!isEditingAny}
+							onDragStart={(e) => {
+								if (isEditingAny) { e.preventDefault(); return }
+								e.dataTransfer.effectAllowed = 'move'
+								e.dataTransfer.setData('text/plain', id)
+
+								// Suppress the native drag image — we render
+								// our own horizontal-only ghost. The element
+								// has to be in the DOM for setDragImage to
+								// snapshot it, but it's invisible and removed
+								// on the next tick.
+								const invisible = document.createElement('div')
+								invisible.style.cssText = 'width:1px;height:1px;position:fixed;top:-1000px;opacity:0;pointer-events:none;'
+								document.body.appendChild(invisible)
+								e.dataTransfer.setDragImage(invisible, 0, 0)
+								setTimeout(() => { invisible.remove() }, 0)
+
+								const rect = e.currentTarget.getBoundingClientRect()
+								const container = stripContainerRef.current
+								const containerRect = container?.getBoundingClientRect()
+								const cLeft = containerRect?.left ?? 0
+								const cTop = containerRect?.top ?? 0
+
+								// Clamp horizontal travel to the first/last
+								// tab's edges so the ghost can't escape the
+								// strip. Only the first/last rects are needed
+								// here — per-event swap thresholds come from
+								// live DOM queries in the container handler.
+								let minLeft = rect.left - cLeft
+								let maxLeft = rect.left - cLeft
+								if (container) {
+									const tabEls = Array.from(container.querySelectorAll<HTMLElement>('[data-tab-id]'))
+									if (tabEls.length > 0) {
+										const firstR = tabEls[0].getBoundingClientRect()
+										const lastR = tabEls[tabEls.length - 1].getBoundingClientRect()
+										minLeft = firstR.left - cLeft
+										maxLeft = (lastR.right - cLeft) - rect.width
+									}
+								}
+
+								ghostMetricsRef.current = {
+									offsetX: e.clientX - rect.left,
+									top: rect.top - cTop,
+									width: rect.width,
+									height: rect.height,
+									initialLeft: rect.left - cLeft,
+									minLeft,
+									maxLeft,
+									containerLeft: cLeft,
+								}
+
+								setDragSource(id)
+								setLiveOrder([...tabs])
+							}}
+							onDrag={(e) => {
+								// clientX is 0 on the terminal dragend event — ignore
+								// that frame (would snap the ghost to the left edge).
+								const el = ghostElRef.current
+								const mm = ghostMetricsRef.current
+								if (el && e.clientX > 0) {
+									const desired = (e.clientX - mm.offsetX) - mm.containerLeft
+									const clamped = Math.max(mm.minLeft, Math.min(mm.maxLeft, desired))
+									el.style.left = `${clamped}px`
+									el.style.top = `${mm.top}px` // lock Y
+								}
+							}}
+							// Always clear on dragend so a drop outside any tab
+							// (e.g. off-strip, ESC cancel) doesn't leave stale state.
+							onDragEnd={clearDragState}
 							onClick={() => {
 								// Don't switch threads while editing this tab's label —
 								// the input lives inside the same div, so the click that
@@ -674,6 +903,7 @@ export const SidebarThreadTabs = () => {
 								${isActive
 									? 'bg-zinc-700/10 dark:bg-zinc-300/10 text-void-fg-1'
 									: 'text-void-fg-3 opacity-80 hover:opacity-100 hover:bg-zinc-700/5 dark:hover:bg-zinc-300/5'}
+								${isDragSource ? 'opacity-40' : ''}
 							`}
 							data-tooltip-id='void-tooltip'
 							data-tooltip-content={isEditingThis ? '' : tooltipLabel}
@@ -760,6 +990,27 @@ export const SidebarThreadTabs = () => {
 					<Plus size={12} />
 				</button>
 			</div>
+			{/* Custom drag ghost — mounted only while dragging, absolute-
+			    positioned in the strip's outer wrapper. `useLayoutEffect`
+			    on `dragSource` applies the captured initial position before
+			    paint; subsequent frames are positioned imperatively from
+			    `onDrag` (so we don't re-render on every drag tick). */}
+			{dragSource ? (() => {
+				const t = allThreads[dragSource]
+				if (!t) return null
+				const customTitle = t.customTitle?.trim()
+				const firstUser = t.messages.find(m => m.role === 'user')
+				const firstMsgLabel = firstUser && firstUser.role === 'user' && firstUser.displayContent ? firstUser.displayContent : 'New Chat'
+				const ghostLabel = customTitle || firstMsgLabel
+				return (
+					<div
+						ref={ghostElRef}
+						className='absolute pointer-events-none flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-void-bg-2 text-void-fg-1 border border-void-border-1 shadow-md max-w-[110px] min-w-0 select-none opacity-90 z-10'
+					>
+						<span className='truncate min-w-0'>{ghostLabel}</span>
+					</div>
+				)
+			})() : null}
 		</div>
 	)
 }

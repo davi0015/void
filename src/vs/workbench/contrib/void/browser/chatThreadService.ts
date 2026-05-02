@@ -446,6 +446,12 @@ export interface IChatThreadService {
 	pinThread(threadId: string): void;
 	unpinThread(threadId: string): void;
 
+	// Reorders a pinned thread to sit immediately before/after `targetThreadId`
+	// in the current workspace's tab strip. Both source and target must already
+	// be pinned in this workspace; mismatched / unknown ids no-op. Returns
+	// `true` when the order changed. Mirrors `reorderCustomModel` in shape.
+	reorderPinnedThread(threadId: string, targetThreadId: string, position: 'before' | 'after'): boolean;
+
 	// User-editable tab label override. Pass `undefined` (or whitespace) to
 	// reset to the auto-derived first-user-message label. Gated by
 	// `_isThreadMutationBlocked` — read-only foreign threads cannot be
@@ -3267,6 +3273,40 @@ We only need to do it for files that were edited since `from`, ie files between 
 		} else {
 			this._setPinsForCurrentWorkspace(newPinned)
 		}
+	}
+
+
+	// Mirrors `reorderCustomModel` (settings service): splice source out,
+	// recompute target index in the resulting array, splice source back in
+	// at `position` relative to the target. Routes through
+	// `_setPinsForCurrentWorkspace` so persistence + multi-window sync are
+	// inherited. Operates on `this.state.pinnedThreadIds` (the current
+	// workspace projection) — `_pinnedThreadIdsByWorkspace[currentKey]` is
+	// the same array, kept consistent by `_setPinsForCurrentWorkspace`.
+	reorderPinnedThread(threadId: string, targetThreadId: string, position: 'before' | 'after'): boolean {
+		if (threadId === targetThreadId) return false
+
+		const pins = this.state.pinnedThreadIds
+		const fromIdx = pins.indexOf(threadId)
+		const toIdx = pins.indexOf(targetThreadId)
+		if (fromIdx === -1 || toIdx === -1) return false
+
+		const without = [...pins.slice(0, fromIdx), ...pins.slice(fromIdx + 1)]
+		const targetAfterRemoval = without.indexOf(targetThreadId)
+		const insertAt = position === 'before' ? targetAfterRemoval : targetAfterRemoval + 1
+		const newPinned = [
+			...without.slice(0, insertAt),
+			threadId,
+			...without.slice(insertAt),
+		]
+
+		// Identity check: if the new array equals the old (e.g. dropping
+		// 'after' onto your immediate left neighbor when you're already to
+		// its right), don't dirty storage or trigger a re-render.
+		if (newPinned.length === pins.length && newPinned.every((id, i) => id === pins[i])) return false
+
+		this._setPinsForCurrentWorkspace(newPinned)
+		return true
 	}
 
 
