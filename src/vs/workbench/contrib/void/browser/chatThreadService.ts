@@ -30,7 +30,7 @@ import { IEditCodeService } from './editCodeServiceInterface.js';
 import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
-import { LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, PINNED_THREADS_STORAGE_KEY, THREAD_STORAGE_KEY } from '../common/storageKeys.js';
+import { LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { RunOnceScheduler, timeout } from '../../../../base/common/async.js';
@@ -572,7 +572,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		super()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string, pinnedThreadIds: [] } // default state
 
-		const readThreads = this._readAllThreads() || {}
+		const readThreads = this._loadAllThreads() || {}
 
 		const allThreads = readThreads
 
@@ -625,15 +625,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// `moveThreadToCurrentWorkspace` re-tags a thread away from
 		// another open window, leaving a ghost tab there until reload.
 		//
-		// Deliberately not listening on `THREAD_STORAGE_KEY` (the
-		// threads blob): each window's blob write contains its own
-		// snapshot of the full map, so applying an external blob would
-		// overwrite any in-flight stream / mid-edit state in this
-		// window with a stale version of those threads. Per-thread
-		// storage would fix that, but is a much larger refactor.
-		// In practice the threads blob desyncs only matter for
-		// "see threads created in another window without reload",
-		// which users notice less than the pin/tab issue.
+		// Deliberately not listening on per-thread storage keys:
+		// applying an external thread write would overwrite any
+		// in-flight stream / mid-edit state in this window. In
+		// practice thread desyncs only matter for "see threads
+		// created in another window without reload", which users
+		// notice less than the pin/tab issue.
 		//
 		// `e.external` filter is essential — every local store call
 		// also fires the same event; without the filter we'd loop
@@ -735,6 +732,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._onDidChangeCurrentThread.fire()
 	}
 	resetState = () => {
+		// Remove all per-thread storage keys before wiping state
+		for (const id of Object.keys(this.state.allThreads)) {
+			this._storageService.remove(THREAD_KEY_PREFIX + id, StorageScope.APPLICATION)
+		}
+		this._storageService.remove(THREAD_INDEX_KEY, StorageScope.APPLICATION)
+		this._storageService.remove(THREAD_STORAGE_KEY, StorageScope.APPLICATION)
+
 		this.state = {
 			allThreads: {},
 			currentThreadId: null as unknown as string, // see constructor
@@ -751,13 +755,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	// !!! this is important for properly restoring URIs from storage
 	// should probably re-use code from void/src/vs/base/common/marshalling.ts instead. but this is simple enough
+	private static _storageReviver(_key: string, value: any): any {
+		if (value && typeof value === 'object' && value.$mid === 1) {
+			return URI.from(value);
+		}
+		return value;
+	}
+
 	private _convertThreadDataFromStorage(threadsStr: string): ChatThreads {
-		return JSON.parse(threadsStr, (key, value) => {
-			if (value && typeof value === 'object' && value.$mid === 1) { // $mid is the MarshalledId. $mid === 1 means it is a URI
-				return URI.from(value); // TODO URI.revive instead of this?
-			}
-			return value;
-		});
+		return JSON.parse(threadsStr, ChatThreadService._storageReviver);
 	}
 
 	private _readAllThreads(): ChatThreads | null {
@@ -770,14 +776,77 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		return threads
 	}
 
-	private _storeAllThreads(threads: ChatThreads) {
-		const serializedThreads = JSON.stringify(threads);
-		this._storageService.store(
-			THREAD_STORAGE_KEY,
-			serializedThreads,
-			StorageScope.APPLICATION,
-			StorageTarget.USER
-		);
+	// ── Per-thread storage ─────────────────────────────────────────────────
+	// Each thread is stored under its own key (`void.chatThread.{id}`) so
+	// that saving one thread doesn't re-serialize the entire map. A small
+	// index key (`void.chatThreadIndex`) stores just the list of thread IDs.
+
+	/**
+	 * Persist a single thread. When the set of thread IDs changes (create or
+	 * delete), pass `updateIndex: true` so the lightweight index is rewritten.
+	 * For pure content mutations (message edits, usage counters) the index is
+	 * unchanged and we skip the extra write.
+	 */
+	private _storeThread(threadId: string, thread: ThreadType | undefined, updateIndex = false) {
+		const key = THREAD_KEY_PREFIX + threadId
+		if (thread === undefined) {
+			this._storageService.remove(key, StorageScope.APPLICATION)
+			updateIndex = true
+		} else {
+			this._storageService.store(key, JSON.stringify(thread), StorageScope.APPLICATION, StorageTarget.USER)
+		}
+		if (updateIndex) this._writeThreadIndex({ added: thread ? threadId : undefined, removed: thread ? undefined : threadId })
+	}
+
+	private _writeThreadIndex(delta?: { added?: string, removed?: string }) {
+		const baseIds = Object.keys(this.state.allThreads).filter(id => this.state.allThreads[id] !== undefined)
+		const ids = new Set(baseIds)
+		if (delta?.added) ids.add(delta.added)
+		if (delta?.removed) ids.delete(delta.removed)
+		this._storageService.store(THREAD_INDEX_KEY, JSON.stringify([...ids]), StorageScope.APPLICATION, StorageTarget.USER)
+	}
+
+	private _readThread(threadId: string): ThreadType | undefined {
+		const raw = this._storageService.get(THREAD_KEY_PREFIX + threadId, StorageScope.APPLICATION)
+		if (!raw) return undefined
+		return JSON.parse(raw, ChatThreadService._storageReviver) as ThreadType
+	}
+
+	private _readAllThreadsSplit(): ChatThreads | null {
+		const indexStr = this._storageService.get(THREAD_INDEX_KEY, StorageScope.APPLICATION)
+		if (!indexStr) return null
+		const ids: string[] = JSON.parse(indexStr)
+		if (ids.length === 0) return null
+		const threads: ChatThreads = {}
+		for (const id of ids) {
+			threads[id] = this._readThread(id)
+		}
+		return threads
+	}
+
+	/** One-time migration: split the old single-blob into per-thread keys, then remove the old key. */
+	private _migrateToPerThreadStorage(): ChatThreads | null {
+		const oldBlob = this._readAllThreads()
+		if (!oldBlob) return null
+		const ids = Object.keys(oldBlob).filter(id => oldBlob[id] !== undefined)
+		if (ids.length === 0) return null
+		for (const id of ids) {
+			const thread = oldBlob[id]
+			if (thread) {
+				this._storageService.store(THREAD_KEY_PREFIX + id, JSON.stringify(thread), StorageScope.APPLICATION, StorageTarget.USER)
+			}
+		}
+		this._storageService.store(THREAD_INDEX_KEY, JSON.stringify(ids), StorageScope.APPLICATION, StorageTarget.USER)
+		this._storageService.remove(THREAD_STORAGE_KEY, StorageScope.APPLICATION)
+		console.log(`[void] Migrated ${ids.length} threads to per-thread storage`)
+		return oldBlob
+	}
+
+	/** Load threads: try per-thread first, fall back to old blob + migrate. */
+	private _loadAllThreads(): ChatThreads | null {
+		const split = this._readAllThreadsSplit()
+		if (split) return split
+		return this._migrateToPerThreadStorage()
 	}
 
 	// Phase E — per-workspace pin storage. Key = workspaceUri (real folder
@@ -1030,7 +1099,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (thread) {
 			thread.latestUsage = usage
 			thread.cumulativeUsageThisThread = this.cumulativeUsageThisThreadOfThreadId[threadId]
-			this._storeAllThreads(this.state.allThreads)
+			this._storeThread(threadId, thread)
 		}
 		this._onDidChangeStreamState.fire({ threadId })
 	}
@@ -1143,7 +1212,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (thread) {
 			thread.latestCompaction = this.latestCompactionOfThreadId[threadId]
 			thread.cumulativeCompactionThisThread = this.cumulativeCompactionThisThreadOfThreadId[threadId]
-			this._storeAllThreads(this.state.allThreads)
+			this._storeThread(threadId, thread)
 		}
 		this._onDidChangeStreamState.fire({ threadId })
 	}
@@ -1177,17 +1246,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// blob every turn when rules haven't moved.
 		if (thread.lastAppliedRules === rules) return
 
-		const newThreads = {
-			...this.state.allThreads,
-			[threadId]: { ...thread, lastAppliedRules: rules },
-		}
-		this._storeAllThreads(newThreads)
+		const updatedThread = { ...thread, lastAppliedRules: rules }
+		const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
+		this._storeThread(threadId, updatedThread)
 		this._setState({ allThreads: newThreads })
 	}
 
 	// Persists the given model selection on the thread so that a later
 	// `switchToThread` can restore the dropdown to whatever the user sent with.
-	// Writes through `_storeAllThreads` to survive reloads. No state change
+	// Writes through `_storeThread` to survive reloads. No state change
 	// event here — the dropdown state lives on `IVoidSettingsService`, not on
 	// this service, so there's nothing for chat-UI listeners to re-render.
 	private _setThreadLastUsedModelSelection(threadId: string, modelSelection: ModelSelection | null) {
@@ -1205,11 +1272,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		) return
 		if (!prev && !modelSelection) return
 
-		const newThreads = {
-			...this.state.allThreads,
-			[threadId]: { ...thread, lastUsedModelSelection: modelSelection },
-		}
-		this._storeAllThreads(newThreads)
+		const updatedThread = { ...thread, lastUsedModelSelection: modelSelection }
+		const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
+		this._storeThread(threadId, updatedThread)
 		this._setState({ allThreads: newThreads })
 	}
 
@@ -2047,20 +2112,18 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const oldThread = allThreads[threadId]
 		if (!oldThread) return // should never happen
 		// update state and store it
-		const newThreads = {
-			...allThreads,
-			[oldThread.id]: {
-				...oldThread,
-				lastModified: new Date().toISOString(),
-				messages: [
-					...oldThread.messages.slice(0, messageIdx),
-					newMessage,
-					...oldThread.messages.slice(messageIdx + 1, Infinity),
-				],
-			}
+		const updatedThread = {
+			...oldThread,
+			lastModified: new Date().toISOString(),
+			messages: [
+				...oldThread.messages.slice(0, messageIdx),
+				newMessage,
+				...oldThread.messages.slice(messageIdx + 1, Infinity),
+			],
 		}
-		this._storeAllThreads(newThreads)
-		this._setState({ allThreads: newThreads }) // the current thread just changed (it had a message added to it)
+		const newThreads = { ...allThreads, [threadId]: updatedThread }
+		this._storeThread(threadId, updatedThread)
+		this._setState({ allThreads: newThreads })
 	}
 
 
@@ -2455,16 +2518,13 @@ We only need to do it for files that were edited since `from`, ie files between 
 			const checkpointIdx = thread.state.currCheckpointIdx;
 			const newMessages = thread.messages.slice(0, checkpointIdx + 1);
 
-			// Update the thread with truncated messages
-			const newThreads = {
-				...this.state.allThreads,
-				[threadId]: {
-					...thread,
-					lastModified: new Date().toISOString(),
-					messages: newMessages,
-				}
+			const updatedThread = {
+				...thread,
+				lastModified: new Date().toISOString(),
+				messages: newMessages,
 			};
-			this._storeAllThreads(newThreads);
+			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread };
+			this._storeThread(threadId, updatedThread);
 			this._setState({ allThreads: newThreads });
 		}
 
@@ -2958,15 +3018,9 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const t = this.state.allThreads[threadId]
 		if (!t || t.workspaceUri) return false
 		const identity = this._getCurrentWorkspaceIdentity()
-		const newThreads = {
-			...this.state.allThreads,
-			[threadId]: {
-				...t,
-				workspaceUri: identity.uri,
-				workspaceLabel: identity.label,
-			},
-		}
-		this._storeAllThreads(newThreads)
+		const updatedThread = { ...t, workspaceUri: identity.uri, workspaceLabel: identity.label }
+		const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
+		this._storeThread(threadId, updatedThread)
 		this._setState({ allThreads: newThreads })
 		return true
 	}
@@ -3057,7 +3111,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const newPinned = this.state.pinnedThreadIds.includes(newThread.id)
 			? this.state.pinnedThreadIds
 			: [...this.state.pinnedThreadIds, newThread.id]
-		this._storeAllThreads(newThreads)
+		this._storeThread(newThread.id, newThread, true)
 		this._setPinsForCurrentWorkspace(newPinned, { allThreads: newThreads, currentThreadId: newThread.id })
 	}
 
@@ -3100,8 +3154,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 		// when debugging via direct SQLite inspection.)
 		this._clearLastActiveEntriesForThread(threadId)
 
-		// store the updated threads
-		this._storeAllThreads(newThreads);
+		this._storeThread(threadId, undefined)
 		this._setState({ ...this.state, allThreads: newThreads, pinnedThreadIds: newPinned })
 	}
 
@@ -3128,7 +3181,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 		if (srcIdx === -1) newPinned.push(newThread.id)
 		else newPinned.splice(srcIdx + 1, 0, newThread.id)
 
-		this._storeAllThreads(newThreads)
+		this._storeThread(newThread.id, newThread, true)
 		this._setPinsForCurrentWorkspace(newPinned, { allThreads: newThreads })
 	}
 
@@ -3170,7 +3223,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 			cumulativeCompactionThisThread: undefined,
 		}
 		const newThreads = { ...this.state.allThreads, [newId]: cloned }
-		this._storeAllThreads(newThreads)
+		this._storeThread(newId, cloned, true)
 		// Drop in-memory telemetry mirrors for the new id (defensive — should
 		// be empty since the id is fresh, but keeps the maps strictly
 		// in-sync with what's persisted on the thread).
@@ -3234,7 +3287,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 			lastModified: new Date().toISOString(),
 		}
 		const newThreads = { ...this.state.allThreads, [threadId]: updated }
-		this._storeAllThreads(newThreads)
+		this._storeThread(threadId, updated)
 		this._setState({ allThreads: newThreads })
 		this.switchToThread(threadId)
 		return threadId
@@ -3338,7 +3391,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 		const newThread: ThreadType = { ...oldThread, customTitle: next, lastModified: new Date().toISOString() }
 		const newThreads = { ...allThreads, [threadId]: newThread }
-		this._storeAllThreads(newThreads)
+		this._storeThread(threadId, newThread)
 		this._setState({ allThreads: newThreads })
 	}
 
@@ -3346,20 +3399,14 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const { allThreads } = this.state
 		const oldThread = allThreads[threadId]
 		if (!oldThread) return // should never happen
-		// update state and store it
-		const newThreads = {
-			...allThreads,
-			[oldThread.id]: {
-				...oldThread,
-				lastModified: new Date().toISOString(),
-				messages: [
-					...oldThread.messages,
-					message
-				],
-			}
+		const updatedThread = {
+			...oldThread,
+			lastModified: new Date().toISOString(),
+			messages: [...oldThread.messages, message],
 		}
-		this._storeAllThreads(newThreads)
-		this._setState({ allThreads: newThreads }) // the current thread just changed (it had a message added to it)
+		const newThreads = { ...allThreads, [threadId]: updatedThread }
+		this._storeThread(threadId, updatedThread)
+		this._setState({ allThreads: newThreads })
 	}
 
 	// sets the currently selected message (must be undefined if no message is selected)
@@ -3566,11 +3613,9 @@ We only need to do it for files that were edited since `from`, ie files between 
 		if (!thread) return
 
 		const messages = buildTestMessages(turns)
-		const newThreads = {
-			...this.state.allThreads,
-			[threadId]: { ...thread, lastModified: new Date().toISOString(), messages },
-		}
-		this._storeAllThreads(newThreads)
+		const updatedThread = { ...thread, lastModified: new Date().toISOString(), messages }
+		const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
+		this._storeThread(threadId, updatedThread)
 		this._setState({ allThreads: newThreads })
 		console.log(`[test] Populated thread ${threadId} with ${turns} turns, ${messages.length} messages. Approx chars: ${JSON.stringify(messages).length}`)
 	}

@@ -18,6 +18,12 @@ export const VOID_SETTINGS_STORAGE_KEY = 'void.settingsServiceStorageII'
 // 1.0.3
 export const THREAD_STORAGE_KEY = 'void.chatThreadStorageII'
 
+// Per-thread storage (replaces the single-blob THREAD_STORAGE_KEY).
+// Each thread is stored under `void.chatThread.{threadId}`.
+// A lightweight index of thread IDs is stored separately.
+export const THREAD_KEY_PREFIX = 'void.chatThread.'
+export const THREAD_INDEX_KEY = 'void.chatThreadIndex'
+
 
 // Ordered list of thread ids pinned as tabs in the chat sidebar. Persisted
 // separately from THREAD_STORAGE_KEY so evolving tab UX doesn't force a
