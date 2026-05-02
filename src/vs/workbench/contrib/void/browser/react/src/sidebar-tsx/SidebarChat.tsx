@@ -1729,7 +1729,7 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 				`Response ended unexpectedly (finish_reason: ${finishReason}).`
 
 	return <>
-		{/* reasoning token */}
+		{/* reasoning token — always mounted during streaming to avoid reflow on transition */}
 		{hasReasoning &&
 			<div className={`${isCheckpointGhost ? 'opacity-50' : ''}`}>
 				<ReasoningWrapper isDoneReasoning={isDoneReasoning} isStreaming={!isCommitted}>
@@ -1746,9 +1746,10 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 			</div>
 		}
 
-		{/* assistant message */}
-		{chatMessage.displayContent &&
-			<div className={`${isCheckpointGhost ? 'opacity-50' : ''}`}>
+		{/* assistant message — during streaming, keep mounted but hidden until content arrives
+		    so the DOM structure doesn't change on the reasoning→text transition */}
+		{(chatMessage.displayContent || !isCommitted) &&
+			<div className={`${isCheckpointGhost ? 'opacity-50' : ''}`} style={!chatMessage.displayContent ? { display: 'none' } : undefined}>
 				<ProseWrapper>
 					<ChatMarkdownRender
 						string={chatMessage.displayContent || ''}
@@ -3113,11 +3114,11 @@ type ChatBubbleProps = {
 	firstPendingToolRequestIdx?: number,
 }
 
-const ChatBubble = (props: ChatBubbleProps) => {
+const ChatBubble = React.memo((props: ChatBubbleProps) => {
 	return <ErrorBoundary>
 		<_ChatBubble {...props} />
 	</ErrorBoundary>
-}
+})
 
 const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, messageIdx, chatIsRunning, _scrollToBottom, firstPendingToolRequestIdx, threadIsReadOnly }: ChatBubbleProps) => {
 	const role = chatMessage.role
@@ -3559,6 +3560,11 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 		return earliest
 	}, [previousMessages])
 
+	const isRunningRef = useRef(isRunning)
+	isRunningRef.current = isRunning
+
+	const scrollToBottomCb = useCallback(() => scrollToBottom(scrollContainerRef), [scrollContainerRef])
+
 	const previousMessagesHTML = useMemo(() => {
 		return previousMessages.map((message, i) => {
 			return <ChatBubble
@@ -3567,14 +3573,14 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 				chatMessage={message}
 				messageIdx={i}
 				isCommitted={true}
-				chatIsRunning={isRunning}
+				chatIsRunning={isRunningRef.current}
 				threadId={threadId}
-				_scrollToBottom={() => scrollToBottom(scrollContainerRef)}
+				_scrollToBottom={scrollToBottomCb}
 				firstPendingToolRequestIdx={firstPendingToolRequestIdx}
 				threadIsReadOnly={threadIsReadOnly}
 			/>
 		})
-	}, [previousMessages, threadId, currCheckpointIdx, isRunning, scrollContainerRef, firstPendingToolRequestIdx, threadIsReadOnly])
+	}, [previousMessages, threadId, currCheckpointIdx, scrollToBottomCb, firstPendingToolRequestIdx, threadIsReadOnly])
 
 	const streamingChatIdx = previousMessagesHTML.length
 	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?

@@ -155,13 +155,13 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
 - **Tool call preview streaming** (`EditToolChildren`): Passes `isStreaming` so the incremental lexer
   is used for the chat-side code preview during `edit_file` / `rewrite_file` tool calls.
 - **Stream throttle**: Bumped from 50ms → 100ms to give the editor more main-thread budget.
+- **Per-thread storage** (`chatThreadService.ts`): Each thread is stored under its own SQLite key
+  (`void.chatThread.{id}`) instead of a single blob for all threads. Saving one thread no longer
+  re-serializes the entire map. A lightweight index key (`void.chatThreadIndex`) stores the list
+  of thread IDs. Automatic one-time migration splits the old blob on first load.
 
 ### Known performance issues
 
-- **Thread storage is full-replace**: `_storeAllThreads` in `chatThreadService.ts` serializes the
-  entire thread map (`JSON.stringify` of all threads) on every message commit, title change, etc.
-  With large conversations this causes a visible stutter on the main thread. Fix options:
-  store each thread under its own storage key, debounce writes, or offload serialization to a worker.
 - **Resize / tab-switch with long chats**: Large DOM tree from fully-rendered messages causes
   expensive reflow. `content-visibility: auto` breaks `scrollTop = scrollHeight` scroll-to-bottom.
   Potential fixes: progressive rendering (render recent messages first, older ones in idle frames),
