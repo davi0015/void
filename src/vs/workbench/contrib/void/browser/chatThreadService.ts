@@ -997,7 +997,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				e.pending = null
 				this.streamState[threadId] = pending
 				this._onDidChangeStreamState.fire({ threadId })
-			}, 50)
+			}, 100)
 			entry = { scheduler, pending: state }
 			this._streamTextThrottle.set(threadId, entry)
 		} else {
