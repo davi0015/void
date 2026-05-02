@@ -1703,10 +1703,10 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 	const thread = chatThreadsService.getCurrentThread()
 
 
-	const chatMessageLocation: ChatMessageLocation = {
+	const chatMessageLocation: ChatMessageLocation = useMemo(() => ({
 		threadId: thread.id,
 		messageIdx: messageIdx,
-	}
+	}), [thread.id, messageIdx])
 
 	const isEmpty = !chatMessage.displayContent && !chatMessage.reasoning
 	if (isEmpty) return null
@@ -2114,11 +2114,11 @@ export const ListableToolItem = ({ name, onClick, isSmall, className, showDot }:
 
 
 
-const EditToolChildren = ({ uri, code, type }: { uri: URI | undefined, code: string, type: 'diff' | 'rewrite' }) => {
+const EditToolChildren = ({ uri, code, type, isStreaming }: { uri: URI | undefined, code: string, type: 'diff' | 'rewrite', isStreaming?: boolean }) => {
 
 	const content = type === 'diff' ?
 		<VoidDiffEditor uri={uri} searchReplaceBlocks={code} />
-		: <ChatMarkdownRender string={`\`\`\`\n${code}\n\`\`\``} codeURI={uri} chatMessageLocation={undefined} />
+		: <ChatMarkdownRender string={`\`\`\`\n${code}\n\`\`\``} codeURI={uri} chatMessageLocation={undefined} isStreaming={isStreaming} />
 
 	return <div className='!select-text cursor-auto'>
 		<SmallProseWrapper>
@@ -3481,7 +3481,8 @@ const EditToolSoFar = ({ toolCallSoFar, }: { toolCallSoFar: RawToolCallObj }) =>
 		<EditToolChildren
 			uri={uri}
 			code={toolCallSoFar.rawParams.search_replace_blocks ?? toolCallSoFar.rawParams.new_content ?? ''}
-			type={'rewrite'} // as it streams, show in rewrite format, don't make a diff editor
+			type={'rewrite'}
+			isStreaming={true}
 		/>
 		<IconLoading />
 	</ToolHeaderWrapper>

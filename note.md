@@ -144,6 +144,31 @@ const msgs = buildTestMessages(20)           // 20 turns of user+assistant
 const { reasoning, display } = getStreamContent({ repetitions: 3 })
 ```
 
+### Performance optimisations applied
+
+- **Incremental lexer** (`ChatMarkdownRender.tsx`): During streaming, reuses frozen tokens for the
+  stable prefix and only re-lexes the appended tail. Per-frame cost: O(delta) instead of O(total).
+- **`React.memo` on `RenderToken`**: Frozen tokens keep stable object references from the incremental
+  lexer, so React skips re-rendering them entirely. Only the last 1-2 tokens re-render per frame.
+- **`useMemo` on `chatMessageLocation`** (`SidebarChat.tsx`): Prevents a new object reference from
+  defeating `React.memo` on every stream update.
+- **Tool call preview streaming** (`EditToolChildren`): Passes `isStreaming` so the incremental lexer
+  is used for the chat-side code preview during `edit_file` / `rewrite_file` tool calls.
+- **Stream throttle**: Bumped from 50ms → 100ms to give the editor more main-thread budget.
+
+### Known performance issues
+
+- **Thread storage is full-replace**: `_storeAllThreads` in `chatThreadService.ts` serializes the
+  entire thread map (`JSON.stringify` of all threads) on every message commit, title change, etc.
+  With large conversations this causes a visible stutter on the main thread. Fix options:
+  store each thread under its own storage key, debounce writes, or offload serialization to a worker.
+- **Resize / tab-switch with long chats**: Large DOM tree from fully-rendered messages causes
+  expensive reflow. `content-visibility: auto` breaks `scrollTop = scrollHeight` scroll-to-bottom.
+  Potential fixes: progressive rendering (render recent messages first, older ones in idle frames),
+  or full message-level virtualization with an IntersectionObserver-based scroll mechanism.
+- **Editor slowdown during tool execution**: The actual file write / diff-apply path — separate from
+  the chat-side preview rendering. Needs investigation.
+
 ## Build
 
 End-to-end: build a `Void.app`, wrap it in a DMG, and hand it to teammates.
