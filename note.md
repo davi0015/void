@@ -159,6 +159,26 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
   (`void.chatThread.{id}`) instead of a single blob for all threads. Saving one thread no longer
   re-serializes the entire map. A lightweight index key (`void.chatThreadIndex`) stores the list
   of thread IDs. Automatic one-time migration splits the old blob on first load.
+- **Granular stream subscriptions** (`services.tsx`): Added `useStreamRunningState` hook that only
+  re-renders when the `isRunning` status transitions (e.g. idle→LLM→idle), not on every content
+  tick. `SidebarChat` and `CommandBarInChat` switched from `useChatThreadsStreamState` (fires every
+  ~100ms during streaming) to this hook. Parent render count dropped from ~100/stream to ~2.
+- **`React.memo` on container components** (`SidebarChat.tsx`, `SidebarThreadSelector.tsx`): Wrapped
+  `CommandBarInChat`, `ThreadMessagesView`, `SidebarThreadTabs`, and `PastThreadsList` in
+  `React.memo`. These components have stable props during streaming and were re-rendering only
+  because their parent (`SidebarChat`) did. Eliminated ~100 redundant renders per stream per component.
+- **Ref-based scroll tracking** (`ScrollToBottomContainer`): Replaced `useState(isAtBottom)` with
+  `useRef`. Scroll events now update the ref directly without triggering React re-renders. Removed
+  ~85 self-triggered re-renders per stream. Threshold increased from 4px to 40px for more robust
+  auto-scroll-to-bottom detection.
+- **Streaming→committed bubble DOM reuse** (`ThreadMessagesView`): Merged streaming and committed
+  `ChatBubble` arrays into a single `allBubblesHTML` array so React can match the same key across
+  the streaming→committed transition. Previously, React unmounted the entire streaming bubble DOM
+  tree and remounted a new committed one (expensive reflow on large messages). Now it patches in
+  place. Eliminated visible stutter at stream end on 90k-token conversations.
+- **Lexer cache seeding on stream end** (`ChatMarkdownRender.tsx`): When the streaming `IncrementalLexer`
+  finishes, its final tokens are written into the module-level LRU cache so the committed message's
+  `cachedLex()` call is an instant hit. Avoids a redundant full re-lex of the entire response.
 
 ### Known performance issues
 
