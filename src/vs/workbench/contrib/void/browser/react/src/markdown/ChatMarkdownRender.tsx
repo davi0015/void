@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import React, { JSX, useState } from 'react'
+import React, { JSX, useRef, useState } from 'react'
 import { marked, MarkedToken, Token } from 'marked'
 
 // Module-level content-keyed cache for marked.lexer output. Every tab switch / every
@@ -28,6 +28,47 @@ const cachedLex = (raw: string): Token[] => {
 	}
 	lexerCache.set(raw, tokens)
 	return tokens
+}
+
+// Incremental lexer for streaming. During streaming the string grows by appending
+// chunks. Instead of re-lexing the entire string every frame (O(n)), we keep the
+// tokens whose raw text hasn't changed (the "stable prefix") and only re-lex the
+// tail that was appended. The stable tokens keep their original object references,
+// which lets React.memo on RenderToken skip re-rendering them entirely.
+//
+// The safe split point is "all tokens except the last one" — an unclosed code fence
+// or partial paragraph stays as the last token and gets re-lexed each frame until
+// the construct is complete.
+class IncrementalLexer {
+	private _prevString = ''
+	private _tokens: Token[] = []
+
+	lex(newString: string): Token[] {
+		if (newString === this._prevString) return this._tokens
+
+		if (
+			newString.length > this._prevString.length
+			&& newString.startsWith(this._prevString)
+			&& this._tokens.length > 0
+		) {
+			// Append-only path: reuse all tokens except the last (which may be incomplete).
+			const stable = this._tokens.slice(0, -1)
+			const stableLen = stable.reduce((sum, t) => sum + t.raw.length, 0)
+			const tail = marked.lexer(newString.slice(stableLen))
+			this._tokens = [...stable, ...tail]
+		} else {
+			// Full re-lex (first call, edit, or non-append change).
+			this._tokens = marked.lexer(newString)
+		}
+
+		this._prevString = newString
+		return this._tokens
+	}
+
+	reset() {
+		this._prevString = ''
+		this._tokens = []
+	}
 }
 
 import { convertToVscodeLang, detectLanguage } from '../../../../common/helpers/languageHelpers.js'
@@ -290,7 +331,10 @@ const paragraphToLatexSegments = (paragraphText: string) => {
 
 
 export type RenderTokenOptions = { isApplyEnabled?: boolean, isLinkDetectionEnabled?: boolean, isStreaming?: boolean }
-const RenderToken = ({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ...options }: { token: Token | string, inPTag?: boolean, codeURI?: URI, chatMessageLocation?: ChatMessageLocation, tokenIdx: string, } & RenderTokenOptions): React.ReactNode => {
+
+type RenderTokenProps = { token: Token | string, inPTag?: boolean, codeURI?: URI, chatMessageLocation?: ChatMessageLocation, tokenIdx: string } & RenderTokenOptions
+
+const RenderToken = React.memo(({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ...options }: RenderTokenProps): React.ReactNode => {
 	const accessor = useAccessor()
 	const languageService = accessor.get('ILanguageService')
 
@@ -566,12 +610,33 @@ const RenderToken = ({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ..
 			<span className='text-sm text-orange-500'>Unknown token rendered...</span>
 		</div>
 	)
-}
+})
 
 
 export const ChatMarkdownRender = ({ string, inPTag = false, chatMessageLocation, ...options }: { string: string, inPTag?: boolean, codeURI?: URI, chatMessageLocation: ChatMessageLocation | undefined } & RenderTokenOptions) => {
 	string = string.replaceAll('\n•', '\n\n•')
-	const tokens = cachedLex(string); // https://marked.js.org/using_pro#renderer
+
+	const incrementalLexerRef = useRef<IncrementalLexer | null>(null)
+	const wasStreamingRef = useRef(false)
+
+	let tokens: Token[]
+	if (options.isStreaming) {
+		if (!incrementalLexerRef.current) {
+			incrementalLexerRef.current = new IncrementalLexer()
+		}
+		tokens = incrementalLexerRef.current.lex(string)
+		wasStreamingRef.current = true
+	} else {
+		if (wasStreamingRef.current) {
+			// Streaming just finished — discard incremental state and populate
+			// the static LRU cache so future re-renders (tab switch etc.) are fast.
+			incrementalLexerRef.current?.reset()
+			incrementalLexerRef.current = null
+			wasStreamingRef.current = false
+		}
+		tokens = cachedLex(string)
+	}
+
 	return (
 		<>
 			{tokens.map((token, index) => (
