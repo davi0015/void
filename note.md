@@ -678,7 +678,7 @@ Goal: chat history lives "in the workspace", not as one global pile. Default thr
 - **Commit 5 — Visual indicators on tab strip.** Lock icon + tooltip for read-only foreign; Globe icon + tooltip for unscoped. Reuses the existing leading-icon slot (running-state spinner takes precedence). Imported icon dropped — see commit 5 notes. Polish-only.
 - **(Optional) Commit 6 — Roadmap entry move.** Move this section into the Done block once everything ships, with measured outcomes / any deviations from plan called out.
 
-**Currently working on: Tier-1 follow-up #1 (multi-window state sync) — code in tree, not yet committed. Commits 1-5 + per-workspace pin refactor + read-only revert all shipped.**
+**All shipped: Phase E commits 1-5, per-workspace pin refactor, read-only revert, and Tier-1 follow-up #1 (multi-window state sync — `7faec235`, on `main` via PR #26 squash `d9ade47f`). Optional Commit 6 (move this whole section into Done with outcomes summary) still pending.**
 
 **Tier-1 follow-up #1 implementation notes (multi-window state sync):**
 
