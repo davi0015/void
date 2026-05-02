@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { startTransition, useEffect, useLayoutEffect, useMemo, useRef, useState, KeyboardEvent } from 'react';
+import React, { startTransition, useEffect, useLayoutEffect, useMemo, useRef, useState, KeyboardEvent } from 'react';
 import { CopyButton, IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
 import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useFullChatThreadsStreamState, useSettingsState } from '../util/services.js';
 import { IconX } from './SidebarChat.js';
@@ -64,7 +64,7 @@ const partitionThreadsByWorkspaceScope = (
 	return { own, foreignByKey }
 }
 
-export const PastThreadsList = ({ className = '' }: { className?: string }) => {
+export const PastThreadsList = React.memo(({ className = '' }: { className?: string }) => {
 	const [showAll, setShowAll] = useState(false);
 	const [hoveredIdx, setHoveredIdx] = useState<number | null>(null)
 	// Top-level "Other workspaces" group is collapsed by default each
@@ -145,7 +145,7 @@ export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 			)}
 		</div>
 	);
-};
+});
 
 // Phase E commit 4 — collapsible "Other workspaces" section. Renders
 // foreign + unscoped threads grouped by workspace label. Each group
@@ -451,7 +451,7 @@ const PastThreadElement = ({ pastThread, idx, hoveredIdx, setHoveredIdx, isRunni
 // underlying thread (it stays reachable via PastThreadsList / history). Users
 // add tabs implicitly by starting a new thread (`+`) or switching to one from
 // history; they remove tabs via the × on the tab itself.
-export const SidebarThreadTabs = () => {
+export const SidebarThreadTabs = React.memo(() => {
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
 	const contextMenuService = accessor.get('IContextMenuService')
@@ -1207,4 +1207,4 @@ export const SidebarThreadTabs = () => {
 			})() : null}
 		</div>
 	)
-}
+})

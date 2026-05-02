@@ -38,7 +38,7 @@ import { IConfigurationService } from '../../../../../../../platform/configurati
 import { IPathService } from '../../../../../../../workbench/services/path/common/pathService.js'
 import { IMetricsService } from '../../../../../../../workbench/contrib/void/common/metricsService.js'
 import { URI } from '../../../../../../../base/common/uri.js'
-import { IChatThreadService, ThreadsState, ThreadStreamState } from '../../../chatThreadService.js'
+import { IChatThreadService, IsRunningType, ThreadsState, ThreadStreamState, ThreadType } from '../../../chatThreadService.js'
 import { type LLMUsage } from '../../../../common/sendLLMMessageTypes.js'
 import { type CompactionInfo } from '../../../../common/chatThreadServiceTypes.js'
 import { ITerminalToolService } from '../../../terminalToolService.js'
@@ -314,6 +314,39 @@ export const useChatThreadsState = () => {
 
 
 
+export const useChatThread = (threadId: string) => {
+	const [thread, setThread] = useState<ThreadType | undefined>(chatThreadsState.allThreads[threadId])
+	useEffect(() => {
+		setThread(chatThreadsState.allThreads[threadId])
+		const listener = (newState: ThreadsState) => {
+			setThread(prev => {
+				const next = newState.allThreads[threadId]
+				if (prev === next) return prev
+				return next
+			})
+		}
+		chatThreadsStateListeners.add(listener)
+		return () => { chatThreadsStateListeners.delete(listener) }
+	}, [threadId])
+	return thread
+}
+
+export const useCurrentWorkspaceUri = () => {
+	const [uri, setUri] = useState(chatThreadsState.currentWorkspaceUri)
+	useEffect(() => {
+		setUri(chatThreadsState.currentWorkspaceUri)
+		const listener = (newState: ThreadsState) => {
+			setUri(prev => {
+				if (prev === newState.currentWorkspaceUri) return prev
+				return newState.currentWorkspaceUri
+			})
+		}
+		chatThreadsStateListeners.add(listener)
+		return () => { chatThreadsStateListeners.delete(listener) }
+	}, [])
+	return uri
+}
+
 export const useChatThreadsStreamState = (threadId: string) => {
 	const [s, ss] = useState<ThreadStreamState[string] | undefined>(chatThreadsStreamState[threadId])
 	useEffect(() => {
@@ -326,6 +359,23 @@ export const useChatThreadsStreamState = (threadId: string) => {
 		return () => { chatThreadsStreamStateListeners.delete(listener) }
 	}, [ss, threadId])
 	return s
+}
+
+export const useStreamRunningState = (threadId: string): IsRunningType => {
+	const [isRunning, setIsRunning] = useState<IsRunningType>(
+		chatThreadsStreamState[threadId]?.isRunning
+	)
+	useEffect(() => {
+		setIsRunning(chatThreadsStreamState[threadId]?.isRunning)
+		const listener = (threadId_: string) => {
+			if (threadId_ !== threadId) return
+			const next: IsRunningType = chatThreadsStreamState[threadId]?.isRunning
+			setIsRunning((prev: IsRunningType) => prev === next ? prev : next)
+		}
+		chatThreadsStreamStateListeners.add(listener)
+		return () => { chatThreadsStreamStateListeners.delete(listener) }
+	}, [threadId])
+	return isRunning
 }
 
 export const useChatThreadLatestUsage = (threadId: string) => {

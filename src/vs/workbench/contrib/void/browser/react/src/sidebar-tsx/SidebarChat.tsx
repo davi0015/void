@@ -6,7 +6,8 @@
 import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 
-import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState, useFullChatThreadsStreamState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction } from '../util/services.js';
+import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useFullChatThreadsStreamState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction } from '../util/services.js';
+
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
@@ -718,36 +719,32 @@ export const ButtonStop = ({ className, ...props }: ButtonHTMLAttributes<HTMLBut
 
 const scrollToBottom = (divRef: { current: HTMLElement | null }) => {
 	if (divRef.current) {
-		divRef.current.scrollTop = divRef.current.scrollHeight;
+		divRef.current.scrollTop = 1e10;
 	}
 };
 
 
 
 const ScrollToBottomContainer = ({ children, className, style, scrollContainerRef }: { children: React.ReactNode, className?: string, style?: React.CSSProperties, scrollContainerRef: React.MutableRefObject<HTMLDivElement | null> }) => {
-	const [isAtBottom, setIsAtBottom] = useState(true); // Start at bottom
+	const isAtBottomRef = useRef(true);
 
 	const divRef = scrollContainerRef
 
-	const onScroll = () => {
+	const onScroll = useCallback(() => {
 		const div = divRef.current;
 		if (!div) return;
 
-		const isBottom = Math.abs(
+		isAtBottomRef.current = Math.abs(
 			div.scrollHeight - div.clientHeight - div.scrollTop
-		) < 4;
+		) < 40;
+	}, [divRef]);
 
-		setIsAtBottom(isBottom);
-	};
-
-	// When children change (new messages added)
 	useEffect(() => {
-		if (isAtBottom) {
+		if (isAtBottomRef.current) {
 			scrollToBottom(divRef);
 		}
-	}, [children, isAtBottom]); // Dependency on children to detect new messages
+	}, [children]);
 
-	// Initial scroll to bottom
 	useEffect(() => {
 		scrollToBottom(divRef);
 	}, []);
@@ -1784,7 +1781,7 @@ const ReasoningWrapper = ({ isDoneReasoning, isStreaming, children }: { isDoneRe
 	useEffect(() => {
 		if (!isWriting || !isOpen) return
 		const el = scrollRef.current
-		if (el) el.scrollTop = el.scrollHeight
+		if (el) el.scrollTop = 1e10
 	}, [children, isWriting, isOpen])
 	return <ToolHeaderWrapper title='Reasoning' desc1={isWriting ? <IconLoading /> : ''} isOpen={isOpen} onClick={() => setIsOpen(v => !v)}>
 		<ToolChildrenWrapper>
@@ -3121,6 +3118,7 @@ const ChatBubble = React.memo((props: ChatBubbleProps) => {
 })
 
 const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, messageIdx, chatIsRunning, _scrollToBottom, firstPendingToolRequestIdx, threadIsReadOnly }: ChatBubbleProps) => {
+
 	const role = chatMessage.role
 
 	const isCheckpointGhost = messageIdx > (currCheckpointIdx ?? Infinity) && !chatIsRunning // whether to show as gray (if chat is running, for good measure just dont show any ghosts)
@@ -3191,16 +3189,16 @@ const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, me
 
 }
 
-const CommandBarInChat = () => {
-	const { stateOfURI: commandBarStateOfURI, sortedURIs: sortedCommandBarURIs } = useCommandBarState()
+const CommandBarInChat = React.memo(() => {
+	const commandBarState = useCommandBarState()
+	const { stateOfURI: commandBarStateOfURI, sortedURIs: sortedCommandBarURIs } = commandBarState
 	const numFilesChanged = sortedCommandBarURIs.length
 
 	const accessor = useAccessor()
 	const editCodeService = accessor.get('IEditCodeService')
 	const commandService = accessor.get('ICommandService')
 	const chatThreadsState = useChatThreadsState()
-	const commandBarState = useCommandBarState()
-	const chatThreadsStreamState = useChatThreadsStreamState(chatThreadsState.currentThreadId)
+	const threadIsRunning = useStreamRunningState(chatThreadsState.currentThreadId)
 
 	// (
 	// 	<IconShell1
@@ -3244,8 +3242,8 @@ const CommandBarInChat = () => {
 	// dark = Done
 
 	const threadStatus = (
-		chatThreadsStreamState?.isRunning === 'awaiting_user' ? { title: 'Needs Approval', color: 'yellow', } as const
-			: chatThreadsStreamState?.isRunning ? { title: 'Running', color: 'orange', } as const
+		threadIsRunning === 'awaiting_user' ? { title: 'Needs Approval', color: 'yellow', } as const
+			: threadIsRunning ? { title: 'Running', color: 'orange', } as const
 				: { title: 'Done', color: 'dark', } as const
 	)
 
@@ -3449,7 +3447,7 @@ const CommandBarInChat = () => {
 			</div>
 		</>
 	)
-}
+})
 
 
 
@@ -3501,23 +3499,22 @@ const EditToolSoFar = ({ toolCallSoFar, }: { toolCallSoFar: RawToolCallObj }) =>
 // Each instance owns its own scroll container ref and subscribes to its own stream
 // state, so a background thread can keep streaming while the user is looking at a
 // different one.
-const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
+const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef }: {
 	threadId: string
 	isActive: boolean
 	scrollContainerRef: React.MutableRefObject<HTMLDivElement | null>
 }) => {
+	const thread = useChatThread(threadId)
 	const accessor = useAccessor()
 	const commandService = accessor.get('ICommandService')
 	const chatThreadsService = accessor.get('IChatThreadService')
-
-	const chatThreadsState = useChatThreadsState()
-	const thread = chatThreadsState.allThreads[threadId]
+	const currentWorkspaceUri = useCurrentWorkspaceUri()
 	const previousMessages = thread?.messages ?? []
 	// Phase E commit 4 — propagated to each user-message bubble so the in-
 	// bubble pencil and click-to-edit path agree with the input-area gating
 	// in `SidebarChat`. Computed here (rather than in `_ChatBubble`) to
 	// avoid one `useChatThreadsState` subscription per message.
-	const threadIsReadOnly = isThreadReadOnly(thread, chatThreadsState.currentWorkspaceUri)
+	const threadIsReadOnly = isThreadReadOnly(thread, currentWorkspaceUri)
 
 	const streamState = useChatThreadsStreamState(threadId)
 	const isRunning = streamState?.isRunning
@@ -3560,32 +3557,72 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 		return earliest
 	}, [previousMessages])
 
-	const isRunningRef = useRef(isRunning)
-	isRunningRef.current = isRunning
-
 	const scrollToBottomCb = useCallback(() => scrollToBottom(scrollContainerRef), [scrollContainerRef])
 
-	const previousMessagesHTML = useMemo(() => {
-		return previousMessages.map((message, i) => {
+	// Incremental JSX cache: when only messages are appended (the common case
+	// at stream end), reuse the existing JSX elements and only createElement
+	// for the new ones. A full rebuild (452 createElement + React reconciliation)
+	// is O(N); the incremental path is O(delta).
+	const prevMsgCacheRef = useRef<{ html: React.ReactNode[], len: number, threadId: string, checkpointIdx: typeof currCheckpointIdx, scrollCb: typeof scrollToBottomCb, pendingIdx: typeof firstPendingToolRequestIdx, readOnly: boolean } | null>(null)
+
+	const previousMessagesHTML = (() => {
+		const cache = prevMsgCacheRef.current
+		const depsMatch = cache
+			&& cache.threadId === threadId
+			&& cache.checkpointIdx === currCheckpointIdx
+			&& cache.scrollCb === scrollToBottomCb
+			&& cache.pendingIdx === firstPendingToolRequestIdx
+			&& cache.readOnly === threadIsReadOnly
+
+		if (depsMatch && previousMessages.length === cache.len) {
+			return cache.html
+		}
+
+		if (depsMatch && previousMessages.length > cache.len) {
+			const newElements: React.ReactNode[] = []
+			for (let i = cache.len; i < previousMessages.length; i++) {
+				newElements.push(<ChatBubble
+					key={i}
+					currCheckpointIdx={currCheckpointIdx}
+					chatMessage={previousMessages[i]}
+					messageIdx={i}
+					isCommitted={true}
+					chatIsRunning={undefined}
+					threadId={threadId}
+					_scrollToBottom={scrollToBottomCb}
+					firstPendingToolRequestIdx={firstPendingToolRequestIdx}
+					threadIsReadOnly={threadIsReadOnly}
+				/>)
+			}
+			const merged = [...cache.html, ...newElements]
+			cache.html = merged
+			cache.len = previousMessages.length
+			return merged
+		}
+
+		const result = previousMessages.map((message, i) => {
 			return <ChatBubble
 				key={i}
 				currCheckpointIdx={currCheckpointIdx}
 				chatMessage={message}
 				messageIdx={i}
 				isCommitted={true}
-				chatIsRunning={isRunningRef.current}
+				chatIsRunning={undefined}
 				threadId={threadId}
 				_scrollToBottom={scrollToBottomCb}
 				firstPendingToolRequestIdx={firstPendingToolRequestIdx}
 				threadIsReadOnly={threadIsReadOnly}
 			/>
 		})
-	}, [previousMessages, threadId, currCheckpointIdx, scrollToBottomCb, firstPendingToolRequestIdx, threadIsReadOnly])
+
+		prevMsgCacheRef.current = { html: result, len: previousMessages.length, threadId, checkpointIdx: currCheckpointIdx, scrollCb: scrollToBottomCb, pendingIdx: firstPendingToolRequestIdx, readOnly: threadIsReadOnly }
+		return result
+	})()
 
 	const streamingChatIdx = previousMessagesHTML.length
 	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
 		<ChatBubble
-			key={'curr-streaming-msg'}
+			key={streamingChatIdx}
 			currCheckpointIdx={currCheckpointIdx}
 			chatMessage={{
 				role: 'assistant',
@@ -3601,6 +3638,13 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 			threadIsReadOnly={threadIsReadOnly}
 		/> : null
 
+	// Merge committed + streaming bubbles into one array so React can match
+	// the same key (streamingChatIdx) across the streaming→committed transition
+	// instead of unmounting/remounting the entire ChatBubble DOM tree.
+	const allBubblesHTML = currStreamingMessageHTML
+		? [...previousMessagesHTML, currStreamingMessageHTML]
+		: previousMessagesHTML
+
 	const generatingTool = toolIsGenerating && currentInFlightTool ?
 		currentInFlightTool.name === 'edit_file' || currentInFlightTool.name === 'rewrite_file' ? <EditToolSoFar
 			key={'curr-streaming-tool'}
@@ -3611,11 +3655,6 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 
 	return (
 		<div
-			// `hidden` maps to `display: none`, which collapses the element out of
-			// layout AND causes IntersectionObserver to report intersections as
-			// false for descendants — so LazyBlockCode in hidden threads won't
-			// mount Monaco editors, keeping memory cost bounded while the thread
-			// is off-screen.
 			hidden={!isActive}
 			className='flex flex-col w-full h-full min-h-0'
 		>
@@ -3630,8 +3669,7 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 					${previousMessagesHTML.length === 0 && !displayContentSoFar ? 'hidden' : ''}
 				`}
 			>
-				{previousMessagesHTML}
-				{currStreamingMessageHTML}
+				{allBubblesHTML}
 				{generatingTool}
 
 				{isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating ? <ProseWrapper>
@@ -3650,10 +3688,10 @@ const ThreadMessagesView = ({ threadId, isActive, scrollContainerRef }: {
 						<WarningBox className='text-sm my-2 mx-4' onClick={() => { commandService.executeCommand(VOID_OPEN_SETTINGS_ACTION_ID) }} text='Open settings' />
 					</div>
 				}
-			</ScrollToBottomContainer>
-		</div>
+		</ScrollToBottomContainer>
+	</div>
 	)
-}
+})
 
 
 export const SidebarChat = () => {
@@ -3676,17 +3714,10 @@ export const SidebarChat = () => {
 	const selections = currentThread.state.stagingSelections
 	const setSelections = (s: StagingSelectionItem[]) => { chatThreadsService.setCurrentThreadState({ stagingSelections: s }) }
 
-	// stream state
-	const currThreadStreamState = useChatThreadsStreamState(chatThreadsState.currentThreadId)
-	const isRunning = currThreadStreamState?.isRunning
-	const latestError = currThreadStreamState?.error
-	const { displayContentSoFar, toolCallsSoFar, reasoningSoFar } = currThreadStreamState?.llmInfo ?? {}
-	// See ThreadMessagesView comment: the last tool in the array is the one still
-	// being streamed; earlier batch siblings may already have complete argument JSON.
-	const currentInFlightTool = toolCallsSoFar && toolCallsSoFar.length > 0 ? toolCallsSoFar[toolCallsSoFar.length - 1] : undefined
-
-	// this is just if it's currently being generated, NOT if it's currently running
-	const toolIsGenerating = currentInFlightTool && !currentInFlightTool.isDone // show loading for slow tools (right now just edit)
+	// Only subscribe to isRunning transitions (not every content tick).
+	// The full stream state (displayContentSoFar, toolCallsSoFar, etc.)
+	// is subscribed inside ThreadMessagesView where it's actually rendered.
+	const isRunning = useStreamRunningState(chatThreadsState.currentThreadId)
 
 	// ----- SIDEBAR CHAT state (local) -----
 
