@@ -1160,9 +1160,6 @@ export const SidebarThreadTabs = () => {
 							<button
 								onClick={(e) => { e.stopPropagation(); chatThreadsService.unpinThread(id); }}
 								className={`ml-0.5 ${isEditingThis ? 'opacity-0 pointer-events-none' : 'opacity-0 group-hover:opacity-100'} shrink-0 rounded hover:bg-black/10 dark:hover:bg-white/10 flex items-center justify-center`}
-								data-tooltip-id='void-tooltip'
-								data-tooltip-content='Remove from tabs (thread stays in history)'
-								data-tooltip-place='bottom'
 							>
 								<X size={10} />
 							</button>
