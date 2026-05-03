@@ -556,6 +556,50 @@ const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'imag
 type ImageMimeType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
 const extForMime: Record<ImageMimeType, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' }
 
+const IMAGE_MAX_DIMENSION = 1024
+const IMAGE_JPEG_QUALITY = 0.85
+
+const compressImage = (file: File, mimeType: ImageMimeType): Promise<{ bytes: Uint8Array, mimeType: ImageMimeType }> => {
+	// GIFs: skip resize to preserve animation
+	if (mimeType === 'image/gif') {
+		return file.arrayBuffer().then(ab => ({ bytes: new Uint8Array(ab), mimeType }))
+	}
+	return new Promise((resolve, reject) => {
+		const img = new Image()
+		const url = URL.createObjectURL(file)
+		img.onload = () => {
+			URL.revokeObjectURL(url)
+			let { width, height } = img
+			const longest = Math.max(width, height)
+			if (longest > IMAGE_MAX_DIMENSION) {
+				const scale = IMAGE_MAX_DIMENSION / longest
+				width = Math.round(width * scale)
+				height = Math.round(height * scale)
+			}
+
+			const canvas = document.createElement('canvas')
+			canvas.width = width
+			canvas.height = height
+			const ctx = canvas.getContext('2d')!
+			ctx.drawImage(img, 0, 0, width, height)
+
+			// Re-encode PNGs as WebP for smaller size; JPEG/WebP keep their format
+			const outputMime: ImageMimeType = mimeType === 'image/png' ? 'image/webp' : mimeType
+			const quality = outputMime === 'image/webp' || outputMime === 'image/jpeg' ? IMAGE_JPEG_QUALITY : undefined
+			canvas.toBlob(
+				blob => {
+					if (!blob) { reject(new Error('Canvas toBlob failed')); return }
+					blob.arrayBuffer().then(ab => resolve({ bytes: new Uint8Array(ab), mimeType: outputMime }))
+				},
+				outputMime,
+				quality,
+			)
+		}
+		img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Failed to load image')) }
+		img.src = url
+	})
+}
+
 const pendingImageData = new Map<string, { blobUrl: string, bytes: Uint8Array }>()
 
 const cleanupPendingImage = (uriPath: string) => {
@@ -599,14 +643,14 @@ const useImageAttach = (selections: StagingSelectionItem[] | undefined, setSelec
 		const newSelections: StagingSelectionItem[] = []
 		for (const file of files) {
 			if (!IMAGE_MIME_TYPES.has(file.type)) continue
-			const mimeType = file.type as ImageMimeType
-			const ext = extForMime[mimeType]
+			const srcMime = file.type as ImageMimeType
 			const id = generateUuid()
-			const fileName = file.name || `pasted-image.${ext}`
+			const fileName = file.name || `pasted-image.${extForMime[srcMime]}`
+
+			const { bytes, mimeType } = await compressImage(file, srcMime)
+			const ext = extForMime[mimeType]
 			const fileUri = joinPath(imageDir, `${id}.${ext}`)
 
-			const arrayBuffer = await file.arrayBuffer()
-			const bytes = new Uint8Array(arrayBuffer)
 			const blob = new Blob([bytes], { type: mimeType })
 			const blobUrl = URL.createObjectURL(blob)
 			pendingImageData.set(fileUri.path, { blobUrl, bytes })

@@ -1232,11 +1232,13 @@ After each prompt phase, rerun the benchmark tasks (see Benchmark section) on Ge
 - **Latency:** The vision helper call happens at send time. Typically 1-3s for Gemini Flash.
 
 **Step 3: Polish**
-- Image preview in chat bubbles (show the actual image inline, not just the description).
-- Multiple images per message.
-- Compress/resize large images before base64 encoding (e.g., max 1024px on longest side) to keep token cost reasonable.
-- Persist images in thread state (base64 can be large — consider storing on disk with a reference URI instead of inline in the JSON blob).
-- Vision helper prompt improvement: include conversation context so the description is more relevant ("The user is working on a React component and asked about...").
+- ✅ Image preview in chat bubbles — 24x24 thumbnail with click-to-expand lightbox.
+- ✅ Multiple images per message — works out of the box via staging selections.
+- ✅ Compress/resize large images at paste time — Canvas API resizes to max 1024px on longest side, PNGs re-encoded as WebP, JPEG/WebP at 0.85 quality. GIFs skipped to preserve animation.
+- ✅ Images stored on disk with URI reference (not inline in DB). Deferred write: in-memory blob until send, then flushed to `voidImages/<uuid>.<ext>`.
+- Image lifecycle management — delete image files when messages/threads are deleted (not yet implemented).
+- Vision helper reads from memory — let helper read from `pendingImageData` instead of disk to avoid pre-flush dependency (not yet implemented).
+- Vision helper prompt improvement: include conversation context so the description is more relevant (not yet implemented).
 
 **Architecture notes:**
 - The `StagingSelectionItem` approach means images flow through the same staging → message pipeline as files and code selections. No new message types needed.
