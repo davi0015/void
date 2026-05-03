@@ -218,6 +218,13 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
   returned stale HTML — the "Editing file..." title never updated to "Edited file". Fixed by including
   the messages array reference in the cache check; since `_editMessageInThread` creates a new array
   via spread, the reference comparison invalidates the cache on any in-place edit.
+- **Tool error reason classification** (`chatThreadService.ts`, `requestTelemetryService.ts`): Added
+  `errorReason` field to `TelemetryToolEntry` so tool errors are classified by cause rather than just
+  `status: 'error'`. `classifyToolError()` maps error messages to short tags: `not_unique` (SEARCH
+  block matched multiple locations), `not_found` (SEARCH block didn't match anything), `has_overlap`
+  (ORIGINAL blocks overlap), `file_not_found` (ENOENT), `stringify` (result serialization failure),
+  `unknown`. Enables telemetry analysis to differentiate e.g. "agent needs more context" from "agent
+  has stale file content" without parsing error message strings.
 
 ### Known performance issues
 
