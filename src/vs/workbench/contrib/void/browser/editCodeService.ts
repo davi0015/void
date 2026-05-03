@@ -472,7 +472,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 	}
 
 
-	private _addDiffStylesToURI = (uri: URI, diff: Diff) => {
+	private _addDiffStylesToURI = (uri: URI, diff: Diff, isStreaming: boolean) => {
 		const { type, diffid } = diff
 
 		const disposeInThisEditorFns: (() => void)[] = []
@@ -489,8 +489,8 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		}
 
 
-		// red in a view zone
-		if (type !== 'insertion') {
+		// red view zones are expensive (each changeViewZones triggers sync layout), skip during streaming
+		if (type !== 'insertion' && !isStreaming) {
 			const consistentZoneId = this._consistentItemService.addConsistentItemToURI({
 				uri,
 				fn: (editor) => {
@@ -562,7 +562,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 
 		const diffZone = this.diffAreaOfId[diff.diffareaid]
-		if (diffZone.type === 'DiffZone' && !diffZone._streamState.isStreaming) {
+		if (diffZone.type === 'DiffZone' && !isStreaming) {
 			// Accept | Reject widget
 			const consistentWidgetId = this._consistentItemService.addConsistentItemToURI({
 				uri,
@@ -624,10 +624,11 @@ class EditCodeService extends Disposable implements IEditCodeService {
 	}
 
 	weAreWriting = false
-	private _writeURIText(uri: URI, text: string, range_: IRange | 'wholeFileRange', { shouldRealignDiffAreas, }: { shouldRealignDiffAreas: boolean, }) {
+	private _writeURIText(uri: URI, text: string, range_: IRange | 'wholeFileRange', { shouldRealignDiffAreas, skipRefresh, }: { shouldRealignDiffAreas: boolean, skipRefresh?: boolean, }) {
 		const { model } = this._voidModelService.getModel(uri)
 		if (!model) {
-			this._refreshStylesAndDiffsInURI(uri) // at the end of a write, we still expect to refresh all styles. e.g. sometimes we expect to restore all the decorations even if no edits were made when _writeText is used
+			if (!skipRefresh)
+				this._refreshStylesAndDiffsInURI(uri)
 			return
 		}
 
@@ -647,7 +648,8 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		// heuristic check
 		const dontNeedToWrite = uriStr === text
 		if (dontNeedToWrite) {
-			this._refreshStylesAndDiffsInURI(uri) // at the end of a write, we still expect to refresh all styles. e.g. sometimes we expect to restore all the decorations even if no edits were made when _writeText is used
+			if (!skipRefresh)
+				this._refreshStylesAndDiffsInURI(uri)
 			return
 		}
 
@@ -655,7 +657,8 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		model.applyEdits([{ range, text }])
 		this.weAreWriting = false
 
-		this._refreshStylesAndDiffsInURI(uri)
+		if (!skipRefresh)
+			this._refreshStylesAndDiffsInURI(uri)
 	}
 
 
@@ -861,7 +864,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			diffareaid: diffZone.diffareaid,
 		}
 
-		const fn = this._addDiffStylesToURI(uri, newDiff)
+		const fn = this._addDiffStylesToURI(uri, newDiff, diffZone._streamState.isStreaming)
 		if (fn) diffZone._removeStylesFns.add(fn)
 
 		this.diffOfId[diffid] = newDiff
@@ -1000,11 +1003,12 @@ class EditCodeService extends Disposable implements IEditCodeService {
 				throw new Error(`Void: diff.type not recognized on: ${lastDiff}`)
 		}
 
+		// all writes within this method skip refresh — the caller does a single refresh at the end
 		// at the start, add a newline between the stream and originalCode to make reasoning easier
 		if (!latestMutable.addedSplitYet) {
 			this._writeURIText(uri, '\n',
 				{ startLineNumber: latestMutable.line, startColumn: latestMutable.col, endLineNumber: latestMutable.line, endColumn: latestMutable.col, },
-				{ shouldRealignDiffAreas: true }
+				{ shouldRealignDiffAreas: true, skipRefresh: true }
 			)
 			latestMutable.addedSplitYet = true
 			numNewLines += 1
@@ -1013,7 +1017,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		// insert deltaText at latest line and col
 		this._writeURIText(uri, deltaText,
 			{ startLineNumber: latestMutable.line, startColumn: latestMutable.col, endLineNumber: latestMutable.line, endColumn: latestMutable.col },
-			{ shouldRealignDiffAreas: true }
+			{ shouldRealignDiffAreas: true, skipRefresh: true }
 		)
 		const deltaNumNewLines = deltaText.split('\n').length - 1
 		latestMutable.line += deltaNumNewLines
@@ -1027,7 +1031,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			const numLinesDeleted = startLineInOriginalCode - latestMutable.originalCodeStartLine
 			this._writeURIText(uri, '',
 				{ startLineNumber: latestMutable.line, startColumn: latestMutable.col, endLineNumber: latestMutable.line + numLinesDeleted, endColumn: Number.MAX_SAFE_INTEGER, },
-				{ shouldRealignDiffAreas: true }
+				{ shouldRealignDiffAreas: true, skipRefresh: true }
 			)
 			numNewLines -= numLinesDeleted
 		}
@@ -1035,7 +1039,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			const newText = '\n' + originalCode.split('\n').slice((startLineInOriginalCode - 1), (latestMutable.originalCodeStartLine - 1) - 1 + 1).join('\n')
 			this._writeURIText(uri, newText,
 				{ startLineNumber: latestMutable.line, startColumn: latestMutable.col, endLineNumber: latestMutable.line, endColumn: latestMutable.col },
-				{ shouldRealignDiffAreas: true }
+				{ shouldRealignDiffAreas: true, skipRefresh: true }
 			)
 			numNewLines += newText.split('\n').length - 1
 		}
@@ -1161,17 +1165,37 @@ class EditCodeService extends Disposable implements IEditCodeService {
 	}
 
 
+	private _findExistingDiffZone(uri: URI): DiffZone | null {
+		for (const diffareaid of this.diffAreasOfURI[uri.fsPath] || []) {
+			const diffArea = this.diffAreaOfId[diffareaid]
+			if (diffArea?.type === 'DiffZone') return diffArea
+		}
+		return null
+	}
+
 	public instantlyApplySearchReplaceBlocks({ uri, searchReplaceBlocks }: { uri: URI, searchReplaceBlocks: string }) {
-		// start diffzone
-		const res = this._startStreamingDiffZone({
-			uri,
-			streamRequestIdRef: { current: null },
-			startBehavior: 'keep-conflicts',
-			linkedCtrlKZone: null,
-			onWillUndo: () => { },
-		})
-		if (!res) return
-		const { diffZone, onFinishEdit } = res
+		const existingDiffZone = this._findExistingDiffZone(uri)
+
+		let diffZone: DiffZone
+		let onFinishEdit: () => void
+
+		if (existingDiffZone && !existingDiffZone._streamState.isStreaming) {
+			diffZone = existingDiffZone
+			this._clearAllDiffAreaEffects(diffZone)
+			const history = this._addToHistory(uri)
+			onFinishEdit = history.onFinishEdit
+		} else {
+			const res = this._startStreamingDiffZone({
+				uri,
+				streamRequestIdRef: { current: null },
+				startBehavior: 'keep-conflicts',
+				linkedCtrlKZone: null,
+				onWillUndo: () => { },
+			})
+			if (!res) return
+			diffZone = res.diffZone
+			onFinishEdit = res.onFinishEdit
+		}
 
 
 		const onDone = () => {
@@ -1206,16 +1230,28 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 
 	public instantlyRewriteFile({ uri, newContent }: { uri: URI, newContent: string }) {
-		// start diffzone
-		const res = this._startStreamingDiffZone({
-			uri,
-			streamRequestIdRef: { current: null },
-			startBehavior: 'keep-conflicts',
-			linkedCtrlKZone: null,
-			onWillUndo: () => { },
-		})
-		if (!res) return
-		const { diffZone, onFinishEdit } = res
+		const existingDiffZone = this._findExistingDiffZone(uri)
+
+		let diffZone: DiffZone
+		let onFinishEdit: () => void
+
+		if (existingDiffZone && !existingDiffZone._streamState.isStreaming) {
+			diffZone = existingDiffZone
+			this._clearAllDiffAreaEffects(diffZone)
+			const history = this._addToHistory(uri)
+			onFinishEdit = history.onFinishEdit
+		} else {
+			const res = this._startStreamingDiffZone({
+				uri,
+				streamRequestIdRef: { current: null },
+				startBehavior: 'keep-conflicts',
+				linkedCtrlKZone: null,
+				onWillUndo: () => { },
+			})
+			if (!res) return
+			diffZone = res.diffZone
+			onFinishEdit = res.onFinishEdit
+		}
 
 
 		const onDone = () => {
@@ -1925,7 +1961,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 							const { startLine: finalStartLine, endLine: finalEndLine } = addedTrackingZoneOfBlockNum[blockNum]
 							this._writeURIText(uri, block.final,
 								{ startLineNumber: finalStartLine, startColumn: 1, endLineNumber: finalEndLine, endColumn: Number.MAX_SAFE_INTEGER }, // 1-indexed
-								{ shouldRealignDiffAreas: true }
+								{ shouldRealignDiffAreas: true, skipRefresh: true }
 							)
 							diffZone._streamState.line = finalEndLine + 1
 							currStreamingBlockNum = blockNum + 1
