@@ -52,6 +52,7 @@ import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 const numLinesOfStr = (str: string) => str.split('\n').length
 
 
+
 export const getLengthOfTextPx = ({ tabWidth, spaceWidth, content }: { tabWidth: number, spaceWidth: number, content: string }) => {
 	let lengthOfTextPx = 0;
 	for (const char of content) {
@@ -1330,7 +1331,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 				// keep conflict on whole file - to keep conflict, revert the change and use those contents as original, then un-revert the file
 				this.acceptOrRejectAllDiffAreas({ uri, removeCtrlKs: true, behavior: 'reject', _addToHistory: false })
 				const oldFileStr = model.getValue(EndOfLinePreference.LF) // use this as original code
-				this._writeURIText(uri, originalFileStr, 'wholeFileRange', { shouldRealignDiffAreas: true }) // un-revert
+				this._writeURIText(uri, originalFileStr, 'wholeFileRange', { shouldRealignDiffAreas: true, skipRefresh: true }) // un-revert
 				originalCode = oldFileStr
 			}
 

@@ -2020,21 +2020,12 @@ const SingleDiffEditor = ({ block, lang }: { block: ExtractedSearchReplaceBlock,
 		[block.final, languageSelection, modelService]
 	);
 
-	// Clean up models on unmount
-	useEffect(() => {
-		return () => {
-			originalModel.dispose();
-			modifiedModel.dispose();
-		};
-	}, [originalModel, modifiedModel]);
-
 	// Imperatively mount the DiffEditorWidget
 	const divRef = useRef<HTMLDivElement | null>(null);
 	const editorRef = useRef<any>(null);
 
 	useEffect(() => {
 		if (!divRef.current) return;
-		// Create the diff editor instance
 		const editor = instantiationService.createInstance(
 			DiffEditorWidget,
 			divRef.current,
@@ -2069,14 +2060,12 @@ const SingleDiffEditor = ({ block, lang }: { block: ExtractedSearchReplaceBlock,
 		);
 		editor.setModel({ original: originalModel, modified: modifiedModel });
 
-		// Calculate the height based on content
 		const updateHeight = () => {
 			const contentHeight = Math.max(
-				originalModel.getLineCount() * 19, // approximate line height
+				originalModel.getLineCount() * 19,
 				modifiedModel.getLineCount() * 19
-			) + 19 * 2 + 1; // add padding
+			) + 19 * 2 + 1;
 
-			// Set reasonable min/max heights
 			const height = Math.min(Math.max(contentHeight, 100), 300);
 			if (divRef.current) {
 				divRef.current.style.height = `${height}px`;
@@ -2087,15 +2076,17 @@ const SingleDiffEditor = ({ block, lang }: { block: ExtractedSearchReplaceBlock,
 		updateHeight();
 		editorRef.current = editor;
 
-		// Update height when content changes
 		const disposable1 = originalModel.onDidChangeContent(() => updateHeight());
 		const disposable2 = modifiedModel.onDidChangeContent(() => updateHeight());
 
+		// dispose editor before models so DiffEditorWidget releases model references first
 		return () => {
 			disposable1.dispose();
 			disposable2.dispose();
 			editor.dispose();
 			editorRef.current = null;
+			originalModel.dispose();
+			modifiedModel.dispose();
 		};
 	}, [originalModel, modifiedModel, instantiationService]);
 
