@@ -985,17 +985,22 @@ const prepareMessages = (params: {
 
 	// if need to convert to gemini style of messaes, do that (treat as anthropic style, then convert to gemini style)
 	if (params.providerName === 'gemini' || specialFormat === 'gemini-style') {
-		// Collect images from SimpleLLMMessage before conversion strips them
+		// Collect images from SimpleLLMMessage before the intermediate Anthropic
+		// conversion, then strip them so prepareOpenAIOrAnthropicMessages doesn't
+		// generate image_url content parts (which Gemini and text-only providers
+		// don't understand). We re-inject them as Gemini inlineData below.
 		const imagesByMsgIndex = new Map<number, ImageAttachment[]>()
 		let userIdx = 0
-		for (const m of params.messages) {
+		const messagesWithoutImages = params.messages.map(m => {
 			if (m.role === 'user') {
 				if (m.images && m.images.length > 0) imagesByMsgIndex.set(userIdx, m.images)
 				userIdx++
+				return { ...m, images: undefined }
 			}
-		}
+			return m
+		})
 
-		const res = prepareOpenAIOrAnthropicMessages({ ...params, specialToolFormat: specialFormat === 'gemini-style' ? 'anthropic-style' : undefined })
+		const res = prepareOpenAIOrAnthropicMessages({ ...params, messages: messagesWithoutImages, specialToolFormat: specialFormat === 'gemini-style' ? 'anthropic-style' : undefined })
 		const messages = res.messages as AnthropicLLMChatMessage[]
 		const messages2 = prepareGeminiMessages(messages)
 
@@ -1270,8 +1275,9 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 
 	// --- LLM Chat messages ---
 
-	private async _chatMessagesToSimpleMessages(chatMessages: ChatMessage[]): Promise<SimpleLLMMessage[]> {
+	private async _chatMessagesToSimpleMessages(chatMessages: ChatMessage[], opts?: { supportsVision?: boolean }): Promise<SimpleLLMMessage[]> {
 		const simpleLLMMessages: SimpleLLMMessage[] = []
+		const attachImages = opts?.supportsVision === true
 
 		for (const m of chatMessages) {
 			if (m.role === 'checkpoint') continue
@@ -1305,18 +1311,20 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			}
 			else if (m.role === 'user') {
 				const images: ImageAttachment[] = []
-				const imageSelections = m.selections?.filter(s => s.type === 'Image') ?? []
-				for (const s of imageSelections) {
-					if (s.type !== 'Image') continue
-					try {
-						const content = await this.fileService.readFile(s.uri)
-						const bytes = content.value.buffer
-						let binary = ''
-						for (let bi = 0; bi < bytes.length; bi++) binary += String.fromCharCode(bytes[bi])
-						const base64 = btoa(binary)
-						images.push({ base64, mimeType: s.mimeType })
-					} catch {
-						// image file may have been deleted; skip silently
+				if (attachImages) {
+					const imageSelections = m.selections?.filter(s => s.type === 'Image') ?? []
+					for (const s of imageSelections) {
+						if (s.type !== 'Image') continue
+						try {
+							const content = await this.fileService.readFile(s.uri)
+							const bytes = content.value.buffer
+							let binary = ''
+							for (let bi = 0; bi < bytes.length; bi++) binary += String.fromCharCode(bytes[bi])
+							const base64 = btoa(binary)
+							images.push({ base64, mimeType: s.mimeType })
+						} catch {
+							// image file may have been deleted; skip silently
+						}
 					}
 				}
 				simpleLLMMessages.push({
@@ -1341,7 +1349,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			supportsSystemMessage,
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
-		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection[featureName][modelSelection.providerName]?.[modelSelection.modelName]
+		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection[featureName]?.[modelSelection.providerName]?.[modelSelection.modelName]
 
 		// Get combined AI instructions
 		const aiInstructions = this._getCombinedAIInstructions();
@@ -1373,6 +1381,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			specialToolFormat,
 			contextWindow,
 			supportsSystemMessage,
+			supportsVision,
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
 		const { disableSystemMessage } = this.voidSettingsService.state.globalSettings;
@@ -1397,7 +1406,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// the stored content is passed through verbatim so each past turn is
 		// byte-identical to what was sent before, keeping the provider's prefix
 		// cache warm across turns.
-		const llmMessagesRaw = await this._chatMessagesToSimpleMessages(chatMessages)
+		const llmMessagesRaw = await this._chatMessagesToSimpleMessages(chatMessages, { supportsVision })
 		// Perf 2 — Light-tier history compaction. Trims bodies of old data-fetching
 		// tool results (read_file / grep / ls_dir / run_command / …) outside the
 		// protection zone (larger of "last 5 user turns" and "last 30 messages").

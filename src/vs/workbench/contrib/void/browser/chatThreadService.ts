@@ -11,7 +11,8 @@ import { IStorageService, StorageScope, StorageTarget } from '../../../../platfo
 import { URI } from '../../../../base/common/uri.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
-import { builtinToolNames, chat_userMessageContent, isABuiltinToolName } from '../common/prompt/prompts.js';
+import { builtinToolNames, chat_userMessageContent, isABuiltinToolName, visionHelper_systemMessage, visionHelper_userMessage } from '../common/prompt/prompts.js';
+import { getModelCapabilities } from '../common/modelCapabilities.js';
 import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
@@ -2452,7 +2453,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 
-	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
+	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _cachedImageDescriptions }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _cachedImageDescriptions?: string }) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
@@ -2507,39 +2508,113 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const currentRulesContent = await this._convertToLLMMessagesService.getCurrentVoidRulesContent()
 		const rulesChangedBefore = thread.lastAppliedRules !== undefined && thread.lastAppliedRules !== currentRulesContent
 
+		// Add the user message immediately so the chat bubble appears right away.
+		// Content may be updated below if the vision helper needs to inject
+		// image descriptions.
 		const userHistoryElt: ChatMessage = {
 			role: 'user',
 			content: contentWithVolatile,
 			displayContent: instructions,
 			selections: currSelns,
 			state: defaultMessageState,
-			// Omit the field entirely when false so persisted history stays slim
-			// and matches pre-feature shape for threads that never see a change.
 			...(rulesChangedBefore ? { rulesChangedBefore: true } : {}),
 		}
 		this._addMessageToThread(threadId, userHistoryElt)
 		this._setThreadLastAppliedRules(threadId, currentRulesContent)
 
-		this._setThreadState(threadId, { currCheckpointIdx: null }) // no longer at a checkpoint because started streaming
+		this._setThreadState(threadId, { currCheckpointIdx: null })
+
+		// scroll to bottom
+		this.state.allThreads[threadId]?.state.mountedInfo?.whenMounted.then(m => {
+			m.scrollToBottom()
+		})
+
+		// Vision helper: if the primary model doesn't support vision and images
+		// are attached, describe them via a vision-capable helper model and inject
+		// the descriptions into the LLM-facing content.
+		const imageSelections = currSelns.filter(s => s.type === 'Image')
+		if (imageSelections.length > 0) {
+			const chatModelSelection = this._settingsService.state.modelSelectionOfFeature['Chat']
+			const { overridesOfModel } = this._settingsService.state
+			const primarySupportsVision = chatModelSelection
+				? getModelCapabilities(chatModelSelection.providerName, chatModelSelection.modelName, overridesOfModel).supportsVision === true
+				: false
+
+			if (!primarySupportsVision) {
+				let imageDescriptions: string
+				if (_cachedImageDescriptions) {
+					imageDescriptions = _cachedImageDescriptions
+				} else {
+					this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '_Processing attached images..._', reasoningSoFar: '', toolCallsSoFar: [] }, interrupt: Promise.resolve(() => { }) })
+					const helperModelSelection = this._settingsService.state.modelSelectionOfFeature['VisionHelper']
+					imageDescriptions = await this._describeImagesWithHelper(imageSelections, helperModelSelection)
+					this._setStreamState(threadId, { isRunning: undefined })
+				}
+				userHistoryElt.content = imageDescriptions + '\n\n' + contentWithVolatile
+				this._onDidChangeCurrentThread.fire()
+			}
+		}
 
 		const modelProps = this._currentModelSelectionProps()
-		// Capture the chosen model at send time so future switches to this
-		// thread restore this exact dropdown choice. Intentionally NOT captured
-		// on tool approve/reject/edit — those don't represent a fresh user
-		// decision about which model to use.
 		this._setThreadLastUsedModelSelection(threadId, modelProps.modelSelection)
 
 		this._wrapRunAgentToNotify(
 			this._runChatAgent({ threadId, ...modelProps, }),
 			threadId,
 		)
-
-		// scroll to bottom
-		this.state.allThreads[threadId]?.state.mountedInfo?.whenMounted.then(m => {
-			m.scrollToBottom()
-		})
 	}
 
+
+	private async _describeImagesWithHelper(imageSelections: (StagingSelectionItem & { type: 'Image' })[], helperModelSelection: ModelSelection | null): Promise<string> {
+		const descriptions: string[] = []
+		for (const s of imageSelections) {
+			if (!helperModelSelection) {
+				descriptions.push(`[Image: ${s.fileName}]\n--- start description ---\n[Configure a Vision Helper model in settings to enable image understanding]\n--- end description ---`)
+				continue
+			}
+			try {
+				const content = await this._fileService.readFile(s.uri)
+				const bytes = content.value.buffer
+				let binary = ''
+				for (let bi = 0; bi < bytes.length; bi++) binary += String.fromCharCode(bytes[bi])
+				const base64 = btoa(binary)
+
+				const helperSelectionOptions = this._settingsService.state.optionsOfModelSelection['VisionHelper']?.[helperModelSelection.providerName]?.[helperModelSelection.modelName]
+				const { overridesOfModel } = this._settingsService.state
+
+				const simpleMessages = [
+					{ role: 'user' as const, content: visionHelper_userMessage(s.fileName), images: [{ base64, mimeType: s.mimeType }] },
+				]
+				const { messages, separateSystemMessage } = this._convertToLLMMessagesService.prepareLLMSimpleMessages({
+					simpleMessages,
+					systemMessage: visionHelper_systemMessage,
+					modelSelection: helperModelSelection,
+					featureName: 'VisionHelper',
+				})
+
+				const description = await new Promise<string>((resolve, reject) => {
+					this._llmMessageService.sendLLMMessage({
+						messagesType: 'chatMessages',
+						messages,
+						separateSystemMessage,
+						chatMode: null,
+						modelSelection: helperModelSelection,
+						modelSelectionOptions: helperSelectionOptions,
+						overridesOfModel,
+						onText: () => { },
+						onFinalMessage: ({ fullText }) => { resolve(fullText) },
+						onError: (err) => { reject(new Error(err.message)) },
+						onAbort: () => { resolve('[Image description aborted]') },
+						logging: { loggingName: 'VisionHelper - Image Description' },
+					})
+				})
+				descriptions.push(`[Image: ${s.fileName}]\n--- start description ---\n${description.trim()}\n--- end description ---`)
+			} catch (e) {
+				descriptions.push(`[Image: ${s.fileName}]\n--- start description ---\n[Error describing image: ${String(e)}]\n--- end description ---`)
+			}
+		}
+		return descriptions.join('\n\n')
+	}
 
 	async addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
 		if (this._isThreadMutationBlocked(threadId, 'addUserMessageAndStreamResponse')) return
@@ -2572,12 +2647,21 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
-		if (thread.messages?.[messageIdx]?.role !== 'user') {
+		const editedMessage = thread.messages[messageIdx]
+		if (editedMessage?.role !== 'user') {
 			throw new Error(`Error: editing a message with role !=='user'`)
 		}
 
 		// get prev and curr selections before clearing the message
-		const currSelns = thread.messages[messageIdx].state.stagingSelections || [] // staging selections for the edited message
+		const currSelns = editedMessage.state.stagingSelections || []
+
+		// Reuse existing image descriptions from the previous content so the
+		// vision helper doesn't re-process images the user didn't change.
+		let cachedImageDescriptions: string | undefined
+		const descMatch = editedMessage.content.match(/^((?:\[Image:.*?\]\n--- start description ---\n[\s\S]*?\n--- end description ---\n?\n?)+)/)
+		if (descMatch) {
+			cachedImageDescriptions = descMatch[1].trimEnd()
+		}
 
 		// clear messages up to the index
 		const slicedMessages = thread.messages.slice(0, messageIdx)
@@ -2592,7 +2676,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 		})
 
 		// re-add the message and stream it
-		this._addUserMessageAndStreamResponse({ userMessage, _chatSelections: currSelns, threadId })
+		this._addUserMessageAndStreamResponse({ userMessage, _chatSelections: currSelns, threadId, _cachedImageDescriptions: cachedImageDescriptions })
 	}
 
 	// ---------- the rest ----------

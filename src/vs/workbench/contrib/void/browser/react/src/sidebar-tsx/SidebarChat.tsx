@@ -576,6 +576,17 @@ const flushPendingImages = async (selections: StagingSelectionItem[], fileServic
 	}
 }
 
+const useImageUploadEnabled = () => {
+	const settingsState = useSettingsState()
+	return useMemo(() => {
+		const chatModel = settingsState.modelSelectionOfFeature['Chat']
+		if (!chatModel) return false
+		const caps = getModelCapabilities(chatModel.providerName, chatModel.modelName, settingsState.overridesOfModel)
+		if (caps.supportsVision) return true
+		return settingsState.modelSelectionOfFeature['VisionHelper'] !== null
+	}, [settingsState.modelSelectionOfFeature, settingsState.overridesOfModel])
+}
+
 const useImageAttach = (selections: StagingSelectionItem[] | undefined, setSelections: ((s: StagingSelectionItem[]) => void) | undefined) => {
 	const accessor = useAccessor()
 	const fileInputRef = useRef<HTMLInputElement>(null)
@@ -708,6 +719,7 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 }) => {
 	const _fallbackImageAttach = useImageAttach(selections, setSelections)
 	const { onPaste, onDrop, onDragOver, handleImageFiles, fileInputRef } = imageAttach ?? _fallbackImageAttach
+	const imageUploadEnabled = useImageUploadEnabled()
 
 	return (
 		<div
@@ -725,9 +737,9 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 			onClick={(e) => {
 				onClickAnywhere?.()
 			}}
-			onPaste={onPaste}
-			onDrop={onDrop}
-			onDragOver={onDragOver}
+			onPaste={imageUploadEnabled ? onPaste : undefined}
+			onDrop={imageUploadEnabled ? onDrop : undefined}
+			onDragOver={imageUploadEnabled ? onDragOver : undefined}
 		>
 			{/* Selections section */}
 			{showSelections && selections && setSelections && (
@@ -772,7 +784,7 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 
 					{isStreaming && loadingIcon}
 
-					{setSelections && (
+					{setSelections && imageUploadEnabled && (
 						<>
 							<input
 								ref={fileInputRef}
@@ -1547,6 +1559,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 	}
 
 	const editImageAttach = useImageAttach(stagingSelections, setStagingSelections)
+	const editImageUploadEnabled = useImageUploadEnabled()
 
 	// local state
 	const mode: ChatBubbleMode = isBeingEdited ? 'edit' : 'display'
@@ -1672,7 +1685,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 				className='min-h-[81px] max-h-[500px] px-0.5'
 				placeholder="Edit your message..."
 				onChangeText={(text) => setIsDisabled(!text)}
-				onPaste={editImageAttach.onPaste}
+				onPaste={editImageUploadEnabled ? editImageAttach.onPaste : undefined}
 				onFocus={() => {
 					setIsFocused(true)
 					chatThreadsService.setCurrentlyFocusedMessageIdx(messageIdx);
@@ -4138,6 +4151,7 @@ export const SidebarChat = () => {
 	}, [onSubmit, onAbort, isRunning])
 
 	const mainImageAttach = useImageAttach(selections, setSelections)
+	const mainImageUploadEnabled = useImageUploadEnabled()
 
 	// Phase E commit 4 — when the current thread is read-only (foreign
 	// workspace), wrap the input in a `pointer-events-none opacity-60`
@@ -4166,7 +4180,7 @@ export const SidebarChat = () => {
 				placeholder={`@ to mention, ${keybindingString ? `${keybindingString} to add a selection. ` : ''}Enter instructions...`}
 				onChangeText={onChangeText}
 				onKeyDown={onKeyDown}
-				onPaste={mainImageAttach.onPaste}
+				onPaste={mainImageUploadEnabled ? mainImageAttach.onPaste : undefined}
 				onFocus={() => { chatThreadsService.setCurrentlyFocusedMessageIdx(undefined) }}
 				ref={textAreaRef}
 				fnsRef={textAreaFnsRef}

@@ -1214,17 +1214,22 @@ After each prompt phase, rerun the benchmark tasks (see Benchmark section) on Ge
 - ✅ `messageOfSelection` returns `[Image attached: <fileName>]` for text-only fallback.
 - **Test:** Paste a screenshot into the chatbox with Gemma/Gemini selected → model should see and respond to the image content.
 
-**Step 2: Vision helper fallback**
-- New settings field: "Vision Helper Model" — provider + model selector (e.g., Gemini Flash, GPT-4o-mini). Shown only when the primary model has `supportsVision: false`.
-- At send time (`chatThreadService._sendNewMessage` or equivalent):
-  - Check if any staged items are `Image` type.
-  - If primary model supports vision → no extra work, images go through natively.
-  - If primary model does NOT support vision AND a vision helper is configured:
-    - Fire a one-shot LLM call to the vision helper with the image + prompt: "Describe this image in detail. Focus on UI layout, text content, code snippets, error messages, or any technical details visible. Be specific and structured."
-    - Replace the `Image` staging item's `base64` with the returned `description` text.
-    - The description is included as a regular text content part in the user message to the primary model.
-  - If no vision helper configured → include a placeholder like `[Image attached: screenshot.png — configure a Vision Helper model in settings to enable image understanding]`.
-- **Latency:** The vision helper call happens at send time (Option B). The UI should show a brief "Processing image..." indicator while the helper runs. Typically 1-3s for Gemini Flash.
+**Step 2: Vision helper fallback** ✅ *Implemented*
+- ✅ Added `'VisionHelper'` to `featureNames` as a new feature slot with its own model dropdown in Settings.
+- ✅ `modelFilterOfFeatureName['VisionHelper']` filters to only show models with `supportsVision: true`.
+- ✅ Settings UI section under the SCM section with a `ModelDropdown` for selecting the helper model.
+- ✅ Vision helper prompt (`visionHelper_systemMessage`, `visionHelper_userMessage`) uses "visual assistant for another AI" framing.
+- ✅ At send time (`chatThreadService._addUserMessageAndStreamResponse`):
+  - Checks if any staged items are `Image` type.
+  - If primary Chat model supports vision → images go through natively (no change).
+  - If primary model does NOT support vision AND a VisionHelper model is configured:
+    - Fires a one-shot `sendLLMMessage` call per image with the image as a multimodal content part.
+    - Injects description into `ChatMessage.content` (LLM-facing) with delimited format:
+      `[Image: filename]\n--- start description ---\n<description>\n--- end description ---`
+    - `displayContent` stays as the user's original text — user sees the image thumbnail via selections.
+    - Description is persisted in `content` so it's not re-generated on subsequent turns.
+  - If no VisionHelper configured → placeholder text asking user to configure one.
+- **Latency:** The vision helper call happens at send time. Typically 1-3s for Gemini Flash.
 
 **Step 3: Polish**
 - Image preview in chat bubbles (show the actual image inline, not just the description).
