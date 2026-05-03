@@ -48,6 +48,14 @@ import { RawMCPToolCall } from '../common/mcpServiceTypes.js';
 const CHAT_RETRIES = 3
 const RETRY_DELAY = 2500
 
+const classifyToolError = (msg: string): string => {
+	if (msg.includes('appears multiple times')) return 'not_unique'
+	if (msg.includes('no match for')) return 'not_found'
+	if (msg.includes('had overlap with')) return 'has_overlap'
+	if (msg.includes('ENOENT')) return 'file_not_found'
+	return 'unknown'
+}
+
 
 const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | undefined, newSelection: StagingSelectionItem): number | null => {
 	if (!currentSelections) return null
@@ -1599,7 +1607,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const telemetryParamsLen = typeof rawParamsStr === 'string'
 			? rawParamsStr.length
 			: (() => { try { return JSON.stringify(opts.unvalidatedToolParams ?? {}).length } catch { return 0 } })()
-		const logToolTelemetry = (status: 'ok' | 'error' | 'invalid_params' | 'interrupted', resultLen?: number) => {
+		const logToolTelemetry = (status: 'ok' | 'error' | 'invalid_params' | 'interrupted', resultLen?: number, errorReason?: string) => {
 			this._requestTelemetryService.logTool({
 				phase: 'tool',
 				t: new Date().toISOString(),
@@ -1607,6 +1615,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				tid: threadId,
 				name: toolName,
 				status,
+				errorReason,
 				paramsLen: telemetryParamsLen,
 				resultLen,
 				durMs: Date.now() - telemetryToolStartMs,
@@ -1728,7 +1737,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 			const errorMessage = getErrorMessage(error)
 			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
-			logToolTelemetry('error', errorMessage.length)
+			const reason = classifyToolError(errorMessage)
+			logToolTelemetry('error', errorMessage.length, reason)
 			return {}
 		}
 
@@ -1744,7 +1754,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		} catch (error) {
 			const errorMessage = this.toolErrMsgs.errWhenStringifying(error)
 			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
-			logToolTelemetry('error', errorMessage.length)
+			logToolTelemetry('error', errorMessage.length, 'stringify')
 			return {}
 		}
 

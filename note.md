@@ -179,6 +179,52 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
 - **Lexer cache seeding on stream end** (`ChatMarkdownRender.tsx`): When the streaming `IncrementalLexer`
   finishes, its final tokens are written into the module-level LRU cache so the committed message's
   `cachedLex()` call is an instant hit. Avoids a redundant full re-lex of the entire response.
+- **DiffZone reuse across agent edits** (`editCodeService.ts`): When the agent calls `edit_file` or
+  `rewrite_file` on the same file multiple times, the existing DiffZone is reused instead of being
+  destroyed and recreated. Diff highlights accumulate against the original baseline — overlapping
+  edits merge, non-overlapping edits show separate highlights. Previously each new edit wiped all
+  prior highlights via `acceptOrRejectAllDiffAreas`.
+- **Deferred view zones + widgets during streaming** (`editCodeService.ts`): Red deleted-code blocks
+  (`IViewZone`) and Accept/Reject inline widgets are skipped during streaming. Each `changeViewZones`
+  call triggers a synchronous layout recalculation; deferring them until stream end avoids repeated
+  forced reflows. Green decorations are still shown during streaming for visual feedback.
+- **Batched streaming writes** (`editCodeService.ts`): Added `skipRefresh` option to `_writeURIText`.
+  During streaming, `_writeStreamedDiffZoneLLMText` makes 2-4 `_writeURIText` calls per tick, each
+  of which previously triggered a full clear → recompute diffs → render cycle. Now all internal
+  writes skip the refresh; the caller does a single refresh at the end. Also applied to
+  `_instantlyApplySRBlocks` and `instantlyRewriteFile` whose writes are followed by `onDone()`.
+- **Character-level search-replace matching** (`editCodeService.ts`): `_instantlyApplySRBlocks` now
+  uses exact `indexOf` for character-level positioning instead of line-level `findTextInCode`. When
+  the LLM sends a partial line in the SEARCH block (e.g. `Elara` matching `Elara found a crystal...`),
+  only the matched substring is replaced — the rest of the line is preserved. Falls back to
+  line-level matching only when exact match fails (whitespace differences).
+- **Uniqueness check on search-replace matching** (`editCodeService.ts`): Both `findTextInCode` and
+  `_instantlyApplySRBlocks` now verify that the SEARCH block matches exactly one location. On the
+  exact `indexOf` path, `lastIndexOf` is compared to detect duplicates. On the whitespace fallback
+  path, the existing uniqueness check is preserved and a new line-boundary validation ensures the
+  match covers complete lines (preventing partial-line truncation when the SEARCH block ends mid-line).
+  Error messages now include match count and line numbers (up to 20 occurrences) so the agent can
+  target the correct location with more context.
+- **Safe fence for `read_file` result** (`toolsService.ts`): The `read_file` tool wraps file contents
+  in code fences (triple backticks). When the file itself contains triple backticks (markdown files,
+  template literals, docstrings), the inner backticks collide with the wrapper, mangling the content
+  from the agent's perspective. `safeFence()` scans the file for the longest backtick run and uses
+  one more backtick than that for the wrapper (e.g. 4 backticks if the file contains triple backticks).
+  This resolves issues where the agent saw stale/corrupted content after `rewrite_file`, failed to
+  match end-of-file content, or couldn't detect unclosed code fences.
+- **Tool status UI cache fix** (`SidebarChat.tsx`): The `ThreadMessagesView` message cache compared
+  only message count and thread-level deps to decide whether to reuse cached JSX. When a tool message
+  was edited in place (e.g. `running_now` → `success`), the array length didn't change so the cache
+  returned stale HTML — the "Editing file..." title never updated to "Edited file". Fixed by including
+  the messages array reference in the cache check; since `_editMessageInThread` creates a new array
+  via spread, the reference comparison invalidates the cache on any in-place edit.
+- **Tool error reason classification** (`chatThreadService.ts`, `requestTelemetryService.ts`): Added
+  `errorReason` field to `TelemetryToolEntry` so tool errors are classified by cause rather than just
+  `status: 'error'`. `classifyToolError()` maps error messages to short tags: `not_unique` (SEARCH
+  block matched multiple locations), `not_found` (SEARCH block didn't match anything), `has_overlap`
+  (ORIGINAL blocks overlap), `file_not_found` (ENOENT), `stringify` (result serialization failure),
+  `unknown`. Enables telemetry analysis to differentiate e.g. "agent needs more context" from "agent
+  has stale file content" without parsing error message strings.
 
 ### Known performance issues
 

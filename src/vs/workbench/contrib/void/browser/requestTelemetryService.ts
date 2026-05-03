@@ -110,6 +110,7 @@ export type TelemetryToolEntry = {
 	tid: string;
 	name: string;
 	status: 'ok' | 'error' | 'invalid_params' | 'interrupted';
+	errorReason?: string;  // short classifier for the error (e.g. 'Not found', 'Not unique', 'Has overlap')
 	paramsLen: number;
 	resultLen?: number;    // stringified tool-result chars (the thing that lands in next-turn history)
 	durMs: number;
