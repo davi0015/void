@@ -753,6 +753,9 @@ export const messageOfSelection = async (
 		const body = `${tripleTick[0]}${s.language}\n${s.text}\n${tripleTick[1]}`
 		return `${header}:\n${body}`
 	}
+	else if (s.type === 'Image') {
+		return `[Image attached: ${s.fileName}]`
+	}
 	else
 		return ''
 

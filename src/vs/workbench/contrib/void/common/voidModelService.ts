@@ -41,9 +41,13 @@ class VoidModelService extends Disposable implements IVoidModelService {
 		})
 	}
 
+	private static readonly _BINARY_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico', '.svg', '.mp3', '.mp4', '.wav', '.ogg', '.zip', '.tar', '.gz', '.pdf', '.woff', '.woff2', '.ttf', '.eot'])
+
 	initializeModel = async (uri: URI) => {
 		try {
 			if (uri.fsPath in this._modelRefOfURI) return;
+			const ext = uri.fsPath.slice(uri.fsPath.lastIndexOf('.')).toLowerCase()
+			if (VoidModelService._BINARY_EXTENSIONS.has(ext)) return;
 			const editorModelRef = await this._textModelService.createModelReference(uri);
 			// Keep a strong reference to prevent disposal
 			this._modelRefOfURI[uri.fsPath] = editorModelRef;

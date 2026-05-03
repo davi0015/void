@@ -23,8 +23,11 @@ import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
-import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight } from 'lucide-react';
+import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
+import { generateUuid } from '../../../../../../../base/common/uuid.js';
+import { VSBuffer } from '../../../../../../../base/common/buffer.js';
+import { joinPath } from '../../../../../../../base/common/resources.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, EditToolAcceptRejectButtonsHTML, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, StatusIndicatorForApplyButton, useApplyStreamState, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { IsRunningType, isThreadReadOnly, shouldShowOwnershipBanner } from '../../../chatThreadService.js';
@@ -549,6 +552,106 @@ const SubmitButtonWithUsageRing: React.FC<{ threadId: string; featureName: Featu
 }
 
 
+const IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
+type ImageMimeType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+const extForMime: Record<ImageMimeType, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' }
+
+const pendingImageData = new Map<string, { blobUrl: string, bytes: Uint8Array }>()
+
+const cleanupPendingImage = (uriPath: string) => {
+	const entry = pendingImageData.get(uriPath)
+	if (entry) {
+		URL.revokeObjectURL(entry.blobUrl)
+		pendingImageData.delete(uriPath)
+	}
+}
+
+const flushPendingImages = async (selections: StagingSelectionItem[], fileService: { writeFile(uri: URI, content: any): Promise<any> }) => {
+	for (const s of selections) {
+		if (s.type !== 'Image') continue
+		const entry = pendingImageData.get(s.uri.path)
+		if (!entry) continue
+		await fileService.writeFile(s.uri, VSBuffer.wrap(entry.bytes))
+		cleanupPendingImage(s.uri.path)
+	}
+}
+
+const useImageAttach = (selections: StagingSelectionItem[] | undefined, setSelections: ((s: StagingSelectionItem[]) => void) | undefined) => {
+	const accessor = useAccessor()
+	const fileInputRef = useRef<HTMLInputElement>(null)
+
+	const handleImageFiles = useCallback(async (files: FileList | File[]) => {
+		if (!setSelections || !selections) return
+		const envService = accessor.get('IEnvironmentService')
+		const imageDir = joinPath(envService.userRoamingDataHome, 'voidImages')
+
+		const newSelections: StagingSelectionItem[] = []
+		for (const file of files) {
+			if (!IMAGE_MIME_TYPES.has(file.type)) continue
+			const mimeType = file.type as ImageMimeType
+			const ext = extForMime[mimeType]
+			const id = generateUuid()
+			const fileName = file.name || `pasted-image.${ext}`
+			const fileUri = joinPath(imageDir, `${id}.${ext}`)
+
+			const arrayBuffer = await file.arrayBuffer()
+			const bytes = new Uint8Array(arrayBuffer)
+			const blob = new Blob([bytes], { type: mimeType })
+			const blobUrl = URL.createObjectURL(blob)
+			pendingImageData.set(fileUri.path, { blobUrl, bytes })
+
+			newSelections.push({
+				type: 'Image',
+				uri: fileUri,
+				mimeType,
+				fileName,
+				state: { wasAddedAsCurrentFile: false },
+			})
+		}
+		if (newSelections.length > 0) {
+			setSelections([...selections, ...newSelections])
+		}
+	}, [accessor, selections, setSelections])
+
+	const onPaste = useCallback((e: React.ClipboardEvent) => {
+		const items = e.clipboardData?.items
+		if (!items) return
+		const imageFiles: File[] = []
+		for (const item of items) {
+			if (item.kind === 'file' && IMAGE_MIME_TYPES.has(item.type)) {
+				const file = item.getAsFile()
+				if (file) imageFiles.push(file)
+			}
+		}
+		if (imageFiles.length > 0) {
+			e.preventDefault()
+			handleImageFiles(imageFiles)
+		}
+	}, [handleImageFiles])
+
+	const onDrop = useCallback((e: React.DragEvent) => {
+		const files = e.dataTransfer?.files
+		if (!files) return
+		const imageFiles: File[] = []
+		for (const file of files) {
+			if (IMAGE_MIME_TYPES.has(file.type)) imageFiles.push(file)
+		}
+		if (imageFiles.length > 0) {
+			e.preventDefault()
+			e.stopPropagation()
+			handleImageFiles(imageFiles)
+		}
+	}, [handleImageFiles])
+
+	const onDragOver = useCallback((e: React.DragEvent) => {
+		if (e.dataTransfer?.types?.includes('Files')) {
+			e.preventDefault()
+		}
+	}, [])
+
+	return { onPaste, onDrop, onDragOver, handleImageFiles, fileInputRef }
+}
+
 interface VoidChatAreaProps {
 	// Required
 	children: React.ReactNode; // This will be the input component
@@ -573,8 +676,8 @@ interface VoidChatAreaProps {
 
 	selections?: StagingSelectionItem[]
 	setSelections?: (s: StagingSelectionItem[]) => void
-	// selections?: any[];
-	// onSelectionsChange?: (selections: any[]) => void;
+
+	imageAttach?: ReturnType<typeof useImageAttach>;
 
 	onClickAnywhere?: () => void;
 	// Optional close button
@@ -601,7 +704,11 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 	featureName,
 	loadingIcon,
 	threadIdForUsageRing,
+	imageAttach,
 }) => {
+	const _fallbackImageAttach = useImageAttach(selections, setSelections)
+	const { onPaste, onDrop, onDragOver, handleImageFiles, fileInputRef } = imageAttach ?? _fallbackImageAttach
+
 	return (
 		<div
 			ref={divRef}
@@ -618,6 +725,9 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 			onClick={(e) => {
 				onClickAnywhere?.()
 			}}
+			onPaste={onPaste}
+			onDrop={onDrop}
+			onDragOver={onDragOver}
 		>
 			{/* Selections section */}
 			{showSelections && selections && setSelections && (
@@ -658,9 +768,37 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 					</div>
 				)}
 
-				<div className="flex items-center gap-2">
+				<div className="flex items-center gap-1.5">
 
 					{isStreaming && loadingIcon}
+
+					{setSelections && (
+						<>
+							<input
+								ref={fileInputRef}
+								type='file'
+								accept='image/png,image/jpeg,image/webp,image/gif'
+								multiple
+								className='hidden'
+								onChange={(e) => {
+									if (e.target.files && e.target.files.length > 0) {
+										handleImageFiles(Array.from(e.target.files))
+									}
+									e.target.value = ''
+								}}
+							/>
+							<button
+								type='button'
+								className='flex items-center justify-center cursor-pointer rounded-md p-1 text-void-fg-3 hover:text-void-fg-1 hover:bg-void-bg-2 transition-colors duration-150'
+								onClick={() => fileInputRef.current?.click()}
+								data-tooltip-id='void-tooltip'
+								data-tooltip-content='Attach image'
+								data-tooltip-place='top'
+							>
+								<ImageIcon size={18} className='stroke-[1.5]' />
+							</button>
+						</>
+					)}
 
 					{(() => {
 						const button = isStreaming
@@ -841,6 +979,64 @@ export const voidOpenFileFn = (
 };
 
 
+const ImageThumbnail = ({ uri, mimeType, fileName, onRemove }: { uri: URI, mimeType: string, fileName: string, onRemove?: () => void }) => {
+	const accessor = useAccessor()
+	const [blobUrl, setBlobUrl] = useState<string | null>(() => pendingImageData.get(uri.path)?.blobUrl ?? null)
+	const [expanded, setExpanded] = useState(false)
+	useEffect(() => {
+		const pending = pendingImageData.get(uri.path)
+		if (pending) { setBlobUrl(pending.blobUrl); return }
+		let revoked = false
+		const fileService = accessor.get('IFileService')
+		fileService.readFile(uri).then(content => {
+			if (revoked) return
+			const blob = new Blob([content.value.buffer], { type: mimeType })
+			setBlobUrl(URL.createObjectURL(blob))
+		}).catch(() => { })
+		return () => { revoked = true }
+	}, [uri.path])
+
+	return (
+		<>
+			<div
+				className='relative group rounded-sm overflow-hidden border border-void-border-1 h-6 w-6 flex items-center justify-center cursor-pointer bg-void-bg-1 hover:brightness-95 transition-all duration-150 flex-shrink-0'
+				onClick={(e) => { e.stopPropagation(); if (blobUrl) setExpanded(true) }}
+				data-tooltip-id='void-tooltip'
+				data-tooltip-content={`${fileName} (${mimeType})`}
+				data-tooltip-place='top'
+				data-tooltip-delay-show={3000}
+			>
+				{blobUrl
+					? <img src={blobUrl} alt='' className='h-full w-full object-cover' />
+					: <ImageIcon size={10} className='text-void-fg-3' />
+				}
+				{onRemove && (
+					<div
+						className='absolute top-0 right-0 cursor-pointer rounded-full bg-black/60 p-px opacity-0 group-hover:opacity-100 transition-opacity'
+						onClick={(e) => { e.stopPropagation(); onRemove() }}
+					>
+						<X className='stroke-[2] text-white' size={8} />
+					</div>
+				)}
+			</div>
+
+			{expanded && blobUrl && (
+				<div
+					className='fixed inset-0 z-50 flex items-center justify-center bg-black/70'
+					onClick={() => setExpanded(false)}
+				>
+					<img
+						src={blobUrl}
+						alt={fileName}
+						className='max-w-[80vw] max-h-[80vh] object-contain rounded-md shadow-2xl'
+						onClick={(e) => e.stopPropagation()}
+					/>
+				</div>
+			)}
+		</>
+	)
+}
+
 export const SelectedFiles = (
 	{ type, selections, setSelections, showProspectiveSelections, messageIdx, }:
 		| { type: 'past', selections: StagingSelectionItem[]; setSelections?: undefined, showProspectiveSelections?: undefined, messageIdx: number, }
@@ -918,17 +1114,31 @@ export const SelectedFiles = (
 							// Terminal snapshots key off their unique synthetic URI so two
 							// captures of the same command never collapse into one chip.
 							: selection.type === 'Terminal' ? selection.type + selection.uri.path
-								: i
+								: selection.type === 'Image' ? selection.type + selection.uri.path
+									: i
 
-				const SelectionIcon = (
-					selection.type === 'File' ? File
-						: selection.type === 'Folder' ? Folder
-							: selection.type === 'CodeSelection' ? Text
-								: selection.type === 'Terminal' ? TerminalSquare
-									: (undefined as never)
-				)
+			const SelectionIcon = (
+				selection.type === 'File' ? File
+					: selection.type === 'Folder' ? Folder
+						: selection.type === 'CodeSelection' ? Text
+							: selection.type === 'Terminal' ? TerminalSquare
+								: (undefined as never)
+			)
 
-				return <div // container for summarybox and code
+				if (selection.type === 'Image') {
+				return <ImageThumbnail
+					key={thisKey}
+					uri={selection.uri}
+					mimeType={selection.mimeType}
+					fileName={selection.fileName}
+					onRemove={type === 'staging' ? () => {
+						cleanupPendingImage(selection.uri.path)
+						setSelections([...selections.slice(0, i), ...selections.slice(i + 1)])
+					} : undefined}
+				/>
+			}
+
+			return <div // container for summarybox and code
 					key={thisKey}
 					className={`flex flex-col space-y-[1px]`}
 				>
@@ -1003,24 +1213,24 @@ export const SelectedFiles = (
 								else if (selection.type === 'Folder') {
 									// TODO!!! reveal in tree
 								}
-								else if (selection.type === 'Terminal') {
-									// No-op for now. Terminal output is a snapshot — we
-									// don't try to scroll the source terminal back to the
-									// captured position because (a) the terminal may have
-									// been closed, (b) the buffer may have scrolled past,
-									// (c) xterm has no public "select range" API. The
-									// tooltip carries enough preview context.
-								}
+							else if (selection.type === 'Terminal') {
+								// No-op for now. Terminal output is a snapshot — we
+								// don't try to scroll the source terminal back to the
+								// captured position because (a) the terminal may have
+								// been closed, (b) the buffer may have scrolled past,
+								// (c) xterm has no public "select range" API. The
+								// tooltip carries enough preview context.
+							}
 							}}
 						>
 							{<SelectionIcon size={10} />}
 
-							{ // file name and range, or terminal label
-								selection.type === 'Terminal'
-									? selection.label
-									: getBasename(selection.uri.fsPath)
-										+ (selection.type === 'CodeSelection' ? ` (${selection.range[0]}-${selection.range[1]})` : '')
-							}
+						{ // file name and range, or terminal label
+							selection.type === 'Terminal'
+								? selection.label
+								: getBasename(selection.uri.fsPath)
+									+ (selection.type === 'CodeSelection' ? ` (${selection.range[0]}-${selection.range[1]})` : '')
+						}
 
 							{selection.type === 'File' && selection.state.wasAddedAsCurrentFile && messageIdx === undefined && currentURI?.fsPath === selection.uri.fsPath ?
 								<span className={`text-[8px] 'void-opacity-60 text-void-fg-4`}>
@@ -1336,6 +1546,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 		setStagingSelections = (s) => chatThreadsService.setCurrentMessageState(messageIdx, { stagingSelections: s })
 	}
 
+	const editImageAttach = useImageAttach(stagingSelections, setStagingSelections)
 
 	// local state
 	const mode: ChatBubbleMode = isBeingEdited ? 'edit' : 'display'
@@ -1405,6 +1616,10 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 
 			await chatThreadsService.abortRunning(threadId)
 
+			// flush any pending images to disk before re-submitting
+			const fileService = accessor.get('IFileService')
+			await flushPendingImages(stagingSelections, fileService)
+
 			// update state
 			setIsBeingEdited(false)
 			chatThreadsService.setCurrentlyFocusedMessageIdx(undefined)
@@ -1448,6 +1663,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 			showProspectiveSelections={false}
 			selections={stagingSelections}
 			setSelections={setStagingSelections}
+			imageAttach={editImageAttach}
 			threadIdForUsageRing={chatThreadsService.state.currentThreadId}
 		>
 			<VoidInputBox2
@@ -1456,6 +1672,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 				className='min-h-[81px] max-h-[500px] px-0.5'
 				placeholder="Edit your message..."
 				onChangeText={(text) => setIsDisabled(!text)}
+				onPaste={editImageAttach.onPaste}
 				onFocus={() => {
 					setIsFocused(true)
 					chatThreadsService.setCurrentlyFocusedMessageIdx(messageIdx);
@@ -1513,10 +1730,9 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 			className={`
             text-left rounded-lg max-w-full
             ${mode === 'edit' ? ''
-					: mode === 'display' ? `p-2 flex flex-col bg-void-bg-1 text-void-fg-1 overflow-x-auto ${isReadOnly ? '' : 'cursor-pointer'}` : ''
+					: mode === 'display' ? `p-2 flex flex-col bg-void-bg-1 text-void-fg-1 overflow-x-auto` : ''
 				}
         `}
-			onClick={() => { if (mode === 'display' && !isReadOnly) { onOpenEdit() } }}
 		>
 			{chatbubbleContents}
 		</div>
@@ -3825,14 +4041,18 @@ export const SidebarChat = () => {
 		// before yielding makes any flushed-later keydowns see an empty
 		// textarea and bail via `isDisabled`.
 		const userMessage = _forceSubmit || textAreaRef.current?.value || ''
+		const _chatSelections = [...selections] // snapshot before clearing
 		setSelections([]) // clear staging
 		textAreaFnsRef.current?.setValue('')
 
 		isSubmittingRef.current = true
 
+		const fileService = accessor.get('IFileService')
+		await flushPendingImages(_chatSelections, fileService)
+
 		const threadId = chatThreadsService.state.currentThreadId
 		try {
-			await chatThreadsService.addUserMessageAndStreamResponse({ userMessage, threadId })
+			await chatThreadsService.addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId })
 		} catch (e) {
 			console.error('Error while sending message in chat:', e)
 		} finally {
@@ -3917,6 +4137,8 @@ export const SidebarChat = () => {
 		}
 	}, [onSubmit, onAbort, isRunning])
 
+	const mainImageAttach = useImageAttach(selections, setSelections)
+
 	// Phase E commit 4 — when the current thread is read-only (foreign
 	// workspace), wrap the input in a `pointer-events-none opacity-60`
 	// shell so mouse / touch can't focus the textarea, click the model
@@ -3934,6 +4156,7 @@ export const SidebarChat = () => {
 			// showProspectiveSelections={previousMessagesHTML.length === 0}
 			selections={selections}
 			setSelections={setSelections}
+			imageAttach={mainImageAttach}
 			onClickAnywhere={() => { textAreaRef.current?.focus() }}
 			threadIdForUsageRing={chatThreadsState.currentThreadId}
 		>
@@ -3943,6 +4166,7 @@ export const SidebarChat = () => {
 				placeholder={`@ to mention, ${keybindingString ? `${keybindingString} to add a selection. ` : ''}Enter instructions...`}
 				onChangeText={onChangeText}
 				onKeyDown={onKeyDown}
+				onPaste={mainImageAttach.onPaste}
 				onFocus={() => { chatThreadsService.setCurrentlyFocusedMessageIdx(undefined) }}
 				ref={textAreaRef}
 				fnsRef={textAreaFnsRef}
