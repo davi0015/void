@@ -52,7 +52,6 @@ import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 const numLinesOfStr = (str: string) => str.split('\n').length
 
 
-
 export const getLengthOfTextPx = ({ tabWidth, spaceWidth, content }: { tabWidth: number, spaceWidth: number, content: string }) => {
 	let lengthOfTextPx = 0;
 	for (const char of content) {
@@ -130,6 +129,8 @@ const findTextInCode = (text: string, fileContents: string, canFallbackToRemoveW
 
 	// if idx was found
 	if (idx !== -1) {
+		const lastIdx = fileContents.lastIndexOf(text)
+		if (lastIdx !== idx) return 'Not unique' as const
 		return returnAns(fileContents, idx)
 	}
 
@@ -144,6 +145,13 @@ const findTextInCode = (text: string, fileContents: string, canFallbackToRemoveW
 	if (idx === -1) return 'Not found' as const
 	const lastIdx = fileContents.lastIndexOf(text)
 	if (lastIdx !== idx) return 'Not unique' as const
+
+	// verify the match covers complete lines (starts at line start, ends at line end)
+	const matchEnd = idx + text.length - 1
+	const charBeforeMatch = idx > 0 ? fileContents[idx - 1] : '\n'
+	const charAfterMatch = matchEnd < fileContents.length - 1 ? fileContents[matchEnd + 1] : '\n'
+	if (charBeforeMatch !== '\n' || charAfterMatch !== '\n')
+		return 'Not found' as const
 
 	return returnAns(fileContents, idx)
 }
@@ -1628,6 +1636,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 	private _errContentOfInvalidStr = (
 		str: 'Not found' | 'Not unique' | 'Has overlap',
 		blockOrig: string,
+		fileContent?: string,
 	): string => {
 		const problematicCode = `${tripleTick[0]}\n${JSON.stringify(blockOrig)}\n${tripleTick[1]}`
 
@@ -1637,9 +1646,23 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			case 'Not found':
 				descStr = `The edit was not applied. The text in ORIGINAL must EXACTLY match lines of code in the file, but there was no match for:\n${problematicCode}. Ensure you have the latest version of the file, and ensure the ORIGINAL code matches a code excerpt exactly.`
 				break
-			case 'Not unique':
-				descStr = `The edit was not applied. The text in ORIGINAL must be unique in the file being edited, but the following ORIGINAL code appears multiple times in the file:\n${problematicCode}. Ensure you have the latest version of the file, and ensure the ORIGINAL code is unique.`
+			case 'Not unique': {
+				let matchInfo = ''
+				if (fileContent) {
+					const matchLines: number[] = []
+					let offset = 0
+					let idx: number
+					while ((idx = fileContent.indexOf(blockOrig, offset)) !== -1 && matchLines.length < 20) {
+						matchLines.push(fileContent.substring(0, idx).split('\n').length)
+						offset = idx + 1
+					}
+					if (matchLines.length > 0) {
+						matchInfo = ` Found ${matchLines.length}${matchLines.length >= 20 ? '+' : ''} occurrences at lines: ${matchLines.join(', ')}.`
+					}
+				}
+				descStr = `The edit was not applied. The text in ORIGINAL must be unique in the file being edited, but the following ORIGINAL code appears multiple times in the file:\n${problematicCode}.${matchInfo} Include more surrounding context in ORIGINAL to make it unique.`
 				break
+			}
 			case 'Has overlap':
 				descStr = `The edit was not applied. The text in the ORIGINAL blocks must not overlap, but the following ORIGINAL code had overlap with another ORIGINAL string:\n${problematicCode}. Ensure you have the latest version of the file, and ensure the ORIGINAL code blocks do not overlap.`
 				break
@@ -1667,6 +1690,9 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		for (const b of blocks) {
 			const idx = modelStr.indexOf(b.orig)
 			if (idx !== -1) {
+				const lastIdx = modelStr.lastIndexOf(b.orig)
+				if (lastIdx !== idx)
+					throw new Error(this._errContentOfInvalidStr('Not unique', b.orig, modelStr))
 				replacements.push({ origStart: idx, origEnd: idx + b.orig.length - 1, block: b })
 				continue
 			}

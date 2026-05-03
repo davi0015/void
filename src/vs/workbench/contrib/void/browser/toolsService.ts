@@ -34,6 +34,16 @@ const isFalsy = (u: unknown) => {
 	return !u || u === 'null' || u === 'undefined'
 }
 
+const safeFence = (content: string): string => {
+	let maxRun = 2
+	const re = /`{3,}/g
+	let m: RegExpExecArray | null
+	while ((m = re.exec(content)) !== null) {
+		if (m[0].length > maxRun) maxRun = m[0].length
+	}
+	return '`'.repeat(maxRun + 1)
+}
+
 const validateStr = (argName: string, value: unknown) => {
 	if (value === null) throw new Error(`Invalid LLM output: ${argName} was null.`)
 	if (typeof value !== 'string') throw new Error(`Invalid LLM output format: ${argName} must be a string, but its type is "${typeof value}". Full value: ${JSON.stringify(value)}.`)
@@ -594,6 +604,7 @@ export class ToolsService implements IToolsService {
 					throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
 				}
 				await editCodeService.callBeforeApplyOrEdit(uri)
+				
 				editCodeService.instantlyRewriteFile({ uri, newContent })
 				// at end, get lint errors
 				const lintErrorsPromise = Promise.resolve().then(async () => {
@@ -621,12 +632,14 @@ export class ToolsService implements IToolsService {
 					throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
 				}
 				await editCodeService.callBeforeApplyOrEdit(uri)
+				
 				editCodeService.instantlyApplySearchReplaceBlocks({ uri, searchReplaceBlocks })
 
 				// at end, get lint errors
 				const lintErrorsPromise = Promise.resolve().then(async () => {
 					await timeout(2000)
 					const { lintErrors } = this._getLintErrors(uri)
+					
 					return { lintErrors }
 				})
 
@@ -665,7 +678,8 @@ export class ToolsService implements IToolsService {
 		// given to the LLM after the call for successful tool calls
 		this.stringOfResult = {
 			read_file: (params, result) => {
-				return `${params.uri.fsPath}\n\`\`\`\n${result.fileContents}\n\`\`\`${nextPageStr(result.hasNextPage)}${result.hasNextPage ? `\nMore info because truncated: this file has ${result.totalNumLines} lines, or ${result.totalFileLen} characters.` : ''}`
+				const fence = safeFence(result.fileContents)
+				return `${params.uri.fsPath}\n${fence}\n${result.fileContents}\n${fence}${nextPageStr(result.hasNextPage)}${result.hasNextPage ? `\nMore info because truncated: this file has ${result.totalNumLines} lines, or ${result.totalFileLen} characters.` : ''}`
 			},
 			ls_dir: (params, result) => {
 				const dirTreeStr = stringifyDirectoryTree1Deep(params, result)

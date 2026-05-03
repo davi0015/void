@@ -3563,12 +3563,13 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	// at stream end), reuse the existing JSX elements and only createElement
 	// for the new ones. A full rebuild (452 createElement + React reconciliation)
 	// is O(N); the incremental path is O(delta).
-	const prevMsgCacheRef = useRef<{ html: React.ReactNode[], len: number, threadId: string, checkpointIdx: typeof currCheckpointIdx, scrollCb: typeof scrollToBottomCb, pendingIdx: typeof firstPendingToolRequestIdx, readOnly: boolean } | null>(null)
+	const prevMsgCacheRef = useRef<{ html: React.ReactNode[], len: number, msgs: typeof previousMessages, threadId: string, checkpointIdx: typeof currCheckpointIdx, scrollCb: typeof scrollToBottomCb, pendingIdx: typeof firstPendingToolRequestIdx, readOnly: boolean } | null>(null)
 
 	const previousMessagesHTML = (() => {
 		const cache = prevMsgCacheRef.current
 		const depsMatch = cache
 			&& cache.threadId === threadId
+			&& cache.msgs === previousMessages
 			&& cache.checkpointIdx === currCheckpointIdx
 			&& cache.scrollCb === scrollToBottomCb
 			&& cache.pendingIdx === firstPendingToolRequestIdx
@@ -3597,6 +3598,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			const merged = [...cache.html, ...newElements]
 			cache.html = merged
 			cache.len = previousMessages.length
+			cache.msgs = previousMessages
 			return merged
 		}
 
@@ -3615,7 +3617,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			/>
 		})
 
-		prevMsgCacheRef.current = { html: result, len: previousMessages.length, threadId, checkpointIdx: currCheckpointIdx, scrollCb: scrollToBottomCb, pendingIdx: firstPendingToolRequestIdx, readOnly: threadIsReadOnly }
+		prevMsgCacheRef.current = { html: result, len: previousMessages.length, msgs: previousMessages, threadId, checkpointIdx: currCheckpointIdx, scrollCb: scrollToBottomCb, pendingIdx: firstPendingToolRequestIdx, readOnly: threadIsReadOnly }
 		return result
 	})()
 
