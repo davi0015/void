@@ -1266,7 +1266,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			}
 		}
 
-		this._writeURIText(uri, newContent, 'wholeFileRange', { shouldRealignDiffAreas: true })
+		this._writeURIText(uri, newContent, 'wholeFileRange', { shouldRealignDiffAreas: true, skipRefresh: true })
 		onDone()
 	}
 
@@ -1664,22 +1664,24 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 		const replacements: { origStart: number; origEnd: number; block: ExtractedSearchReplaceBlock }[] = []
 		for (const b of blocks) {
+			const idx = modelStr.indexOf(b.orig)
+			if (idx !== -1) {
+				replacements.push({ origStart: idx, origEnd: idx + b.orig.length - 1, block: b })
+				continue
+			}
+
+			// fallback: match via line-level search (handles whitespace differences)
 			const res = findTextInCode(b.orig, modelStr, true, { returnType: 'lines' })
 			if (typeof res === 'string')
 				throw new Error(this._errContentOfInvalidStr(res, b.orig))
 			let [startLine, endLine] = res
 			startLine -= 1 // 0-index
 			endLine -= 1
-
-			// including newline before start
 			const origStart = (startLine !== 0 ?
 				modelStrLines.slice(0, startLine).join('\n') + '\n'
 				: '').length
-
-			// including endline at end
 			const origEnd = modelStrLines.slice(0, endLine + 1).join('\n').length - 1
-
-			replacements.push({ origStart, origEnd, block: b });
+			replacements.push({ origStart, origEnd, block: b })
 		}
 		// sort in increasing order
 		replacements.sort((a, b) => a.origStart - b.origStart)
@@ -1700,7 +1702,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 		this._writeURIText(uri, newCode,
 			'wholeFileRange',
-			{ shouldRealignDiffAreas: true }
+			{ shouldRealignDiffAreas: true, skipRefresh: true }
 		)
 	}
 
