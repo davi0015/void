@@ -179,6 +179,25 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
 - **Lexer cache seeding on stream end** (`ChatMarkdownRender.tsx`): When the streaming `IncrementalLexer`
   finishes, its final tokens are written into the module-level LRU cache so the committed message's
   `cachedLex()` call is an instant hit. Avoids a redundant full re-lex of the entire response.
+- **DiffZone reuse across agent edits** (`editCodeService.ts`): When the agent calls `edit_file` or
+  `rewrite_file` on the same file multiple times, the existing DiffZone is reused instead of being
+  destroyed and recreated. Diff highlights accumulate against the original baseline — overlapping
+  edits merge, non-overlapping edits show separate highlights. Previously each new edit wiped all
+  prior highlights via `acceptOrRejectAllDiffAreas`.
+- **Deferred view zones + widgets during streaming** (`editCodeService.ts`): Red deleted-code blocks
+  (`IViewZone`) and Accept/Reject inline widgets are skipped during streaming. Each `changeViewZones`
+  call triggers a synchronous layout recalculation; deferring them until stream end avoids repeated
+  forced reflows. Green decorations are still shown during streaming for visual feedback.
+- **Batched streaming writes** (`editCodeService.ts`): Added `skipRefresh` option to `_writeURIText`.
+  During streaming, `_writeStreamedDiffZoneLLMText` makes 2-4 `_writeURIText` calls per tick, each
+  of which previously triggered a full clear → recompute diffs → render cycle. Now all internal
+  writes skip the refresh; the caller does a single refresh at the end. Also applied to
+  `_instantlyApplySRBlocks` and `instantlyRewriteFile` whose writes are followed by `onDone()`.
+- **Character-level search-replace matching** (`editCodeService.ts`): `_instantlyApplySRBlocks` now
+  uses exact `indexOf` for character-level positioning instead of line-level `findTextInCode`. When
+  the LLM sends a partial line in the SEARCH block (e.g. `Elara` matching `Elara found a crystal...`),
+  only the matched substring is replaced — the rest of the line is preserved. Falls back to
+  line-level matching only when exact match fails (whitespace differences).
 
 ### Known performance issues
 
