@@ -483,10 +483,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 				...this.state.overridesOfModel,
 				[providerName]: {
 					...this.state.overridesOfModel[providerName],
-					[modelName]: overrides === undefined ? undefined : {
-						...this.state.overridesOfModel[providerName][modelName],
-						...overrides
-					},
+					[modelName]: overrides === undefined ? undefined : overrides,
 				}
 			}
 		};
