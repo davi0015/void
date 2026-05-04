@@ -183,6 +183,9 @@ export type StagingSelectionItem = {
 	uri: URI;
 	mimeType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
 	fileName: string;
+	// Vision helper description, set after the first send. Carried forward
+	// on edit so unchanged images don't need re-describing.
+	cachedDescription?: string;
 	state: { wasAddedAsCurrentFile: false };
 }
 

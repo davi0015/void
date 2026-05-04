@@ -600,7 +600,7 @@ const compressImage = (file: File, mimeType: ImageMimeType): Promise<{ bytes: Ui
 	})
 }
 
-const pendingImageData = new Map<string, { blobUrl: string, bytes: Uint8Array }>()
+const pendingImageData = new Map<string, { blobUrl: string, bytes: Uint8Array | null }>()
 
 const cleanupPendingImage = (uriPath: string) => {
 	const entry = pendingImageData.get(uriPath)
@@ -610,11 +610,17 @@ const cleanupPendingImage = (uriPath: string) => {
 	}
 }
 
+// Free the raw bytes but keep the blob URL alive for thumbnails.
+const releasePendingImageBytes = (uriPath: string) => {
+	const entry = pendingImageData.get(uriPath)
+	if (entry) entry.bytes = null
+}
+
 const flushPendingImages = async (selections: StagingSelectionItem[], fileService: { writeFile(uri: URI, content: any): Promise<any> }) => {
 	for (const s of selections) {
 		if (s.type !== 'Image') continue
 		const entry = pendingImageData.get(s.uri.path)
-		if (!entry) continue
+		if (!entry?.bytes) continue
 		await fileService.writeFile(s.uri, VSBuffer.wrap(entry.bytes))
 		cleanupPendingImage(s.uri.path)
 	}
@@ -1041,14 +1047,38 @@ const ImageThumbnail = ({ uri, mimeType, fileName, onRemove }: { uri: URI, mimeT
 	const [expanded, setExpanded] = useState(false)
 	useEffect(() => {
 		const pending = pendingImageData.get(uri.path)
-		if (pending) { setBlobUrl(pending.blobUrl); return }
+		if (pending) {
+			setBlobUrl(pending.blobUrl)
+			// Also try loading from disk in the background. Once the file is
+			// available, swap to a fresh blob URL and free the pending entry.
+			const fileService = accessor.get('IFileService')
+			let cancelled = false
+			fileService.readFile(uri).then(content => {
+				if (cancelled) return
+				const blob = new Blob([content.value.buffer], { type: mimeType })
+				setBlobUrl(URL.createObjectURL(blob))
+				cleanupPendingImage(uri.path)
+			}).catch(() => { })
+			return () => { cancelled = true }
+		}
 		let revoked = false
 		const fileService = accessor.get('IFileService')
 		fileService.readFile(uri).then(content => {
 			if (revoked) return
 			const blob = new Blob([content.value.buffer], { type: mimeType })
 			setBlobUrl(URL.createObjectURL(blob))
-		}).catch(() => { })
+		}).catch(e => {
+			console.warn('[ImageThumbnail] Failed to read image:', uri.toString(), e)
+			// Retry with file:// scheme in case the URI scheme changed
+			if (uri.scheme !== 'file' && uri.path) {
+				const fileUri = URI.file(uri.path)
+				fileService.readFile(fileUri).then(content => {
+					if (revoked) return
+					const blob = new Blob([content.value.buffer], { type: mimeType })
+					setBlobUrl(URL.createObjectURL(blob))
+				}).catch(() => { })
+			}
+		})
 		return () => { revoked = true }
 	}, [uri.path])
 
@@ -1673,9 +1703,11 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 
 			await chatThreadsService.abortRunning(threadId)
 
-			// flush any pending images to disk before re-submitting
-			const fileService = accessor.get('IFileService')
-			await flushPendingImages(stagingSelections, fileService)
+			// Flush any newly added images during edit to disk
+			if (stagingSelections.some(s => s.type === 'Image' && pendingImageData.has(s.uri.path))) {
+				const fileService = accessor.get('IFileService')
+				await flushPendingImages(stagingSelections, fileService)
+			}
 
 			// update state
 			setIsBeingEdited(false)
@@ -4104,12 +4136,22 @@ export const SidebarChat = () => {
 
 		isSubmittingRef.current = true
 
-		const fileService = accessor.get('IFileService')
-		await flushPendingImages(_chatSelections, fileService)
+		// Extract in-memory bytes for the service layer (reads from memory,
+		// flushes to disk after persist). Release the raw bytes to free memory
+		// but keep the blob URLs alive for ImageThumbnail previews.
+		const _pendingImageBytes = new Map<string, Uint8Array>()
+		for (const s of _chatSelections) {
+			if (s.type !== 'Image') continue
+			const entry = pendingImageData.get(s.uri.path)
+			if (entry?.bytes) {
+				_pendingImageBytes.set(s.uri.path, entry.bytes)
+				releasePendingImageBytes(s.uri.path)
+			}
+		}
 
 		const threadId = chatThreadsService.state.currentThreadId
 		try {
-			await chatThreadsService.addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId })
+			await chatThreadsService.addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes })
 		} catch (e) {
 			console.error('Error while sending message in chat:', e)
 		} finally {

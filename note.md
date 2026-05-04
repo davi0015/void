@@ -1236,13 +1236,15 @@ After each prompt phase, rerun the benchmark tasks (see Benchmark section) on Ge
 - ✅ Multiple images per message — works out of the box via staging selections.
 - ✅ Compress/resize large images at paste time — Canvas API resizes to max 1024px on longest side, PNGs re-encoded as WebP, JPEG/WebP at 0.85 quality. GIFs skipped to preserve animation.
 - ✅ Images stored on disk with URI reference (not inline in DB). Deferred write: in-memory blob until send, then flushed to `voidImages/<uuid>.<ext>`.
-- Image lifecycle management — delete image files when messages/threads are deleted (not yet implemented).
-- Vision helper reads from memory — let helper read from `pendingImageData` instead of disk to avoid pre-flush dependency (not yet implemented).
+- ✅ Image lifecycle management — image files deleted when messages/threads are removed. Single `_deleteOrphanedImages` function handles all deletion paths (thread delete, edit, checkpoint restore). Uses retained-set comparison so shared images are never prematurely deleted.
+- ✅ Vision helper + native LLM read from memory first — both `_describeImagesWithHelper` and `_chatMessagesToSimpleMessages` check `pendingImageBytes` map before falling back to disk. Bytes flow from React layer → `addUserMessageAndStreamResponse` → thread-keyed map → `prepareLLMChatMessages`. Cleared after first agent-loop request.
+- ✅ Transactional image flush — disk write happens after message persist (inside `_addUserMessageAndStreamResponse`), not before. In-memory bytes are available for both vision helper and native LLM, so no dependency on disk write completing.
+- ✅ Per-image description caching — `cachedDescription` field on Image selection type. Descriptions travel with selections on edit (no regex parsing from content). Only new/replaced images need re-describing; unchanged images reuse their cached description.
 - Vision helper prompt improvement: include conversation context so the description is more relevant (not yet implemented).
 
 **Architecture notes:**
 - The `StagingSelectionItem` approach means images flow through the same staging → message pipeline as files and code selections. No new message types needed.
-- The vision helper is a separate, isolated LLM call — it doesn't share context with the main conversation. This keeps it simple but means it can't tailor descriptions to the conversation. Step 3 can improve this.
+- The vision helper is a separate, isolated LLM call — it doesn't share context with the main conversation. This keeps it simple but means it can't tailor descriptions to the conversation.
 - Token cost: a 512x512 image costs ~250-500 tokens as a vision input. A text description from the helper is typically 200-500 chars (~50-100 tokens). The helper approach is ~5x cheaper in subsequent turns since the description doesn't grow with re-reads.
 
 ### Backlog / Open ideas

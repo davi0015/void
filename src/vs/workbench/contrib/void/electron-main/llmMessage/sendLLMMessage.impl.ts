@@ -149,8 +149,7 @@ const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includ
 
 	else if (providerName === 'deepseek') {
 		const thisConfig = settingsOfProvider[providerName]
-		// return new OpenAI({ baseURL: 'https://api.deepseek.com/v1', apiKey: thisConfig.apiKey, ...commonPayloadOpts })
-		return new OpenAI({ baseURL: 'http://192.168.0.2:8080/v1', apiKey: thisConfig.apiKey, ...commonPayloadOpts })
+		return new OpenAI({ baseURL: 'https://api.deepseek.com/v1', apiKey: thisConfig.apiKey, ...commonPayloadOpts })
 	}
 	else if (providerName === 'openAICompatible') {
 		const thisConfig = settingsOfProvider[providerName]

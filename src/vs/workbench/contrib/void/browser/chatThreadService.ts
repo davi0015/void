@@ -9,6 +9,7 @@ import { createDecorator } from '../../../../platform/instantiation/common/insta
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 
 import { URI } from '../../../../base/common/uri.js';
+import { VSBuffer } from '../../../../base/common/buffer.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { builtinToolNames, chat_userMessageContent, isABuiltinToolName, visionHelper_systemMessage, visionHelper_userMessage } from '../common/prompt/prompts.js';
@@ -512,7 +513,7 @@ export interface IChatThreadService {
 	editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId }: { userMessage: string, messageIdx: number, threadId: string }): Promise<void>;
 
 	// call to add a message
-	addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }): Promise<void>;
+	addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array> }): Promise<void>;
 
 	// approve/reject
 	approveLatestToolRequest(threadId: string): void;
@@ -548,6 +549,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// executions triggered by that request read this map to attribute themselves
 	// to the emitting rid. Ephemeral / not persisted.
 	private readonly _telemetryRidByThread = new Map<string, string>()
+	private readonly _pendingImageBytesByThread = new Map<string, Map<string, Uint8Array>>()
 	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
@@ -1860,13 +1862,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// chars/ratio estimate handles that case alone.
 			const lastUsage = this.latestUsageOfThreadId[threadId]
 			const priorContentTokens = lastUsage ? (lastUsage.inputTokens ?? 0) + (lastUsage.outputTokens ?? 0) : undefined
+			const pendingImageBytes = this._pendingImageBytesByThread.get(threadId)
 			const { messages, separateSystemMessage, compactionInfo, sentChars, telemetryRequestId } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages,
 				modelSelection,
 				chatMode,
 				priorContentTokens,
 				threadId,
+				pendingImageBytes,
 			})
+			// Images are only attached on the first user message of a turn;
+			// clear after the first prepare so subsequent tool-loop iterations
+			// don't carry stale references (the bytes are on disk by now).
+			if (pendingImageBytes) this._pendingImageBytesByThread.delete(threadId)
 			// Wall-clock for the request/response round-trip. Captured right after
 			// `prepareLLMChatMessages` (which emits the "request" telemetry line) so
 			// durMs on the response line is the time from log-request → log-response.
@@ -2453,7 +2461,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 
-	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _cachedImageDescriptions }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _cachedImageDescriptions?: string }) {
+	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array> }) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
@@ -2541,17 +2549,48 @@ We only need to do it for files that were edited since `from`, ie files between 
 				: false
 
 			if (!primarySupportsVision) {
-				let imageDescriptions: string
-				if (_cachedImageDescriptions) {
-					imageDescriptions = _cachedImageDescriptions
-				} else {
+				// Images that already have a cachedDescription (from a previous
+				// send or carried forward on edit) don't need re-describing.
+				const cachedDescs: string[] = []
+				const newImages: (StagingSelectionItem & { type: 'Image' })[] = []
+				for (const img of imageSelections) {
+					if (img.type !== 'Image') continue
+					if (img.cachedDescription) {
+						cachedDescs.push(img.cachedDescription)
+					} else {
+						newImages.push(img)
+					}
+				}
+
+				let newDescs = ''
+				if (newImages.length > 0) {
 					this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '_Processing attached images..._', reasoningSoFar: '', toolCallsSoFar: [] }, interrupt: Promise.resolve(() => { }) })
 					const helperModelSelection = this._settingsService.state.modelSelectionOfFeature['VisionHelper']
-					imageDescriptions = await this._describeImagesWithHelper(imageSelections, helperModelSelection)
+					newDescs = await this._describeImagesWithHelper(newImages, helperModelSelection, _pendingImageBytes)
 					this._setStreamState(threadId, { isRunning: undefined })
 				}
-				userHistoryElt.content = imageDescriptions + '\n\n' + contentWithVolatile
+
+				const allDescs = [...cachedDescs, ...(newDescs ? [newDescs] : [])].join('\n\n')
+				userHistoryElt.content = allDescs + '\n\n' + contentWithVolatile
 				this._onDidChangeCurrentThread.fire()
+			}
+		}
+
+		// Store pending bytes so the agent loop can pass them to
+		// prepareLLMChatMessages for the first request (before flush).
+		if (_pendingImageBytes && _pendingImageBytes.size > 0) {
+			this._pendingImageBytesByThread.set(threadId, _pendingImageBytes)
+		}
+
+		// Flush pending images to disk for persistence. This runs after the
+		// message is already persisted and the in-memory bytes are stored on
+		// the service, so the agent loop can start immediately without waiting.
+		if (_pendingImageBytes && _pendingImageBytes.size > 0) {
+			for (const s of currSelns) {
+				if (s.type !== 'Image') continue
+				const bytes = _pendingImageBytes.get(s.uri.path)
+				if (!bytes) continue
+				this._fileService.writeFile(s.uri, VSBuffer.wrap(bytes)).catch(e => { console.error('[Image flush] Failed to write image to disk:', s.uri.path, e) })
 			}
 		}
 
@@ -2565,7 +2604,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 
-	private async _describeImagesWithHelper(imageSelections: (StagingSelectionItem & { type: 'Image' })[], helperModelSelection: ModelSelection | null): Promise<string> {
+	private async _describeImagesWithHelper(imageSelections: (StagingSelectionItem & { type: 'Image' })[], helperModelSelection: ModelSelection | null, pendingImageBytes?: Map<string, Uint8Array>): Promise<string> {
 		const descriptions: string[] = []
 		for (const s of imageSelections) {
 			if (!helperModelSelection) {
@@ -2573,8 +2612,14 @@ We only need to do it for files that were edited since `from`, ie files between 
 				continue
 			}
 			try {
-				const content = await this._fileService.readFile(s.uri)
-				const bytes = content.value.buffer
+				const pending = pendingImageBytes?.get(s.uri.path)
+				let bytes: Uint8Array
+				if (pending) {
+					bytes = pending
+				} else {
+					const content = await this._fileService.readFile(s.uri)
+					bytes = content.value.buffer
+				}
 				let binary = ''
 				for (let bi = 0; bi < bytes.length; bi++) binary += String.fromCharCode(bytes[bi])
 				const base64 = btoa(binary)
@@ -2608,15 +2653,19 @@ We only need to do it for files that were edited since `from`, ie files between 
 						logging: { loggingName: 'VisionHelper - Image Description' },
 					})
 				})
-				descriptions.push(`[Image: ${s.fileName}]\n--- start description ---\n${description.trim()}\n--- end description ---`)
+				const descBlock = `[Image: ${s.fileName}]\n--- start description ---\n${description.trim()}\n--- end description ---`
+				s.cachedDescription = descBlock
+				descriptions.push(descBlock)
 			} catch (e) {
-				descriptions.push(`[Image: ${s.fileName}]\n--- start description ---\n[Error describing image: ${String(e)}]\n--- end description ---`)
+				const descBlock = `[Image: ${s.fileName}]\n--- start description ---\n[Error describing image: ${String(e)}]\n--- end description ---`
+				s.cachedDescription = descBlock
+				descriptions.push(descBlock)
 			}
 		}
 		return descriptions.join('\n\n')
 	}
 
-	async addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
+	async addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array> }) {
 		if (this._isThreadMutationBlocked(threadId, 'addUserMessageAndStreamResponse')) return
 		const thread = this.state.allThreads[threadId];
 		if (!thread) return
@@ -2625,6 +2674,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 		if (thread.state.currCheckpointIdx !== null) {
 			const checkpointIdx = thread.state.currCheckpointIdx;
 			const newMessages = thread.messages.slice(0, checkpointIdx + 1);
+			const removedMessages = thread.messages.slice(checkpointIdx + 1);
 
 			const updatedThread = {
 				...thread,
@@ -2634,10 +2684,11 @@ We only need to do it for files that were edited since `from`, ie files between 
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread };
 			this._storeThread(threadId, updatedThread);
 			this._setState({ allThreads: newThreads });
+
+			this._deleteOrphanedImages(removedMessages, newMessages);
 		}
 
-		// Now call the original method to add the user message and stream the response
-		await this._addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId });
+		await this._addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes });
 
 	}
 
@@ -2652,19 +2703,13 @@ We only need to do it for files that were edited since `from`, ie files between 
 			throw new Error(`Error: editing a message with role !=='user'`)
 		}
 
-		// get prev and curr selections before clearing the message
+		// Staging selections already carry `cachedDescription` from the
+		// original send — unchanged images reuse it, new images have none.
 		const currSelns = editedMessage.state.stagingSelections || []
-
-		// Reuse existing image descriptions from the previous content so the
-		// vision helper doesn't re-process images the user didn't change.
-		let cachedImageDescriptions: string | undefined
-		const descMatch = editedMessage.content.match(/^((?:\[Image:.*?\]\n--- start description ---\n[\s\S]*?\n--- end description ---\n?\n?)+)/)
-		if (descMatch) {
-			cachedImageDescriptions = descMatch[1].trimEnd()
-		}
 
 		// clear messages up to the index
 		const slicedMessages = thread.messages.slice(0, messageIdx)
+		const removedMessages = thread.messages.slice(messageIdx)
 		this._setState({
 			allThreads: {
 				...this.state.allThreads,
@@ -2675,11 +2720,38 @@ We only need to do it for files that were edited since `from`, ie files between 
 			}
 		})
 
+		// The edited message's images are re-sent (currSelns), so retain them.
+		// Images only in the removed tail are orphaned.
+		const retainedWithEdit: ChatMessage[] = [...slicedMessages, { role: 'user' as const, content: '', displayContent: '', selections: currSelns, state: { stagingSelections: currSelns, isBeingEdited: false } }]
+		this._deleteOrphanedImages(removedMessages, retainedWithEdit)
+
 		// re-add the message and stream it
-		this._addUserMessageAndStreamResponse({ userMessage, _chatSelections: currSelns, threadId, _cachedImageDescriptions: cachedImageDescriptions })
+		this._addUserMessageAndStreamResponse({ userMessage, _chatSelections: currSelns, threadId })
 	}
 
 	// ---------- the rest ----------
+
+	/**
+	 * Delete image files referenced by the given messages but NOT referenced
+	 * by any of `retainedMessages`. Best-effort; errors are swallowed.
+	 */
+	private _deleteOrphanedImages(removedMessages: ChatMessage[], retainedMessages: ChatMessage[]) {
+		const retainedPaths = new Set<string>()
+		for (const m of retainedMessages) {
+			if (m.role !== 'user') continue
+			for (const s of m.selections ?? []) {
+				if (s.type === 'Image') retainedPaths.add(s.uri.path)
+			}
+		}
+		for (const m of removedMessages) {
+			if (m.role !== 'user') continue
+			for (const s of m.selections ?? []) {
+				if (s.type === 'Image' && !retainedPaths.has(s.uri.path)) {
+					this._fileService.del(s.uri).catch(() => { /* best-effort */ })
+				}
+			}
+		}
+	}
 
 	private _getAllSeenFileURIs(threadId: string) {
 		const thread = this.state.allThreads[threadId]
@@ -3235,6 +3307,12 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 	deleteThread(threadId: string): void {
 		const { allThreads: currentThreads } = this.state
+		const deletedThread = currentThreads[threadId]
+
+		// Clean up image files owned by this thread
+		if (deletedThread) {
+			this._deleteOrphanedImages(deletedThread.messages, [])
+		}
 
 		// delete the thread
 		const newThreads = { ...currentThreads };
@@ -3262,6 +3340,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 		// the user can purge the whole voidRequestLogs dir when they want to
 		// reclaim.
 		this._telemetryRidByThread.delete(threadId)
+		this._pendingImageBytesByThread.delete(threadId)
 		this._requestTelemetryService.forgetThread(threadId)
 
 		// Phase E — also clear any per-workspace last-active pointers to this
