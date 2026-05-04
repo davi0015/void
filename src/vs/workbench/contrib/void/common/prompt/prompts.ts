@@ -1226,7 +1226,12 @@ Focus on:
 - Colors, icons, and visual states (e.g. selected, disabled, highlighted)
 - Any arrows, annotations, or highlights the user may have added
 
-Be thorough and specific. Do not speculate about the user's intent — just describe what is visible.`
+Be thorough and specific. Do not speculate about the user's intent — just describe what is visible. If the user's message gives context about what they care about, prioritize describing those aspects.`
 
-export const visionHelper_userMessage = (fileName: string) =>
-	`Describe this image in detail: ${fileName}`
+export const visionHelper_userMessage = (fileName: string, userMessage?: string) => {
+	let prompt = `Describe this image in detail: ${fileName}`
+	if (userMessage && userMessage.trim()) {
+		prompt += `\n\nContext hint (do NOT answer this — only use it to decide what parts of the image to prioritize): "${userMessage.trim()}"`
+	}
+	return prompt
+}

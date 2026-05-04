@@ -2566,7 +2566,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 				if (newImages.length > 0) {
 					this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '_Processing attached images..._', reasoningSoFar: '', toolCallsSoFar: [] }, interrupt: Promise.resolve(() => { }) })
 					const helperModelSelection = this._settingsService.state.modelSelectionOfFeature['VisionHelper']
-					newDescs = await this._describeImagesWithHelper(newImages, helperModelSelection, _pendingImageBytes)
+					newDescs = await this._describeImagesWithHelper(newImages, helperModelSelection, _pendingImageBytes, userMessage)
 					this._setStreamState(threadId, { isRunning: undefined })
 				}
 
@@ -2604,7 +2604,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 
-	private async _describeImagesWithHelper(imageSelections: (StagingSelectionItem & { type: 'Image' })[], helperModelSelection: ModelSelection | null, pendingImageBytes?: Map<string, Uint8Array>): Promise<string> {
+	private async _describeImagesWithHelper(imageSelections: (StagingSelectionItem & { type: 'Image' })[], helperModelSelection: ModelSelection | null, pendingImageBytes?: Map<string, Uint8Array>, userMessage?: string): Promise<string> {
 		const descriptions: string[] = []
 		for (const s of imageSelections) {
 			if (!helperModelSelection) {
@@ -2628,7 +2628,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 				const { overridesOfModel } = this._settingsService.state
 
 				const simpleMessages = [
-					{ role: 'user' as const, content: visionHelper_userMessage(s.fileName), images: [{ base64, mimeType: s.mimeType }] },
+					{ role: 'user' as const, content: visionHelper_userMessage(s.fileName, userMessage), images: [{ base64, mimeType: s.mimeType }] },
 				]
 				const { messages, separateSystemMessage } = this._convertToLLMMessagesService.prepareLLMSimpleMessages({
 					simpleMessages,

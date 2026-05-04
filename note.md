@@ -1240,7 +1240,7 @@ After each prompt phase, rerun the benchmark tasks (see Benchmark section) on Ge
 - ✅ Vision helper + native LLM read from memory first — both `_describeImagesWithHelper` and `_chatMessagesToSimpleMessages` check `pendingImageBytes` map before falling back to disk. Bytes flow from React layer → `addUserMessageAndStreamResponse` → thread-keyed map → `prepareLLMChatMessages`. Cleared after first agent-loop request.
 - ✅ Transactional image flush — disk write happens after message persist (inside `_addUserMessageAndStreamResponse`), not before. In-memory bytes are available for both vision helper and native LLM, so no dependency on disk write completing.
 - ✅ Per-image description caching — `cachedDescription` field on Image selection type. Descriptions travel with selections on edit (no regex parsing from content). Only new/replaced images need re-describing; unchanged images reuse their cached description.
-- Vision helper prompt improvement: include conversation context so the description is more relevant (not yet implemented).
+- ✅ Vision helper prompt with conversation context — user's current message is passed as a "context hint" so the helper prioritizes relevant parts of the image (e.g. error text when user says "fix this"). Explicit "do NOT answer" guard prevents the helper from trying to respond to the user's question.
 
 **Architecture notes:**
 - The `StagingSelectionItem` approach means images flow through the same staging → message pipeline as files and code selections. No new message types needed.
