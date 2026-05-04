@@ -621,6 +621,46 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// workspaces' threads were touched more recently.
 		Object.assign(this._lastActiveThreadIdByWorkspace, this._readLastActiveThreadIdByWorkspace())
 
+		// Migration: re-tag threads that used the old volatile
+		// `void-untitled-workspace://<workspace.id>` URI to the current
+		// identity. Also merge pin buckets and last-active entries.
+		const wsUri = currentWorkspace.uri
+		if (wsUri) {
+			let migrated = 0
+			const oldKeys: string[] = []
+			for (const id in allThreads) {
+				const t = allThreads[id]
+				if (!t?.workspaceUri) continue
+				if (t.workspaceUri === wsUri) continue
+				const isOldUntitledPrefix = t.workspaceUri.startsWith('void-untitled-workspace://')
+			const isOldTempWorkspaceJson = t.workspaceUri.endsWith('/workspace.json')
+			if (!isOldUntitledPrefix && !isOldTempWorkspaceJson) continue
+				if (!oldKeys.includes(t.workspaceUri)) oldKeys.push(t.workspaceUri)
+				t.workspaceUri = wsUri
+				t.workspaceLabel = currentWorkspace.label
+				this._storeThread(id, t)
+				migrated++
+			}
+			for (const oldKey of oldKeys) {
+				const oldPins = this._pinnedThreadIdsByWorkspace[oldKey]
+				if (oldPins?.length) {
+					const cur = this._pinnedThreadIdsByWorkspace[wsUri] ?? []
+					this._pinnedThreadIdsByWorkspace[wsUri] = [...new Set([...cur, ...oldPins])]
+				}
+				delete this._pinnedThreadIdsByWorkspace[oldKey]
+				if (!this._lastActiveThreadIdByWorkspace[wsUri] && this._lastActiveThreadIdByWorkspace[oldKey]) {
+					this._lastActiveThreadIdByWorkspace[wsUri] = this._lastActiveThreadIdByWorkspace[oldKey]
+				}
+				delete this._lastActiveThreadIdByWorkspace[oldKey]
+			}
+			if (migrated > 0) {
+				this.state.pinnedThreadIds = this._pinnedThreadIdsByWorkspace[wsUri] ?? []
+				this._storePinnedThreadIdsByWorkspace()
+				this._storeLastActiveThreadIdByWorkspace()
+				console.log(`[void/chat] migrated ${migrated} thread(s) from old void-untitled-workspace:// URI to ${wsUri}`)
+			}
+		}
+
 		// Phase E — startup landing. `_normalizeCurrentThreadInScope` runs a
 		// 3-step cascade: per-workspace last-active (pinned & in scope) →
 		// newest pinned in-scope → openNewThread. Restricting to pinned at
@@ -3136,29 +3176,26 @@ We only need to do it for files that were edited since `from`, ie files between 
 			return { uri: identifier.uri.toString(), label }
 		}
 		if ('configPath' in identifier) {
-			// multi-root .code-workspace
-			const raw = resourceBasename(identifier.configPath) || identifier.configPath.toString()
-			const label = raw.replace(/\.code-workspace$/, '') || raw
-			return { uri: identifier.configPath.toString(), label }
+			const configName = resourceBasename(identifier.configPath)
+			if (configName !== 'workspace.json' && configName.endsWith('.code-workspace')) {
+				// Saved .code-workspace file — use configPath as identity.
+				const label = configName.replace(/\.code-workspace$/, '') || configName
+				return { uri: identifier.configPath.toString(), label }
+			}
+			// Untitled workspace (temp workspace.json) — fall through to
+			// first-folder identity below so adding/removing extra folders
+			// doesn't break thread ownership.
 		}
-		// Untitled multi-root window: the user has multiple folders in one
-		// window but hasn't saved it as a `.code-workspace`. VS Code's
-		// `toWorkspaceIdentifier` returns just `{ id }` here — no uri, no
-		// configPath. This used to fall through to "treat as empty window"
-		// and produced silently-untagged threads (the second bug found
-		// during commit-2 testing). Detect it by checking that the workspace
-		// has any folders at all, then use the synthetic workspace.id as the
-		// scoping key. The id is stable for the lifetime of the untitled
-		// workspace; saving it as a `.code-workspace` mints a new id and
-		// existing threads stay tagged to the old id (an accepted edge case
-		// — easy recovery via Move once commit 4 ships).
+		// Single-folder or untitled multi-root: use the first folder's URI
+		// as identity. For untitled multi-root, this deliberately matches
+		// the single-folder identity so threads stay in scope when the
+		// user adds/removes folders without saving a .code-workspace.
 		if (workspace.folders.length > 0) {
-			const firstName = resourceBasename(workspace.folders[0].uri) || workspace.folders[0].uri.toString()
+			const primaryUri = workspace.folders[0].uri.toString()
+			const firstName = resourceBasename(workspace.folders[0].uri) || primaryUri
 			const extra = workspace.folders.length - 1
 			const label = extra > 0 ? `${firstName} (+${extra})` : firstName
-			// Prefix the synthetic id so it can never accidentally collide
-			// with a real folder/file URI string in storage / Move actions.
-			return { uri: `void-untitled-workspace://${workspace.id}`, label }
+			return { uri: primaryUri, label }
 		}
 		// True empty window — no folders at all. Threads become unscoped.
 		return {}
