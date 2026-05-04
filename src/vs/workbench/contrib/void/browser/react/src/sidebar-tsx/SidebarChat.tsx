@@ -23,7 +23,7 @@ import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
-import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight } from 'lucide-react';
+import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { generateUuid } from '../../../../../../../base/common/uuid.js';
 import { VSBuffer } from '../../../../../../../base/common/buffer.js';
@@ -4003,6 +4003,56 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 })
 
 
+const useRulesOutdated = (threadId: string, lastAppliedRules: string | undefined) => {
+	const accessor = useAccessor()
+	const convertToLLMMessageService = accessor.get('IConvertToLLMMessageService')
+
+	const [outdatedInfo, setOutdatedInfo] = useState<{ isOutdated: boolean; detectedAt: Date | null }>({ isOutdated: false, detectedAt: null })
+
+	useEffect(() => {
+		if (lastAppliedRules === undefined) {
+			setOutdatedInfo({ isOutdated: false, detectedAt: null })
+			return
+		}
+
+		let cancelled = false
+		const check = async () => {
+			if (cancelled) return
+			try {
+				const current = await convertToLLMMessageService.getCurrentVoidRulesContent()
+				if (cancelled) return
+				const isOutdated = current !== lastAppliedRules
+				setOutdatedInfo(prev => {
+					if (isOutdated && !prev.isOutdated) return { isOutdated: true, detectedAt: new Date() }
+					if (!isOutdated && prev.isOutdated) return { isOutdated: false, detectedAt: null }
+					return prev
+				})
+			} catch { /* ignore read errors */ }
+		}
+
+		check()
+		const interval = setInterval(check, 5000)
+		return () => { cancelled = true; clearInterval(interval) }
+	}, [threadId, lastAppliedRules, convertToLLMMessageService])
+
+	return outdatedInfo
+}
+
+const RulesOutdatedBanner = ({ detectedAt }: { detectedAt: Date }) => {
+	const timeStr = detectedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+	return (
+		<div
+			className='flex items-center gap-1.5 text-xs text-yellow-600 dark:text-yellow-400 bg-yellow-500/10 px-3 py-1.5 mx-2 mb-1 rounded select-none'
+			data-tooltip-id='void-tooltip'
+			data-tooltip-content='Rules are frozen for this thread. To apply the new rules, ask the agent to read_file .voidrules'
+			data-tooltip-place='bottom'
+		>
+			<FileWarning size={13} className='shrink-0' />
+			<span>.voidrules changed on disk (at {timeStr})</span>
+		</div>
+	)
+}
+
 export const SidebarChat = () => {
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null)
 	const textAreaFnsRef = useRef<TextAreaFns | null>(null)
@@ -4022,6 +4072,8 @@ export const SidebarChat = () => {
 
 	const selections = currentThread.state.stagingSelections
 	const setSelections = (s: StagingSelectionItem[]) => { chatThreadsService.setCurrentThreadState({ stagingSelections: s }) }
+
+	const rulesOutdated = useRulesOutdated(currentThread.id, currentThread.lastAppliedRules)
 
 	// Only subscribe to isRunning transitions (not every content tick).
 	// The full stream state (displayContentSoFar, toolCallsSoFar, etc.)
@@ -4396,6 +4448,9 @@ export const SidebarChat = () => {
 		<ErrorBoundary>
 			{messagesHTML}
 		</ErrorBoundary>
+		{rulesOutdated.isOutdated && rulesOutdated.detectedAt && (
+			<RulesOutdatedBanner detectedAt={rulesOutdated.detectedAt} />
+		)}
 		<ErrorBoundary>
 			{threadPageInput}
 		</ErrorBoundary>
