@@ -41,8 +41,11 @@ export type AnthropicLLMChatMessage = {
 	)[]
 }
 export type OpenAILLMChatMessage = {
-	role: 'system' | 'user' | 'developer';
+	role: 'system' | 'developer';
 	content: string;
+} | {
+	role: 'user';
+	content: string | ({ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } })[];
 } | {
 	role: 'assistant',
 	content: string | (AnthropicReasoning | { type: 'text'; text: string })[];
@@ -71,6 +74,7 @@ export type GeminiLLMChatMessage = {
 	parts: (
 		| { text: string; }
 		| { functionResponse: { id: string; name: ToolName, response: { output: string } } }
+		| { inlineData: { mimeType: string; data: string } }
 	)[];
 }
 

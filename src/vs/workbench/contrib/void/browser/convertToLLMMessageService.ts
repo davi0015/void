@@ -27,6 +27,11 @@ export const EMPTY_MESSAGE = '(empty message)'
 
 
 
+export type ImageAttachment = {
+	base64: string;
+	mimeType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
+}
+
 type SimpleLLMMessage = {
 	role: 'tool';
 	content: string;
@@ -40,6 +45,7 @@ type SimpleLLMMessage = {
 } | {
 	role: 'user';
 	content: string;
+	images?: ImageAttachment[];
 } | {
 	role: 'assistant';
 	content: string;
@@ -381,8 +387,24 @@ const prepareMessages_openai_tools = (
 			continue
 		}
 
+		if (currMsg.role === 'user') {
+			if (currMsg.images && currMsg.images.length > 0) {
+				const parts: ({ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } })[] = [
+					{ type: 'text', text: currMsg.content },
+					...currMsg.images.map(img => ({
+						type: 'image_url' as const,
+						image_url: { url: `data:${img.mimeType};base64,${img.base64}` },
+					})),
+				]
+				newMessages.push({ role: 'user', content: parts })
+			} else {
+				newMessages.push({ role: 'user', content: currMsg.content })
+			}
+			continue
+		}
+
 		if (currMsg.role !== 'tool') {
-			newMessages.push(currMsg)
+			newMessages.push(currMsg as any)
 			continue
 		}
 
@@ -963,9 +985,40 @@ const prepareMessages = (params: {
 
 	// if need to convert to gemini style of messaes, do that (treat as anthropic style, then convert to gemini style)
 	if (params.providerName === 'gemini' || specialFormat === 'gemini-style') {
-		const res = prepareOpenAIOrAnthropicMessages({ ...params, specialToolFormat: specialFormat === 'gemini-style' ? 'anthropic-style' : undefined })
+		// Collect images from SimpleLLMMessage before the intermediate Anthropic
+		// conversion, then strip them so prepareOpenAIOrAnthropicMessages doesn't
+		// generate image_url content parts (which Gemini and text-only providers
+		// don't understand). We re-inject them as Gemini inlineData below.
+		const imagesByMsgIndex = new Map<number, ImageAttachment[]>()
+		let userIdx = 0
+		const messagesWithoutImages = params.messages.map(m => {
+			if (m.role === 'user') {
+				if (m.images && m.images.length > 0) imagesByMsgIndex.set(userIdx, m.images)
+				userIdx++
+				return { ...m, images: undefined }
+			}
+			return m
+		})
+
+		const res = prepareOpenAIOrAnthropicMessages({ ...params, messages: messagesWithoutImages, specialToolFormat: specialFormat === 'gemini-style' ? 'anthropic-style' : undefined })
 		const messages = res.messages as AnthropicLLMChatMessage[]
 		const messages2 = prepareGeminiMessages(messages)
+
+		// Inject images into Gemini user messages
+		if (imagesByMsgIndex.size > 0) {
+			let geminiUserIdx = 0
+			for (const m of messages2) {
+				if (m.role === 'user') {
+					const imgs = imagesByMsgIndex.get(geminiUserIdx)
+					if (imgs) {
+						for (const img of imgs) {
+							m.parts.push({ inlineData: { mimeType: img.mimeType, data: img.base64 } })
+						}
+					}
+					geminiUserIdx++
+				}
+			}
+		}
 		return { messages: messages2, separateSystemMessage: res.separateSystemMessage, emergencyInfo: res.emergencyInfo }
 	}
 
@@ -997,7 +1050,7 @@ export interface IConvertToLLMMessageService {
 	// can route the entry to the right thread file. `telemetryRequestId` in the
 	// result is the rid the caller must echo back to `IRequestTelemetryService.logResponse`
 	// so request and response lines can be paired during analysis.
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string, pendingImageBytes?: Map<string, Uint8Array> }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 	// Called by chat creation paths to snapshot runtime grounding (date, open files,
 	// active URI, directory listing, terminal IDs) into a user message at storage time.
@@ -1222,8 +1275,9 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 
 	// --- LLM Chat messages ---
 
-	private _chatMessagesToSimpleMessages(chatMessages: ChatMessage[]): SimpleLLMMessage[] {
+	private async _chatMessagesToSimpleMessages(chatMessages: ChatMessage[], opts?: { supportsVision?: boolean, pendingImageBytes?: Map<string, Uint8Array> }): Promise<SimpleLLMMessage[]> {
 		const simpleLLMMessages: SimpleLLMMessage[] = []
+		const attachImages = opts?.supportsVision === true
 
 		for (const m of chatMessages) {
 			if (m.role === 'checkpoint') continue
@@ -1256,9 +1310,33 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 				})
 			}
 			else if (m.role === 'user') {
+				const images: ImageAttachment[] = []
+				if (attachImages) {
+					const imageSelections = m.selections?.filter(s => s.type === 'Image') ?? []
+					for (const s of imageSelections) {
+						if (s.type !== 'Image') continue
+						try {
+							const pending = opts?.pendingImageBytes?.get(s.uri.path)
+							let bytes: Uint8Array
+							if (pending) {
+								bytes = pending
+							} else {
+								const content = await this.fileService.readFile(s.uri)
+								bytes = content.value.buffer
+							}
+							let binary = ''
+							for (let bi = 0; bi < bytes.length; bi++) binary += String.fromCharCode(bytes[bi])
+							const base64 = btoa(binary)
+							images.push({ base64, mimeType: s.mimeType })
+						} catch {
+							// image file may have been deleted; skip silently
+						}
+					}
+				}
 				simpleLLMMessages.push({
 					role: m.role,
 					content: m.content,
+					images: images.length > 0 ? images : undefined,
 				})
 			}
 		}
@@ -1277,7 +1355,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			supportsSystemMessage,
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
-		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection[featureName][modelSelection.providerName]?.[modelSelection.modelName]
+		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection[featureName]?.[modelSelection.providerName]?.[modelSelection.modelName]
 
 		// Get combined AI instructions
 		const aiInstructions = this._getCombinedAIInstructions();
@@ -1299,7 +1377,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		})
 		return { messages, separateSystemMessage };
 	}
-	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId }) => {
+	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId, pendingImageBytes }) => {
 		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined, compactionInfo: null, sentChars: 0 }
 
 		const { overridesOfModel } = this.voidSettingsService.state
@@ -1309,6 +1387,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			specialToolFormat,
 			contextWindow,
 			supportsSystemMessage,
+			supportsVision,
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
 		const { disableSystemMessage } = this.voidSettingsService.state.globalSettings;
@@ -1333,7 +1412,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// the stored content is passed through verbatim so each past turn is
 		// byte-identical to what was sent before, keeping the provider's prefix
 		// cache warm across turns.
-		const llmMessagesRaw = this._chatMessagesToSimpleMessages(chatMessages)
+		const llmMessagesRaw = await this._chatMessagesToSimpleMessages(chatMessages, { supportsVision, pendingImageBytes })
 		// Perf 2 — Light-tier history compaction. Trims bodies of old data-fetching
 		// tool results (read_file / grep / ls_dir / run_command / …) outside the
 		// protection zone (larger of "last 5 user turns" and "last 30 messages").

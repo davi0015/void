@@ -1194,6 +1194,59 @@ Separate scratch clone where an alternative `prompts.ts` was drafted against *up
 
 After each prompt phase, rerun the benchmark tasks (see Benchmark section) on Gemma 4 31B with fixed random seed / temperature settings, and record: task completion rate, hedge-word count in responses, tool-call efficiency (useful calls vs. retries), and cached-token ratio. Phase A should bump completion rate and drop hedge words. Phase B should bump cache ratio on long sessions. Phase C should drop terminal-tool usage for file ops. Phase D is subjective — judge by whether the plan UI actually helps you track progress.
 
+### Next — Image support in chat (design sketch)
+
+**Goal:** Let users paste/drag-drop images into the chatbox. If the primary model supports vision, send the image natively. If not, a configured "vision helper" model describes the image at send time, and the text description is included instead.
+
+**Step 1 (MVP): Native image upload for Gemma / Gemini** ✅ *Implemented*
+- Added `Image` type to `StagingSelectionItem` (disk-backed via URI, no inline base64 in DB):
+  ```
+  { type: 'Image'; uri: URI;
+    mimeType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
+    fileName: string; state: { wasAddedAsCurrentFile: false } }
+  ```
+- ✅ Paste (`onPaste`) and drag-drop (`onDrop`) handlers in `VoidChatArea` save image to disk (`voidImages/<uuid>.<ext>`) and create staging item.
+- ✅ Image chip in staging area with `ImageIcon`, filename label, and tooltip showing `fileName (mimeType)`.
+- ✅ `convertToLLMMessageService._chatMessagesToSimpleMessages` reads image files from disk and attaches `ImageAttachment[]` to user `SimpleLLMMessage`.
+- ✅ OpenAI-compat path: user messages with images emit structured `content: [{ type: 'text', text }, { type: 'image_url', image_url: { url: 'data:...' } }]`.
+- ✅ Gemini path: injects `{ inlineData: { mimeType, data } }` into user message parts after Anthropic→Gemini conversion.
+- ✅ `supportsVision?: boolean` added to `VoidStaticModelInfo`. Set `true` for all Gemini models, GPT-4o, GPT-4o-mini. Default `false`.
+- ✅ `messageOfSelection` returns `[Image attached: <fileName>]` for text-only fallback.
+- **Test:** Paste a screenshot into the chatbox with Gemma/Gemini selected → model should see and respond to the image content.
+
+**Step 2: Vision helper fallback** ✅ *Implemented*
+- ✅ Added `'VisionHelper'` to `featureNames` as a new feature slot with its own model dropdown in Settings.
+- ✅ `modelFilterOfFeatureName['VisionHelper']` filters to only show models with `supportsVision: true`.
+- ✅ Settings UI section under the SCM section with a `ModelDropdown` for selecting the helper model.
+- ✅ Vision helper prompt (`visionHelper_systemMessage`, `visionHelper_userMessage`) uses "visual assistant for another AI" framing.
+- ✅ At send time (`chatThreadService._addUserMessageAndStreamResponse`):
+  - Checks if any staged items are `Image` type.
+  - If primary Chat model supports vision → images go through natively (no change).
+  - If primary model does NOT support vision AND a VisionHelper model is configured:
+    - Fires a one-shot `sendLLMMessage` call per image with the image as a multimodal content part.
+    - Injects description into `ChatMessage.content` (LLM-facing) with delimited format:
+      `[Image: filename]\n--- start description ---\n<description>\n--- end description ---`
+    - `displayContent` stays as the user's original text — user sees the image thumbnail via selections.
+    - Description is persisted in `content` so it's not re-generated on subsequent turns.
+  - If no VisionHelper configured → placeholder text asking user to configure one.
+- **Latency:** The vision helper call happens at send time. Typically 1-3s for Gemini Flash.
+
+**Step 3: Polish**
+- ✅ Image preview in chat bubbles — 24x24 thumbnail with click-to-expand lightbox.
+- ✅ Multiple images per message — works out of the box via staging selections.
+- ✅ Compress/resize large images at paste time — Canvas API resizes to max 1024px on longest side, PNGs re-encoded as WebP, JPEG/WebP at 0.85 quality. GIFs skipped to preserve animation.
+- ✅ Images stored on disk with URI reference (not inline in DB). Deferred write: in-memory blob until send, then flushed to `voidImages/<uuid>.<ext>`.
+- ✅ Image lifecycle management — image files deleted when messages/threads are removed. Single `_deleteOrphanedImages` function handles all deletion paths (thread delete, edit, checkpoint restore). Uses retained-set comparison so shared images are never prematurely deleted.
+- ✅ Vision helper + native LLM read from memory first — both `_describeImagesWithHelper` and `_chatMessagesToSimpleMessages` check `pendingImageBytes` map before falling back to disk. Bytes flow from React layer → `addUserMessageAndStreamResponse` → thread-keyed map → `prepareLLMChatMessages`. Cleared after first agent-loop request.
+- ✅ Transactional image flush — disk write happens after message persist (inside `_addUserMessageAndStreamResponse`), not before. In-memory bytes are available for both vision helper and native LLM, so no dependency on disk write completing.
+- ✅ Per-image description caching — `cachedDescription` field on Image selection type. Descriptions travel with selections on edit (no regex parsing from content). Only new/replaced images need re-describing; unchanged images reuse their cached description.
+- ✅ Vision helper prompt with conversation context — user's current message is passed as a "context hint" so the helper prioritizes relevant parts of the image (e.g. error text when user says "fix this"). Explicit "do NOT answer" guard prevents the helper from trying to respond to the user's question.
+
+**Architecture notes:**
+- The `StagingSelectionItem` approach means images flow through the same staging → message pipeline as files and code selections. No new message types needed.
+- The vision helper is a separate, isolated LLM call — it doesn't share context with the main conversation. This keeps it simple but means it can't tailor descriptions to the conversation.
+- Token cost: a 512x512 image costs ~250-500 tokens as a vision input. A text description from the helper is typically 200-500 chars (~50-100 tokens). The helper approach is ~5x cheaper in subsequent turns since the description doesn't grow with re-reads.
+
 ### Backlog / Open ideas
 
 - **`read_file` contract clarity** — the tool description claims "Returns full contents of a given file" but actually paginates at `MAX_FILE_CHARS_PAGE`. Weak models distrust the "truncated" output and fall back to terminal `cat`. Fix: update description to "Returns contents of a file, paginated. If truncated, increment `page_number` to continue." and document `page_number` properly. User deprioritized this for now since most daily files fit in one page; revisit if cross-chunk reads start causing friction.
@@ -1204,6 +1257,7 @@ After each prompt phase, rerun the benchmark tasks (see Benchmark section) on Ge
 - **Endpoint profiles / capability bundles** — once we have 2+ per-provider default fields, replace the ad-hoc `default<Field>` slots with a single `endpointProfile: Partial<VoidStaticModelInfo>` slot, plus named bundles like `OAI_COMPAT_PROFILE`, `ANTHROPIC_PROFILE`, `GEMINI_PROFILE`. The profile captures "this kind of wire-protocol endpoint behaves this way" once and is reused across all providers that share it. Resolution chain becomes: `globalDefaults → endpointProfile → perProviderOverride → perModelEntry → regexFallback → userOverride`. Defer until we'd otherwise be repeating the same field across 3+ providers — until then YAGNI.
 - **Strip cross-provider `gemini-style` leak** — `extensiveModelOptionsFallback` returns `'gemini-style'` for Gemini-named models even when served via OAI-compat providers (vLLM, lmStudio, liteLLM, openAICompatible). Only `openRouter` overrides this. Fix: stop setting `specialToolFormat` in the regex fallback at all and let the provider's `defaultSpecialToolFormat` fill it in.
 - **Strip redundant per-model `specialToolFormat` declarations** — every recognized model currently restates the format that matches its provider's default. Pure cleanup, zero behavior change after the per-provider refactor.
+- **Refactor provider/model message conversion pipeline** — currently Gemini messages are built by first converting `SimpleLLMMessage → AnthropicLLMChatMessage` via `prepareOpenAIOrAnthropicMessages`, then `AnthropicLLMChatMessage → GeminiLLMChatMessage` via `prepareGeminiMessages`. This two-step chain drops custom fields (e.g. `images`) in the intermediate representation, forcing workarounds like the pre-collect/post-inject dance for image attachments. Refactor to give each provider its own direct `SimpleLLMMessage → ProviderMessage` converter, or carry a richer intermediate type that preserves all fields through the pipeline.
 - **`supportsTools: boolean` per model** — separates "does this model support tool calling" from "what format" so the rare model that genuinely can't call tools can be encoded explicitly instead of relying on `specialToolFormat: undefined` (which is now ambiguous).
 - **Audit `importantDetails` for unenforceable rules** — empirically observed during Phase A1+A2 baseline that capable models (e.g. MiniMax 2.5) ignore `Do NOT write tables` for tabular data. Likely cause: late position in a long numbered list. Two fixes worth considering: (a) reposition genuinely-important rules early in the list and demote optional style preferences to a separate "style preferences" block the model can break, (b) drop rules we don't actually enforce — every ignored rule teaches the model the system message isn't authoritative, weakening compliance on rules we *do* care about. Cheap pass, ~30 min, do as part of Option 2 prompt rewrite.
 - ~~**Surface `finish_reason` on OpenAI-compatible streams**~~ — promoted to Next → Quality 1 above.

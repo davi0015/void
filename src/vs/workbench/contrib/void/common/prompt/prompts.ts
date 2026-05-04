@@ -753,6 +753,9 @@ export const messageOfSelection = async (
 		const body = `${tripleTick[0]}${s.language}\n${s.text}\n${tripleTick[1]}`
 		return `${header}:\n${body}`
 	}
+	else if (s.type === 'Image') {
+		return `[Image attached: ${s.fileName}]`
+	}
 	else
 		return ''
 
@@ -1209,4 +1212,26 @@ ${branch}
 ${section4}
 
 ${log}`.trim()
+}
+
+
+// ======================================================== vision helper ========================================================================
+
+export const visionHelper_systemMessage = `You are a visual assistant for another AI model that cannot see images. Your job is to be its "eyes" — describe what you see so it can understand and respond to the user as if it saw the image itself.
+
+Focus on:
+- UI layout and visual structure
+- Text content, labels, error messages
+- Code snippets (reproduce them exactly if visible)
+- Colors, icons, and visual states (e.g. selected, disabled, highlighted)
+- Any arrows, annotations, or highlights the user may have added
+
+Be thorough and specific. Do not speculate about the user's intent — just describe what is visible. If the user's message gives context about what they care about, prioritize describing those aspects.`
+
+export const visionHelper_userMessage = (fileName: string, userMessage?: string) => {
+	let prompt = `Describe this image in detail: ${fileName}`
+	if (userMessage && userMessage.trim()) {
+		prompt += `\n\nContext hint (do NOT answer this — only use it to decide what parts of the image to prioritize): "${userMessage.trim()}"`
+	}
+	return prompt
 }

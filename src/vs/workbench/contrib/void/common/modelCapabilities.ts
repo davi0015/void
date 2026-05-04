@@ -169,6 +169,7 @@ export type VoidStaticModelInfo = { // not stateful
 	supportsSystemMessage: false | 'system-role' | 'developer-role' | 'separated'; // typically you should use 'system-role'. 'separated' means the system message is passed as a separate field (e.g. anthropic)
 	specialToolFormat?: 'openai-style' | 'anthropic-style' | 'gemini-style', // typically you should use 'openai-style'. null means "can't call tools by default", and asks the LLM to output XML in agent mode
 	supportsFIM: boolean; // whether the model was specifically designed for autocomplete or "FIM" ("fill-in-middle" format)
+	supportsVision?: boolean; // whether the model accepts image inputs (e.g. Gemini, GPT-4o, Claude)
 
 	additionalOpenAIPayload?: { [key: string]: string } // additional payload in the message body for requests that are openai-compatible (ollama, vllm, openai, openrouter, etc)
 
@@ -211,6 +212,7 @@ export const modelOverrideKeys = [
 	'supportsSystemMessage',
 	'specialToolFormat',
 	'supportsFIM',
+	'supportsVision',
 	'reasoningCapabilities',
 	'additionalOpenAIPayload'
 ] as const
@@ -256,6 +258,7 @@ const defaultModelOptions = {
 	downloadable: false,
 	supportsSystemMessage: false,
 	supportsFIM: false,
+	supportsVision: false,
 	reasoningCapabilities: false,
 } as const satisfies VoidStaticModelInfo
 
@@ -688,6 +691,7 @@ const openAIModelOptions = { // https://platform.openai.com/docs/pricing
 		supportsFIM: false,
 		specialToolFormat: 'openai-style',
 		supportsSystemMessage: 'system-role',
+		supportsVision: true,
 		reasoningCapabilities: false,
 	},
 	'o1-mini': {
@@ -707,6 +711,7 @@ const openAIModelOptions = { // https://platform.openai.com/docs/pricing
 		supportsFIM: false,
 		specialToolFormat: 'openai-style',
 		supportsSystemMessage: 'system-role', // ??
+		supportsVision: true,
 		reasoningCapabilities: false,
 	},
 } as const satisfies { [s: string]: VoidStaticModelInfo }
@@ -824,6 +829,7 @@ const geminiModelOptions = { // https://ai.google.dev/gemini-api/docs/pricing
 		supportsFIM: false,
 		supportsSystemMessage: 'separated',
 		specialToolFormat: 'gemini-style',
+		supportsVision: true,
 		reasoningCapabilities: {
 			supportsReasoning: true,
 			canTurnOffReasoning: true,
@@ -840,6 +846,7 @@ const geminiModelOptions = { // https://ai.google.dev/gemini-api/docs/pricing
 		supportsFIM: false,
 		supportsSystemMessage: 'separated',
 		specialToolFormat: 'gemini-style',
+		supportsVision: true,
 		reasoningCapabilities: false, // no reasoning
 	},
 	'gemini-2.5-flash-preview-04-17': {
@@ -850,6 +857,7 @@ const geminiModelOptions = { // https://ai.google.dev/gemini-api/docs/pricing
 		supportsFIM: false,
 		supportsSystemMessage: 'separated',
 		specialToolFormat: 'gemini-style',
+		supportsVision: true,
 		reasoningCapabilities: {
 			supportsReasoning: true,
 			canTurnOffReasoning: true,
@@ -866,6 +874,7 @@ const geminiModelOptions = { // https://ai.google.dev/gemini-api/docs/pricing
 		supportsFIM: false,
 		supportsSystemMessage: 'separated',
 		specialToolFormat: 'gemini-style',
+		supportsVision: true,
 		reasoningCapabilities: {
 			supportsReasoning: true,
 			canTurnOffReasoning: true,
@@ -882,6 +891,7 @@ const geminiModelOptions = { // https://ai.google.dev/gemini-api/docs/pricing
 		supportsFIM: false,
 		supportsSystemMessage: 'separated',
 		specialToolFormat: 'gemini-style',
+		supportsVision: true,
 		reasoningCapabilities: false,
 	},
 	'gemini-2.0-flash-lite-preview-02-05': {
@@ -892,6 +902,7 @@ const geminiModelOptions = { // https://ai.google.dev/gemini-api/docs/pricing
 		supportsFIM: false,
 		supportsSystemMessage: 'separated',
 		specialToolFormat: 'gemini-style',
+		supportsVision: true,
 		reasoningCapabilities: false,
 	},
 	'gemini-1.5-flash': {
@@ -902,6 +913,7 @@ const geminiModelOptions = { // https://ai.google.dev/gemini-api/docs/pricing
 		supportsFIM: false,
 		supportsSystemMessage: 'separated',
 		specialToolFormat: 'gemini-style',
+		supportsVision: true,
 		reasoningCapabilities: false,
 	},
 	'gemini-1.5-pro': {
@@ -912,6 +924,7 @@ const geminiModelOptions = { // https://ai.google.dev/gemini-api/docs/pricing
 		supportsFIM: false,
 		supportsSystemMessage: 'separated',
 		specialToolFormat: 'gemini-style',
+		supportsVision: true,
 		reasoningCapabilities: false,
 	},
 	'gemini-1.5-flash-8b': {
@@ -922,6 +935,7 @@ const geminiModelOptions = { // https://ai.google.dev/gemini-api/docs/pricing
 		supportsFIM: false,
 		supportsSystemMessage: 'separated',
 		specialToolFormat: 'gemini-style',
+		supportsVision: true,
 		reasoningCapabilities: false,
 	},
 } as const satisfies { [s: string]: VoidStaticModelInfo }

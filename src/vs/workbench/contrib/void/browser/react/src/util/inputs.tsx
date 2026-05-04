@@ -350,11 +350,12 @@ type InputBox2Props = {
 	className?: string;
 	onChangeText?: (value: string) => void;
 	onKeyDown?: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+	onPaste?: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
 	onFocus?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
 	onBlur?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
 	onChangeHeight?: (newHeight: number) => void;
 }
-export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(function X({ initValue, placeholder, multiline, enableAtToMention, fnsRef, className, onKeyDown, onFocus, onBlur, onChangeText }, ref) {
+export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(function X({ initValue, placeholder, multiline, enableAtToMention, fnsRef, className, onKeyDown, onPaste, onFocus, onBlur, onChangeText }, ref) {
 
 
 	// mirrors whatever is in ref
@@ -750,6 +751,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 
 			onFocus={onFocus}
 			onBlur={onBlur}
+			onPaste={onPaste}
 
 			disabled={!isEnabled}
 
@@ -2066,6 +2068,7 @@ const SingleDiffEditor = ({ block, lang }: { block: ExtractedSearchReplaceBlock,
 				modifiedModel.getLineCount() * 19
 			) + 19 * 2 + 1;
 
+			// Set reasonable min/max heights
 			const height = Math.min(Math.max(contentHeight, 100), 300);
 			if (divRef.current) {
 				divRef.current.style.height = `${height}px`;
@@ -2076,6 +2079,7 @@ const SingleDiffEditor = ({ block, lang }: { block: ExtractedSearchReplaceBlock,
 		updateHeight();
 		editorRef.current = editor;
 
+		// Update height when content changes
 		const disposable1 = originalModel.onDidChangeContent(() => updateHeight());
 		const disposable2 = modifiedModel.onDidChangeContent(() => updateHeight());
 
