@@ -196,11 +196,11 @@ export const builtinTools: {
 
 	read_file: {
 		name: 'read_file',
-		description: `Use this to read a file's contents when you need to inspect, quote, or reason about code. Returns the full contents of the file. Never use \`run_command\` with \`cat\` to read files — this tool is the correct choice.`,
+		description: `Use this to read a file's contents when you need to inspect, quote, or reason about code. For small files, returns the full contents. For large files called without \`start_line\`/\`end_line\`, returns a **symbol outline** with line ranges instead of the body — use those line numbers to call \`read_file\` again with \`start_line\`/\`end_line\` to read specific sections. Never use \`run_command\` with \`cat\` to read files — this tool is the correct choice.`,
 		params: {
 			...uriParam('file'),
-			start_line: { description: 'Optional. Do NOT fill this field in unless you were specifically given exact line numbers to search. Defaults to the beginning of the file.' },
-			end_line: { description: 'Optional. Do NOT fill this field in unless you were specifically given exact line numbers to search. Defaults to the end of the file.' },
+			start_line: { description: 'Optional. Line number to start reading from (1-indexed). When omitted on large files, an outline is returned instead — use the line numbers from the outline to make a targeted read.' },
+			end_line: { description: 'Optional. Line number to stop reading at (inclusive). Use together with \`start_line\` to read a specific section of a large file.' },
 			...paginationParam,
 		},
 	},
