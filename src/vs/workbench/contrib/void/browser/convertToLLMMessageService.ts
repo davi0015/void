@@ -1050,7 +1050,7 @@ export interface IConvertToLLMMessageService {
 	// can route the entry to the right thread file. `telemetryRequestId` in the
 	// result is the rid the caller must echo back to `IRequestTelemetryService.logResponse`
 	// so request and response lines can be paired during analysis.
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string, pendingImageBytes?: Map<string, Uint8Array> }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string, pendingImageBytes?: Map<string, Uint8Array>, frozenAiInstructions?: string }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 	// Called by chat creation paths to snapshot runtime grounding (date, open files,
 	// active URI, directory listing, terminal IDs) into a user message at storage time.
@@ -1075,6 +1075,11 @@ export interface IConvertToLLMMessageService {
 	// already receives current rules via the system message on every
 	// request — this getter exists purely to drive the UI affordance.
 	getCurrentVoidRulesContent(): Promise<string>
+
+	// Returns globalAIInstructions + .voidrules combined. Used by
+	// chatThreadService to freeze instructions on a thread's first send so
+	// subsequent turns reuse the same prefix (keeps provider cache warm).
+	getCombinedAIInstructionsAsync(): Promise<string>
 }
 
 export const IConvertToLLMMessageService = createDecorator<IConvertToLLMMessageService>('ConvertToLLMMessageService');
@@ -1165,7 +1170,8 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			try {
 				if (!(await this.fileService.exists(uri))) continue
 				const content = await this.fileService.readFile(uri)
-				parts.push(content.value.toString())
+				const text = content.value.toString()
+				parts.push(workspaceFolders.length > 1 ? `[Rules for ${folder.name}/]:\n${text}` : text)
 			} catch { /* unreadable — skip this folder */ }
 		}
 		const combined = parts.join('\n\n').trim()
@@ -1195,12 +1201,14 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	private _getVoidRulesFileContentsSync(): string {
 		try {
 			const workspaceFolders = this.workspaceContextService.getWorkspace().folders;
+			const multiRoot = workspaceFolders.length > 1
 			let voidRules = '';
 			for (const folder of workspaceFolders) {
 				const uri = URI.joinPath(folder.uri, '.voidrules')
 				const { model } = this.voidModelService.getModel(uri)
 				if (!model) continue
-				voidRules += model.getValue(EndOfLinePreference.LF) + '\n\n';
+				const text = model.getValue(EndOfLinePreference.LF)
+				voidRules += (multiRoot ? `[Rules for ${folder.name}/]:\n${text}` : text) + '\n\n';
 			}
 			return voidRules.trim();
 		}
@@ -1241,6 +1249,10 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	// LLM via the system message in `prepareLLMChatMessages` regardless.
 	getCurrentVoidRulesContent: IConvertToLLMMessageService['getCurrentVoidRulesContent'] = async () => {
 		return this._getVoidRulesFileContentsFromDisk();
+	}
+
+	getCombinedAIInstructionsAsync: IConvertToLLMMessageService['getCombinedAIInstructionsAsync'] = async () => {
+		return this._getCombinedAIInstructionsAsync();
 	}
 
 
@@ -1377,7 +1389,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		})
 		return { messages, separateSystemMessage };
 	}
-	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId, pendingImageBytes }) => {
+	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId, pendingImageBytes, frozenAiInstructions }) => {
 		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined, compactionInfo: null, sentChars: 0 }
 
 		const { overridesOfModel } = this.voidSettingsService.state
@@ -1396,9 +1408,11 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 
 		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
-		// Async path reads `.voidrules` fresh from disk — picks up edits
-		// mid-session on the very next user message, no Void restart needed.
-		const aiInstructions = await this._getCombinedAIInstructionsAsync();
+		// Use the thread's frozen rules snapshot when available (rules are
+		// frozen on first send so edits don't bust the prefix cache mid-thread).
+		// Falls back to a fresh disk read for the first send or when the caller
+		// doesn't provide a snapshot.
+		const aiInstructions = frozenAiInstructions ?? await this._getCombinedAIInstructionsAsync();
 		const isReasoningEnabled = getIsReasoningEnabledState('Chat', providerName, modelName, modelSelectionOptions, overridesOfModel)
 		const reservedOutputTokenSpace = getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
 		// Model-calibrated chars/token ratio for the active model. Shared across

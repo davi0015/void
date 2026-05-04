@@ -180,6 +180,13 @@ export type ThreadType = {
 	// doesn't flag, only subsequent sends can).
 	lastAppliedRules?: string;
 
+	// Full combined AI instructions (globalAIInstructions + .voidrules) frozen
+	// on the thread's first send. Passed to prepareLLMChatMessages on every
+	// subsequent request so the system-message prefix is byte-identical across
+	// turns, keeping the provider's prefix cache warm. Undefined before the
+	// first send (no baseline yet).
+	frozenAiInstructions?: string;
+
 	// ===== Workspace scoping (Phase E — workspace-scoped chats) =====
 	// Stable per-workspace identity captured at thread creation time. URI string
 	// of the folder (single-folder workspace) or `.code-workspace` file (multi-root).
@@ -1326,6 +1333,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._setState({ allThreads: newThreads })
 	}
 
+	private _setThreadFrozenAiInstructions(threadId: string, instructions: string) {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return
+
+		const updatedThread = { ...thread, frozenAiInstructions: instructions }
+		const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
+		this._storeThread(threadId, updatedThread)
+		this._setState({ allThreads: newThreads })
+	}
+
 	// Persists the given model selection on the thread so that a later
 	// `switchToThread` can restore the dropdown to whatever the user sent with.
 	// Writes through `_storeThread` to survive reloads. No state change
@@ -1903,6 +1920,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const lastUsage = this.latestUsageOfThreadId[threadId]
 			const priorContentTokens = lastUsage ? (lastUsage.inputTokens ?? 0) + (lastUsage.outputTokens ?? 0) : undefined
 			const pendingImageBytes = this._pendingImageBytesByThread.get(threadId)
+			const frozenAiInstructions = this.state.allThreads[threadId]?.frozenAiInstructions
 			const { messages, separateSystemMessage, compactionInfo, sentChars, telemetryRequestId } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages,
 				modelSelection,
@@ -1910,6 +1928,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				priorContentTokens,
 				threadId,
 				pendingImageBytes,
+				frozenAiInstructions,
 			})
 			// Images are only attached on the first user message of a turn;
 			// clear after the first prepare so subsequent tool-loop iterations
@@ -2555,6 +2574,16 @@ We only need to do it for files that were edited since `from`, ie files between 
 		// flag (no baseline to compare against).
 		const currentRulesContent = await this._convertToLLMMessagesService.getCurrentVoidRulesContent()
 		const rulesChangedBefore = thread.lastAppliedRules !== undefined && thread.lastAppliedRules !== currentRulesContent
+
+		// Freeze combined AI instructions on the thread's first send. Subsequent
+		// sends reuse this snapshot so the system-message prefix is byte-identical
+		// across turns, keeping the provider's prefix cache warm. If rules change
+		// on disk the user sees an indicator and can manually re-apply via
+		// `read_file .voidrules`.
+		if (thread.frozenAiInstructions === undefined) {
+			const combined = await this._convertToLLMMessagesService.getCombinedAIInstructionsAsync()
+			this._setThreadFrozenAiInstructions(threadId, combined)
+		}
 
 		// Add the user message immediately so the chat bubble appears right away.
 		// Content may be updated below if the vision helper needs to inject
