@@ -1000,7 +1000,7 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 ~~**E2 — `.cursor/rules` / `AGENTS.md` auto-loading**~~ **Reconsidered — redundant with `.voidrules`; pivoted to fixing `.voidrules` reliability + change-awareness instead.**
 - Original plan (watch `.cursor/rules/*.mdc`, parse frontmatter, mirror Cursor rule-selection semantics) was dropped after noticing Void already has `.voidrules` doing the exact same thing: workspace-root file → text → injected into the system prompt via `GUIDELINES (from the user's .voidrules file):\n{contents}` (see `prepareOpenAIOrAnthropicMessages` in `convertToLLMMessageService.ts`). Adding a second convention would just fragment the mental model. Frontmatter/glob-matching/selection semantics are a "nice-to-have" that can sit in E3's successor; daily-use pain was actually elsewhere.
 
-**E2' — `.voidrules` fix: always-fresh read + rule-change chip** ✅ DONE (user request pivot)
+**E2' — `.voidrules` fix: always-fresh read + rule-change chip** ✅ DONE (user request pivot) — **RECONSIDER: token cost**
 - *Pain observed*: edited `.voidrules`, sent a new chat, rules weren't applied. Neither new threads nor existing threads picked up edits until a full Void restart. No UI signal either way — silent.
 - *Root cause*: `_getVoidRulesFileContents()` read rules from a cached `ITextModel` populated once at startup (or on workspace folder change) by `convertToLLMMessageWorkbenchContrib.ts → voidModelService.initializeModel()`. Two failure modes: (1) if `.voidrules` didn't exist at launch, `createModelReference` threw `FileNotFound`, the silent `catch` in `initializeModel` swallowed it, the model reference was never registered, and no watcher re-tried if the file was created later — `getModel()` returned `null` forever that session; (2) even when the model did exist, in-memory `getValue()` wasn't reliably reflecting external disk edits in practice. Symptom: "I just modified the rule and opened a thread — new thread needs to read the rule, right?"
 - *Fix* (A + B):
@@ -1032,6 +1032,19 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
   - Cite line numbers when referring to existing code
   ```
 - Mental model: `.voidrules` is a *standing system-prompt addendum*, not a chat message. Phrase it as instructions to the model, not as a note to yourself.
+
+**E2' token cost concern — cache-busting on rule edit (post-ship observation)**
+- **Critical problem with current design**: `.voidrules` is embedded in the system message (the stable prefix). When the user edits `.voidrules` mid-session, the system message changes → `sysHash` flips → the **entire prefix cache is invalidated**. On a 200K-token conversation, a 2K-char rule edit causes the next request to pay for 200K+ uncached input tokens. The rules change is 2K; the cache miss cost is 200K. This is the wrong trade-off.
+- **Root cause**: rules are in the wrong layer. The system prompt prefix should be truly stable (persona, tool defs, mode instructions). Anything the user can edit mid-session should live *outside* the cached prefix so edits only cost their own size.
+- **Proposed fix (deferred)**: move `.voidrules` out of the system prompt. Inject rules as a **separate system message at the end of the message array**, just before the latest user message. Layout: `[system prompt (stable, cached)] [history (cached)] [system: voidrules] [user message]`. The rules message sits outside the prefix-cacheable region, so editing it never busts the history cache.
+  - **First message on a new thread**: auto-inject (no button needed, same UX as today).
+  - **Subsequent turns**: rules message persists in the array from when it was first injected. Not re-injected on every turn — it's part of the conversation history.
+  - **Rule change mid-session**: the existing rule-change chip becomes a clickable "Re-apply rules" button. Clicking it appends the updated rules as a new system message at the end. Old rules message stays in history (model sees both, latest wins by recency).
+  - **Provider compatibility**: OpenAI-compatible providers support multiple system messages in the array. For Anthropic/Gemini (single system field), fall back to appending as a user message with a `[System instructions updated]` wrapper, or concatenate into the volatile block.
+  - **Cache impact**: the stable prefix (`[system prompt]`) never changes on rule edits, so prefix cache stays warm. Only the trailing rules message + user message are uncached, which is their natural cost anyway.
+  - **Risk**: rules in the message array (not the system prefix) could be compacted away in very long sessions. Mitigation: mark the rules message as non-compactable, or re-inject on compaction.
+  - **Cache analysis**: on normal turns (no rule edit), token cost is identical either way — the rules message is part of the cached prefix whether it's in the system message or a separate message in the array. The win is purely on rule edits: current design busts the entire prefix cache (~200K tokens); proposed design only uncaches the new rules message (~2K tokens). The old rules_v1 stays in history and remains cached.
+  - **Priority**: medium. The cache-busting pathology only fires when the user edits `.voidrules` during an active long session. If rules are set once at project start and left alone, the current design is fine. Revisit if E4 telemetry shows `sysHash` flips correlated with rule edits.
 
 **E3 — Expanded `@`-mentions** (~1 day split across types)
 - Two new `StagingSelectionItem` variants: `'GitDiff'` (args: `{ ref?: string }`, defaults to `HEAD`) and `'Problems'` (current diagnostics, scoped by optional folder URI). Resolver produces text content at attach-time, injected into the user message as a code block with a `[git diff @HEAD]` or `[problems in <path>]` header.
@@ -1073,21 +1086,25 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - *Restart note*: full Void quit + relaunch required (new singleton + new constructor deps on two eager services).
 - *Next step after collecting a few sessions' worth of data*: eyeball `sysHash` stability and `cached` hit rate. If we see unexpected hash flips → hunt down the volatility source (probably something in `chat_systemMessage` / `chat_volatileContext` / rules injection that looks static but isn't). If `cached` is always 0 on providers that should populate it → audit the request path for header/whitespace drift. Either finding directly informs the next concrete token-reduction change.
 
-**E5 — Auto-outline `read_file` for large files** (next, ~1–2 days, highest-ROI single change)
-- *Driving observation*: comparison with Zed's agent (see "Reference — Zed agent comparison" below) showed they auto-substitute a tree-sitter symbol outline for `read_file` when the file body exceeds 16 KB. The tool description and result text both reinforce that the outline IS a successful response and the model should call `read_file` again with `start_line`/`end_line` from the outline to drill into a specific symbol. This attacks the "agent reads a whole 3,000-line file when it only needs one function" pathology directly via **behavior change** rather than via prompt rule. The biggest token-efficiency gap between Void and Zed comes from this single mechanism, not from prompt minimalism.
-- *Plan*: when `read_file` is called with no `start_line`/`end_line` AND the file body exceeds a tunable threshold, return a symbol outline (one line per top-level symbol with `[Lstart-end]` ranges + nested method/field rows) instead of the body. Wrap the response with explicit guidance: "SUCCESS: file outline retrieved. This file is too large to read in one call; use the line numbers below to read a specific symbol via `read_file` with `start_line`/`end_line`. **Do NOT retry without ranges — you will get the same outline.**" Mirror Zed's anti-loop framing word-for-word; eval evidence (Phase A4 + C6) is that anti-loop nudges in result text land where prompt-only bullets get drifted past.
-- *Implementation*:
-  - Reuse `ILanguageFeaturesService` already wired in `toolsService.ts` for E1 (`go_to_definition`/`go_to_usages`). Use `getDocumentSymbols` for the outline structure. No new service injection needed.
-  - Fallback when no symbol provider is registered for the file's language (markdown, plain text, lockfiles): return first ~1 KB of the file with a header noting "no outline available, file truncated to first N bytes — call again with `start_line`/`end_line` to read more." Matches Zed's `outline.rs:48-64` fallback shape.
-  - Add an optional `force_full: boolean` param (default false) so the agent has an escape hatch when it really does need the whole body — e.g. small generated config files that read as huge by char count but are essentially flat.
-  - Light telemetry hook: log `outlined: true/false` + `outlineLineCount` on each `read_file` invocation so post-ship analysis can answer "how often does the outline path fire, and does the agent successfully follow up with a ranged read in one turn?".
-- *Threshold tuning*: Zed uses 16,384 bytes (~4k tokens). For Void users on TypeScript-heavy codebases that's aggressive (every mid-sized service file would outline on first read; would inflate tool-call count if the agent then reads the body anyway). **Start at 30,000 bytes (~7.5k tokens)** and revisit based on E4 telemetry once we have data. The right threshold is the one where median next-action is a ranged read, not a `force_full` retry. If telemetry shows the model re-reads without ranges in agent mode > 30% of the time, threshold's too low — raise it.
-- *Adjacent prompt simplification (deferred to E6, NOT shipped with E5)*: with auto-outline doing the structural work, two A4 bullets ("don't re-read files you've already read this turn", "stop once you have enough context") become slightly less load-bearing. **Do NOT pre-emptively delete them in E5** — auto-outline handles structural over-reading, but those bullets also cover semantic over-iteration (running redundant verification, post-edit re-search). Measure first via E4 telemetry, prune in E6 only if data supports it.
-- *Risk and mitigation*:
-  - **Weak-model retry loops**: Gemma might ignore the outline and call `read_file` again without ranges. Mitigation: anti-loop wording in result text (Zed pattern); deterministic threshold so the response is predictable; `force_full` escape hatch is a single retry, not a 3-call dance.
-  - **Pagination interaction**: existing pagination at `MAX_FILE_CHARS_PAGE` (500_000 chars) is structurally orthogonal — outline runs first based on file size, pagination only kicks in if the model asks for ranges that exceed page bounds. Document this in the tool description; don't conflate the two truncation modes.
-  - **LSP-not-ready races**: monaco's symbol provider can be unready on first request after file open (E1 hit this). Use the same `getDocumentSymbols`-with-retry pattern E1 settled on; if symbols aren't available within a short timeout, fall back to the first-1KB path rather than blocking the tool call.
-- *Files*: `toolsService.ts` (extend `read_file` body to compute file size up-front, branch to outline path when over threshold and no range given; add `force_full` param wiring; new module-scope `_getFileOutline` helper), `prompts.ts` (`read_file` tool description rewrite to document the outline behavior + anti-loop guidance; add `force_full` param description), `SidebarChat.tsx` (renderer probably no change — outline returns as text; may want a visual hint that the result is structural rather than the body, low priority), optional small change to `toolsServiceTypes.ts` if `force_full` warrants schema explicitness.
+**E5 — Auto-outline `read_file` for large files** ✅ done (core logic shipped)
+- *Driving observation*: comparison with Zed's agent (see "Reference — Zed agent comparison" below) showed they auto-substitute a tree-sitter symbol outline for `read_file` when the file body exceeds 16 KB. This attacks the "agent reads a whole 3,000-line file when it only needs one function" pathology directly via **behavior change** rather than via prompt rule.
+- *What shipped*:
+  - `AUTO_OUTLINE_THRESHOLD = 30_000` chars in `prompts.ts`.
+  - `BuiltinToolResultType['read_file']` changed to a discriminated union (`outlined: true | false`) in `toolsServiceTypes.ts`.
+  - Three-tier fallback in `toolsService.ts`:
+    1. **LSP `DocumentSymbolProvider`** — hierarchical symbol outline with `[Lstart-end]` ranges via `renderSymbolOutline()`. Works for all languages with a registered provider (TypeScript, Python, C++, etc.).
+    2. **Markdown heading parse** — `renderMarkdownHeadingOutline()` scans for `#` headings with line ranges. Fires for `.md`/`.mdx` files when no LSP provider is available.
+    3. **1KB truncation fallback** — for files with neither LSP nor markdown headings (lockfiles, plain text, etc.), returns the first 1024 chars with a "no outline available" header.
+  - Anti-loop framing in `stringOfResult.read_file`: "Do NOT retry without line numbers — you will get the same outline."
+  - UI hint in `SidebarChat.tsx`: `(outline)` label on outlined results.
+  - `force_full` param was **dropped** — the agent's escape hatch is simply providing explicit `start_line`/`end_line`, which bypasses the outline path entirely.
+- *Measured results* (DeepSeek R1-0528-Qwen3-8B, pricing: input $0.14/M, output $0.28/M, cached $0.0028/M):
+  - Uncached tokens (the expensive input): **-27%** across a 2-question test (56.5k → 41.4k).
+  - Total tokens sent went up +55% (more round-trips), but mostly cached.
+  - Net input cost: **-22%** ($0.0082 → $0.0064). Savings compound on longer conversations since the outline (~2k chars) pollutes history far less than a full file dump (~170k chars).
+- *Still pending (follow-up commits)*:
+  - Rewrite `read_file` tool description in `prompts.ts` to document outline behavior to the model.
+  - Settings toggle to enable/disable auto-outline.
 
 **E6 — Selective prompt audit vs. Zed reference** (held — evidence-driven, post-E5 telemetry)
 - *Premise*: after E5 ships and we have ~1 week of E4 telemetry showing the new `read_file` distribution, audit whether any `importantDetails` bullets have become redundant with the new behavior. The Zed reference comparison gives candidate trims; E4 telemetry tells us which trims are safe vs. which would re-open known model regressions.
@@ -1103,9 +1120,9 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - *Out of scope*: deciding whether to merge `search_in_file` + `search_for_files` into a single `grep`-style tool (Zed's pattern). That's a tool-surface refactor with its own eval needs; track separately if the audit surfaces it as worthwhile.
 
 **Execution order & commit strategy**
-- E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E4 (per-request telemetry) ✅ done (own commit) — supersedes E3.
-- **Up next**: E5 (auto-outline `read_file`). One commit, ~1–2 days, plumbing is mostly E1's `ILanguageFeaturesService` injection; the substantive work is the outline rendering + tool description rewrite + threshold tuning.
-- **After E5**: 1-week dog-food window, then evaluate E4 telemetry data (resultLen distribution on `read_file`, follow-up-with-ranges hit rate, `force_full` invocation rate) before deciding whether E6 is worth doing.
+- E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E4 (per-request telemetry) ✅ done (own commit) — supersedes E3. E5 ✅ core logic shipped (own commit).
+- **Up next**: E5 follow-ups (tool description rewrite in `prompts.ts`, settings toggle). Then 1-week dog-food window.
+- **After E5 dog-food**: evaluate E4 telemetry data (resultLen distribution on `read_file`, follow-up-with-ranges hit rate) before deciding whether E6 is worth doing.
 - After each phase, dog-food with a one-day daily-use window before committing the next. If a phase's real-world impact is smaller than projected (or reveals a different problem), the later phases can be resequenced / dropped.
 - Phase D deferred below — no observed pain to justify it.
 - Phase F (indexing) held pending Phase E daily-use data.
@@ -1148,7 +1165,7 @@ Audited Zed's `crates/agent` (added to workspace as `Projects/zed`) against ours
 - **Mode-specific guidance** (agent / gather / normal) is a Void-only structural choice. Zed has one mode. Folding modes together is a separate decision with its own eval needs; not a Zed-comparison consequence.
 
 **What's actionable to borrow** (with concrete plan):
-- **Auto-outline `read_file`** — see E5 above. Highest-ROI single change. ~1–2 days. Builds on E1's `ILanguageFeaturesService` plumbing.
+- **Auto-outline `read_file`** — see E5 above. ✅ Shipped. Measured 22% input cost reduction, 27% uncached token reduction.
 - **Communication block compactness** — extract general tone rules into a brief leading section; modest token savings; held for E6.
 - **"Don't refetch context already in conversation" rule** — explicit in Zed, implicit in Void via A4. Worth lifting verbatim in E6.
 - **Diagnostics 2-attempts-then-defer rule** — pairs with `read_lint_errors`; addresses an under-covered failure mode (lint-fix loops on hard cases). E6 candidate.
@@ -1161,7 +1178,7 @@ Audited Zed's `crates/agent` (added to workspace as `Projects/zed`) against ours
 
 **Open evaluation questions (post-E5)**:
 - After E5 ships, does median `read_file` `resultLen` drop on E4 telemetry? Target: 30%+ reduction on files > threshold. If less, threshold's wrong or the agent isn't following up with ranged reads.
-- Does the agent successfully follow an outline result with a ranged read in **the next turn** (no wasted retries, no `force_full` invocations)? Watch for model × model variance: MiniMax/Claude likely yes, Gemma/Nemotron may need stronger anti-loop wording in the result text.
+- Does the agent successfully follow an outline result with a ranged read in **the next turn** (no wasted retries, no full-file re-reads)? Watch for model × model variance: MiniMax/Claude likely yes, Gemma/Nemotron may need stronger anti-loop wording in the result text.
 - Does outline-mode adoption let us safely trim any A4 bullets in E6, or do they continue to land on semantic over-iteration (running redundant verification, post-edit re-search) that auto-outline doesn't address?
 
 ### Reference — side experiment in `/Users/david.halim/Documents/Projects/test/void` (not committed, not decided)

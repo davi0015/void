@@ -460,6 +460,7 @@ export type GlobalSettings = {
 	isOnboardingComplete: boolean;
 	disableSystemMessage: boolean;
 	autoAcceptLLMChanges: boolean;
+	autoOutlineReadFile: boolean;
 }
 
 export const defaultGlobalSettings: GlobalSettings = {
@@ -476,6 +477,7 @@ export const defaultGlobalSettings: GlobalSettings = {
 	isOnboardingComplete: false,
 	disableSystemMessage: false,
 	autoAcceptLLMChanges: false,
+	autoOutlineReadFile: true,
 }
 
 export type GlobalSettingName = keyof GlobalSettings

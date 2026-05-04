@@ -19,7 +19,8 @@ import { computeDirectoryTree1Deep, IDirectoryStrService, stringifyDirectoryTree
 import { IMarkerService, MarkerSeverity } from '../../../../platform/markers/common/markers.js'
 import { timeout } from '../../../../base/common/async.js'
 import { RawToolParamsObj } from '../common/sendLLMMessageTypes.js'
-import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js'
+import { AUTO_OUTLINE_THRESHOLD, MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js'
+import { DocumentSymbol, SymbolKind } from '../../../../editor/common/languages.js'
 import { IVoidSettingsService } from '../common/voidSettingsService.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
 
@@ -187,6 +188,100 @@ const resolveSymbolPosition = (model: ITextModel, symbolName: string, lineHint: 
 		if (m) return { line: lineHint, column: m.index + 1 }
 	}
 	return findFirstSymbolOccurrence(model, symbolName)
+}
+
+const symbolKindLabel: Record<number, string> = {
+	[SymbolKind.File]: 'file',
+	[SymbolKind.Module]: 'module',
+	[SymbolKind.Namespace]: 'namespace',
+	[SymbolKind.Package]: 'package',
+	[SymbolKind.Class]: 'class',
+	[SymbolKind.Method]: 'method',
+	[SymbolKind.Property]: 'property',
+	[SymbolKind.Field]: 'field',
+	[SymbolKind.Constructor]: 'constructor',
+	[SymbolKind.Enum]: 'enum',
+	[SymbolKind.Interface]: 'interface',
+	[SymbolKind.Function]: 'function',
+	[SymbolKind.Variable]: 'variable',
+	[SymbolKind.Constant]: 'constant',
+	[SymbolKind.String]: 'string',
+	[SymbolKind.Number]: 'number',
+	[SymbolKind.Boolean]: 'boolean',
+	[SymbolKind.Array]: 'array',
+	[SymbolKind.Object]: 'object',
+	[SymbolKind.Key]: 'key',
+	[SymbolKind.Null]: 'null',
+	[SymbolKind.EnumMember]: 'enum-member',
+	[SymbolKind.Struct]: 'struct',
+	[SymbolKind.Event]: 'event',
+	[SymbolKind.Operator]: 'operator',
+	[SymbolKind.TypeParameter]: 'type-param',
+}
+
+function renderSymbolOutline(symbols: DocumentSymbol[], depth: number = 0): string {
+	const lines: string[] = []
+	for (const sym of symbols) {
+		const indent = '  '.repeat(depth)
+		const kind = symbolKindLabel[sym.kind] ?? 'symbol'
+		const startLine = sym.range.startLineNumber
+		const endLine = sym.range.endLineNumber
+		const range = startLine === endLine ? `[L${startLine}]` : `[L${startLine}-${endLine}]`
+		lines.push(`${indent}${kind} ${sym.name} ${range}`)
+		if (sym.children && sym.children.length > 0) {
+			lines.push(renderSymbolOutline(sym.children, depth + 1))
+		}
+	}
+	return lines.join('\n')
+}
+
+function renderMarkdownHeadingOutline(content: string): string | null {
+	const lines = content.split('\n')
+	const headings: { level: number; text: string; line: number }[] = []
+	for (let i = 0; i < lines.length; i++) {
+		const match = lines[i].match(/^(#{1,6})\s+(.+)/)
+		if (match) {
+			headings.push({ level: match[1].length, text: match[2].trim(), line: i + 1 })
+		}
+	}
+	if (headings.length === 0) return null
+
+	const result: string[] = []
+	for (let i = 0; i < headings.length; i++) {
+		const h = headings[i]
+		const nextLine = i + 1 < headings.length ? headings[i + 1].line - 1 : lines.length
+		const indent = '  '.repeat(h.level - 1)
+		const range = h.line === nextLine ? `[L${h.line}]` : `[L${h.line}-${nextLine}]`
+		result.push(`${indent}${h.text} ${range}`)
+	}
+	return result.join('\n')
+}
+
+async function getFileOutline(
+	model: ITextModel,
+	languageFeaturesService: ILanguageFeaturesService,
+	uri: URI,
+): Promise<string | null> {
+	const providers = languageFeaturesService.documentSymbolProvider.ordered(model)
+	if (providers.length > 0) {
+		try {
+			const symbols = await providers[0].provideDocumentSymbols(model, CancellationToken.None)
+			if (symbols && symbols.length > 0) {
+				return renderSymbolOutline(symbols)
+			}
+		} catch {
+			// provider failed, fall through
+		}
+	}
+
+	// Markdown heading fallback
+	if (uri.path.endsWith('.md') || uri.path.endsWith('.mdx')) {
+		const content = model.getValue(EndOfLinePreference.LF)
+		const headingOutline = renderMarkdownHeadingOutline(content)
+		if (headingOutline) return headingOutline
+	}
+
+	return null
 }
 
 export interface IToolsService {
@@ -394,6 +489,22 @@ export class ToolsService implements IToolsService {
 				const { model } = await voidModelService.getModelSafe(uri)
 				if (model === null) { throw new Error(`No contents; File does not exist.`) }
 
+				const totalNumLines = model.getLineCount()
+
+				if (startLine === null && endLine === null && pageNumber === 1 && this.voidSettingsService.state.globalSettings.autoOutlineReadFile) {
+					const fullContent = model.getValue(EndOfLinePreference.LF)
+					if (fullContent.length > AUTO_OUTLINE_THRESHOLD) {
+						const outlineText = await getFileOutline(model, languageFeaturesService, uri)
+						if (outlineText !== null) {
+							return { result: { outlined: true as const, outlineText, totalFileLen: fullContent.length, totalNumLines } }
+						}
+						// No outline available — return first ~1KB as fallback
+						const truncated = fullContent.slice(0, 1024)
+						const fallbackText = `(No symbol outline available for this file type. Showing first ~1KB.)\n\n${truncated}`
+						return { result: { outlined: true as const, outlineText: fallbackText, totalFileLen: fullContent.length, totalNumLines } }
+					}
+				}
+
 				let contents: string
 				if (startLine === null && endLine === null) {
 					contents = model.getValue(EndOfLinePreference.LF)
@@ -404,14 +515,12 @@ export class ToolsService implements IToolsService {
 					contents = model.getValueInRange({ startLineNumber, startColumn: 1, endLineNumber, endColumn: Number.MAX_SAFE_INTEGER }, EndOfLinePreference.LF)
 				}
 
-				const totalNumLines = model.getLineCount()
-
 				const fromIdx = MAX_FILE_CHARS_PAGE * (pageNumber - 1)
 				const toIdx = MAX_FILE_CHARS_PAGE * pageNumber - 1
 				const fileContents = contents.slice(fromIdx, toIdx + 1) // paginate
 				const hasNextPage = (contents.length - 1) - toIdx >= 1
 				const totalFileLen = contents.length
-				return { result: { fileContents, totalFileLen, hasNextPage, totalNumLines } }
+				return { result: { outlined: false as const, fileContents, totalFileLen, hasNextPage, totalNumLines } }
 			},
 
 			ls_dir: async ({ uri, pageNumber }) => {
@@ -678,6 +787,9 @@ export class ToolsService implements IToolsService {
 		// given to the LLM after the call for successful tool calls
 		this.stringOfResult = {
 			read_file: (params, result) => {
+				if (result.outlined) {
+					return `SUCCESS: File outline retrieved for ${params.uri.fsPath} (${result.totalNumLines} lines, ${result.totalFileLen} characters).\nThis file is too large to read all at once. The outline below shows the file's structure with line numbers.\n\nIMPORTANT: Do NOT retry this call without line numbers — you will get the same outline.\nUse start_line and end_line to read specific sections.\n\n${result.outlineText}\n\nNEXT STEPS: To read a specific section, call read_file with the same path plus start_line and end_line from the outline above.`
+				}
 				const fence = safeFence(result.fileContents)
 				return `${params.uri.fsPath}\n${fence}\n${result.fileContents}\n${fence}${nextPageStr(result.hasNextPage)}${result.hasNextPage ? `\nMore info because truncated: this file has ${result.totalNumLines} lines, or ${result.totalFileLen} characters.` : ''}`
 			},
