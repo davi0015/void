@@ -985,7 +985,7 @@ Asked "what brings Void to the next level?" → audited the codebase to separate
 - **Codebase indexing / semantic search** — zero matches for `embedding` / `vector` / `semantic search` outside of code-sample string literals. No embedding pipeline, no vector store, no `semantic_search` tool. This is the single biggest capability gap vs. Cursor — every "agent made wrong lexical query → got nothing → retried with different keywords" symptom in our eval logs traces back here.
 - **`.cursor/rules` / `AGENTS.md` auto-loading** — no matches for `.cursor/rules`, `.cursorrules`, `AGENTS.md`, or `.mdc` parsing in the Void codebase. Per-project conventions have to be pasted into chat manually each time. The prompt-injection plumbing (`chat_systemMessage` composition) already exists in `prompts.ts` — the missing piece is just the file watcher + parser + frontmatter matcher.
 - **`@`-mention variety** — only `File` / `Folder` / `CodeSelection` in `StagingSelectionItem`. Missing: `@git-diff`, `@recent-changes` (modified since last commit), `@problems` (current diagnostics), `@terminal`, `@pr`, `@web`, `@docs`, `@codebase`. Each missing type is a workflow where the user pastes context manually today.
-- **LSP navigation tools (`go_to_definition`, `go_to_usages`)** — stubbed as TODO comments on lines 342–343 of `prompts.ts` (`// go_to_definition` / `// go_to_usages`). The monaco LSP APIs needed are already available — this was scoped and abandoned. Would cut the agent's dependency on `search_in_file` for "where is X defined / used" queries (currently a big token sink).
+- ~~**LSP navigation tools (`go_to_definition`, `go_to_usages`)**~~ ✅ DONE — fully implemented in `prompts.ts` (tool definitions + descriptions) and `toolsService.ts` (execution). Tested across MiniMax (ideal 1-call flow), Gemma (ignored LSP, used read_file), Nemotron (grep-party, never reached for LSP). Base-model capability issue for weaker models, not a prompt issue. See "Prompt Phase C6+C7" section for details.
 - **Web / doc fetch tool** — no `web_search`, no `fetch_web`, no URL fetcher. MCP covers this if you install a server; nothing built-in.
 - **Image input in chat** — no evidence in the chat flow. Not verified exhaustively but nothing surfaced in the audit.
 
@@ -1117,9 +1117,30 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - *Hard guardrail*: do NOT strip Phase A1+A2 / A3+A4 / Phase C bullets without a re-run of the benchmark Tasks 0/1/3/5 on Gemma 4 / MiniMax / Nemotron. Each one was measured into existence; removing them blind is a regression risk. The Zed reference is for *additions and replacements*, not for greenfield rewriting.
 - *Out of scope*: deciding whether to merge `search_in_file` + `search_for_files` into a single `grep`-style tool (Zed's pattern). That's a tool-surface refactor with its own eval needs; track separately if the audit surfaces it as worthwhile.
 
+**E7 — `fetch_url` built-in tool** (planned)
+- *Pain*: user pastes a link to docs / GitHub issue / API reference in chat, agent can't access it. Every competing IDE agent has this; Void forces the user to copy-paste content manually.
+- *Design*: new built-in tool in `prompts.ts` + `toolsService.ts`. Agent calls `fetch_url({ url })` when it needs web content. Runs HTTP GET in electron main process (unrestricted network), converts HTML to readable text (strip tags / extract article body), truncates to a sane limit (~30k chars, same as `AUTO_OUTLINE_THRESHOLD`). Returns plain text to the model.
+- *Scope*: tool definition, implementation, result formatting. No auto-fetch on paste (user explicitly asks or agent decides). No search engine integration (that's MCP territory).
+- *Complexity*: Low. Self-contained addition, no existing code modified beyond tool registration.
+- *Priority*: **1st** — fastest to ship, highest immediate utility, zero risk to existing code.
+
+**E8 — Search in chat** (planned)
+- *Pain*: long threads have no way to find specific content. User has to scroll manually. Ctrl+F in the IDE searches the editor, not the chat panel.
+- *Design*: search bar overlay (Ctrl+F or a search icon in the chat header). Matches against `displayContent` of all messages in the current thread. Highlights matches, arrow keys / Enter to navigate between them, scroll-to-match. Simple substring or case-insensitive text matching (no regex needed).
+- *Dependency*: easier to implement before E9 (viewport rendering), since all messages are currently in the DOM and can be searched/highlighted directly.
+- *Complexity*: Medium.
+- *Priority*: **2nd** — do before virtualization while all messages are in the DOM.
+
+**E9 — Viewport-based rendering (virtualized scroll)** (planned)
+- *Pain*: long threads (100+ messages with code blocks, diffs, tool results) slow down rendering. All messages are in the DOM even when off-screen.
+- *Design*: only render messages near the current scroll position. Variable-height items (code blocks, tool results, diffs) make this harder than fixed-row virtualization. Needs: height estimation/caching per message, windowed rendering in `ThreadMessagesView`, preserve scroll-to-bottom behavior for streaming, checkpoint navigation must scroll-to + mount the target message.
+- *Interaction with E8*: search needs to be able to scroll to and mount messages that are outside the current viewport window.
+- *Complexity*: High. Touches `ThreadMessagesView`, `ScrollToBottomContainer`, checkpoint nav, message focus/edit, streaming display.
+- *Priority*: **3rd** — biggest refactor, benefits from E8 already working. Only worth it if long-thread performance is a real pain point.
+
 **Execution order & commit strategy**
 - E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E2' cache-busting fix (freeze-on-first-send + indicator) ✅ done. E4 (per-request telemetry) ✅ done (own commit) — supersedes E3. E5 ✅ core logic shipped (own commit).
-- **Up next**: E5 dog-food (1 week), then E6 evaluation.
+- **Up next**: E7 (fetch_url) → E8 (search in chat) → E9 (viewport rendering). E5 dog-food continues passively. E6 evaluation after E5 data.
 - **After E5 dog-food**: evaluate E4 telemetry data (resultLen distribution on `read_file`, follow-up-with-ranges hit rate) before deciding whether E6 is worth doing.
 - After each phase, dog-food with a one-day daily-use window before committing the next. If a phase's real-world impact is smaller than projected (or reveals a different problem), the later phases can be resequenced / dropped.
 - Phase D deferred below — no observed pain to justify it.
