@@ -2694,7 +2694,9 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			if (toolMessage.type === 'success') {
 				const { result } = toolMessage
 				componentParams.onClick = () => { voidOpenFileFn(params.uri, accessor, range) }
-				if (result.hasNextPage && params.pageNumber === 1)  // first page
+				if (result.outlined) {
+					componentParams.desc2 = '(outline)'
+				} else if (result.hasNextPage && params.pageNumber === 1)  // first page
 					componentParams.desc2 = `(truncated after ${Math.round(MAX_FILE_CHARS_PAGE) / 1000}k)`
 				else if (params.pageNumber > 1) // subsequent pages
 					componentParams.desc2 = `(part ${params.pageNumber})`

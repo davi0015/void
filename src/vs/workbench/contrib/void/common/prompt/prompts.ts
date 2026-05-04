@@ -24,6 +24,7 @@ export const MAX_DIRSTR_RESULTS_TOTAL_TOOL = 100
 // tool info
 export const MAX_FILE_CHARS_PAGE = 500_000
 export const MAX_CHILDREN_URIs_PAGE = 500
+export const AUTO_OUTLINE_THRESHOLD = 30_000 // chars; files larger than this get a symbol outline instead of full content
 
 // terminal tool info
 export const MAX_TERMINAL_CHARS = 100_000
