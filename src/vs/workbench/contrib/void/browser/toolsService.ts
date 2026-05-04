@@ -23,6 +23,7 @@ import { AUTO_OUTLINE_THRESHOLD, MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MA
 import { DocumentSymbol, SymbolKind } from '../../../../editor/common/languages.js'
 import { IVoidSettingsService } from '../common/voidSettingsService.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
+import { IFetchUrlService } from '../common/fetchUrlService.js'
 
 
 // tool use for AI
@@ -314,6 +315,7 @@ export class ToolsService implements IToolsService {
 		@IMarkerService private readonly markerService: IMarkerService,
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
 		@ILanguageFeaturesService languageFeaturesService: ILanguageFeaturesService,
+		@IFetchUrlService private readonly fetchUrlService: IFetchUrlService,
 	) {
 		const queryBuilder = instantiationService.createInstance(QueryBuilder);
 
@@ -478,6 +480,15 @@ export class ToolsService implements IToolsService {
 				const { persistent_terminal_id: terminalIdUnknown } = params;
 				const persistentTerminalId = validateProposedTerminalId(terminalIdUnknown);
 				return { persistentTerminalId };
+			},
+
+			fetch_url: (params: RawToolParamsObj) => {
+				const { url: urlUnknown } = params;
+				const url = validateStr('url', urlUnknown);
+				if (!/^https?:\/\//i.test(url)) {
+					throw new Error(`Invalid URL: "${url}". URL must start with http:// or https://.`);
+				}
+				return { url };
 			},
 
 		}
@@ -772,6 +783,11 @@ export class ToolsService implements IToolsService {
 				await this.terminalToolService.killPersistentTerminal(persistentTerminalId)
 				return { result: {} }
 			},
+
+			fetch_url: async ({ url }) => {
+				const result = await this.fetchUrlService.fetchUrl(url);
+				return { result };
+			},
 		}
 
 
@@ -905,6 +921,10 @@ export class ToolsService implements IToolsService {
 			},
 			kill_persistent_terminal: (params, _result) => {
 				return `Successfully closed terminal "${params.persistentTerminalId}".`;
+			},
+
+			fetch_url: (_params, result) => {
+				return `# ${result.title}\n\nSource: ${result.url}\n\n${result.content}`;
 			},
 		}
 
