@@ -1619,6 +1619,18 @@ export const Settings = () => {
 														<span className='text-void-fg-3 text-xs pointer-events-none'>Auto-accept LLM changes</span>
 													</div>
 												</ErrorBoundary>
+
+												{/* Auto-outline read_file Switch */}
+												<ErrorBoundary>
+													<div className='flex items-center gap-x-2 my-2'>
+														<VoidSwitch
+															size='xs'
+															value={settingsState.globalSettings.autoOutlineReadFile}
+															onChange={(newVal) => voidSettingsService.setGlobalSetting('autoOutlineReadFile', newVal)}
+														/>
+														<span className='text-void-fg-3 text-xs pointer-events-none'>Auto-outline large files</span>
+													</div>
+												</ErrorBoundary>
 											</div>
 										</div>
 

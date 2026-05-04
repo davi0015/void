@@ -491,9 +491,7 @@ export class ToolsService implements IToolsService {
 
 				const totalNumLines = model.getLineCount()
 
-				// Auto-outline: when reading a full file that exceeds the threshold,
-				// return a symbol outline instead of the raw body.
-				if (startLine === null && endLine === null && pageNumber === 1) {
+				if (startLine === null && endLine === null && pageNumber === 1 && this.voidSettingsService.state.globalSettings.autoOutlineReadFile) {
 					const fullContent = model.getValue(EndOfLinePreference.LF)
 					if (fullContent.length > AUTO_OUTLINE_THRESHOLD) {
 						const outlineText = await getFileOutline(model, languageFeaturesService, uri)
