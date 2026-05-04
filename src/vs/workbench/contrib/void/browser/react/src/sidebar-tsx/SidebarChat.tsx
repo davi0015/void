@@ -8,8 +8,6 @@ import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, K
 
 import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useFullChatThreadsStreamState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction } from '../util/services.js';
 
-import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
-
 import { ChatMarkdownRender, ChatMessageLocation } from '../markdown/ChatMarkdownRender.js';
 import { URI } from '../../../../../../../base/common/uri.js';
 import { IDisposable } from '../../../../../../../base/common/lifecycle.js';
@@ -33,6 +31,7 @@ import { IconShell1, StatusIndicator } from '../markdown/ApplyBlockHoverButtons.
 import { IsRunningType, isThreadReadOnly, shouldShowOwnershipBanner } from '../../../chatThreadService.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
 import { isABuiltinToolName, MAX_TERMINAL_INACTIVE_TIME } from '../../../../common/prompt/prompts.js';
+import { getBasename, getFolderName, getRelative, voidOpenFileFn, IconLoading, SmallProseWrapper } from './sidebarChatHelpers.js';
 import { type LLMUsage, RawToolCallObj } from '../../../../common/sendLLMMessageTypes.js';
 import ErrorBoundary from './ErrorBoundary.js';
 import {
@@ -133,32 +132,7 @@ export const IconWarning = ({ size, className = '' }: { size: number, className?
 };
 
 
-export const IconLoading = ({ className = '' }: { className?: string }) => {
-
-	const [loadingText, setLoadingText] = useState('.');
-
-	useEffect(() => {
-		let intervalId;
-
-		// Function to handle the animation
-		const toggleLoadingText = () => {
-			if (loadingText === '...') {
-				setLoadingText('.');
-			} else {
-				setLoadingText(loadingText + '.');
-			}
-		};
-
-		// Start the animation loop
-		intervalId = setInterval(toggleLoadingText, 300);
-
-		// Cleanup function to clear the interval when component unmounts
-		return () => clearInterval(intervalId);
-	}, [loadingText, setLoadingText]);
-
-	return <div className={`${className}`}>{loadingText}</div>;
-
-}
+export { IconLoading } from './sidebarChatHelpers.js';
 
 
 
@@ -970,84 +944,11 @@ const ScrollToBottomContainer = ({ children, className, style, scrollContainerRe
 	);
 };
 
-export const getRelative = (uri: URI, accessor: ReturnType<typeof useAccessor>) => {
-	const workspaceContextService = accessor.get('IWorkspaceContextService')
-	let path: string
-	const isInside = workspaceContextService.isInsideWorkspace(uri)
-	if (isInside) {
-		const f = workspaceContextService.getWorkspace().folders.find(f => uri.fsPath?.startsWith(f.uri.fsPath))
-		if (f) { path = uri.fsPath.replace(f.uri.fsPath, '') }
-		else { path = uri.fsPath }
-	}
-	else {
-		path = uri.fsPath
-	}
-	return path || undefined
-}
-
-export const getFolderName = (pathStr: string) => {
-	// 'unixify' path
-	pathStr = pathStr.replace(/[/\\]+/g, '/') // replace any / or \ or \\ with /
-	const parts = pathStr.split('/') // split on /
-	// Filter out empty parts (the last element will be empty if path ends with /)
-	const nonEmptyParts = parts.filter(part => part.length > 0)
-	if (nonEmptyParts.length === 0) return '/' // Root directory
-	if (nonEmptyParts.length === 1) return nonEmptyParts[0] + '/' // Only one folder
-	// Get the last two parts
-	const lastTwo = nonEmptyParts.slice(-2)
-	return lastTwo.join('/') + '/'
-}
-
-export const getBasename = (pathStr: string, parts: number = 1) => {
-	// 'unixify' path
-	pathStr = pathStr.replace(/[/\\]+/g, '/') // replace any / or \ or \\ with /
-	const allParts = pathStr.split('/') // split on /
-	if (allParts.length === 0) return pathStr
-	return allParts.slice(-parts).join('/')
-}
+export { getRelative, getFolderName, getBasename } from './sidebarChatHelpers.js';
 
 
 
-// Open file utility function
-export const voidOpenFileFn = (
-	uri: URI,
-	accessor: ReturnType<typeof useAccessor>,
-	range?: [number, number]
-) => {
-	const commandService = accessor.get('ICommandService')
-	const editorService = accessor.get('ICodeEditorService')
-
-	// Get editor selection from CodeSelection range
-	let editorSelection = undefined;
-
-	// If we have a selection, create an editor selection from the range
-	if (range) {
-		editorSelection = {
-			startLineNumber: range[0],
-			startColumn: 1,
-			endLineNumber: range[1],
-			endColumn: Number.MAX_SAFE_INTEGER,
-		};
-	}
-
-	// open the file
-	commandService.executeCommand('vscode.open', uri).then(() => {
-
-		// select the text
-		setTimeout(() => {
-			if (!editorSelection) return;
-
-			const editor = editorService.getActiveCodeEditor()
-			if (!editor) return;
-
-			editor.setSelection(editorSelection)
-			editor.revealRange(editorSelection, ScrollType.Immediate)
-
-		}, 50) // needed when document was just opened and needs to initialize
-
-	})
-
-};
+export { voidOpenFileFn } from './sidebarChatHelpers.js';
 
 
 const ImageThumbnail = ({ uri, mimeType, fileName, onRemove }: { uri: URI, mimeType: string, fileName: string, onRemove?: () => void }) => {
@@ -1613,67 +1514,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 
 }
 
-export const SmallProseWrapper = ({ children }: { children: React.ReactNode }) => {
-	return <div className='
-text-void-fg-4
-prose
-prose-sm
-break-words
-max-w-none
-leading-snug
-text-[13px]
-
-[&>:first-child]:!mt-0
-[&>:last-child]:!mb-0
-
-prose-h1:text-[14px]
-prose-h1:my-4
-
-prose-h2:text-[13px]
-prose-h2:my-4
-
-prose-h3:text-[13px]
-prose-h3:my-3
-
-prose-h4:text-[13px]
-prose-h4:my-2
-
-prose-p:my-2
-prose-p:leading-snug
-prose-hr:my-2
-
-prose-ul:my-2
-prose-ul:pl-4
-prose-ul:list-outside
-prose-ul:list-disc
-prose-ul:leading-snug
-
-
-prose-ol:my-2
-prose-ol:pl-4
-prose-ol:list-outside
-prose-ol:list-decimal
-prose-ol:leading-snug
-
-marker:text-inherit
-
-prose-blockquote:pl-2
-prose-blockquote:my-2
-
-prose-code:text-void-fg-3
-prose-code:text-[12px]
-prose-code:before:content-none
-prose-code:after:content-none
-
-prose-pre:text-[12px]
-prose-pre:p-2
-prose-pre:my-2
-
-prose-table:text-[13px]
-'>
-		{children}
-	</div>
-}
+export { SmallProseWrapper } from './sidebarChatHelpers.js';
 
 // Main assistant-message wrapper. Mirrors SmallProseWrapper's tightening pass:
 // explicit body size, capped heading sizes (only ~1px above body so `**bold**`
@@ -2588,8 +2429,10 @@ const useRulesOutdated = (threadId: string, lastAppliedRules: string | undefined
 	const convertToLLMMessageService = accessor.get('IConvertToLLMMessageService')
 
 	const [outdatedInfo, setOutdatedInfo] = useState<{ isOutdated: boolean; detectedAt: Date | null }>({ isOutdated: false, detectedAt: null })
+	const isFirstCheckRef = useRef(true)
 
 	useEffect(() => {
+		isFirstCheckRef.current = true
 		if (lastAppliedRules === undefined) {
 			setOutdatedInfo({ isOutdated: false, detectedAt: null })
 			return
@@ -2602,8 +2445,10 @@ const useRulesOutdated = (threadId: string, lastAppliedRules: string | undefined
 				const current = await convertToLLMMessageService.getCurrentVoidRulesContent()
 				if (cancelled) return
 				const isOutdated = current !== lastAppliedRules
+				const firstCheck = isFirstCheckRef.current
+				isFirstCheckRef.current = false
 				setOutdatedInfo(prev => {
-					if (isOutdated && !prev.isOutdated) return { isOutdated: true, detectedAt: new Date() }
+					if (isOutdated && !prev.isOutdated) return { isOutdated: true, detectedAt: firstCheck ? null : new Date() }
 					if (!isOutdated && prev.isOutdated) return { isOutdated: false, detectedAt: null }
 					return prev
 				})
@@ -2618,8 +2463,8 @@ const useRulesOutdated = (threadId: string, lastAppliedRules: string | undefined
 	return outdatedInfo
 }
 
-const RulesOutdatedBanner = ({ detectedAt }: { detectedAt: Date }) => {
-	const timeStr = detectedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+const RulesOutdatedBanner = ({ detectedAt }: { detectedAt: Date | null }) => {
+	const timeStr = detectedAt ? detectedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : null
 	return (
 		<div
 			className='flex items-center gap-1.5 text-xs text-yellow-600 dark:text-yellow-400 bg-yellow-500/10 px-3 py-1.5 mx-2 mb-1 rounded select-none'
@@ -2628,7 +2473,7 @@ const RulesOutdatedBanner = ({ detectedAt }: { detectedAt: Date }) => {
 			data-tooltip-place='bottom'
 		>
 			<FileWarning size={13} className='shrink-0' />
-			<span>.voidrules changed on disk (at {timeStr})</span>
+			<span>.voidrules changed on disk{timeStr ? ` (at ${timeStr})` : ''}</span>
 		</div>
 	)
 }
@@ -3028,7 +2873,7 @@ export const SidebarChat = () => {
 		<ErrorBoundary>
 			{messagesHTML}
 		</ErrorBoundary>
-		{rulesOutdated.isOutdated && rulesOutdated.detectedAt && (
+		{rulesOutdated.isOutdated && (
 			<RulesOutdatedBanner detectedAt={rulesOutdated.detectedAt} />
 		)}
 		<ErrorBoundary>

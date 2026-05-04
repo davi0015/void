@@ -97,6 +97,8 @@ export type BuiltinToolCallParams = {
 	'open_persistent_terminal': { cwd: string | null },
 	'run_persistent_command': { command: string; persistentTerminalId: string },
 	'kill_persistent_terminal': { persistentTerminalId: string },
+	// --- web ---
+	'fetch_url': { url: string },
 }
 
 // RESULT OF TOOL CALL
@@ -121,6 +123,8 @@ export type BuiltinToolResultType = {
 	'run_persistent_command': { result: string; resolveReason: TerminalResolveReason; },
 	'open_persistent_terminal': { persistentTerminalId: string },
 	'kill_persistent_terminal': {},
+	// --- web ---
+	'fetch_url': { title: string, content: string, url: string },
 }
 
 

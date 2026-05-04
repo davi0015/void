@@ -1117,12 +1117,21 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - *Hard guardrail*: do NOT strip Phase A1+A2 / A3+A4 / Phase C bullets without a re-run of the benchmark Tasks 0/1/3/5 on Gemma 4 / MiniMax / Nemotron. Each one was measured into existence; removing them blind is a regression risk. The Zed reference is for *additions and replacements*, not for greenfield rewriting.
 - *Out of scope*: deciding whether to merge `search_in_file` + `search_for_files` into a single `grep`-style tool (Zed's pattern). That's a tool-surface refactor with its own eval needs; track separately if the audit surfaces it as worthwhile.
 
-**E7 — `fetch_url` built-in tool** (planned)
-- *Pain*: user pastes a link to docs / GitHub issue / API reference in chat, agent can't access it. Every competing IDE agent has this; Void forces the user to copy-paste content manually.
-- *Design*: new built-in tool in `prompts.ts` + `toolsService.ts`. Agent calls `fetch_url({ url })` when it needs web content. Runs HTTP GET in electron main process (unrestricted network), converts HTML to readable text (strip tags / extract article body), truncates to a sane limit (~30k chars, same as `AUTO_OUTLINE_THRESHOLD`). Returns plain text to the model.
-- *Scope*: tool definition, implementation, result formatting. No auto-fetch on paste (user explicitly asks or agent decides). No search engine integration (that's MCP territory).
-- *Complexity*: Low. Self-contained addition, no existing code modified beyond tool registration.
-- *Priority*: **1st** — fastest to ship, highest immediate utility, zero risk to existing code.
+**E7 — `fetch_url` built-in tool** ✅ DONE
+- *Pain*: user pastes a link to docs / GitHub issue / API reference in chat, agent can't access it.
+- *Implementation*: new built-in tool `fetch_url({ url })`. Agent calls it when it needs web content.
+  - **IPC channel** (`fetchUrlChannel.ts`): runs in Electron main process (unrestricted network). HTTP fetch with 15s timeout, `User-Agent` header, redirect following.
+  - **HTML → Markdown pipeline**: `linkedom` (DOM parser) → `@mozilla/readability` (article extraction) → `turndown` (HTML-to-Markdown). Strips nav/ads/footer, keeps article body. 30k char limit.
+  - **Non-HTML fallback**: JSON/plain text returned as-is (truncated to limit).
+  - **Browser-side service** (`fetchUrlService.ts`): `IFetchUrlService` proxies calls to main process via `void-channel-fetchUrl`.
+  - **Tool registration**: `prompts.ts` (definition), `toolsServiceTypes.ts` (params/result types), `toolsService.ts` (validate/call/stringify).
+  - **UI component** (`ToolResultComponents.tsx`): shows page title, URL (clickable), and a 500-char Markdown preview of the fetched content.
+  - **Read-only**: no approval needed, available in both `gather` and `agent` modes.
+- *Refactoring side-effects*:
+  - Extracted shared helpers (`IconLoading`, `getRelative`, `getFolderName`, `getBasename`, `voidOpenFileFn`, `SmallProseWrapper`) from `SidebarChat.tsx` into `sidebarChatHelpers.tsx` to break a circular dependency between `SidebarChat.tsx` ↔ `ToolResultComponents.tsx`.
+  - Fixed `.voidrules` banner showing a misleading timestamp on refresh (now omits time for pre-existing mismatches, only shows time when the change is detected during the session).
+- *Tested*: GitHub issue page — Readability correctly extracted issue body, stripped GitHub chrome (nav, sidebar, footer). ~3-4k tokens of noise removed.
+- *Future refinement*: GitHub issue comments may be missed by Readability (it treats the issue body as the "article"). Could add domain-specific fallback for `github.com` URLs to capture comments. Not needed for v1 — covers docs, blog posts, API refs, and issue bodies well.
 
 **E8 — Search in chat** (planned)
 - *Pain*: long threads have no way to find specific content. User has to scroll manually. Ctrl+F in the IDE searches the editor, not the chat panel.
@@ -1140,7 +1149,7 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 
 **Execution order & commit strategy**
 - E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E2' cache-busting fix (freeze-on-first-send + indicator) ✅ done. E4 (per-request telemetry) ✅ done (own commit) — supersedes E3. E5 ✅ core logic shipped (own commit).
-- **Up next**: E7 (fetch_url) → E8 (search in chat) → E9 (viewport rendering). E5 dog-food continues passively. E6 evaluation after E5 data.
+- **Up next**: E8 (search in chat) → E9 (viewport rendering). E5 dog-food continues passively. E6 evaluation after E5 data. E7 ✅ shipped.
 - **After E5 dog-food**: evaluate E4 telemetry data (resultLen distribution on `read_file`, follow-up-with-ranges hit rate) before deciding whether E6 is worth doing.
 - After each phase, dog-food with a one-day daily-use window before committing the next. If a phase's real-world impact is smaller than projected (or reveals a different problem), the later phases can be resequenced / dropped.
 - Phase D deferred below — no observed pain to justify it.

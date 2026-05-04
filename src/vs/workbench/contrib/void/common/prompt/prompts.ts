@@ -358,7 +358,17 @@ export const builtinTools: {
 		name: 'kill_persistent_terminal',
 		description: `Interrupts and closes a persistent terminal that you opened with open_persistent_terminal.`,
 		params: { persistent_terminal_id: { description: `The ID of the persistent terminal.` } }
-	}
+	},
+
+	// --- web ---
+
+	fetch_url: {
+		name: 'fetch_url',
+		description: `Use this to fetch the content of a web page. The URL must be a fully-qualified HTTP or HTTPS URL. Returns the page content as readable Markdown text (article body extracted, navigation/ads stripped). Use when the user shares a link (docs, issue tracker, API reference, blog post, etc.) and you need to read its content. Do NOT use this for local files — use \`read_file\` instead.`,
+		params: {
+			url: { description: `The fully-qualified URL to fetch (must start with \`http://\` or \`https://\`).` },
+		},
+	},
 
 } satisfies { [T in keyof BuiltinToolResultType]: InternalToolInfo }
 

@@ -26,7 +26,7 @@ import {
 	voidOpenFileFn,
 	IconLoading,
 	SmallProseWrapper,
-} from './SidebarChat.js';
+} from './sidebarChatHelpers.js';
 
 
 
@@ -316,6 +316,7 @@ export const titleOfBuiltinToolName = {
 	'search_in_file': { done: 'Searched in file', proposed: 'Search in file', running: loadingTitleWrapper('Searching in file') },
 	'go_to_definition': { done: 'Found definition', proposed: 'Go to definition', running: loadingTitleWrapper('Finding definition') },
 	'go_to_usages': { done: 'Found usages', proposed: 'Go to usages', running: loadingTitleWrapper('Finding usages') },
+	'fetch_url': { done: 'Fetched URL', proposed: 'Fetch URL', running: loadingTitleWrapper('Fetching URL') },
 } as const satisfies Record<BuiltinToolName, { done: any, proposed: any, running: any }>
 
 
@@ -484,6 +485,17 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 				desc1: `"${toolParams.symbolName}"`,
 				desc1Info: toolParams.line !== null ? `${filePart}:${toolParams.line}` : filePart,
 			}
+		},
+		'fetch_url': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['fetch_url']
+			let display: string
+			try {
+				const u = new URL(toolParams.url)
+				display = u.hostname + (u.pathname !== '/' ? u.pathname : '')
+			} catch {
+				display = toolParams.url
+			}
+			return { desc1: display }
 		},
 		'go_to_usages': () => {
 			const toolParams = _toolParams as BuiltinToolCallParams['go_to_usages']
@@ -1447,6 +1459,52 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 				const { persistentTerminalId } = params
 				componentParams.desc1 = persistentTerminalNameOfId(persistentTerminalId)
 				componentParams.onClick = () => terminalToolsService.focusPersistentTerminal(persistentTerminalId)
+			}
+			else if (toolMessage.type === 'tool_error') {
+				const { result } = toolMessage
+				componentParams.bottomChildren = <BottomChildren title='Error'>
+					<CodeChildren>
+						{result}
+					</CodeChildren>
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		},
+	},
+	'fetch_url': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const title = getTitle(toolMessage)
+			const icon = null
+
+			if (toolMessage.type === 'tool_request') return null
+			if (toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
+
+			const isError = false
+			const isRejected = toolMessage.type === 'rejected'
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (toolMessage.type === 'success') {
+				const { result } = toolMessage
+				const pageTitle = result.title || result.url
+				componentParams.desc1 = pageTitle
+				componentParams.desc1Info = result.url
+				componentParams.desc1OnClick = () => {
+					window.open(result.url, '_blank')
+				}
+				const previewLen = 500
+				const preview = result.content.length > previewLen
+					? result.content.substring(0, previewLen) + '...'
+					: result.content
+				componentParams.bottomChildren = <BottomChildren title='Content preview'>
+					<SmallProseWrapper>
+						<ChatMarkdownRender string={preview} chatMessageLocation={undefined} isApplyEnabled={false} />
+					</SmallProseWrapper>
+				</BottomChildren>
 			}
 			else if (toolMessage.type === 'tool_error') {
 				const { result } = toolMessage
