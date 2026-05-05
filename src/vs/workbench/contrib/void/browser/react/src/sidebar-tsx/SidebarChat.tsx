@@ -1297,6 +1297,8 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 	const [isFocused, setIsFocused] = useState(false)
 	const [isHovered, setIsHovered] = useState(false)
 	const [isDisabled, setIsDisabled] = useState(false)
+	const bubbleRef = useRef<HTMLDivElement>(null)
+	const [isTruncated, setIsTruncated] = useState(false)
 	const [textAreaRefState, setTextAreaRef] = useState<HTMLTextAreaElement | null>(null)
 	const textAreaFnsRef = useRef<TextAreaFns | null>(null)
 	// initialize on first render, and when edit was just enabled
@@ -1323,6 +1325,13 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 		}
 
 	}, [chatMessage, mode, _justEnabledEdit, textAreaRefState, textAreaFnsRef.current, _justEnabledEdit.current, _mustInitialize.current])
+
+	useLayoutEffect(() => {
+		const el = bubbleRef.current
+		if (el && mode === 'display') {
+			setIsTruncated(el.scrollHeight > el.clientHeight + 1)
+		}
+	}, [mode, chatMessage.displayContent])
 
 	const onOpenEdit = () => {
 		setIsBeingEdited(true)
@@ -1472,15 +1481,21 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 			onMouseLeave={() => setIsHovered(false)}
 		>
 		<div
-			// style chatbubble according to role
+			ref={bubbleRef}
 			className={`
             text-left rounded-lg max-w-full
             ${mode === 'edit' ? ''
-					: mode === 'display' ? `p-2 flex flex-col bg-void-bg-1 text-void-fg-1 overflow-x-auto` : ''
+					: mode === 'display' ? `relative p-2 flex flex-col bg-void-bg-1 text-void-fg-1 overflow-x-auto max-h-[4.5em] overflow-y-hidden` : ''
 				}
         `}
 		>
 			{chatbubbleContents}
+			{mode === 'display' && isTruncated && (
+				<div
+					className="absolute bottom-0 left-0 right-0 h-[1.5em] pointer-events-none rounded-b-lg"
+					style={{ background: 'linear-gradient(to bottom, transparent, var(--void-bg-1))' }}
+				/>
+			)}
 		</div>
 
 
