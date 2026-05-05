@@ -1140,16 +1140,27 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - *Complexity*: Medium.
 - *Priority*: **2nd** — do before virtualization while all messages are in the DOM.
 
-**E9 — Viewport-based rendering (virtualized scroll)** (planned)
+**E9 — Viewport-based rendering (virtualized scroll)** ✅ DONE
 - *Pain*: long threads (100+ messages with code blocks, diffs, tool results) slow down rendering. All messages are in the DOM even when off-screen.
-- *Design*: only render messages near the current scroll position. Variable-height items (code blocks, tool results, diffs) make this harder than fixed-row virtualization. Needs: height estimation/caching per message, windowed rendering in `ThreadMessagesView`, preserve scroll-to-bottom behavior for streaming, checkpoint navigation must scroll-to + mount the target message.
+- *Design*: lazy mount/unmount from the top — start with the newest message, adaptively fill the viewport (3× `VIEWPORT_FILL_FACTOR`), then expand/trim on scroll. `mountStart` state controls first mounted index; `previousMessages.slice(mountStart)` renders only the visible+buffered range. Scroll down to newest is always fast (few DOM nodes); scroll up loads history on demand.
+- *Final approach — `flex-col` + wrapper-spacer + ResizeObserver*: messages render inside a wrapper `spacerRef` div with `overflow: hidden` and height controlled via direct DOM manipulation. Three complementary layers handle scroll stability:
+  1. **`useLayoutEffect` sync** — fires synchronously on `mountStart`/`totalCount` changes. On expand (delta > 0): grow wrapper first, then `scrollTop += delta`. On trim (delta < 0): `scrollTop += delta` first, then shrink wrapper. This ordering prevents the browser from clamping `scrollTop`.
+  2. **`ResizeObserver` on `contentRef`** — catches content height changes outside of expand/trim (e.g., `LazyBlockCode` placeholder → Monaco swap). Syncs wrapper height and compensates `scrollTop` immediately. Skips `scrollTop` compensation when panel width changed (reflow from resize should not shift the viewport). Uses a `mountChangeRef` flag to avoid double-adjustment with the `useLayoutEffect`.
+  3. **`LazyBlockCode` height-lock** — minimizes the delta at source. Captures the placeholder's `offsetHeight` before the swap, locks the wrapper's `height`, clears via `onReady` callback after Monaco's first `resize()`.
+- *Approach explored & reverted — `flex-direction: column-reverse`*: puts `scrollTop=0` at the bottom (newest). Old messages live at the far end of the scroll range — adding/removing them doesn't affect `scrollTop` (zero manual scroll compensation). Proved via logging that `scrollDelta=0` on every expand — the approach is correct. However, **column-reverse anchors at the bottom**: when the user scrolls far up and resizes the window, the shift is much larger than with a top-anchored layout. Normal `flex-col` (top-anchored) is closer to the viewport when scrolled up, so resize shifts are small. Reverted in favor of wrapper-spacer approach.
 - *Interaction with E8*: search needs to be able to scroll to and mount messages that are outside the current viewport window.
-- *Complexity*: High. Touches `ThreadMessagesView`, `ScrollToBottomContainer`, checkpoint nav, message focus/edit, streaming display.
-- *Priority*: **3rd** — biggest refactor, benefits from E8 already working. Only worth it if long-thread performance is a real pain point.
+- *Files*: `SidebarChat.tsx` (wrapper-spacer virtualization, `useLayoutEffect` sync, `ResizeObserver`, scroll handler), `inputs.tsx` (`LazyBlockCode` height-lock fix, `BlockCode` `onReady` callback).
+
+**E10 — Sticky question header** ✅ DONE
+- *Pain*: in long conversations, after scrolling down into the response, the user loses sight of which question the assistant is answering. They have to scroll back up to re-read the question.
+- *Design*: a sticky overlay that pins the last user message that scrolled above the viewport top. Uses direct DOM manipulation (no React re-renders on scroll). Detects user messages via `data-user-msg-idx` attribute and `getBoundingClientRect()`. Triggers as soon as the message's top edge crosses the viewport top (`rect.top < containerTop`) so the transition is seamless — no gap where the message disappears before the sticky appears.
+- *Push effect*: when the next user message approaches the top, the sticky header's `maxHeight` shrinks so it clips from the bottom, creating a "push up and out" animation.
+- *Trimmed messages*: messages virtualized out of the DOM (`mountStart > 0`) are checked via `previousMessagesRef` to ensure the sticky still shows the correct question even when the original element is unmounted.
+- *Files*: `SidebarChat.tsx` (`updateStickyQuestion` callback, `stickyHeaderRef`/`stickyTextRef` refs, scroll handler integration, absolute overlay in JSX).
 
 **Execution order & commit strategy**
 - E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E2' cache-busting fix (freeze-on-first-send + indicator) ✅ done. E4 (per-request telemetry) ✅ done (own commit) — supersedes E3. E5 ✅ core logic shipped (own commit).
-- **Up next**: E8 (search in chat) → E9 (viewport rendering). E5 dog-food continues passively. E6 evaluation after E5 data. E7 ✅ shipped.
+- E9 ✅ done (viewport rendering + code block height fix). **Up next**: E8 (search in chat). E5 dog-food continues passively. E6 evaluation after E5 data. E7 ✅ shipped.
 - **After E5 dog-food**: evaluate E4 telemetry data (resultLen distribution on `read_file`, follow-up-with-ranges hit rate) before deciding whether E6 is worth doing.
 - After each phase, dog-food with a one-day daily-use window before committing the next. If a phase's real-world impact is smaller than projected (or reveals a different problem), the later phases can be resequenced / dropped.
 - Phase D deferred below — no observed pain to justify it.

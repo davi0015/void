@@ -3,7 +3,9 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
+
 
 
 import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useFullChatThreadsStreamState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction } from '../util/services.js';
@@ -1295,6 +1297,8 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 	const [isFocused, setIsFocused] = useState(false)
 	const [isHovered, setIsHovered] = useState(false)
 	const [isDisabled, setIsDisabled] = useState(false)
+	const bubbleRef = useRef<HTMLDivElement>(null)
+	const [isTruncated, setIsTruncated] = useState(false)
 	const [textAreaRefState, setTextAreaRef] = useState<HTMLTextAreaElement | null>(null)
 	const textAreaFnsRef = useRef<TextAreaFns | null>(null)
 	// initialize on first render, and when edit was just enabled
@@ -1322,17 +1326,41 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 
 	}, [chatMessage, mode, _justEnabledEdit, textAreaRefState, textAreaFnsRef.current, _justEnabledEdit.current, _mustInitialize.current])
 
+	useLayoutEffect(() => {
+		const el = bubbleRef.current
+		if (el && mode === 'display') {
+			setIsTruncated(el.scrollHeight > el.clientHeight + 1)
+		}
+	}, [mode, chatMessage.displayContent])
+
+	// Suppress ResizeObserver scrollTop compensation during edit mode transitions.
+	// Double-rAF: ResizeObserver fires between the 1st rAF and paint, so a single
+	// rAF would clear the flag too early. The 2nd rAF runs after the observer has
+	// processed the resize, making it safe to remove the suppression.
+	const suppressScrollCompensation = useCallback(() => {
+		const container = bubbleRef.current?.closest('[data-virtualized-content]')
+		if (container) {
+			container.setAttribute('data-suppress-scroll', '1')
+			requestAnimationFrame(() => {
+				requestAnimationFrame(() => {
+					container.removeAttribute('data-suppress-scroll')
+				})
+			})
+		}
+	}, [])
+
 	const onOpenEdit = () => {
+		suppressScrollCompensation()
 		setIsBeingEdited(true)
 		chatThreadsService.setCurrentlyFocusedMessageIdx(messageIdx)
 		_justEnabledEdit.current = true
 	}
 	const onCloseEdit = () => {
+		suppressScrollCompensation()
 		setIsFocused(false)
 		setIsHovered(false)
 		setIsBeingEdited(false)
 		chatThreadsService.setCurrentlyFocusedMessageIdx(undefined)
-
 	}
 
 	const EditSymbol = mode === 'display' ? Pencil : X
@@ -1457,7 +1485,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 			</div>
 		}
 		<div
-			// align chatbubble accoridng to role
+			data-user-msg-idx={messageIdx}
 			className={`
         relative ml-auto
         ${mode === 'edit' ? 'w-full max-w-full'
@@ -1470,15 +1498,21 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 			onMouseLeave={() => setIsHovered(false)}
 		>
 		<div
-			// style chatbubble according to role
+			ref={bubbleRef}
 			className={`
             text-left rounded-lg max-w-full
             ${mode === 'edit' ? ''
-					: mode === 'display' ? `p-2 flex flex-col bg-void-bg-1 text-void-fg-1 overflow-x-auto` : ''
+					: mode === 'display' ? `relative p-2 flex flex-col bg-void-bg-1 text-void-fg-1 overflow-x-auto max-h-[4.5em] overflow-y-hidden` : ''
 				}
         `}
 		>
 			{chatbubbleContents}
+			{mode === 'display' && isTruncated && (
+				<div
+					className="absolute bottom-0 left-0 right-0 h-[1.5em] pointer-events-none rounded-b-lg"
+					style={{ background: 'linear-gradient(to bottom, transparent, var(--void-bg-1))' }}
+				/>
+			)}
 		</div>
 
 
@@ -2227,6 +2261,9 @@ const EditToolSoFar = ({ toolCallSoFar, }: { toolCallSoFar: RawToolCallObj }) =>
 // Each instance owns its own scroll container ref and subscribes to its own stream
 // state, so a background thread can keep streaming while the user is looking at a
 // different one.
+
+const VIEWPORT_FILL_FACTOR = 3
+
 const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef }: {
 	threadId: string
 	isActive: boolean
@@ -2287,17 +2324,295 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 
 	const scrollToBottomCb = useCallback(() => scrollToBottom(scrollContainerRef), [scrollContainerRef])
 
-	// Incremental JSX cache: when only messages are appended (the common case
-	// at stream end), reuse the existing JSX elements and only createElement
-	// for the new ones. A full rebuild (452 createElement + React reconciliation)
-	// is O(N); the incremental path is O(delta).
-	const prevMsgCacheRef = useRef<{ html: React.ReactNode[], len: number, msgs: typeof previousMessages, threadId: string, checkpointIdx: typeof currCheckpointIdx, scrollCb: typeof scrollToBottomCb, pendingIdx: typeof firstPendingToolRequestIdx, readOnly: boolean } | null>(null)
+	// --- E9: Wrapper-spacer virtualization ---
+	// Messages render inside a wrapper div (spacerRef) whose height is
+	// controlled via direct DOM manipulation. When mountStart changes,
+	// useLayoutEffect measures the new content height and adjusts both
+	// the wrapper height and scrollTop in the correct order to prevent
+	// the browser from clamping scrollTop during the transition.
+	const totalCount = previousMessages.length
+	const [mountStart, setMountStart] = useState(Math.max(0, totalCount - 1))
+
+	const mountStartRef = useRef(mountStart)
+	mountStartRef.current = mountStart
+	const totalCountRef = useRef(totalCount)
+	totalCountRef.current = totalCount
+
+	const spacerRef = useRef<HTMLDivElement | null>(null)
+	const contentRef = useRef<HTMLDivElement | null>(null)
+	const spacerHeightRef = useRef(0)
+	const lastScrollTopRef = useRef(0)
+
+	const getContentHeight = useCallback(() => {
+		return contentRef.current?.offsetHeight ?? 0
+	}, [])
+
+	const getAvgHeight = useCallback(() => {
+		const contentH = getContentHeight()
+		const mounted = totalCountRef.current - mountStartRef.current
+		return mounted > 0 && contentH > 0 ? contentH / mounted : 200
+	}, [getContentHeight])
+
+	const msgsForPx = useCallback((px: number) => {
+		const avg = getAvgHeight()
+		return Math.max(1, Math.ceil(px / avg))
+	}, [getAvgHeight])
+
+	// Adaptive initial mount: start with 1, measure, fill viewport.
+	const initialFillDoneRef = useRef(false)
+	useLayoutEffect(() => {
+		if (initialFillDoneRef.current) return
+		const scrollEl = scrollContainerRef.current
+		if (!scrollEl || !isActive) return
+		if (scrollEl.clientHeight === 0) return
+		const target = scrollEl.clientHeight * VIEWPORT_FILL_FACTOR
+		const contentH = getContentHeight()
+		if (contentH >= target || mountStart === 0) {
+			initialFillDoneRef.current = true
+			spacerHeightRef.current = contentH
+			if (spacerRef.current) spacerRef.current.style.height = contentH + 'px'
+			return
+		}
+		const deficit = target - contentH
+		const needed = msgsForPx(deficit)
+		setMountStart(prev => Math.max(0, prev - needed))
+	}, [mountStart, totalCount, isActive, scrollContainerRef, msgsForPx, getContentHeight])
+
+	// Sync wrapper height + scrollTop after expand/trim.
+	// Expand (delta > 0): grow wrapper first, then adjust scrollTop.
+	// Trim (delta < 0): adjust scrollTop first, then shrink wrapper.
+	// This ordering prevents the browser from clamping scrollTop.
+	const prevMountStartRef = useRef(mountStart)
+	useLayoutEffect(() => {
+		if (!initialFillDoneRef.current) return
+		const scrollEl = scrollContainerRef.current
+		const spacerEl = spacerRef.current
+		if (!scrollEl || !spacerEl) return
+
+		const contentH = getContentHeight()
+		const oldH = spacerHeightRef.current
+		const delta = contentH - oldH
+		const mountStartChanged = mountStart !== prevMountStartRef.current
+		prevMountStartRef.current = mountStart
+
+		if (Math.abs(delta) < 1) return
+
+		spacerHeightRef.current = contentH
+		mountChangeRef.current = true
+
+		if (mountStartChanged) {
+			if (delta > 0) {
+				spacerEl.style.height = contentH + 'px'
+				scrollEl.scrollTop += delta
+			} else {
+				scrollEl.scrollTop += delta
+				spacerEl.style.height = contentH + 'px'
+			}
+			lastScrollTopRef.current = scrollEl.scrollTop
+		} else {
+			spacerEl.style.height = contentH + 'px'
+		}
+		requestAnimationFrame(() => { mountChangeRef.current = false })
+	}, [mountStart, totalCount, scrollContainerRef, getContentHeight])
+
+	// ResizeObserver: sync wrapper height + scrollTop when content resizes
+	// outside of expand/trim (e.g., LazyBlockCode placeholder → Monaco swap).
+	// Without this, the wrapper stays stale and accumulates delta until the
+	// next mount change, causing a big jump.
+	// Skip scrollTop compensation when width changed (panel resize / reflow).
+	const mountChangeRef = useRef(false)
+	useEffect(() => {
+		const contentEl = contentRef.current
+		const spacerEl = spacerRef.current
+		const scrollEl = scrollContainerRef.current
+		if (!contentEl || !spacerEl || !scrollEl) return
+		if (typeof ResizeObserver === 'undefined') return
+
+		let prevWidth = scrollEl.clientWidth
+
+		const contentRo = new ResizeObserver(() => {
+			if (!initialFillDoneRef.current) return
+			if (mountChangeRef.current) return
+
+			const currWidth = scrollEl.clientWidth
+			const widthChanged = currWidth !== prevWidth
+			prevWidth = currWidth
+
+			const contentH = contentEl.offsetHeight
+			const oldH = spacerHeightRef.current
+			const delta = contentH - oldH
+			if (Math.abs(delta) < 1) return
+
+			spacerHeightRef.current = contentH
+			spacerEl.style.height = contentH + 'px'
+
+			if (!widthChanged && !contentEl.hasAttribute('data-suppress-scroll')) {
+				scrollEl.scrollTop += delta
+				lastScrollTopRef.current = scrollEl.scrollTop
+			}
+		})
+		contentRo.observe(contentEl)
+
+		// Re-evaluate sticky question when the scroll container resizes
+		// (e.g., read-only banner appearing changes available height).
+		const scrollRo = new ResizeObserver(() => {
+			updateStickyQuestion(scrollEl)
+		})
+		scrollRo.observe(scrollEl)
+
+		return () => { contentRo.disconnect(); scrollRo.disconnect() }
+	}, [scrollContainerRef])
+
+	const expandUp = useCallback(() => {
+		const scrollEl = scrollContainerRef.current
+		if (!scrollEl) return
+		const batch = msgsForPx(scrollEl.clientHeight * 2)
+		flushSync(() => setMountStart(prev => Math.max(0, prev - batch)))
+	}, [scrollContainerRef, msgsForPx])
+
+	const hasMore = mountStart > 0
+
+	// Sticky question header: shows the last user message that scrolled
+	// above the viewport top. Updated via direct DOM manipulation to avoid
+	// React re-renders on every scroll frame.
+	const stickyHeaderRef = useRef<HTMLDivElement>(null)
+	const stickyTextRef = useRef<HTMLSpanElement>(null)
+	const activeStickyIdxRef = useRef<number>(-1)
+
+	const previousMessagesRef = useRef(previousMessages)
+	previousMessagesRef.current = previousMessages
+
+	const updateStickyQuestion = useCallback((scrollEl: HTMLElement) => {
+		const containerTop = scrollEl.getBoundingClientRect().top
+		let activeIdx = -1
+		let activeContent = ''
+		let nextUserMsgTop = Infinity
+
+		// Check trimmed messages (not in DOM, definitely above viewport)
+		const ms = mountStartRef.current
+		const msgs = previousMessagesRef.current
+		for (let i = ms - 1; i >= 0; i--) {
+			const m = msgs[i]
+			if (m?.role === 'user') {
+				activeIdx = i
+				activeContent = m.displayContent || ''
+				break
+			}
+		}
+
+		// Check mounted messages in DOM — trigger as soon as the message's
+		// top edge crosses the viewport top so the sticky appears while the
+		// message is still partially visible (smooth hand-off, no gap).
+		const userMsgs = Array.from(scrollEl.querySelectorAll<HTMLElement>('[data-user-msg-idx]'))
+		for (let i = 0; i < userMsgs.length; i++) {
+			const el = userMsgs[i]
+			const rect = el.getBoundingClientRect()
+			if (rect.top < containerTop) {
+				activeIdx = parseInt(el.getAttribute('data-user-msg-idx')!)
+				activeContent = el.querySelector('span')?.textContent ?? ''
+				nextUserMsgTop = Infinity
+			} else if (activeIdx >= 0 && nextUserMsgTop === Infinity) {
+				nextUserMsgTop = rect.top - containerTop
+			}
+		}
+
+		if (activeStickyIdxRef.current !== activeIdx) {
+			activeStickyIdxRef.current = activeIdx
+			if (stickyTextRef.current) {
+				stickyTextRef.current.textContent = activeContent
+			}
+		}
+
+		const header = stickyHeaderRef.current
+		if (!header) return
+		if (activeIdx < 0) {
+			header.style.display = 'none'
+			return
+		}
+		header.style.display = ''
+
+		// Push effect: when the next user message approaches the top,
+		// shrink the sticky header's maxHeight so it clips from the bottom.
+		// This looks like the new question pushing the old one up and out.
+		const headerH = header.scrollHeight
+		if (nextUserMsgTop < headerH) {
+			header.style.maxHeight = Math.max(0, nextUserMsgTop) + 'px'
+		} else {
+			header.style.maxHeight = ''
+		}
+	}, [])
+
+	// Scroll handler: expand on scroll-up near top, trim on scroll-down.
+	useEffect(() => {
+		const el = scrollContainerRef.current
+		if (!el) return
+		let rafId = 0
+		lastScrollTopRef.current = el.scrollTop
+
+		const onScroll = () => {
+			cancelAnimationFrame(rafId)
+			rafId = requestAnimationFrame(() => {
+				const currScrollTop = el.scrollTop
+				const prevScrollTop = lastScrollTopRef.current
+				lastScrollTopRef.current = currScrollTop
+				const scrollingUp = currScrollTop < prevScrollTop
+				const scrollingDown = currScrollTop > prevScrollTop
+
+				updateStickyQuestion(el)
+
+				if (scrollingUp && currScrollTop < el.clientHeight && mountStartRef.current > 0) {
+					expandUp()
+					return
+				}
+				if (scrollingDown && currScrollTop > el.clientHeight * 3) {
+					const mounted = totalCountRef.current - mountStartRef.current
+					const avgH = mounted > 0 ? (contentRef.current?.offsetHeight ?? el.scrollHeight) / mounted : 200
+					const msgsAbove = Math.floor(currScrollTop / avgH)
+					const msgsToKeepAbove = Math.ceil((el.clientHeight * 2) / avgH)
+					const msgsToRemove = msgsAbove - msgsToKeepAbove
+					if (msgsToRemove > 0) {
+						flushSync(() => setMountStart(prev => Math.min(prev + msgsToRemove, Math.max(0, totalCountRef.current - 1))))
+					}
+				}
+			})
+		}
+
+		el.addEventListener('scroll', onScroll, { passive: true })
+		return () => {
+			cancelAnimationFrame(rafId)
+			el.removeEventListener('scroll', onScroll)
+		}
+	}, [scrollContainerRef, expandUp, updateStickyQuestion])
+
+	// Initialize sticky question on activation — double-rAF to ensure
+	// scroll-to-bottom and initial fill have settled first.
+	useEffect(() => {
+		if (!isActive) return
+		const el = scrollContainerRef.current
+		if (!el) return
+		requestAnimationFrame(() => {
+			requestAnimationFrame(() => {
+				updateStickyQuestion(el)
+			})
+		})
+	}, [isActive, scrollContainerRef, updateStickyQuestion])
+
+	// Clamp mountStart when totalCount shrinks (checkpoint rollback)
+	useEffect(() => {
+		setMountStart(prev => Math.min(prev, Math.max(0, totalCount - 1)))
+	}, [totalCount])
+
+	// Incremental JSX cache for the mounted slice. When only messages are
+	// appended (streaming commit) and mountStart hasn't changed, reuse
+	// existing elements and only createElement for the new ones.
+	const prevMsgCacheRef = useRef<{ html: React.ReactNode[], len: number, mountStart: number, msgs: typeof previousMessages, threadId: string, checkpointIdx: typeof currCheckpointIdx, scrollCb: typeof scrollToBottomCb, pendingIdx: typeof firstPendingToolRequestIdx, readOnly: boolean } | null>(null)
 
 	const previousMessagesHTML = (() => {
 		const cache = prevMsgCacheRef.current
 		const depsMatch = cache
 			&& cache.threadId === threadId
 			&& cache.msgs === previousMessages
+			&& cache.mountStart === mountStart
 			&& cache.checkpointIdx === currCheckpointIdx
 			&& cache.scrollCb === scrollToBottomCb
 			&& cache.pendingIdx === firstPendingToolRequestIdx
@@ -2330,11 +2645,13 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			return merged
 		}
 
-		const result = previousMessages.map((message, i) => {
-			return <ChatBubble
+		// Full rebuild: mountStart changed, thread deps changed, etc.
+		const result: React.ReactNode[] = []
+		for (let i = mountStart; i < previousMessages.length; i++) {
+			result.push(<ChatBubble
 				key={i}
 				currCheckpointIdx={currCheckpointIdx}
-				chatMessage={message}
+				chatMessage={previousMessages[i]}
 				messageIdx={i}
 				isCommitted={true}
 				chatIsRunning={undefined}
@@ -2342,14 +2659,14 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				_scrollToBottom={scrollToBottomCb}
 				firstPendingToolRequestIdx={firstPendingToolRequestIdx}
 				threadIsReadOnly={threadIsReadOnly}
-			/>
-		})
+			/>)
+		}
 
-		prevMsgCacheRef.current = { html: result, len: previousMessages.length, msgs: previousMessages, threadId, checkpointIdx: currCheckpointIdx, scrollCb: scrollToBottomCb, pendingIdx: firstPendingToolRequestIdx, readOnly: threadIsReadOnly }
+		prevMsgCacheRef.current = { html: result, len: previousMessages.length, mountStart, msgs: previousMessages, threadId, checkpointIdx: currCheckpointIdx, scrollCb: scrollToBottomCb, pendingIdx: firstPendingToolRequestIdx, readOnly: threadIsReadOnly }
 		return result
 	})()
 
-	const streamingChatIdx = previousMessagesHTML.length
+	const streamingChatIdx = previousMessages.length
 	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
 		<ChatBubble
 			key={streamingChatIdx}
@@ -2368,13 +2685,6 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			threadIsReadOnly={threadIsReadOnly}
 		/> : null
 
-	// Merge committed + streaming bubbles into one array so React can match
-	// the same key (streamingChatIdx) across the streaming→committed transition
-	// instead of unmounting/remounting the entire ChatBubble DOM tree.
-	const allBubblesHTML = currStreamingMessageHTML
-		? [...previousMessagesHTML, currStreamingMessageHTML]
-		: previousMessagesHTML
-
 	const generatingTool = toolIsGenerating && currentInFlightTool ?
 		currentInFlightTool.name === 'edit_file' || currentInFlightTool.name === 'rewrite_file' ? <EditToolSoFar
 			key={'curr-streaming-tool'}
@@ -2386,8 +2696,25 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	return (
 		<div
 			hidden={!isActive}
-			className='flex flex-col w-full h-full min-h-0'
+			className='relative flex flex-col w-full h-full min-h-0'
 		>
+			{/* Sticky question — absolute overlay, no layout shift */}
+			<div
+				ref={stickyHeaderRef}
+				className='absolute top-0 left-0 right-0 z-10 bg-void-bg-2 overflow-hidden'
+				style={{ display: 'none' }}
+			>
+				<div className='px-4 pt-2 pb-2'>
+					<div className='ml-auto w-fit max-w-full p-2 rounded-lg bg-void-bg-1 text-void-fg-1 whitespace-pre-wrap max-h-[4.5em] overflow-hidden relative'>
+						<span ref={stickyTextRef} className='px-0.5' />
+						<div
+							className='absolute bottom-0 left-0 right-0 h-[1.5em] pointer-events-none rounded-b-lg'
+							style={{ background: 'linear-gradient(to bottom, transparent, var(--void-bg-1))' }}
+						/>
+					</div>
+				</div>
+				<div className='h-px w-full' style={{ background: 'linear-gradient(to right, transparent, var(--void-border-1), transparent)' }} />
+			</div>
 			<ScrollToBottomContainer
 				scrollContainerRef={scrollContainerRef}
 				className={`
@@ -2398,8 +2725,14 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					overflow-y-auto
 					${previousMessagesHTML.length === 0 && !displayContentSoFar ? 'hidden' : ''}
 				`}
+				style={{ overflowAnchor: 'none' } as React.CSSProperties}
 			>
-				{allBubblesHTML}
+				<div ref={spacerRef} style={{ overflow: 'hidden', flexShrink: 0 }}>
+					<div ref={contentRef} data-virtualized-content className='flex flex-col space-y-4'>
+						{previousMessagesHTML}
+					</div>
+				</div>
+				{currStreamingMessageHTML}
 				{generatingTool}
 
 				{isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating ? <ProseWrapper>
@@ -2873,7 +3206,7 @@ export const SidebarChat = () => {
 		<ErrorBoundary>
 			{messagesHTML}
 		</ErrorBoundary>
-		{rulesOutdated.isOutdated && (
+		{rulesOutdated.isOutdated && rulesOutdated.detectedAt && (
 			<RulesOutdatedBanner detectedAt={rulesOutdated.detectedAt} />
 		)}
 		<ErrorBoundary>
