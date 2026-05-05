@@ -1333,17 +1333,34 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 		}
 	}, [mode, chatMessage.displayContent])
 
+	// Suppress ResizeObserver scrollTop compensation during edit mode transitions.
+	// Double-rAF: ResizeObserver fires between the 1st rAF and paint, so a single
+	// rAF would clear the flag too early. The 2nd rAF runs after the observer has
+	// processed the resize, making it safe to remove the suppression.
+	const suppressScrollCompensation = useCallback(() => {
+		const container = bubbleRef.current?.closest('[data-virtualized-content]')
+		if (container) {
+			container.setAttribute('data-suppress-scroll', '1')
+			requestAnimationFrame(() => {
+				requestAnimationFrame(() => {
+					container.removeAttribute('data-suppress-scroll')
+				})
+			})
+		}
+	}, [])
+
 	const onOpenEdit = () => {
+		suppressScrollCompensation()
 		setIsBeingEdited(true)
 		chatThreadsService.setCurrentlyFocusedMessageIdx(messageIdx)
 		_justEnabledEdit.current = true
 	}
 	const onCloseEdit = () => {
+		suppressScrollCompensation()
 		setIsFocused(false)
 		setIsHovered(false)
 		setIsBeingEdited(false)
 		chatThreadsService.setCurrentlyFocusedMessageIdx(undefined)
-
 	}
 
 	const EditSymbol = mode === 'display' ? Pencil : X
@@ -2429,7 +2446,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			spacerHeightRef.current = contentH
 			spacerEl.style.height = contentH + 'px'
 
-			if (!widthChanged) {
+			if (!widthChanged && !contentEl.hasAttribute('data-suppress-scroll')) {
 				scrollEl.scrollTop += delta
 				lastScrollTopRef.current = scrollEl.scrollTop
 			}
@@ -2601,7 +2618,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				style={{ overflowAnchor: 'none' } as React.CSSProperties}
 			>
 				<div ref={spacerRef} style={{ overflow: 'hidden', flexShrink: 0 }}>
-					<div ref={contentRef} className='flex flex-col space-y-4'>
+					<div ref={contentRef} data-virtualized-content className='flex flex-col space-y-4'>
 						{previousMessagesHTML}
 					</div>
 				</div>
