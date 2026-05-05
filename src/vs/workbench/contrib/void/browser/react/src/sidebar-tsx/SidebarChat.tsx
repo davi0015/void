@@ -3,7 +3,9 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
+
 
 
 import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useFullChatThreadsStreamState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction } from '../util/services.js';
@@ -902,7 +904,7 @@ export const ButtonStop = ({ className, ...props }: ButtonHTMLAttributes<HTMLBut
 
 const scrollToBottom = (divRef: { current: HTMLElement | null }) => {
 	if (divRef.current) {
-		divRef.current.scrollTop = 1e10;
+		divRef.current.scrollTop = 0;
 	}
 };
 
@@ -917,9 +919,8 @@ const ScrollToBottomContainer = ({ children, className, style, scrollContainerRe
 		const div = divRef.current;
 		if (!div) return;
 
-		isAtBottomRef.current = Math.abs(
-			div.scrollHeight - div.clientHeight - div.scrollTop
-		) < 40;
+		// column-reverse: scrollTop=0 is bottom, negative going up
+		isAtBottomRef.current = div.scrollTop > -40;
 	}, [divRef]);
 
 	useEffect(() => {
@@ -2227,6 +2228,9 @@ const EditToolSoFar = ({ toolCallSoFar, }: { toolCallSoFar: RawToolCallObj }) =>
 // Each instance owns its own scroll container ref and subscribes to its own stream
 // state, so a background thread can keep streaming while the user is looking at a
 // different one.
+
+const VIEWPORT_FILL_FACTOR = 3
+
 const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef }: {
 	threadId: string
 	isActive: boolean
@@ -2287,17 +2291,126 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 
 	const scrollToBottomCb = useCallback(() => scrollToBottom(scrollContainerRef), [scrollContainerRef])
 
-	// Incremental JSX cache: when only messages are appended (the common case
-	// at stream end), reuse the existing JSX elements and only createElement
-	// for the new ones. A full rebuild (452 createElement + React reconciliation)
-	// is O(N); the incremental path is O(delta).
-	const prevMsgCacheRef = useRef<{ html: React.ReactNode[], len: number, msgs: typeof previousMessages, threadId: string, checkpointIdx: typeof currCheckpointIdx, scrollCb: typeof scrollToBottomCb, pendingIdx: typeof firstPendingToolRequestIdx, readOnly: boolean } | null>(null)
+	// --- E9: column-reverse virtualization ---
+	// flex-direction: column-reverse: scrollTop=0 = bottom (newest).
+	// scrollTop increases upward toward older messages. Old messages are at
+	// the far end of the scroll range — adding/removing them doesn't shift
+	// the viewport. No manual scroll compensation needed.
+	const totalCount = previousMessages.length
+	const [mountStart, setMountStart] = useState(Math.max(0, totalCount - 1))
+
+	const mountStartRef = useRef(mountStart)
+	mountStartRef.current = mountStart
+	const totalCountRef = useRef(totalCount)
+	totalCountRef.current = totalCount
+
+	const contentRef = useRef<HTMLDivElement | null>(null)
+	const lastScrollTopRef = useRef(0)
+
+	const getContentHeight = useCallback(() => {
+		return contentRef.current?.offsetHeight ?? 0
+	}, [])
+
+	const getAvgHeight = useCallback(() => {
+		const contentH = getContentHeight()
+		const mounted = totalCountRef.current - mountStartRef.current
+		return mounted > 0 && contentH > 0 ? contentH / mounted : 200
+	}, [getContentHeight])
+
+	const msgsForPx = useCallback((px: number) => {
+		const avg = getAvgHeight()
+		return Math.max(1, Math.ceil(px / avg))
+	}, [getAvgHeight])
+
+	// Adaptive initial mount: start with 1, measure, fill viewport.
+	const initialFillDoneRef = useRef(false)
+	useLayoutEffect(() => {
+		if (initialFillDoneRef.current) return
+		const scrollEl = scrollContainerRef.current
+		if (!scrollEl || !isActive) return
+		if (scrollEl.clientHeight === 0) return
+		const target = scrollEl.clientHeight * VIEWPORT_FILL_FACTOR
+		const contentH = getContentHeight()
+		if (contentH >= target || mountStart === 0) {
+			initialFillDoneRef.current = true
+			return
+		}
+		const deficit = target - contentH
+		const needed = msgsForPx(deficit)
+		setMountStart(prev => Math.max(0, prev - needed))
+	}, [mountStart, totalCount, isActive, scrollContainerRef, msgsForPx, getContentHeight])
+
+	const expandUp = useCallback(() => {
+		const scrollEl = scrollContainerRef.current
+		if (!scrollEl) return
+		const batch = msgsForPx(scrollEl.clientHeight * 2)
+		flushSync(() => setMountStart(prev => Math.max(0, prev - batch)))
+	}, [scrollContainerRef, msgsForPx])
+
+	const hasMore = mountStart > 0
+
+	// Scroll handler: column-reverse scrollTop is 0 (bottom) to negative (up).
+	// scrollingUp = scrollTop becoming more negative.
+	// scrollingDown = scrollTop moving toward 0.
+	useEffect(() => {
+		const el = scrollContainerRef.current
+		if (!el) return
+		let rafId = 0
+		lastScrollTopRef.current = el.scrollTop
+
+		const onScroll = () => {
+			cancelAnimationFrame(rafId)
+			rafId = requestAnimationFrame(() => {
+				const currScrollTop = el.scrollTop // 0 or negative
+				const prevScrollTop = lastScrollTopRef.current
+				lastScrollTopRef.current = currScrollTop
+				const scrollingUp = currScrollTop < prevScrollTop
+				const scrollingDown = currScrollTop > prevScrollTop
+
+				const distFromBottom = -currScrollTop
+				const distFromTop = (el.scrollHeight - el.clientHeight) - distFromBottom
+
+				if (scrollingUp && distFromTop < el.clientHeight && mountStartRef.current > 0) {
+					expandUp()
+					return
+				}
+				if (scrollingDown && distFromTop > el.clientHeight * 3) {
+					const mounted = totalCountRef.current - mountStartRef.current
+					const contentH = contentRef.current?.offsetHeight ?? el.scrollHeight
+					const avgH = mounted > 0 ? contentH / mounted : 200
+					const msgsAboveViewport = Math.floor(distFromTop / avgH)
+					const msgsToKeepAbove = Math.ceil((el.clientHeight * 2) / avgH)
+					const msgsToRemove = msgsAboveViewport - msgsToKeepAbove
+					if (msgsToRemove > 0) {
+						flushSync(() => setMountStart(prev => Math.min(prev + msgsToRemove, Math.max(0, totalCountRef.current - 1))))
+					}
+				}
+			})
+		}
+
+		el.addEventListener('scroll', onScroll, { passive: true })
+		return () => {
+			cancelAnimationFrame(rafId)
+			el.removeEventListener('scroll', onScroll)
+		}
+	}, [scrollContainerRef, expandUp])
+
+	// Clamp mountStart when totalCount shrinks (checkpoint rollback)
+	useEffect(() => {
+		setMountStart(prev => Math.min(prev, Math.max(0, totalCount - 1)))
+	}, [totalCount])
+
+	// Incremental JSX cache for the mounted slice. When only messages are
+	// appended (streaming commit) and mountStart hasn't changed, reuse
+	// existing elements and only createElement for the new ones.
+	const prevMsgCacheRef = useRef<{ html: React.ReactNode[], len: number, mountStart: number, msgs: typeof previousMessages, threadId: string, checkpointIdx: typeof currCheckpointIdx, scrollCb: typeof scrollToBottomCb, pendingIdx: typeof firstPendingToolRequestIdx, readOnly: boolean } | null>(null)
 
 	const previousMessagesHTML = (() => {
 		const cache = prevMsgCacheRef.current
 		const depsMatch = cache
 			&& cache.threadId === threadId
 			&& cache.msgs === previousMessages
+			&& cache.mountStart === mountStart
 			&& cache.checkpointIdx === currCheckpointIdx
 			&& cache.scrollCb === scrollToBottomCb
 			&& cache.pendingIdx === firstPendingToolRequestIdx
@@ -2330,11 +2443,13 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			return merged
 		}
 
-		const result = previousMessages.map((message, i) => {
-			return <ChatBubble
+		// Full rebuild: mountStart changed, thread deps changed, etc.
+		const result: React.ReactNode[] = []
+		for (let i = mountStart; i < previousMessages.length; i++) {
+			result.push(<ChatBubble
 				key={i}
 				currCheckpointIdx={currCheckpointIdx}
-				chatMessage={message}
+				chatMessage={previousMessages[i]}
 				messageIdx={i}
 				isCommitted={true}
 				chatIsRunning={undefined}
@@ -2342,14 +2457,14 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				_scrollToBottom={scrollToBottomCb}
 				firstPendingToolRequestIdx={firstPendingToolRequestIdx}
 				threadIsReadOnly={threadIsReadOnly}
-			/>
-		})
+			/>)
+		}
 
-		prevMsgCacheRef.current = { html: result, len: previousMessages.length, msgs: previousMessages, threadId, checkpointIdx: currCheckpointIdx, scrollCb: scrollToBottomCb, pendingIdx: firstPendingToolRequestIdx, readOnly: threadIsReadOnly }
+		prevMsgCacheRef.current = { html: result, len: previousMessages.length, mountStart, msgs: previousMessages, threadId, checkpointIdx: currCheckpointIdx, scrollCb: scrollToBottomCb, pendingIdx: firstPendingToolRequestIdx, readOnly: threadIsReadOnly }
 		return result
 	})()
 
-	const streamingChatIdx = previousMessagesHTML.length
+	const streamingChatIdx = previousMessages.length
 	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
 		<ChatBubble
 			key={streamingChatIdx}
@@ -2368,13 +2483,6 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			threadIsReadOnly={threadIsReadOnly}
 		/> : null
 
-	// Merge committed + streaming bubbles into one array so React can match
-	// the same key (streamingChatIdx) across the streaming→committed transition
-	// instead of unmounting/remounting the entire ChatBubble DOM tree.
-	const allBubblesHTML = currStreamingMessageHTML
-		? [...previousMessagesHTML, currStreamingMessageHTML]
-		: previousMessagesHTML
-
 	const generatingTool = toolIsGenerating && currentInFlightTool ?
 		currentInFlightTool.name === 'edit_file' || currentInFlightTool.name === 'rewrite_file' ? <EditToolSoFar
 			key={'curr-streaming-tool'}
@@ -2391,20 +2499,16 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			<ScrollToBottomContainer
 				scrollContainerRef={scrollContainerRef}
 				className={`
-					flex flex-col
-					px-4 py-4 space-y-4
+					flex flex-col-reverse
+					px-4 py-4 gap-4
 					w-full h-full
 					overflow-x-hidden
 					overflow-y-auto
 					${previousMessagesHTML.length === 0 && !displayContentSoFar ? 'hidden' : ''}
 				`}
+				style={{ overflowAnchor: 'none' } as React.CSSProperties}
 			>
-				{allBubblesHTML}
-				{generatingTool}
-
-				{isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating ? <ProseWrapper>
-					{<IconLoading className='opacity-50 text-sm' />}
-				</ProseWrapper> : null}
+				{/* column-reverse: DOM-first = visual bottom. Reverse children for correct visual order. */}
 
 				{latestError === undefined ? null :
 					<div className='px-2 my-1'>
@@ -2418,6 +2522,17 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 						<WarningBox className='text-sm my-2 mx-4' onClick={() => { commandService.executeCommand(VOID_OPEN_SETTINGS_ACTION_ID) }} text='Open settings' />
 					</div>
 				}
+
+				{isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating ? <ProseWrapper>
+					{<IconLoading className='opacity-50 text-sm' />}
+				</ProseWrapper> : null}
+
+				{generatingTool}
+				{currStreamingMessageHTML}
+
+				<div ref={contentRef} className='flex flex-col gap-4'>
+					{previousMessagesHTML}
+				</div>
 		</ScrollToBottomContainer>
 	</div>
 	)
@@ -2873,7 +2988,7 @@ export const SidebarChat = () => {
 		<ErrorBoundary>
 			{messagesHTML}
 		</ErrorBoundary>
-		{rulesOutdated.isOutdated && (
+		{rulesOutdated.isOutdated && rulesOutdated.detectedAt && (
 			<RulesOutdatedBanner detectedAt={rulesOutdated.detectedAt} />
 		)}
 		<ErrorBoundary>

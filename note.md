@@ -1140,16 +1140,18 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - *Complexity*: Medium.
 - *Priority*: **2nd** — do before virtualization while all messages are in the DOM.
 
-**E9 — Viewport-based rendering (virtualized scroll)** (planned)
+**E9 — Viewport-based rendering (virtualized scroll)** ✅ DONE
 - *Pain*: long threads (100+ messages with code blocks, diffs, tool results) slow down rendering. All messages are in the DOM even when off-screen.
-- *Design*: only render messages near the current scroll position. Variable-height items (code blocks, tool results, diffs) make this harder than fixed-row virtualization. Needs: height estimation/caching per message, windowed rendering in `ThreadMessagesView`, preserve scroll-to-bottom behavior for streaming, checkpoint navigation must scroll-to + mount the target message.
+- *Design*: lazy mount/unmount from the top — start with the newest message, adaptively fill the viewport (3× `VIEWPORT_FILL_FACTOR`), then expand/trim on scroll. `mountStart` state controls first mounted index; `previousMessages.slice(mountStart)` renders only the visible+buffered range. Scroll down to newest is always fast (few DOM nodes); scroll up loads history on demand.
+- *Approach explored — `flex-direction: column-reverse`*: puts `scrollTop=0` at the bottom (newest). Old messages live at the far end of the scroll range — adding/removing them doesn't affect `scrollTop` (zero manual scroll compensation). `scrollTop` is negative (0 to −X). Proved via logging that `scrollDelta=0` on every expand — the approach is correct. However, **column-reverse anchors at the bottom**: when the user scrolls far up and resizes the window, the shift is much larger than with a top-anchored layout. Normal `flex-col` (top-anchored) is closer to the viewport when scrolled up, so resize shifts are small. Decision: **use column-reverse for now** (simpler code, no manual scroll compensation), revert to `flex-col` + wrapper-spacer approach if resize UX becomes a pain point.
+- *Code block height instability fix*: the "small jump" on scroll was traced to `LazyBlockCode` — the `<pre>` placeholder and the Monaco editor have slightly different heights (Monaco's line height, `+1` padding, horizontal scrollbar). When `IntersectionObserver` triggers the swap, the height change causes a layout shift. Fix: `LazyBlockCode` now wraps both placeholder and editor in the same outer `<div>`, captures the placeholder's `offsetHeight` before the swap, locks it as the wrapper's `height`, and clears it via an `onReady` callback after Monaco's first `resize()`. Zero-shift transition.
 - *Interaction with E8*: search needs to be able to scroll to and mount messages that are outside the current viewport window.
-- *Complexity*: High. Touches `ThreadMessagesView`, `ScrollToBottomContainer`, checkpoint nav, message focus/edit, streaming display.
-- *Priority*: **3rd** — biggest refactor, benefits from E8 already working. Only worth it if long-thread performance is a real pain point.
+- *Files*: `SidebarChat.tsx` (virtualization, `ScrollToBottomContainer` column-reverse, scroll handler), `inputs.tsx` (`LazyBlockCode` height-lock fix, `BlockCode` `onReady` callback).
+- *Remaining*: test resize, streaming, checkpoint nav with 300+ messages. Consider reverting to `flex-col` + wrapper if resize UX is problematic.
 
 **Execution order & commit strategy**
 - E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E2' cache-busting fix (freeze-on-first-send + indicator) ✅ done. E4 (per-request telemetry) ✅ done (own commit) — supersedes E3. E5 ✅ core logic shipped (own commit).
-- **Up next**: E8 (search in chat) → E9 (viewport rendering). E5 dog-food continues passively. E6 evaluation after E5 data. E7 ✅ shipped.
+- E9 ✅ done (viewport rendering + code block height fix). **Up next**: E8 (search in chat). E5 dog-food continues passively. E6 evaluation after E5 data. E7 ✅ shipped.
 - **After E5 dog-food**: evaluate E4 telemetry data (resultLen distribution on `read_file`, follow-up-with-ranges hit rate) before deciding whether E6 is worth doing.
 - After each phase, dog-food with a one-day daily-use window before committing the next. If a phase's real-world impact is smaller than projected (or reveals a different problem), the later phases can be resequenced / dropped.
 - Phase D deferred below — no observed pain to justify it.

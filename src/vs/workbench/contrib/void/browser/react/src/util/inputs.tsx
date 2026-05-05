@@ -1649,7 +1649,7 @@ const modelOfEditorId: { [id: string]: ITextModel | undefined } = {}
 export type BlockCodeProps = { initValue: string, language?: string, maxHeight?: number, showScrollbars?: boolean, isStreaming?: boolean }
 // Not exported: the only call-site is LazyBlockCode below. Using this directly re-introduces
 // the tab-switch/long-chat perf regression we fixed in Perf 1 Fix C — always go through LazyBlockCode.
-const BlockCode = ({ initValue, language, maxHeight, showScrollbars }: BlockCodeProps) => {
+const BlockCode = ({ initValue, language, maxHeight, showScrollbars, onReady }: BlockCodeProps & { onReady?: () => void }) => {
 
 	initValue = normalizeIndentation(initValue)
 
@@ -1669,6 +1669,8 @@ const BlockCode = ({ initValue, language, maxHeight, showScrollbars }: BlockCode
 	// these are used to pass to the model creation of modelRef
 	const initValueRef = useRef(initValue)
 	const languageRef = useRef(language)
+	const onReadyRef = useRef(onReady)
+	onReadyRef.current = onReady
 
 	const modelRef = useRef<ITextModel | null>(null)
 
@@ -1767,6 +1769,7 @@ const BlockCode = ({ initValue, language, maxHeight, showScrollbars }: BlockCode
 				}
 
 				resize()
+				onReadyRef.current?.()
 				const disposable = editor.onDidContentSizeChange(() => { resize() });
 
 				return [disposable, model]
@@ -1823,15 +1826,10 @@ const scheduleLazyMount = (cb: () => void) => {
 // of piling onto a single frame.
 export const LazyBlockCode = ({ initValue, language, maxHeight, showScrollbars, isStreaming }: BlockCodeProps) => {
 	const wrapperRef = useRef<HTMLDivElement | null>(null)
+	const lockedHeightRef = useRef<number | null>(null)
 	const [isVisible, setIsVisible] = useState(false)
 
 	useEffect(() => {
-		// Defer Monaco mount while the parent message is still streaming. Mounting a
-		// Monaco editor costs ~10-30ms of layout/measure work per code block, and a
-		// streaming reply can incrementally produce many fenced blocks (each one
-		// re-mounting as its content grows). Rendering as plain <pre> until the
-		// message is committed avoids that thrash; the editor mounts in one shot
-		// when streaming finishes, which feels instant to the user.
 		if (isStreaming) return
 		if (isVisible) return
 		const el = wrapperRef.current
@@ -1847,6 +1845,9 @@ export const LazyBlockCode = ({ initValue, language, maxHeight, showScrollbars, 
 				io.disconnect()
 				scheduleLazyMount(() => {
 					if (cancelled) return
+					// Capture placeholder height so the wrapper stays the same
+					// size while Monaco replaces the <pre> content inside it.
+					lockedHeightRef.current = el.offsetHeight
 					setIsVisible(true)
 				})
 			}
@@ -1858,16 +1859,32 @@ export const LazyBlockCode = ({ initValue, language, maxHeight, showScrollbars, 
 		}
 	}, [isVisible, isStreaming])
 
-	if (isVisible && !isStreaming) {
-		return <BlockCode initValue={initValue} language={language} maxHeight={maxHeight} showScrollbars={showScrollbars} />
-	}
+	// Once Monaco's onDidContentSizeChange fires and sets the real height,
+	// clear the locked height so the wrapper follows the editor naturally.
+	const onEditorReady = useCallback(() => {
+		lockedHeightRef.current = null
+		if (wrapperRef.current) wrapperRef.current.style.height = ''
+	}, [])
 
-	const normalized = normalizeIndentation(initValue)
+	const lockedStyle = lockedHeightRef.current != null
+		? { height: lockedHeightRef.current + 'px' } as React.CSSProperties
+		: undefined
+
 	return (
-		<div ref={wrapperRef} className='relative z-0 px-2 py-1 bg-void-bg-3'>
-			<pre className='m-0 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto text-void-fg-2'>
-				<code>{normalized}</code>
-			</pre>
+		<div ref={wrapperRef} style={lockedStyle}>
+			{isVisible && !isStreaming
+				? <BlockCode initValue={initValue} language={language} maxHeight={maxHeight} showScrollbars={showScrollbars} onReady={onEditorReady} />
+				: (() => {
+					const normalized = normalizeIndentation(initValue)
+					return (
+						<div className='relative z-0 px-2 py-1 bg-void-bg-3'>
+							<pre className='m-0 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto text-void-fg-2'>
+								<code>{normalized}</code>
+							</pre>
+						</div>
+					)
+				})()
+			}
 		</div>
 	)
 }
