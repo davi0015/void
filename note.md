@@ -1151,6 +1151,13 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - *Interaction with E8*: search needs to be able to scroll to and mount messages that are outside the current viewport window.
 - *Files*: `SidebarChat.tsx` (wrapper-spacer virtualization, `useLayoutEffect` sync, `ResizeObserver`, scroll handler), `inputs.tsx` (`LazyBlockCode` height-lock fix, `BlockCode` `onReady` callback).
 
+**E10 — Sticky question header** ✅ DONE
+- *Pain*: in long conversations, after scrolling down into the response, the user loses sight of which question the assistant is answering. They have to scroll back up to re-read the question.
+- *Design*: a sticky overlay that pins the last user message that scrolled above the viewport top. Uses direct DOM manipulation (no React re-renders on scroll). Detects user messages via `data-user-msg-idx` attribute and `getBoundingClientRect()`. Triggers as soon as the message's top edge crosses the viewport top (`rect.top < containerTop`) so the transition is seamless — no gap where the message disappears before the sticky appears.
+- *Push effect*: when the next user message approaches the top, the sticky header's `maxHeight` shrinks so it clips from the bottom, creating a "push up and out" animation.
+- *Trimmed messages*: messages virtualized out of the DOM (`mountStart > 0`) are checked via `previousMessagesRef` to ensure the sticky still shows the correct question even when the original element is unmounted.
+- *Files*: `SidebarChat.tsx` (`updateStickyQuestion` callback, `stickyHeaderRef`/`stickyTextRef` refs, scroll handler integration, absolute overlay in JSX).
+
 **Execution order & commit strategy**
 - E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E2' cache-busting fix (freeze-on-first-send + indicator) ✅ done. E4 (per-request telemetry) ✅ done (own commit) — supersedes E3. E5 ✅ core logic shipped (own commit).
 - E9 ✅ done (viewport rendering + code block height fix). **Up next**: E8 (search in chat). E5 dog-food continues passively. E6 evaluation after E5 data. E7 ✅ shipped.

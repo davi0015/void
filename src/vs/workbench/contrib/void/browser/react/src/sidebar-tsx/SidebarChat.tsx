@@ -1485,7 +1485,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 			</div>
 		}
 		<div
-			// align chatbubble accoridng to role
+			data-user-msg-idx={messageIdx}
 			className={`
         relative ml-auto
         ${mode === 'edit' ? 'w-full max-w-full'
@@ -2430,7 +2430,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 
 		let prevWidth = scrollEl.clientWidth
 
-		const ro = new ResizeObserver(() => {
+		const contentRo = new ResizeObserver(() => {
 			if (!initialFillDoneRef.current) return
 			if (mountChangeRef.current) return
 
@@ -2451,8 +2451,16 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				lastScrollTopRef.current = scrollEl.scrollTop
 			}
 		})
-		ro.observe(contentEl)
-		return () => ro.disconnect()
+		contentRo.observe(contentEl)
+
+		// Re-evaluate sticky question when the scroll container resizes
+		// (e.g., read-only banner appearing changes available height).
+		const scrollRo = new ResizeObserver(() => {
+			updateStickyQuestion(scrollEl)
+		})
+		scrollRo.observe(scrollEl)
+
+		return () => { contentRo.disconnect(); scrollRo.disconnect() }
 	}, [scrollContainerRef])
 
 	const expandUp = useCallback(() => {
@@ -2463,6 +2471,76 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	}, [scrollContainerRef, msgsForPx])
 
 	const hasMore = mountStart > 0
+
+	// Sticky question header: shows the last user message that scrolled
+	// above the viewport top. Updated via direct DOM manipulation to avoid
+	// React re-renders on every scroll frame.
+	const stickyHeaderRef = useRef<HTMLDivElement>(null)
+	const stickyTextRef = useRef<HTMLSpanElement>(null)
+	const activeStickyIdxRef = useRef<number>(-1)
+
+	const previousMessagesRef = useRef(previousMessages)
+	previousMessagesRef.current = previousMessages
+
+	const updateStickyQuestion = useCallback((scrollEl: HTMLElement) => {
+		const containerTop = scrollEl.getBoundingClientRect().top
+		let activeIdx = -1
+		let activeContent = ''
+		let nextUserMsgTop = Infinity
+
+		// Check trimmed messages (not in DOM, definitely above viewport)
+		const ms = mountStartRef.current
+		const msgs = previousMessagesRef.current
+		for (let i = ms - 1; i >= 0; i--) {
+			const m = msgs[i]
+			if (m?.role === 'user') {
+				activeIdx = i
+				activeContent = m.displayContent || ''
+				break
+			}
+		}
+
+		// Check mounted messages in DOM — trigger as soon as the message's
+		// top edge crosses the viewport top so the sticky appears while the
+		// message is still partially visible (smooth hand-off, no gap).
+		const userMsgs = Array.from(scrollEl.querySelectorAll<HTMLElement>('[data-user-msg-idx]'))
+		for (let i = 0; i < userMsgs.length; i++) {
+			const el = userMsgs[i]
+			const rect = el.getBoundingClientRect()
+			if (rect.top < containerTop) {
+				activeIdx = parseInt(el.getAttribute('data-user-msg-idx')!)
+				activeContent = el.querySelector('span')?.textContent ?? ''
+				nextUserMsgTop = Infinity
+			} else if (activeIdx >= 0 && nextUserMsgTop === Infinity) {
+				nextUserMsgTop = rect.top - containerTop
+			}
+		}
+
+		if (activeStickyIdxRef.current !== activeIdx) {
+			activeStickyIdxRef.current = activeIdx
+			if (stickyTextRef.current) {
+				stickyTextRef.current.textContent = activeContent
+			}
+		}
+
+		const header = stickyHeaderRef.current
+		if (!header) return
+		if (activeIdx < 0) {
+			header.style.display = 'none'
+			return
+		}
+		header.style.display = ''
+
+		// Push effect: when the next user message approaches the top,
+		// shrink the sticky header's maxHeight so it clips from the bottom.
+		// This looks like the new question pushing the old one up and out.
+		const headerH = header.scrollHeight
+		if (nextUserMsgTop < headerH) {
+			header.style.maxHeight = Math.max(0, nextUserMsgTop) + 'px'
+		} else {
+			header.style.maxHeight = ''
+		}
+	}, [])
 
 	// Scroll handler: expand on scroll-up near top, trim on scroll-down.
 	useEffect(() => {
@@ -2479,6 +2557,8 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				lastScrollTopRef.current = currScrollTop
 				const scrollingUp = currScrollTop < prevScrollTop
 				const scrollingDown = currScrollTop > prevScrollTop
+
+				updateStickyQuestion(el)
 
 				if (scrollingUp && currScrollTop < el.clientHeight && mountStartRef.current > 0) {
 					expandUp()
@@ -2502,7 +2582,20 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			cancelAnimationFrame(rafId)
 			el.removeEventListener('scroll', onScroll)
 		}
-	}, [scrollContainerRef, expandUp])
+	}, [scrollContainerRef, expandUp, updateStickyQuestion])
+
+	// Initialize sticky question on activation — double-rAF to ensure
+	// scroll-to-bottom and initial fill have settled first.
+	useEffect(() => {
+		if (!isActive) return
+		const el = scrollContainerRef.current
+		if (!el) return
+		requestAnimationFrame(() => {
+			requestAnimationFrame(() => {
+				updateStickyQuestion(el)
+			})
+		})
+	}, [isActive, scrollContainerRef, updateStickyQuestion])
 
 	// Clamp mountStart when totalCount shrinks (checkpoint rollback)
 	useEffect(() => {
@@ -2603,8 +2696,25 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	return (
 		<div
 			hidden={!isActive}
-			className='flex flex-col w-full h-full min-h-0'
+			className='relative flex flex-col w-full h-full min-h-0'
 		>
+			{/* Sticky question — absolute overlay, no layout shift */}
+			<div
+				ref={stickyHeaderRef}
+				className='absolute top-0 left-0 right-0 z-10 bg-void-bg-2 overflow-hidden'
+				style={{ display: 'none' }}
+			>
+				<div className='px-4 pt-2 pb-2'>
+					<div className='ml-auto w-fit max-w-full p-2 rounded-lg bg-void-bg-1 text-void-fg-1 whitespace-pre-wrap max-h-[4.5em] overflow-hidden relative'>
+						<span ref={stickyTextRef} className='px-0.5' />
+						<div
+							className='absolute bottom-0 left-0 right-0 h-[1.5em] pointer-events-none rounded-b-lg'
+							style={{ background: 'linear-gradient(to bottom, transparent, var(--void-bg-1))' }}
+						/>
+					</div>
+				</div>
+				<div className='h-px w-full' style={{ background: 'linear-gradient(to right, transparent, var(--void-border-1), transparent)' }} />
+			</div>
 			<ScrollToBottomContainer
 				scrollContainerRef={scrollContainerRef}
 				className={`
