@@ -904,7 +904,7 @@ export const ButtonStop = ({ className, ...props }: ButtonHTMLAttributes<HTMLBut
 
 const scrollToBottom = (divRef: { current: HTMLElement | null }) => {
 	if (divRef.current) {
-		divRef.current.scrollTop = 0;
+		divRef.current.scrollTop = 1e10;
 	}
 };
 
@@ -919,8 +919,9 @@ const ScrollToBottomContainer = ({ children, className, style, scrollContainerRe
 		const div = divRef.current;
 		if (!div) return;
 
-		// column-reverse: scrollTop=0 is bottom, negative going up
-		isAtBottomRef.current = div.scrollTop > -40;
+		isAtBottomRef.current = Math.abs(
+			div.scrollHeight - div.clientHeight - div.scrollTop
+		) < 40;
 	}, [divRef]);
 
 	useEffect(() => {
@@ -2291,11 +2292,12 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 
 	const scrollToBottomCb = useCallback(() => scrollToBottom(scrollContainerRef), [scrollContainerRef])
 
-	// --- E9: column-reverse virtualization ---
-	// flex-direction: column-reverse: scrollTop=0 = bottom (newest).
-	// scrollTop increases upward toward older messages. Old messages are at
-	// the far end of the scroll range — adding/removing them doesn't shift
-	// the viewport. No manual scroll compensation needed.
+	// --- E9: Wrapper-spacer virtualization ---
+	// Messages render inside a wrapper div (spacerRef) whose height is
+	// controlled via direct DOM manipulation. When mountStart changes,
+	// useLayoutEffect measures the new content height and adjusts both
+	// the wrapper height and scrollTop in the correct order to prevent
+	// the browser from clamping scrollTop during the transition.
 	const totalCount = previousMessages.length
 	const [mountStart, setMountStart] = useState(Math.max(0, totalCount - 1))
 
@@ -2304,7 +2306,9 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	const totalCountRef = useRef(totalCount)
 	totalCountRef.current = totalCount
 
+	const spacerRef = useRef<HTMLDivElement | null>(null)
 	const contentRef = useRef<HTMLDivElement | null>(null)
+	const spacerHeightRef = useRef(0)
 	const lastScrollTopRef = useRef(0)
 
 	const getContentHeight = useCallback(() => {
@@ -2333,12 +2337,91 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		const contentH = getContentHeight()
 		if (contentH >= target || mountStart === 0) {
 			initialFillDoneRef.current = true
+			spacerHeightRef.current = contentH
+			if (spacerRef.current) spacerRef.current.style.height = contentH + 'px'
 			return
 		}
 		const deficit = target - contentH
 		const needed = msgsForPx(deficit)
 		setMountStart(prev => Math.max(0, prev - needed))
 	}, [mountStart, totalCount, isActive, scrollContainerRef, msgsForPx, getContentHeight])
+
+	// Sync wrapper height + scrollTop after expand/trim.
+	// Expand (delta > 0): grow wrapper first, then adjust scrollTop.
+	// Trim (delta < 0): adjust scrollTop first, then shrink wrapper.
+	// This ordering prevents the browser from clamping scrollTop.
+	const prevMountStartRef = useRef(mountStart)
+	useLayoutEffect(() => {
+		if (!initialFillDoneRef.current) return
+		const scrollEl = scrollContainerRef.current
+		const spacerEl = spacerRef.current
+		if (!scrollEl || !spacerEl) return
+
+		const contentH = getContentHeight()
+		const oldH = spacerHeightRef.current
+		const delta = contentH - oldH
+		const mountStartChanged = mountStart !== prevMountStartRef.current
+		prevMountStartRef.current = mountStart
+
+		if (Math.abs(delta) < 1) return
+
+		spacerHeightRef.current = contentH
+		mountChangeRef.current = true
+
+		if (mountStartChanged) {
+			if (delta > 0) {
+				spacerEl.style.height = contentH + 'px'
+				scrollEl.scrollTop += delta
+			} else {
+				scrollEl.scrollTop += delta
+				spacerEl.style.height = contentH + 'px'
+			}
+			lastScrollTopRef.current = scrollEl.scrollTop
+		} else {
+			spacerEl.style.height = contentH + 'px'
+		}
+		requestAnimationFrame(() => { mountChangeRef.current = false })
+	}, [mountStart, totalCount, scrollContainerRef, getContentHeight])
+
+	// ResizeObserver: sync wrapper height + scrollTop when content resizes
+	// outside of expand/trim (e.g., LazyBlockCode placeholder → Monaco swap).
+	// Without this, the wrapper stays stale and accumulates delta until the
+	// next mount change, causing a big jump.
+	// Skip scrollTop compensation when width changed (panel resize / reflow).
+	const mountChangeRef = useRef(false)
+	useEffect(() => {
+		const contentEl = contentRef.current
+		const spacerEl = spacerRef.current
+		const scrollEl = scrollContainerRef.current
+		if (!contentEl || !spacerEl || !scrollEl) return
+		if (typeof ResizeObserver === 'undefined') return
+
+		let prevWidth = scrollEl.clientWidth
+
+		const ro = new ResizeObserver(() => {
+			if (!initialFillDoneRef.current) return
+			if (mountChangeRef.current) return
+
+			const currWidth = scrollEl.clientWidth
+			const widthChanged = currWidth !== prevWidth
+			prevWidth = currWidth
+
+			const contentH = contentEl.offsetHeight
+			const oldH = spacerHeightRef.current
+			const delta = contentH - oldH
+			if (Math.abs(delta) < 1) return
+
+			spacerHeightRef.current = contentH
+			spacerEl.style.height = contentH + 'px'
+
+			if (!widthChanged) {
+				scrollEl.scrollTop += delta
+				lastScrollTopRef.current = scrollEl.scrollTop
+			}
+		})
+		ro.observe(contentEl)
+		return () => ro.disconnect()
+	}, [scrollContainerRef])
 
 	const expandUp = useCallback(() => {
 		const scrollEl = scrollContainerRef.current
@@ -2349,9 +2432,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 
 	const hasMore = mountStart > 0
 
-	// Scroll handler: column-reverse scrollTop is 0 (bottom) to negative (up).
-	// scrollingUp = scrollTop becoming more negative.
-	// scrollingDown = scrollTop moving toward 0.
+	// Scroll handler: expand on scroll-up near top, trim on scroll-down.
 	useEffect(() => {
 		const el = scrollContainerRef.current
 		if (!el) return
@@ -2361,26 +2442,22 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		const onScroll = () => {
 			cancelAnimationFrame(rafId)
 			rafId = requestAnimationFrame(() => {
-				const currScrollTop = el.scrollTop // 0 or negative
+				const currScrollTop = el.scrollTop
 				const prevScrollTop = lastScrollTopRef.current
 				lastScrollTopRef.current = currScrollTop
 				const scrollingUp = currScrollTop < prevScrollTop
 				const scrollingDown = currScrollTop > prevScrollTop
 
-				const distFromBottom = -currScrollTop
-				const distFromTop = (el.scrollHeight - el.clientHeight) - distFromBottom
-
-				if (scrollingUp && distFromTop < el.clientHeight && mountStartRef.current > 0) {
+				if (scrollingUp && currScrollTop < el.clientHeight && mountStartRef.current > 0) {
 					expandUp()
 					return
 				}
-				if (scrollingDown && distFromTop > el.clientHeight * 3) {
+				if (scrollingDown && currScrollTop > el.clientHeight * 3) {
 					const mounted = totalCountRef.current - mountStartRef.current
-					const contentH = contentRef.current?.offsetHeight ?? el.scrollHeight
-					const avgH = mounted > 0 ? contentH / mounted : 200
-					const msgsAboveViewport = Math.floor(distFromTop / avgH)
+					const avgH = mounted > 0 ? (contentRef.current?.offsetHeight ?? el.scrollHeight) / mounted : 200
+					const msgsAbove = Math.floor(currScrollTop / avgH)
 					const msgsToKeepAbove = Math.ceil((el.clientHeight * 2) / avgH)
-					const msgsToRemove = msgsAboveViewport - msgsToKeepAbove
+					const msgsToRemove = msgsAbove - msgsToKeepAbove
 					if (msgsToRemove > 0) {
 						flushSync(() => setMountStart(prev => Math.min(prev + msgsToRemove, Math.max(0, totalCountRef.current - 1))))
 					}
@@ -2499,8 +2576,8 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			<ScrollToBottomContainer
 				scrollContainerRef={scrollContainerRef}
 				className={`
-					flex flex-col-reverse
-					px-4 py-4 gap-4
+					flex flex-col
+					px-4 py-4 space-y-4
 					w-full h-full
 					overflow-x-hidden
 					overflow-y-auto
@@ -2508,7 +2585,17 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				`}
 				style={{ overflowAnchor: 'none' } as React.CSSProperties}
 			>
-				{/* column-reverse: DOM-first = visual bottom. Reverse children for correct visual order. */}
+				<div ref={spacerRef} style={{ overflow: 'hidden', flexShrink: 0 }}>
+					<div ref={contentRef} className='flex flex-col space-y-4'>
+						{previousMessagesHTML}
+					</div>
+				</div>
+				{currStreamingMessageHTML}
+				{generatingTool}
+
+				{isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating ? <ProseWrapper>
+					{<IconLoading className='opacity-50 text-sm' />}
+				</ProseWrapper> : null}
 
 				{latestError === undefined ? null :
 					<div className='px-2 my-1'>
@@ -2522,17 +2609,6 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 						<WarningBox className='text-sm my-2 mx-4' onClick={() => { commandService.executeCommand(VOID_OPEN_SETTINGS_ACTION_ID) }} text='Open settings' />
 					</div>
 				}
-
-				{isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating ? <ProseWrapper>
-					{<IconLoading className='opacity-50 text-sm' />}
-				</ProseWrapper> : null}
-
-				{generatingTool}
-				{currStreamingMessageHTML}
-
-				<div ref={contentRef} className='flex flex-col gap-4'>
-					{previousMessagesHTML}
-				</div>
 		</ScrollToBottomContainer>
 	</div>
 	)
