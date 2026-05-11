@@ -1158,9 +1158,25 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - *Trimmed messages*: messages virtualized out of the DOM (`mountStart > 0`) are checked via `previousMessagesRef` to ensure the sticky still shows the correct question even when the original element is unmounted.
 - *Files*: `SidebarChat.tsx` (`updateStickyQuestion` callback, `stickyHeaderRef`/`stickyTextRef` refs, scroll handler integration, absolute overlay in JSX).
 
+**E11 — LaTeX / math equation rendering in chat** ✅ DONE
+- *Pain*: math-heavy responses (physics, ML, optimization) render formulas as raw `$\frac{a}{b}$` text — unreadable.
+- *Implementation*: KaTeX (`katex` npm package) renders `$...$` (inline), `$$...$$` (display), `\(...\)`, and `\[...\]` delimiters. Single unified regex (`LATEX_RE_SOURCE`) handles all four delimiter types in one pass.
+- *Rendering pipeline*:
+  - `splitLatexSegments()` splits paragraph `raw` text into `{type: 'text' | 'latex', content}` segments.
+  - Text segments go through `ChatMarkdownRender` with `inPTag={true}` so markdown formatting (bold, italic, code) is preserved between equations.
+  - LaTeX segments go through `LatexRender` which uses `katex.render()` (DOM-based, not `renderToString`) to write directly to a ref element. This avoids `innerHTML` / `dangerouslySetInnerHTML` which are blocked by VS Code's Trusted Types CSP.
+- *Output mode*: `output: 'html'` with KaTeX CSS loaded via `vscode-file://` protocol. CSS `<link>` tag injected at module init, path derived from `document.baseURI` → `node_modules/katex/dist/katex.min.css`. Font `url()` paths resolve correctly since the browser resolves them relative to the CSS file location.
+- *Iterations before landing*:
+  1. `dangerouslySetInnerHTML` → blocked by Trusted Types CSP.
+  2. `trustedTypes.createPolicy('voidKatex')` → policy name not in CSP allowlist.
+  3. `katex.render()` + `output: 'mathml'` → works but accent rendering (`\hat{}`, `\tilde{}`) poor (browser MathML engine vs KaTeX's math fonts).
+  4. `katex.render()` + `output: 'html'` + CSS via `vscode-file://` → final solution, proper font rendering.
+- *System prompt*: added LaTeX support hint to `importantDetails` in `prompts.ts` so the agent knows it can use math notation.
+- *Files*: `ChatMarkdownRender.tsx` (KaTeX import, CSS loader, `LatexRender` component, `splitLatexSegments`, paragraph handler), `prompts.ts` (LaTeX hint), `package.json` (`katex` dependency).
+
 **Execution order & commit strategy**
 - E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E2' cache-busting fix (freeze-on-first-send + indicator) ✅ done. E4 (per-request telemetry) ✅ done (own commit) — supersedes E3. E5 ✅ core logic shipped (own commit).
-- E9 ✅ done (viewport rendering + code block height fix). **Up next**: E8 (search in chat). E5 dog-food continues passively. E6 evaluation after E5 data. E7 ✅ shipped.
+- E9 ✅ done (viewport rendering + code block height fix). E10 ✅ done (sticky question header). E11 ✅ done (LaTeX rendering). **Up next**: E8 (search in chat). E5 dog-food continues passively. E6 evaluation after E5 data. E7 ✅ shipped.
 - **After E5 dog-food**: evaluate E4 telemetry data (resultLen distribution on `read_file`, follow-up-with-ranges hit rate) before deciding whether E6 is worth doing.
 - After each phase, dog-food with a one-day daily-use window before committing the next. If a phase's real-world impact is smaller than projected (or reveals a different problem), the later phases can be resequenced / dropped.
 - Phase D deferred below — no observed pain to justify it.
@@ -1176,6 +1192,72 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 - Rough scope (to refine when this actually starts): local embeddings via Ollama's `/api/embeddings` endpoint (no external services, reuses existing Ollama infra); SQLite-backed vector store; file-watcher-driven incremental reindex with debounce; new `semantic_search` tool in `prompts.ts` alongside the lexical tools (hybrid, not replacement); `.gitignore` + `.voidignore` respect.
 - Estimated: ~1-2 weeks of focused work. Not a weekend project.
 - Decision trigger: after ~2 weeks of Phase-E-enabled daily use, if the symptom "agent fished for the right keyword via lexical search" still dominates the pain log → commit to Phase F. If Phase E subsumes it → keep deferred.
+
+### Reference — OpenCode + Oh-My-OpenAgent + Karpathy LLM Wiki analysis (May 2026)
+
+Audited three external codebases/docs against Void's objective ("code editor first with chat panel"):
+- **OpenCode** (`/Users/david.halim/Documents/Projects/opencode`): open-source TUI AI coding agent. Monorepo, Bun/Effect-ts, SQLite, ai-sdk. 7 model-specific system prompt variants.
+- **Oh-My-OpenAgent** (`/Users/david.halim/Documents/Projects/oh-my-openagent`): plugin for OpenCode adding multi-agent orchestration (Sisyphus/Hephaestus/Prometheus/Atlas), category-based model routing, hash-anchored edits, skills system, team mode.
+- **Karpathy's LLM Wiki** (`docs/karpathy-llm-wiki.md`): pattern for persistent LLM-maintained knowledge bases — raw sources → wiki layer → schema. Relevant in spirit (compounding context vs re-deriving per query).
+
+**Feature analysis — what's worth building:**
+
+| Priority | Feature | Source | Rationale |
+|---|---|---|---|
+| **High** | Prompt Phase D2 (editing philosophy + formatting) | OpenCode GPT/Gemini prompts | ~125 new tokens: editing philosophy ("minimal changes", "don't extract single-use helpers", "no speculative backward-compat"), response formatting ("flat lists", "`file:line` code refs"), security reminder, anti-stalling. High behavioral impact, no eval risk. |
+| **High** | Shadow-git checkpointing | OpenCode `snapshot/index.ts` | Per-agent-turn file snapshots via shadow git. Undo agent actions without touching user's git. Huge trust builder. |
+| **High** | Auto-approve mode for read-only tools | OmO Ralph Loop / ultrawork | Toggle that auto-approves reads/searches, prompts only for writes. Reduces friction for experienced users. |
+| **High** | Per-task model routing | OmO category system | Classify user intent (simple edit vs architecture vs frontend) and auto-select best model from configured set. Void already has per-conversation model persistence — this is the next step. |
+| Medium | Heavy-tier compaction with anchored summaries | OpenCode `compaction.ts` | LLM-generated summary replacing old messages. Anchored pattern (update previous summary, don't regenerate) is cheaper and more stable. Extends existing Light tier. |
+| Medium | Additional LSP tools (`documentSymbol`, `workspaceSymbol`) | OpenCode `lsp.ts` | `documentSymbol` = file overview without reading full body. `workspaceSymbol` = project-wide symbol search. Reduces grep-fishing. |
+| Medium | Project Context Cache | Karpathy Wiki insight | Persistent LLM-maintained project summary (architecture, key files, conventions). Updated incrementally on file changes. Consulted at query time instead of expensive grep/read cycles. |
+| Lower | Hash-anchored edits | OmO Hashline | Content-hash tags per line. Edits reference hashes — stale reads rejected. Trade-off: reliability vs token cost. Prototype for weaker models. |
+| Lower | Workspace profiles | OmO skills (simplified) | Project-type-aware prompt extensions. Detect React/Python/etc and load relevant guidance. |
+| Lower | Codebase health check | Karpathy "Lint" operation | Slash command: audit for stale TODOs, dead code, inconsistent patterns. |
+
+**Prompt comparison — Void vs OpenCode vs OmO:**
+
+Void's prompt architecture is stronger in two critical ways:
+1. **Phase B caching layout** (`[stable sys][history][volatile + user]`): neither OpenCode nor OmO does this. They embed environment info in the system prompt, breaking prefix cache on every turn.
+2. **Empirically validated rules**: each bullet (A1-A4, C1-C6, E1) has eval data against multiple models with token counts and success rates. OpenCode and OmO prompts are designed by intuition.
+
+Gaps identified in Void's prompt (actionable additions for Phase D2):
+- **No editing philosophy.** OpenCode GPT: "best changes are often the smallest", "keep things in one function unless composable", "don't add backward-compat code without concrete need". Void has nothing equivalent — model defaults to over-engineering.
+- **No response formatting rules.** OpenCode GPT: "flat lists only", "short Title Case headers", "inline code for paths/functions". Void only says "use MARKDOWN, no tables".
+- **No code reference format.** OpenCode: "When referencing code, use `file_path:line_number`." Void models default to inconsistent styles.
+- **No security reminder.** "Never introduce code that exposes or logs secrets." ~15 tokens.
+- **No anti-stalling.** OmO beast: "When you say you will do X, actually do X in the same turn." ~15 tokens.
+- **No concurrent-edit safety.** OpenCode GPT: "If you notice unexpected changes you did not make, continue with your task. NEVER revert." ~25 tokens.
+
+What NOT to adopt:
+- Output length caps ("fewer than 4 lines") — too restrictive for IDE.
+- Model-specific prompt variants — maintenance burden outweighs benefit; Void's single prompt is already eval-validated across models.
+- Intent verbalization (OmO "I detect [type] intent") — adds latency and visible noise.
+- TodoWrite emphasis (OpenCode Anthropic) — clutters output for IDE context.
+- Beast-mode aggressive autonomy ("EXTENSIVE INTERNET RESEARCH") — too aggressive for local code editing.
+
+**Phase D2 — Prompt editing philosophy + response formatting (planned)**
+
+Concrete additions to `chat_systemMessage` in `prompts.ts`:
+
+1. **Editing philosophy** (agent mode only, after A4 bullets):
+   - Prefer the smallest correct change. Don't extract single-use helpers, don't add backward-compatibility code without concrete need (persisted data, external consumers, explicit requirement).
+   - Follow existing code conventions: naming, structure, framework choices, imports. Read surrounding code before editing.
+
+2. **Response formatting** (all modes, after markdown bullet):
+   - When referencing code, use `file_path:line_number` format.
+   - Keep lists flat (single level). If you need hierarchy, split into separate sections.
+
+3. **Safety** (agent mode, after workspace permission bullet):
+   - Never introduce code that exposes, logs, or commits secrets, API keys, or credentials.
+   - If you notice unexpected file changes you did not make, continue with your task — do not revert changes made by the user or other processes.
+
+4. **Anti-stalling** (agent mode, in action rules):
+   - When you say you will do something, do it in the same turn. Don't announce actions without executing them.
+
+Estimated total: ~125 tokens added to system message. Needs eval on benchmark tasks before commit to confirm no regression on Gemma/Nemotron.
+
+Files: `prompts.ts` (`chat_systemMessage` — new bullets in `importantDetails`).
 
 ### Reference — Zed agent comparison (read for inspiration, partial harvest planned via E5/E6)
 
