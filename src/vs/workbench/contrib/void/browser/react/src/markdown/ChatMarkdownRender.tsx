@@ -5,6 +5,7 @@
 
 import React, { JSX, useEffect, useRef, useState } from 'react'
 import { marked, MarkedToken, Token } from 'marked'
+import katex from 'katex'
 
 // Module-level content-keyed cache for marked.lexer output. Every tab switch / every
 // re-render of a bubble otherwise re-lexes the entire message from scratch, even
@@ -112,59 +113,42 @@ function isValidUri(s: string): boolean {
 
 // renders contiguous string of latex eg $e^{i\pi}$
 const LatexRender = ({ latex }: { latex: string }) => {
-	return <span className="katex-error text-red-500">{latex}</span>
-	// try {
-	// 	let formula = latex;
-	// 	let displayMode = false;
+	const ref = useRef<HTMLSpanElement>(null);
 
-	// 	// Extract the formula from delimiters
-	// 	if (latex.startsWith('$') && latex.endsWith('$')) {
-	// 		// Check if it's display math $$...$$
-	// 		if (latex.startsWith('$$') && latex.endsWith('$$')) {
-	// 			formula = latex.slice(2, -2);
-	// 			displayMode = true;
-	// 		} else {
-	// 			formula = latex.slice(1, -1);
-	// 		}
-	// 	} else if (latex.startsWith('\\(') && latex.endsWith('\\)')) {
-	// 		formula = latex.slice(2, -2);
-	// 	} else if (latex.startsWith('\\[') && latex.endsWith('\\]')) {
-	// 		formula = latex.slice(2, -2);
-	// 		displayMode = true;
-	// 	}
+	let formula = latex;
+	let displayMode = false;
 
-	// 	// Render LaTeX
-	// 	const html = katex.renderToString(formula, {
-	// 		displayMode: displayMode,
-	// 		throwOnError: false,
-	// 		output: 'html'
-	// 	});
+	if (latex.startsWith('$$') && latex.endsWith('$$')) {
+		formula = latex.slice(2, -2);
+		displayMode = true;
+	} else if (latex.startsWith('$') && latex.endsWith('$')) {
+		formula = latex.slice(1, -1);
+	} else if (latex.startsWith('\\[') && latex.endsWith('\\]')) {
+		formula = latex.slice(2, -2);
+		displayMode = true;
+	} else if (latex.startsWith('\\(') && latex.endsWith('\\)')) {
+		formula = latex.slice(2, -2);
+	}
 
-	// 	// Sanitize the HTML output with DOMPurify
-	// 	const sanitizedHtml = dompurify.sanitize(html, {
-	// 		RETURN_TRUSTED_TYPE: true,
-	// 		USE_PROFILES: { html: true, svg: true, mathMl: true }
-	// 	});
+	useEffect(() => {
+		if (!ref.current) return;
+		try {
+			katex.render(formula, ref.current, {
+				displayMode,
+				throwOnError: false,
+				output: 'mathml',
+			});
+		} catch (err) {
+			console.error('[LatexRender] failed:', err);
+			ref.current.textContent = latex;
+		}
+	}, [formula, displayMode, latex]);
 
-	// 	// Add proper styling based on mode
-	// 	const className = displayMode
-	// 		? 'katex-block my-2 text-center'
-	// 		: 'katex-inline';
+	const className = displayMode
+		? 'katex-block my-2 text-center'
+		: 'katex-inline';
 
-	// 	// Use the ref approach to avoid dangerouslySetInnerHTML
-	// 	const mathRef = React.useRef<HTMLSpanElement>(null);
-
-	// 	React.useEffect(() => {
-	// 		if (mathRef.current) {
-	// 			mathRef.current.innerHTML = sanitizedHtml as unknown as string;
-	// 		}
-	// 	}, [sanitizedHtml]);
-
-	// 	return <span ref={mathRef} className={className}></span>;
-	// } catch (error) {
-	// 	console.error('KaTeX rendering error:', error);
-	// 	return <span className="katex-error text-red-500">{latex}</span>;
-	// }
+	return <span ref={ref} className={className} />;
 }
 
 const Codespan = ({ text, className, onClick, tooltip }: { text: string, className?: string, onClick?: () => void, tooltip?: string }) => {
@@ -244,102 +228,46 @@ const CodespanWithLink = ({ text, rawText, chatMessageLocation }: { text: string
 }
 
 
-const paragraphToLatexSegments = (paragraphText: string) => {
+// Matches all LaTeX delimiters: $$...$$, \[...\], $...$, \(...\)
+// Display variants are matched first (longer delimiters) to avoid partial matches.
+const LATEX_RE_SOURCE = /\$\$([\s\S]*?)\$\$|\\\[([\s\S]*?)\\\]|\$((?!\$)(?:\\.|[^$])*?)\$|\\\(((?:\\.|[^)])*?)\\\)/.source;
 
-	const segments: React.ReactNode[] = [];
+type LatexSegment = { type: 'text', content: string } | { type: 'latex', content: string };
 
-	if (paragraphText
-		&& !(paragraphText.includes('#') || paragraphText.includes('`')) // don't process latex if a codespan or header tag
-		&& !/^[\w\s.()[\]{}]+$/.test(paragraphText) // don't process latex if string only contains alphanumeric chars, whitespace, periods, and brackets
+const splitLatexSegments = (paragraphText: string): LatexSegment[] | null => {
+	if (
+		!paragraphText
+		|| paragraphText.includes('#') || paragraphText.includes('`')
+		|| !/[$\\]/.test(paragraphText)
 	) {
-		const rawText = paragraphText;
-		// Regular expressions to match LaTeX delimiters
-		const displayMathRegex = /\$\$(.*?)\$\$/g;  // Display math: $$...$$
-		const inlineMathRegex = /\$((?!\$).*?)\$/g; // Inline math: $...$ (but not $$)
-
-		// Check if the paragraph contains any LaTeX expressions
-		if (displayMathRegex.test(rawText) || inlineMathRegex.test(rawText)) {
-			// Reset the regex state (since we used .test earlier)
-			displayMathRegex.lastIndex = 0;
-			inlineMathRegex.lastIndex = 0;
-
-			// Parse the text into segments of regular text and LaTeX
-			let lastIndex = 0;
-			let segmentId = 0;
-
-			// First replace display math ($$...$$)
-			let match;
-			while ((match = displayMathRegex.exec(rawText)) !== null) {
-				const [fullMatch, formula] = match;
-				const matchIndex = match.index;
-
-				// Add text before the LaTeX expression
-				if (matchIndex > lastIndex) {
-					const textBefore = rawText.substring(lastIndex, matchIndex);
-					segments.push(
-						<span key={`text-${segmentId++}`}>
-							{textBefore}
-						</span>
-					);
-				}
-
-				// Add the LaTeX expression
-				segments.push(
-					<LatexRender key={`latex-${segmentId++}`} latex={fullMatch} />
-				);
-
-				lastIndex = matchIndex + fullMatch.length;
-			}
-
-			// Add any remaining text (which might contain inline math)
-			if (lastIndex < rawText.length) {
-				const remainingText = rawText.substring(lastIndex);
-
-				// Process inline math in the remaining text
-				lastIndex = 0;
-				inlineMathRegex.lastIndex = 0;
-				const inlineSegments: React.ReactNode[] = [];
-
-				while ((match = inlineMathRegex.exec(remainingText)) !== null) {
-					const [fullMatch] = match;
-					const matchIndex = match.index;
-
-					// Add text before the inline LaTeX
-					if (matchIndex > lastIndex) {
-						const textBefore = remainingText.substring(lastIndex, matchIndex);
-						inlineSegments.push(
-							<span key={`inline-text-${segmentId++}`}>
-								{textBefore}
-							</span>
-						);
-					}
-
-					// Add the inline LaTeX
-					inlineSegments.push(
-						<LatexRender key={`inline-latex-${segmentId++}`} latex={fullMatch} />
-					);
-
-					lastIndex = matchIndex + fullMatch.length;
-				}
-
-				// Add any remaining text after all inline math
-				if (lastIndex < remainingText.length) {
-					inlineSegments.push(
-						<span key={`inline-final-${segmentId++}`}>
-							{remainingText.substring(lastIndex)}
-						</span>
-					);
-				}
-
-				segments.push(...inlineSegments);
-			}
-
-
-		}
+		return null;
 	}
 
+	const latexPattern = new RegExp(LATEX_RE_SOURCE, 'g');
+	if (!latexPattern.test(paragraphText)) return null;
 
-	return segments
+	latexPattern.lastIndex = 0;
+	const segments: LatexSegment[] = [];
+	let lastIndex = 0;
+	let match;
+
+	while ((match = latexPattern.exec(paragraphText)) !== null) {
+		const [fullMatch] = match;
+		const matchIndex = match.index;
+
+		if (matchIndex > lastIndex) {
+			segments.push({ type: 'text', content: paragraphText.substring(lastIndex, matchIndex) });
+		}
+
+		segments.push({ type: 'latex', content: fullMatch });
+		lastIndex = matchIndex + fullMatch.length;
+	}
+
+	if (segments.length > 0 && lastIndex < paragraphText.length) {
+		segments.push({ type: 'text', content: paragraphText.substring(lastIndex) });
+	}
+
+	return segments.length > 0 ? segments : null;
 }
 
 
@@ -531,12 +459,17 @@ const RenderToken = React.memo(({ token, inPTag, codeURI, chatMessageLocation, t
 	if (t.type === 'paragraph') {
 
 		// check for latex
-		const latexSegments = paragraphToLatexSegments(t.raw)
-		if (latexSegments.length !== 0) {
+		const latexSegments = splitLatexSegments(t.raw)
+		if (latexSegments !== null) {
+			const rendered = latexSegments.map((seg, i) =>
+				seg.type === 'latex'
+					? <LatexRender key={`latex-${i}`} latex={seg.content} />
+					: <ChatMarkdownRender key={`text-${i}`} chatMessageLocation={chatMessageLocation} string={seg.content} inPTag={true} {...options} />
+			);
 			if (inPTag) {
-				return <span className='block'>{latexSegments}</span>;
+				return <span className='block'>{rendered}</span>;
 			}
-			return <p>{latexSegments}</p>;
+			return <p>{rendered}</p>;
 		}
 
 		// if no latex, default behavior
