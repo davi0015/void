@@ -7,6 +7,18 @@ import React, { JSX, useEffect, useRef, useState } from 'react'
 import { marked, MarkedToken, Token } from 'marked'
 import katex from 'katex'
 
+// Load KaTeX CSS at runtime via vscode-file:// so relative font url() paths
+// resolve correctly to node_modules/katex/dist/fonts/.
+(() => {
+	try {
+		const appRoot = document.baseURI.replace(/\/out\/vs\/.*$/, '');
+		const link = document.createElement('link');
+		link.rel = 'stylesheet';
+		link.href = `${appRoot}/node_modules/katex/dist/katex.min.css`;
+		document.head.appendChild(link);
+	} catch { /* fonts unavailable — equations still render via MathML fallback */ }
+})();
+
 // Module-level content-keyed cache for marked.lexer output. Every tab switch / every
 // re-render of a bubble otherwise re-lexes the entire message from scratch, even
 // though the content is identical to the previous lex. Cache survives component
@@ -136,7 +148,7 @@ const LatexRender = ({ latex }: { latex: string }) => {
 			katex.render(formula, ref.current, {
 				displayMode,
 				throwOnError: false,
-				output: 'mathml',
+				output: 'html',
 			});
 		} catch (err) {
 			console.error('[LatexRender] failed:', err);
