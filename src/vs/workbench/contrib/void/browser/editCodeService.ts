@@ -1904,12 +1904,11 @@ class EditCodeService extends Disposable implements IEditCodeService {
 						if (!(blockNum in addedTrackingZoneOfBlockNum)) {
 
 							const originalBounds = findTextInCode(block.orig, originalFileCode, true, { returnType: 'lines' })
-							// if error
-							// Check for overlap with existing modified ranges
-							const hasOverlap = addedTrackingZoneOfBlockNum.some(trackingZone => {
+							// Check for overlap with existing modified ranges (only when bounds are valid)
+							const hasOverlap = typeof originalBounds !== 'string' && addedTrackingZoneOfBlockNum.some(trackingZone => {
 								const [existingStart, existingEnd] = trackingZone.metadata.originalBounds;
-								const hasNoOverlap = endLine < existingStart || startLine > existingEnd
-								return !hasNoOverlap
+								const [s, e] = convertOriginalRangeToFinalRange(originalBounds)
+								return !(e < existingStart || s > existingEnd)
 							});
 
 							if (typeof originalBounds === 'string' || hasOverlap) {
@@ -1952,17 +1951,8 @@ class EditCodeService extends Disposable implements IEditCodeService {
 								return
 							}
 
-
-
 							const [startLine, endLine] = convertOriginalRangeToFinalRange(originalBounds)
 
-							// console.log('---------adding-------')
-							// console.log('CURRENT TEXT!!!', { current: model?.getValue(EndOfLinePreference.LF) })
-							// console.log('block', deepClone(block))
-							// console.log('origBounds', originalBounds)
-							// console.log('start end', startLine, endLine)
-
-							// otherwise if no error, add the position as a diffarea
 							const adding: Omit<TrackingZone<SearchReplaceDiffAreaMetadata>, 'diffareaid'> = {
 								type: 'TrackingZone',
 								startLine: startLine,
