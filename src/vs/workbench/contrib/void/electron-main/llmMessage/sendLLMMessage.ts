@@ -5,7 +5,7 @@
 
 import { SendLLMMessageParams, OnText, OnFinalMessage, OnError } from '../../common/sendLLMMessageTypes.js';
 import { IMetricsService } from '../../common/metricsService.js';
-import { displayInfoOfProviderName } from '../../common/voidSettingsTypes.js';
+import { BackendProviderSettings, BuiltInProviderName, isBackendId, displayInfoOfProviderName } from '../../common/voidSettingsTypes.js';
 import { sendLLMMessageToProviderImplementation } from './sendLLMMessage.impl.js';
 
 
@@ -109,7 +109,14 @@ export const sendLLMMessage = async ({
 
 
 	try {
-		const implementation = sendLLMMessageToProviderImplementation[providerName]
+		let implKey: BuiltInProviderName
+		if (isBackendId(providerName)) {
+			const backendSettings = settingsOfProvider[providerName] as BackendProviderSettings
+			implKey = backendSettings.protocol
+		} else {
+			implKey = providerName as BuiltInProviderName
+		}
+		const implementation = sendLLMMessageToProviderImplementation[implKey]
 		if (!implementation) {
 			onError({ message: `Error: Provider "${providerName}" not recognized.`, fullError: null })
 			return
