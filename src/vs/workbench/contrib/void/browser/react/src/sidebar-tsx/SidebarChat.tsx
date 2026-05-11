@@ -2410,7 +2410,12 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			}
 			lastScrollTopRef.current = scrollEl.scrollTop
 		} else {
+			const wasAtBottom = Math.abs(scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop) < 40
 			spacerEl.style.height = contentH + 'px'
+			if (wasAtBottom) {
+				scrollEl.scrollTop = 1e10
+			}
+			lastScrollTopRef.current = scrollEl.scrollTop
 		}
 		requestAnimationFrame(() => { mountChangeRef.current = false })
 	}, [mountStart, totalCount, scrollContainerRef, getContentHeight])
