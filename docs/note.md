@@ -1176,7 +1176,7 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 
 **Execution order & commit strategy**
 - E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E2' cache-busting fix (freeze-on-first-send + indicator) ✅ done. E4 (per-request telemetry) ✅ done (own commit) — supersedes E3. E5 ✅ core logic shipped (own commit).
-- E9 ✅ done (viewport rendering + code block height fix). E10 ✅ done (sticky question header). E11 ✅ done (LaTeX rendering). **Up next**: E8 (search in chat). E5 dog-food continues passively. E6 evaluation after E5 data. E7 ✅ shipped.
+- E9 ✅ done (viewport rendering + code block height fix). E10 ✅ done (sticky question header). E11 ✅ done (LaTeX rendering). D2 ✅ done (editing philosophy + formatting). D3 ✅ done (agent persona). **Up next**: E8 (search in chat). E5 dog-food continues passively. E6 evaluation after E5 data. E7 ✅ shipped.
 - **After E5 dog-food**: evaluate E4 telemetry data (resultLen distribution on `read_file`, follow-up-with-ranges hit rate) before deciding whether E6 is worth doing.
 - After each phase, dog-food with a one-day daily-use window before committing the next. If a phase's real-world impact is smaller than projected (or reveals a different problem), the later phases can be resequenced / dropped.
 - Phase D deferred below — no observed pain to justify it.
@@ -1236,7 +1236,7 @@ What NOT to adopt:
 - TodoWrite emphasis (OpenCode Anthropic) — clutters output for IDE context.
 - Beast-mode aggressive autonomy ("EXTENSIVE INTERNET RESEARCH") — too aggressive for local code editing.
 
-**Phase D2 — Prompt editing philosophy + response formatting (planned)**
+**Phase D2 — Prompt editing philosophy + response formatting** ✅ *Implemented*
 
 Concrete additions to `chat_systemMessage` in `prompts.ts`:
 
@@ -1255,9 +1255,31 @@ Concrete additions to `chat_systemMessage` in `prompts.ts`:
 4. **Anti-stalling** (agent mode, in action rules):
    - When you say you will do something, do it in the same turn. Don't announce actions without executing them.
 
-Estimated total: ~125 tokens added to system message. Needs eval on benchmark tasks before commit to confirm no regression on Gemma/Nemotron.
+Estimated total: ~125 tokens added to system message.
 
 Files: `prompts.ts` (`chat_systemMessage` — new bullets in `importantDetails`).
+
+**Phase D3 — Agent persona improvement** ✅ *Implemented*
+
+Sharpen persona identity and communication style in the `header` of `chat_systemMessage`. Sources: OpenCode GPT/default prompts, OmO Sisyphus, Zed agent. Filtered for IDE chat agent relevance — no CLI, multi-agent, or output-cap patterns.
+
+Changes to `header` in `prompts.ts`:
+
+1. **Persona identity**: "a senior software engineer" → "a pragmatic senior software engineer ... in a code editor". Anchors character to IDE context.
+
+2. **Per-mode role voice** (replaces generic "focused on developing/searching/coding" clauses):
+   - **agent**: "You work autonomously — investigate, implement, and verify without waiting for permission on each step."
+   - **gather**: "You research the codebase — find, read, and synthesize code to give grounded answers."
+   - **normal**: "You answer questions and suggest edits, describing code changes precisely in code blocks."
+
+3. **Communication style block** (new paragraph after ownership, ~45 tokens):
+   - Anti-flattery: don't open with "Got it", "Great question!", "Sure!".
+   - Professional objectivity: prioritize technical accuracy over agreeing with the user; state concerns and propose alternatives.
+   - Style matching: terse question → terse answer.
+
+No overlap with `importantDetails` — existing anti-hedging (A2), anti-padding (A2), honesty, and editing philosophy (D2) bullets untouched. ~45 tokens added to stable system prefix (cacheable).
+
+Files: `prompts.ts` (`chat_systemMessage` — `header` const, lines 512-520).
 
 ### Reference — Zed agent comparison (read for inspiration, partial harvest planned via E5/E6)
 
