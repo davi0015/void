@@ -1306,6 +1306,11 @@ Files: `prompts.ts` (`chat_systemMessage` — `header` const, lines 512-520).
 - **DeepSeek V4 reasoning effort**: Added `reasoning_effort` slider with values `['high', 'max']` (default `'high'`). Payload includes both `thinking: { type: 'enabled' }` and `reasoning_effort` when reasoning is on.
 - **Auth error messages**: 401 errors now show the actual server message instead of generic "Invalid API key" for all protocols.
 
+### Per-thread chat state ✅ *Implemented*
+
+- **Text box draft preservation**: Draft text is saved per thread in a ref map. Switching tabs restores the previous draft instead of clearing the input. The draft is cleared on submit.
+- **Per-thread reasoning toggle**: Thinking on/off and reasoning effort/budget are now independent per tab. Toggling reasoning in one thread no longer affects other threads using the same model. Per-thread reasoning options override global settings at send time via `modelSelectionOptionsOverride`.
+
 ### Reference — Zed agent comparison (read for inspiration, partial harvest planned via E5/E6)
 
 Audited Zed's `crates/agent` (added to workspace as `Projects/zed`) against ours in Apr 2026. The user's hypothesis going in was "Zed feels more token-efficient." Confirmed; here's where the gap actually lives.

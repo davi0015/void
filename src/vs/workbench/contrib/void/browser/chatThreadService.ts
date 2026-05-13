@@ -520,7 +520,7 @@ export interface IChatThreadService {
 	editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId }: { userMessage: string, messageIdx: number, threadId: string }): Promise<void>;
 
 	// call to add a message
-	addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array> }): Promise<void>;
+	addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes, modelSelectionOptionsOverride }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array>, modelSelectionOptionsOverride?: ModelSelectionOptions }): Promise<void>;
 
 	// approve/reject
 	approveLatestToolRequest(threadId: string): void;
@@ -2520,7 +2520,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 	}
 
 
-	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array> }) {
+	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes, modelSelectionOptionsOverride }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array>, modelSelectionOptionsOverride?: ModelSelectionOptions }) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
@@ -2664,6 +2664,9 @@ We only need to do it for files that were edited since `from`, ie files between 
 		}
 
 		const modelProps = this._currentModelSelectionProps()
+		if (modelSelectionOptionsOverride) {
+			modelProps.modelSelectionOptions = { ...modelProps.modelSelectionOptions, ...modelSelectionOptionsOverride }
+		}
 		this._setThreadLastUsedModelSelection(threadId, modelProps.modelSelection)
 
 		this._wrapRunAgentToNotify(
@@ -2734,7 +2737,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 		return descriptions.join('\n\n')
 	}
 
-	async addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array> }) {
+	async addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes, modelSelectionOptionsOverride }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array>, modelSelectionOptionsOverride?: ModelSelectionOptions }) {
 		if (this._isThreadMutationBlocked(threadId, 'addUserMessageAndStreamResponse')) return
 		const thread = this.state.allThreads[threadId];
 		if (!thread) return
@@ -2757,7 +2760,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 			this._deleteOrphanedImages(removedMessages, newMessages);
 		}
 
-		await this._addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes });
+		await this._addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes, modelSelectionOptionsOverride });
 
 	}
 
