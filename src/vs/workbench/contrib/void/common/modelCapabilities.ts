@@ -252,11 +252,11 @@ type VoidStaticProviderInfo = { // doesn't change (not stateful)
 
 
 const defaultModelOptions = {
-	contextWindow: 4_096,
-	reservedOutputTokenSpace: 4_096,
+	contextWindow: 128_000,
+	reservedOutputTokenSpace: 8_192,
 	cost: { input: 0, output: 0 },
 	downloadable: false,
-	supportsSystemMessage: false,
+	supportsSystemMessage: 'system-role',
 	supportsFIM: false,
 	supportsVision: false,
 	reasoningCapabilities: false,
@@ -965,9 +965,7 @@ const _deepseekV4SharedCaps = {
 	supportsFIM: false, // FIM only available outside thinking mode; we don't expose FIM for V4 chat
 	supportsSystemMessage: 'system-role',
 	specialToolFormat: 'openai-style',
-	// Thinking is a simple on/off — no slider in the UI. SendableReasoningInfo's
-	// `enabled_no_slider` variant carries this through to `deepseekIncludeInPayloadReasoning`.
-	reasoningCapabilities: { supportsReasoning: true, canTurnOffReasoning: true, canIOReasoning: true },
+	reasoningCapabilities: { supportsReasoning: true, canTurnOffReasoning: true, canIOReasoning: true, reasoningSlider: { type: 'effort_slider', values: ['high', 'max'], default: 'high' } },
 	downloadable: false,
 } as const satisfies Partial<VoidStaticModelInfo>
 
@@ -992,7 +990,8 @@ const deepseekModelOptions = {
 // off in the UI" — emit `disabled` so we override DeepSeek's default-on.
 const deepseekIncludeInPayloadReasoning = (reasoningInfo: SendableReasoningInfo) => {
 	if (reasoningInfo?.isReasoningEnabled) {
-		return { thinking: { type: 'enabled' } }
+		const effort = reasoningInfo.type === 'effort_slider_value' ? reasoningInfo.reasoningEffort : undefined
+		return { thinking: { type: 'enabled' }, ...(effort ? { reasoning_effort: effort } : {}) }
 	}
 	return { thinking: { type: 'disabled' } }
 }

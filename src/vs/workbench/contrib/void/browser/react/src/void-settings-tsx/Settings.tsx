@@ -237,7 +237,7 @@ const SimpleModelSettingsDialog = ({
 	const partialDefaults: Partial<ModelOverrides> = {};
 	for (const k of modelOverrideKeys) {
 		if (k === 'specialToolFormat') continue;
-		if (defaultModelCapabilities[k]) partialDefaults[k] = defaultModelCapabilities[k] as any;
+		if (defaultModelCapabilities[k] !== undefined) partialDefaults[k] = defaultModelCapabilities[k] as any;
 	}
 	const placeholder = JSON.stringify(partialDefaults, null, 2);
 

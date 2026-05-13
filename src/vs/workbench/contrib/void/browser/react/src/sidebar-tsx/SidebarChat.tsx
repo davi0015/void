@@ -19,7 +19,7 @@ import { ModelDropdown, } from '../void-settings-tsx/ModelDropdown.js';
 import { PastThreadsList, SidebarThreadTabs } from './SidebarThreadSelector.js';
 import { VOID_CTRL_L_ACTION_ID } from '../../../actionIDs.js';
 import { VOID_OPEN_SETTINGS_ACTION_ID } from '../../../voidSettingsPane.js';
-import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled } from '../../../../../../../workbench/contrib/void/common/voidSettingsTypes.js';
+import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled, ModelSelectionOptions } from '../../../../../../../workbench/contrib/void/common/voidSettingsTypes.js';
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
@@ -139,7 +139,13 @@ export { IconLoading } from './sidebarChatHelpers.js';
 
 
 // SLIDER ONLY:
-const ReasoningOptionSlider = ({ featureName }: { featureName: FeatureName }) => {
+// When `threadOptions`/`onChangeThreadOptions` are provided, the slider
+// reads/writes per-thread reasoning state instead of the global settings.
+const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptions }: {
+	featureName: FeatureName,
+	threadOptions?: ModelSelectionOptions,
+	onChangeThreadOptions?: (opts: Partial<ModelSelectionOptions>) => void,
+}) => {
 	const accessor = useAccessor()
 
 	const voidSettingsService = accessor.get('IVoidSettingsService')
@@ -154,8 +160,17 @@ const ReasoningOptionSlider = ({ featureName }: { featureName: FeatureName }) =>
 	const { reasoningCapabilities } = getModelCapabilities(providerName, modelName, overridesOfModel)
 	const { canTurnOffReasoning, reasoningSlider: reasoningBudgetSlider } = reasoningCapabilities || {}
 
-	const modelSelectionOptions = voidSettingsState.optionsOfModelSelection[featureName][providerName]?.[modelName]
+	const globalOptions = voidSettingsState.optionsOfModelSelection[featureName][providerName]?.[modelName]
+	const modelSelectionOptions = threadOptions ?? globalOptions
 	const isReasoningEnabled = getIsReasoningEnabledState(featureName, providerName, modelName, modelSelectionOptions, overridesOfModel)
+
+	const setOptions = (opts: Partial<ModelSelectionOptions>) => {
+		if (onChangeThreadOptions) {
+			onChangeThreadOptions(opts)
+		} else {
+			voidSettingsService.setOptionsOfModelSelection(featureName, modelSelection.providerName, modelSelection.modelName, opts)
+		}
+	}
 
 	if (canTurnOffReasoning && !reasoningBudgetSlider) { // if it's just a on/off toggle without a power slider
 		return <div className='flex items-center gap-x-2'>
@@ -165,7 +180,7 @@ const ReasoningOptionSlider = ({ featureName }: { featureName: FeatureName }) =>
 				value={isReasoningEnabled}
 				onChange={(newVal) => {
 					const isOff = canTurnOffReasoning && !newVal
-					voidSettingsService.setOptionsOfModelSelection(featureName, modelSelection.providerName, modelSelection.modelName, { reasoningEnabled: !isOff })
+					setOptions({ reasoningEnabled: !isOff })
 				}}
 			/>
 		</div>
@@ -179,7 +194,7 @@ const ReasoningOptionSlider = ({ featureName }: { featureName: FeatureName }) =>
 
 		const valueIfOff = min_ - stepSize
 		const min = canTurnOffReasoning ? valueIfOff : min_
-		const value = isReasoningEnabled ? voidSettingsState.optionsOfModelSelection[featureName][modelSelection.providerName]?.[modelSelection.modelName]?.reasoningBudget ?? defaultVal
+		const value = isReasoningEnabled ? modelSelectionOptions?.reasoningBudget ?? defaultVal
 			: valueIfOff
 
 		return <div className='flex items-center gap-x-2'>
@@ -193,7 +208,7 @@ const ReasoningOptionSlider = ({ featureName }: { featureName: FeatureName }) =>
 				value={value}
 				onChange={(newVal) => {
 					const isOff = canTurnOffReasoning && newVal === valueIfOff
-					voidSettingsService.setOptionsOfModelSelection(featureName, modelSelection.providerName, modelSelection.modelName, { reasoningEnabled: !isOff, reasoningBudget: newVal })
+					setOptions({ reasoningEnabled: !isOff, reasoningBudget: newVal })
 				}}
 			/>
 			<span className='text-void-fg-3 text-xs pointer-events-none'>{isReasoningEnabled ? `${value} tokens` : 'Thinking disabled'}</span>
@@ -207,7 +222,7 @@ const ReasoningOptionSlider = ({ featureName }: { featureName: FeatureName }) =>
 		const min = canTurnOffReasoning ? -1 : 0
 		const max = values.length - 1
 
-		const currentEffort = voidSettingsState.optionsOfModelSelection[featureName][modelSelection.providerName]?.[modelSelection.modelName]?.reasoningEffort ?? defaultVal
+		const currentEffort = modelSelectionOptions?.reasoningEffort ?? defaultVal
 		const valueIfOff = -1
 		const value = isReasoningEnabled && currentEffort ? values.indexOf(currentEffort) : valueIfOff
 
@@ -224,7 +239,7 @@ const ReasoningOptionSlider = ({ featureName }: { featureName: FeatureName }) =>
 				value={value}
 				onChange={(newVal) => {
 					const isOff = canTurnOffReasoning && newVal === valueIfOff
-					voidSettingsService.setOptionsOfModelSelection(featureName, modelSelection.providerName, modelSelection.modelName, { reasoningEnabled: !isOff, reasoningEffort: values[newVal] ?? undefined })
+					setOptions({ reasoningEnabled: !isOff, reasoningEffort: values[newVal] ?? undefined })
 				}}
 			/>
 			<span className='text-void-fg-3 text-xs pointer-events-none'>{isReasoningEnabled ? `${currentEffortCapitalized}` : 'Thinking disabled'}</span>
@@ -730,6 +745,10 @@ interface VoidChatAreaProps {
 	onClose?: () => void;
 
 	featureName: FeatureName;
+
+	// Per-thread reasoning overrides (independent toggle per tab)
+	threadReasoningOptions?: ModelSelectionOptions;
+	onChangeThreadReasoningOptions?: (opts: Partial<ModelSelectionOptions>) => void;
 }
 
 export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
@@ -751,6 +770,8 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 	loadingIcon,
 	threadIdForUsageRing,
 	imageAttach,
+	threadReasoningOptions,
+	onChangeThreadReasoningOptions,
 }) => {
 	const _fallbackImageAttach = useImageAttach(selections, setSelections)
 	const { onPaste, onDrop, onDragOver, handleImageFiles, fileInputRef } = imageAttach ?? _fallbackImageAttach
@@ -806,7 +827,7 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 			<div className='flex flex-row justify-between items-end gap-1'>
 				{showModelDropdown && (
 					<div className='flex flex-col gap-y-1'>
-						<ReasoningOptionSlider featureName={featureName} />
+						<ReasoningOptionSlider featureName={featureName} threadOptions={threadReasoningOptions} onChangeThreadOptions={onChangeThreadReasoningOptions} />
 
 						<div className='flex items-center flex-wrap gap-x-2 gap-y-1 text-nowrap '>
 							{featureName === 'Chat' && <ChatModeDropdown className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-2 rounded py-0.5 px-1' />}
@@ -2845,9 +2866,21 @@ export const SidebarChat = () => {
 
 	// ----- SIDEBAR CHAT state (local) -----
 
-	// state of current message
-	const initVal = ''
-	const [instructionsAreEmpty, setInstructionsAreEmpty] = useState(!initVal)
+	// Per-thread draft text. Survives tab switches so the user doesn't lose
+	// what they were typing. Stored as a ref so writes don't trigger re-renders.
+	const draftsRef = useRef(new Map<string, string>())
+	const draftForCurrentThread = draftsRef.current.get(currentThread.id) ?? ''
+	const [instructionsAreEmpty, setInstructionsAreEmpty] = useState(!draftForCurrentThread)
+
+	// Per-thread reasoning options so toggling thinking in one tab doesn't affect others.
+	const [reasoningByThread, setReasoningByThread] = useState<Record<string, ModelSelectionOptions>>({})
+	const threadReasoningOptions = reasoningByThread[currentThread.id]
+	const onChangeThreadReasoningOptions = useCallback((opts: Partial<ModelSelectionOptions>) => {
+		setReasoningByThread(prev => ({
+			...prev,
+			[currentThread.id]: { ...prev[currentThread.id], ...opts },
+		}))
+	}, [currentThread.id])
 
 	// Phase E commit 4 — read-only fires for foreign threads only.
 	// Unscoped threads stay editable (claim-on-engagement still works);
@@ -2950,6 +2983,7 @@ export const SidebarChat = () => {
 		const _chatSelections = [...selections] // snapshot before clearing
 		setSelections([]) // clear staging
 		textAreaFnsRef.current?.setValue('')
+		draftsRef.current.delete(chatThreadsService.state.currentThreadId)
 
 		isSubmittingRef.current = true
 
@@ -2967,8 +3001,9 @@ export const SidebarChat = () => {
 		}
 
 		const threadId = chatThreadsService.state.currentThreadId
+		const modelSelectionOptionsOverride = reasoningByThread[threadId]
 		try {
-			await chatThreadsService.addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes })
+			await chatThreadsService.addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes, modelSelectionOptionsOverride })
 		} catch (e) {
 			console.error('Error while sending message in chat:', e)
 		} finally {
@@ -2977,7 +3012,7 @@ export const SidebarChat = () => {
 
 		textAreaRef.current?.focus() // focus input after submit
 
-	}, [chatThreadsService, isDisabled, isRunning, textAreaRef, textAreaFnsRef, setSelections, settingsState, isCurrentThreadReadOnly])
+	}, [chatThreadsService, isDisabled, isRunning, textAreaRef, textAreaFnsRef, setSelections, settingsState, isCurrentThreadReadOnly, reasoningByThread])
 
 	const onAbort = async () => {
 		const threadId = currentThread.id
@@ -3002,14 +3037,10 @@ export const SidebarChat = () => {
 
 	}, [chatThreadsState, threadId, textAreaRef, scrollContainerRef, isResolved])
 
-	// Reset the "input is empty" flag on thread switch. Previously the outer
-	// Fragment key={threadId} nuked everything including this useState, which
-	// side-effectively reset the submit button's disabled state. Now that the
-	// parallel-thread cache keeps SidebarChat mounted across switches, we have
-	// to reset this explicitly. The textarea itself is still cleared via the
-	// keyed `threadPageInput` below.
+	// Sync the "input is empty" flag with the draft for the new thread.
 	useEffect(() => {
-		setInstructionsAreEmpty(true)
+		const draft = draftsRef.current.get(currentThread.id) ?? ''
+		setInstructionsAreEmpty(!draft)
 	}, [currentThread.id])
 
 	// Render one ThreadMessagesView per cached thread id, with only the active
@@ -3044,7 +3075,8 @@ export const SidebarChat = () => {
 
 	const onChangeText = useCallback((newStr: string) => {
 		setInstructionsAreEmpty(!newStr)
-	}, [setInstructionsAreEmpty])
+		draftsRef.current.set(currentThread.id, newStr)
+	}, [setInstructionsAreEmpty, currentThread.id])
 	const onKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
 		if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
 			onSubmit()
@@ -3076,9 +3108,12 @@ export const SidebarChat = () => {
 			imageAttach={mainImageAttach}
 			onClickAnywhere={() => { textAreaRef.current?.focus() }}
 			threadIdForUsageRing={chatThreadsState.currentThreadId}
+			threadReasoningOptions={threadReasoningOptions}
+			onChangeThreadReasoningOptions={onChangeThreadReasoningOptions}
 		>
 			<VoidInputBox2
 				enableAtToMention
+				initValue={draftForCurrentThread || null}
 				className={`min-h-[81px] px-0.5 py-0.5`}
 				placeholder={`@ to mention, ${keybindingString ? `${keybindingString} to add a selection. ` : ''}Enter instructions...`}
 				onChangeText={onChangeText}

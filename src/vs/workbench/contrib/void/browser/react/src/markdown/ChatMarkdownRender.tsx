@@ -123,6 +123,14 @@ function isValidUri(s: string): boolean {
 	return s.length > 5 && isAbsolute(s) && !s.includes('//') && !s.includes('/*') // common case that is a false positive is comments like //
 }
 
+const looksLikeLatex = (text: string): boolean => {
+	if (!text) return false
+	if (text.startsWith('$') && text.endsWith('$')) return true
+	if (text.startsWith('\\(') && text.endsWith('\\)')) return true
+	if (text.startsWith('\\[') && text.endsWith('\\]')) return true
+	return false
+}
+
 // renders contiguous string of latex eg $e^{i\pi}$
 const LatexRender = ({ latex }: { latex: string }) => {
 	const ref = useRef<HTMLSpanElement>(null);
@@ -246,19 +254,32 @@ const LATEX_RE_SOURCE = /\$\$([\s\S]*?)\$\$|\\\[([\s\S]*?)\\\]|\$((?!\$)(?:\\.|[
 
 type LatexSegment = { type: 'text', content: string } | { type: 'latex', content: string };
 
+// Find all backtick-delimited regions so we can skip LaTeX matches inside them.
+const findBacktickRanges = (text: string): [number, number][] => {
+	const ranges: [number, number][] = [];
+	const re = /`[^`]*`/g;
+	let m;
+	while ((m = re.exec(text)) !== null) {
+		ranges.push([m.index, m.index + m[0].length]);
+	}
+	return ranges;
+}
+
+const isInsideRanges = (pos: number, end: number, ranges: [number, number][]): boolean => {
+	return ranges.some(([s, e]) => pos >= s && end <= e);
+}
+
 const splitLatexSegments = (paragraphText: string): LatexSegment[] | null => {
 	if (
 		!paragraphText
-		|| paragraphText.includes('#') || paragraphText.includes('`')
+		|| paragraphText.includes('#')
 		|| !/[$\\]/.test(paragraphText)
 	) {
 		return null;
 	}
 
+	const backtickRanges = findBacktickRanges(paragraphText);
 	const latexPattern = new RegExp(LATEX_RE_SOURCE, 'g');
-	if (!latexPattern.test(paragraphText)) return null;
-
-	latexPattern.lastIndex = 0;
 	const segments: LatexSegment[] = [];
 	let lastIndex = 0;
 	let match;
@@ -266,6 +287,9 @@ const splitLatexSegments = (paragraphText: string): LatexSegment[] | null => {
 	while ((match = latexPattern.exec(paragraphText)) !== null) {
 		const [fullMatch] = match;
 		const matchIndex = match.index;
+
+		// Skip LaTeX matches that fall inside backtick-delimited regions
+		if (isInsideRanges(matchIndex, matchIndex + fullMatch.length, backtickRanges)) continue;
 
 		if (matchIndex > lastIndex) {
 			segments.push({ type: 'text', content: paragraphText.substring(lastIndex, matchIndex) });
@@ -539,8 +563,17 @@ const RenderToken = React.memo(({ token, inPTag, codeURI, chatMessageLocation, t
 		return <em>{t.text}</em>
 	}
 
-	// inline code
+	// inline code — render as KaTeX when content has LaTeX delimiters
 	if (t.type === 'codespan') {
+
+		if (looksLikeLatex(t.text)) {
+			// If already delimited ($...$, \(...\), \[...\]), pass as-is;
+			// otherwise wrap in $...$ for inline math.
+			const hasDelimiters = (t.text.startsWith('$') && t.text.endsWith('$'))
+				|| (t.text.startsWith('\\(') && t.text.endsWith('\\)'))
+				|| (t.text.startsWith('\\[') && t.text.endsWith('\\]'))
+			return <LatexRender latex={hasDelimiters ? t.text : '$' + t.text + '$'} />
+		}
 
 		if (options.isLinkDetectionEnabled && chatMessageLocation) {
 			return <CodespanWithLink
