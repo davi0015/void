@@ -20,6 +20,11 @@ export type ProviderName = BuiltInProviderName | BackendId
 export const providerNames = Object.keys(defaultProviderSettings) as BuiltInProviderName[]
 export const isBackendId = (providerName: ProviderName): providerName is BackendId => providerName.startsWith('backend_')
 
+const _backendDisplayNames: Record<string, string> = {}
+export const registerBackendDisplayNames = (backends: Record<BackendId, { displayName: string }>) => {
+	for (const [id, { displayName }] of Object.entries(backends)) _backendDisplayNames[id] = displayName
+}
+
 export const localProviderNames = ['ollama', 'vLLM', 'lmStudio'] satisfies ProviderName[] // all local names
 export const nonlocalProviderNames = providerNames.filter((name) => !(localProviderNames as string[]).includes(name)) // all non-local names
 
@@ -118,7 +123,7 @@ export const displayInfoOfProviderName = (providerName: ProviderName): DisplayIn
 		return { title: 'AWS Bedrock', }
 	}
 	else if (isBackendId(providerName)) {
-		return { title: providerName }
+		return { title: _backendDisplayNames[providerName] ?? providerName }
 	}
 
 	throw new Error(`descOfProviderName: Unknown provider name: "${providerName}"`)

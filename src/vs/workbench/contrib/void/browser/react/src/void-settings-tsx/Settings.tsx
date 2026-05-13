@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
-import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName } from '../../../../common/voidSettingsTypes.js'
+import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName, BackendId, BackendProtocol, BackendProviderSettings } from '../../../../common/voidSettingsTypes.js'
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js'
 import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSegmentedControl, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js'
 import { useAccessor, useIsDark, useIsOptedOut, useRefreshModelListener, useRefreshModelState, useSettingsState } from '../util/services.js'
@@ -28,6 +28,7 @@ type Tab =
 	| 'models'
 	| 'localProviders'
 	| 'providers'
+	| 'backends'
 	| 'featureOptions'
 	| 'mcp'
 	| 'general'
@@ -466,13 +467,14 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 	// a dump of all the enabled providers' models
 	const modelDump: (VoidStatefulModelInfo & { providerName: ProviderName, providerEnabled: boolean })[] = []
 
-	// Use either filtered providers or all providers
-	const providersToShow = filteredProviders || providerNames;
-
-	for (let providerName of providersToShow) {
+	for (const providerName of (filteredProviders || providerNames)) {
 		const providerSettings = settingsState.settingsOfProvider[providerName]
-		// if (!providerSettings.enabled) continue
 		modelDump.push(...providerSettings.models.map(model => ({ ...model, providerName, providerEnabled: !!providerSettings._didFillInProviderSettings })))
+	}
+	for (const [backendId, backendSettings] of Object.entries(settingsState.backends)) {
+		for (const model of (backendSettings.models ?? [])) {
+			modelDump.push({ ...model, providerName: backendId as BackendId, providerEnabled: !!backendSettings.endpoint })
+		}
 	}
 
 	// sort by hidden
@@ -545,7 +547,6 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 			const { isHidden, type, modelName, providerName, providerEnabled } = m
 
 			const isNewProviderName = (i > 0 ? modelDump[i - 1] : undefined)?.providerName !== providerName
-
 			const providerTitle = displayInfoOfProviderName(providerName).title
 
 			const disabled = !providerEnabled
@@ -786,7 +787,7 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 					{/* Provider dropdown */}
 					<ErrorBoundary>
 						<VoidCustomDropdownBox
-							options={providersToShow}
+							options={[...providerNames, ...(Object.keys(settingsState.backends) as BackendId[])]}
 							selectedOption={userChosenProviderName}
 							onChangeOption={(pn) => setUserChosenProviderName(pn)}
 							getOptionDisplayName={(pn) => pn ? displayInfoOfProviderName(pn).title : 'Provider Name'}
@@ -994,6 +995,127 @@ export const SettingsForProvider = ({ providerName, showProviderTitle, showProvi
 				: null}
 		</div>
 	</div >
+}
+
+
+const BackendSettingsEntry = ({ backendId }: { backendId: BackendId }) => {
+	const accessor = useAccessor()
+	const voidSettingsService = accessor.get('IVoidSettingsService')
+	const settingsState = useSettingsState()
+	const settings = settingsState.backends[backendId]
+
+	return <div className='border border-void-border-1 rounded-md p-4 flex flex-col gap-3'>
+		<div className='flex items-center justify-between'>
+			<h3 className='text-lg font-medium'>{settings.displayName}</h3>
+			<button
+				onClick={() => voidSettingsService.removeBackend(backendId)}
+				className='text-void-fg-3 hover:text-red-500 transition-colors'
+				data-tooltip-id='void-tooltip'
+				data-tooltip-content='Remove Backend'
+			>
+				<X size={16} />
+			</button>
+		</div>
+
+		<div className='text-xs text-void-fg-3'>Protocol: {settings.protocol}</div>
+
+		<VoidSimpleInputBox
+			placeholder='Display Name'
+			value={settings.displayName}
+			onChangeValue={(val) => voidSettingsService.setBackendSetting(backendId, 'displayName', val)}
+			compact
+		/>
+		<VoidSimpleInputBox
+			placeholder='Endpoint URL'
+			value={settings.endpoint}
+			onChangeValue={(val) => voidSettingsService.setBackendSetting(backendId, 'endpoint', val)}
+			compact
+		/>
+		<VoidSimpleInputBox
+			placeholder='API Key'
+			value={settings.apiKey}
+			onChangeValue={(val) => voidSettingsService.setBackendSetting(backendId, 'apiKey', val)}
+			passwordBlur
+			compact
+		/>
+		<VoidSimpleInputBox
+			placeholder='Headers JSON (optional)'
+			value={settings.headersJSON}
+			onChangeValue={(val) => voidSettingsService.setBackendSetting(backendId, 'headersJSON', val)}
+			compact
+		/>
+	</div>
+}
+
+const BackendSettings = () => {
+	const accessor = useAccessor()
+	const voidSettingsService = accessor.get('IVoidSettingsService')
+	const settingsState = useSettingsState()
+
+	const [isAdding, setIsAdding] = useState(false)
+	const [newName, setNewName] = useState('')
+	const [newProtocol, setNewProtocol] = useState<BackendProtocol>('openAI')
+	const [newEndpoint, setNewEndpoint] = useState('')
+	const [newApiKey, setNewApiKey] = useState('')
+
+	const backendIds = Object.keys(settingsState.backends) as BackendId[]
+
+	const handleAdd = async () => {
+		if (!newName.trim()) return
+		const id = await voidSettingsService.addBackend(newName.trim(), newProtocol)
+		if (newEndpoint) await voidSettingsService.setBackendSetting(id, 'endpoint', newEndpoint)
+		if (newApiKey) await voidSettingsService.setBackendSetting(id, 'apiKey', newApiKey)
+		setNewName('')
+		setNewEndpoint('')
+		setNewApiKey('')
+		setIsAdding(false)
+	}
+
+	return <div className='flex flex-col gap-4'>
+		{backendIds.map(id => <BackendSettingsEntry key={id} backendId={id} />)}
+
+		{isAdding ? (
+			<div className='border border-void-border-1 rounded-md p-4 flex flex-col gap-3'>
+				<VoidSimpleInputBox
+					placeholder='Backend Name (e.g. "Internal API")'
+					value={newName}
+					onChangeValue={setNewName}
+					compact
+				/>
+				<VoidCustomDropdownBox
+					options={['openAI', 'anthropic', 'gemini'] as BackendProtocol[]}
+					selectedOption={newProtocol}
+					onChangeOption={(p) => setNewProtocol(p)}
+					getOptionDisplayName={(p) => p}
+					getOptionDropdownName={(p) => p}
+					getOptionsEqual={(a, b) => a === b}
+					className='w-full resize-none bg-void-bg-1 text-void-fg-1 placeholder:text-void-fg-3 border border-void-border-2 focus:border-void-border-1 py-1 px-2 rounded'
+					arrowTouchesText={false}
+				/>
+				<VoidSimpleInputBox
+					placeholder='Endpoint URL'
+					value={newEndpoint}
+					onChangeValue={setNewEndpoint}
+					compact
+				/>
+				<VoidSimpleInputBox
+					placeholder='API Key'
+					value={newApiKey}
+					onChangeValue={setNewApiKey}
+					passwordBlur
+					compact
+				/>
+				<div className='flex gap-2'>
+					<VoidButtonBgDarken className='px-4 py-1' onClick={handleAdd}>Create</VoidButtonBgDarken>
+					<VoidButtonBgDarken className='px-4 py-1' onClick={() => { setIsAdding(false); setNewName(''); setNewEndpoint(''); setNewApiKey('') }}>Cancel</VoidButtonBgDarken>
+				</div>
+			</div>
+		) : (
+			<VoidButtonBgDarken className='px-4 py-1 w-fit' onClick={() => setIsAdding(true)}>
+				<span className='flex items-center gap-1'><Plus size={14} /> Add Backend</span>
+			</VoidButtonBgDarken>
+		)}
+	</div>
 }
 
 
@@ -1322,6 +1444,7 @@ export const Settings = () => {
 		{ tab: 'models', label: 'Models' },
 		{ tab: 'localProviders', label: 'Local Providers' },
 		{ tab: 'providers', label: 'Main Providers' },
+		{ tab: 'backends', label: 'Backends' },
 		{ tab: 'featureOptions', label: 'Feature Options' },
 		{ tab: 'general', label: 'General' },
 		{ tab: 'mcp', label: 'MCP' },
@@ -1492,10 +1615,19 @@ export const Settings = () => {
 								</ErrorBoundary>
 							</div>
 
-							{/* Feature Options section */}
-							<div className={shouldShowTab('featureOptions') ? `` : 'hidden'}>
-								<ErrorBoundary>
-									<h2 className={`text-3xl mb-2`}>Feature Options</h2>
+						{/* Backends section */}
+						<div className={shouldShowTab('backends') ? `` : 'hidden'}>
+							<ErrorBoundary>
+								<h2 className={`text-3xl mb-2`}>Backends</h2>
+								<h3 className={`text-void-fg-3 mb-2`}>{`Add custom API endpoints. Models are added via the Models section after configuring a backend.`}</h3>
+								<BackendSettings />
+							</ErrorBoundary>
+						</div>
+
+						{/* Feature Options section */}
+						<div className={shouldShowTab('featureOptions') ? `` : 'hidden'}>
+							<ErrorBoundary>
+								<h2 className={`text-3xl mb-2`}>Feature Options</h2>
 
 									<div className='flex flex-col gap-y-8 my-4'>
 										<ErrorBoundary>
