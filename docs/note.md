@@ -1299,6 +1299,13 @@ Files: `prompts.ts` (`chat_systemMessage` — `header` const, lines 512-520).
 
 **Files modified:** `voidSettingsTypes.ts`, `voidSettingsService.ts`, `modelCapabilities.ts`, `sendLLMMessage.ts`, `sendLLMMessage.impl.ts`, `Settings.tsx`, `ModelDropdown.tsx`.
 
+### Model defaults improvements ✅ *Implemented*
+
+- **Unrecognized model defaults**: `contextWindow` 4k→128k, `reservedOutputTokenSpace` 4k→8k, `supportsSystemMessage` false→`'system-role'`. Affects all unrecognized models including backend models.
+- **Advanced settings dialog**: Now shows all default values including `false` (was filtered by truthy check).
+- **DeepSeek V4 reasoning effort**: Added `reasoning_effort` slider with values `['high', 'max']` (default `'high'`). Payload includes both `thinking: { type: 'enabled' }` and `reasoning_effort` when reasoning is on.
+- **Auth error messages**: 401 errors now show the actual server message instead of generic "Invalid API key" for all protocols.
+
 ### Reference — Zed agent comparison (read for inspiration, partial harvest planned via E5/E6)
 
 Audited Zed's `crates/agent` (added to workspace as `Projects/zed`) against ours in Apr 2026. The user's hypothesis going in was "Zed feels more token-efficient." Confirmed; here's where the gap actually lives.
