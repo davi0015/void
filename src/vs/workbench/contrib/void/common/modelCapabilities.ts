@@ -252,11 +252,11 @@ type VoidStaticProviderInfo = { // doesn't change (not stateful)
 
 
 const defaultModelOptions = {
-	contextWindow: 4_096,
-	reservedOutputTokenSpace: 4_096,
+	contextWindow: 128_000,
+	reservedOutputTokenSpace: 8_192,
 	cost: { input: 0, output: 0 },
 	downloadable: false,
-	supportsSystemMessage: false,
+	supportsSystemMessage: 'system-role',
 	supportsFIM: false,
 	supportsVision: false,
 	reasoningCapabilities: false,

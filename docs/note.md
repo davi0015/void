@@ -1281,6 +1281,24 @@ No overlap with `importantDetails` — existing anti-hedging (A2), anti-padding 
 
 Files: `prompts.ts` (`chat_systemMessage` — `header` const, lines 512-520).
 
+### Backend (named endpoint) support ✅ *Implemented*
+
+**Goal:** Let users configure multiple named OpenAI-compatible endpoints ("backends") — e.g. corporate proxies, self-hosted models — and use them alongside built-in providers without special-casing.
+
+**Architecture:**
+- `BackendId = \`backend_${string}\``, `BackendProtocol = 'openAI' | 'anthropic' | 'gemini'`, `ProviderName = BuiltInProviderName | BackendId`.
+- Backends stored in `state.backends: Record<BackendId, BackendProviderSettings>`, merged into `settingsOfProvider` at runtime by `_validatedModelState`, stripped before persisting in `_storeState`. Runtime code accesses `settingsOfProvider[providerName]` uniformly for both built-in and backend providers.
+- `displayInfoOfProviderName` resolves backend display names via a module-level `_backendDisplayNames` registry, populated by `registerBackendDisplayNames` (called in both browser and main processes).
+
+**What shipped:**
+- Settings UI: Backends tab for creating/editing/deleting backends (endpoint, API key, headers, protocol, display name).
+- Models tab: backend models shown alongside built-in provider models; add/toggle/delete/reorder all work.
+- LLM dispatch: `sendLLMMessage.ts` routes backends to the correct implementation based on `protocol`. `newOpenAICompatibleSDK`, `sendAnthropicChat`, `sendGeminiChat` all handle backend settings (endpoint, apiKey, headers).
+- Error messages: 401 errors now show actual server message instead of generic "Invalid API key". Backend display names shown in errors via main-process registry.
+- `modelCapabilities` falls back to protocol-based lookup for backends.
+
+**Files modified:** `voidSettingsTypes.ts`, `voidSettingsService.ts`, `modelCapabilities.ts`, `sendLLMMessage.ts`, `sendLLMMessage.impl.ts`, `Settings.tsx`, `ModelDropdown.tsx`.
+
 ### Reference — Zed agent comparison (read for inspiration, partial harvest planned via E5/E6)
 
 Audited Zed's `crates/agent` (added to workspace as `Projects/zed`) against ours in Apr 2026. The user's hypothesis going in was "Zed feels more token-efficient." Confirmed; here's where the gap actually lives.
