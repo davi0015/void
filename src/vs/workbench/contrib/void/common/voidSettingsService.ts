@@ -160,7 +160,7 @@ const _validatedModelState = (state: Omit<VoidSettingsState, '_modelOptions'>): 
 		if (isBackendId(key as ProviderName)) delete (newSettingsOfProvider as any)[key]
 	}
 	for (const [backendId, bs] of Object.entries(state.backends)) {
-		(newSettingsOfProvider as any)[backendId] = { ...bs, models: bs.models ?? [], _didFillInProviderSettings: !!bs.endpoint }
+		(newSettingsOfProvider as any)[backendId] = { ...bs, protocol: bs.protocol ?? 'openAI', models: bs.models ?? [], _didFillInProviderSettings: !!bs.endpoint }
 	}
 
 	// recompute _didFillInProviderSettings for built-in providers

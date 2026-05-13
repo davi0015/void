@@ -5,7 +5,7 @@
 
 import { SendLLMMessageParams, OnText, OnFinalMessage, OnError } from '../../common/sendLLMMessageTypes.js';
 import { IMetricsService } from '../../common/metricsService.js';
-import { BackendProviderSettings, BuiltInProviderName, isBackendId, displayInfoOfProviderName } from '../../common/voidSettingsTypes.js';
+import { BackendProviderSettings, BuiltInProviderName, isBackendId, displayInfoOfProviderName, registerBackendDisplayNames } from '../../common/voidSettingsTypes.js';
 import { sendLLMMessageToProviderImplementation } from './sendLLMMessage.impl.js';
 
 
@@ -31,6 +31,16 @@ export const sendLLMMessage = async ({
 
 
 	const { providerName, modelName } = modelSelection
+
+	// register backend display names so error messages show the display name
+	const backends: Record<string, { displayName: string }> = {}
+	for (const key of Object.keys(settingsOfProvider)) {
+		if (isBackendId(key as any)) {
+			const bs = (settingsOfProvider as any)[key] as BackendProviderSettings
+			backends[key] = { displayName: bs?.displayName || 'Custom Backend' }
+		}
+	}
+	registerBackendDisplayNames(backends as any)
 
 	// only captures number of messages and message "shape", no actual code, instructions, prompts, etc
 	const captureLLMEvent = (eventId: string, extras?: object) => {
