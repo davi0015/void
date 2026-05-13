@@ -13,17 +13,26 @@ type UnionOfKeys<T> = T extends T ? keyof T : never;
 
 
 
-export type ProviderName = keyof typeof defaultProviderSettings
-export const providerNames = Object.keys(defaultProviderSettings) as ProviderName[]
+export type BackendId = `backend_${string}`
+export type BackendProtocol = 'openAI' | 'anthropic' | 'gemini'
+export type BuiltInProviderName = keyof typeof defaultProviderSettings
+export type ProviderName = BuiltInProviderName | BackendId
+export const providerNames = Object.keys(defaultProviderSettings) as BuiltInProviderName[]
+export const isBackendId = (providerName: ProviderName): providerName is BackendId => providerName.startsWith('backend_')
+
+const _backendDisplayNames: Record<string, string> = {}
+export const registerBackendDisplayNames = (backends: Record<BackendId, { displayName: string }>) => {
+	for (const [id, { displayName }] of Object.entries(backends)) _backendDisplayNames[id] = displayName
+}
 
 export const localProviderNames = ['ollama', 'vLLM', 'lmStudio'] satisfies ProviderName[] // all local names
 export const nonlocalProviderNames = providerNames.filter((name) => !(localProviderNames as string[]).includes(name)) // all non-local names
 
-type CustomSettingName = UnionOfKeys<typeof defaultProviderSettings[ProviderName]>
-type CustomProviderSettings<providerName extends ProviderName> = {
+type CustomSettingName = UnionOfKeys<typeof defaultProviderSettings[BuiltInProviderName]>
+type CustomProviderSettings<providerName extends BuiltInProviderName> = {
 	[k in CustomSettingName]: k extends keyof typeof defaultProviderSettings[providerName] ? string : undefined
 }
-export const customSettingNamesOfProvider = (providerName: ProviderName) => {
+export const customSettingNamesOfProvider = (providerName: BuiltInProviderName) => {
 	return Object.keys(defaultProviderSettings[providerName]) as CustomSettingName[]
 }
 
@@ -42,15 +51,22 @@ type CommonProviderSettings = {
 	models: VoidStatefulModelInfo[],
 }
 
-export type SettingsAtProvider<providerName extends ProviderName> = CustomProviderSettings<providerName> & CommonProviderSettings
+export type BackendProviderSettings = CommonProviderSettings & {
+	endpoint: string;
+	apiKey: string;
+	headersJSON: string;
+	protocol: BackendProtocol;
+	displayName: string;
+}
 
-// part of state
+export type SettingsAtProvider<providerName extends BuiltInProviderName> = CustomProviderSettings<providerName> & CommonProviderSettings
+
 export type SettingsOfProvider = {
-	[providerName in ProviderName]: SettingsAtProvider<providerName>
+	[P in ProviderName]: P extends BuiltInProviderName ? SettingsAtProvider<P> : BackendProviderSettings
 }
 
 
-export type SettingName = keyof SettingsAtProvider<ProviderName>
+export type SettingName = keyof SettingsAtProvider<BuiltInProviderName>
 
 type DisplayInfoForProviderName = {
 	title: string,
@@ -106,6 +122,9 @@ export const displayInfoOfProviderName = (providerName: ProviderName): DisplayIn
 	else if (providerName === 'awsBedrock') {
 		return { title: 'AWS Bedrock', }
 	}
+	else if (isBackendId(providerName)) {
+		return { title: _backendDisplayNames[providerName] ?? providerName }
+	}
 
 	throw new Error(`descOfProviderName: Unknown provider name: "${providerName}"`)
 }
@@ -128,6 +147,7 @@ export const subTextMdOfProviderName = (providerName: ProviderName): string => {
 	if (providerName === 'vLLM') return 'Read more about custom [Endpoints here](https://docs.vllm.ai/en/latest/getting_started/quickstart.html#openai-compatible-server).'
 	if (providerName === 'lmStudio') return 'Read more about custom [Endpoints here](https://lmstudio.ai/docs/app/api/endpoints/openai).'
 	if (providerName === 'liteLLM') return 'Read more about endpoints [here](https://docs.litellm.ai/docs/providers/openai_compatible).'
+	if (isBackendId(providerName)) return ''
 
 	throw new Error(`subTextMdOfProviderName: Unknown provider name: "${providerName}"`)
 }

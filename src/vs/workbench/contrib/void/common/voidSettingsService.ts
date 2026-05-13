@@ -13,7 +13,7 @@ import { IStorageService, StorageScope, StorageTarget } from '../../../../platfo
 import { IMetricsService } from './metricsService.js';
 import { defaultProviderSettings, getModelCapabilities, ModelOverrides } from './modelCapabilities.js';
 import { VOID_SETTINGS_STORAGE_KEY } from './storageKeys.js';
-import { defaultSettingsOfProvider, FeatureName, ProviderName, ModelSelectionOfFeature, SettingsOfProvider, SettingName, providerNames, ModelSelection, modelSelectionsEqual, featureNames, VoidStatefulModelInfo, GlobalSettings, GlobalSettingName, defaultGlobalSettings, ModelSelectionOptions, OptionsOfModelSelection, ChatMode, OverridesOfModel, defaultOverridesOfModel, MCPUserStateOfName as MCPUserStateOfName, MCPUserState } from './voidSettingsTypes.js';
+import { defaultSettingsOfProvider, FeatureName, ProviderName, ModelSelectionOfFeature, SettingsOfProvider, SettingName, providerNames, ModelSelection, modelSelectionsEqual, featureNames, VoidStatefulModelInfo, GlobalSettings, GlobalSettingName, defaultGlobalSettings, ModelSelectionOptions, OptionsOfModelSelection, ChatMode, OverridesOfModel, defaultOverridesOfModel, MCPUserStateOfName as MCPUserStateOfName, MCPUserState, BackendId, BackendProtocol, BackendProviderSettings, isBackendId, registerBackendDisplayNames, displayInfoOfProviderName } from './voidSettingsTypes.js';
 
 
 // name is the name in the dropdown
@@ -38,7 +38,8 @@ type SetOptionsOfModelSelection = (featureName: FeatureName, providerName: Provi
 
 
 export type VoidSettingsState = {
-	readonly settingsOfProvider: SettingsOfProvider; // optionsOfProvider
+	readonly settingsOfProvider: SettingsOfProvider; // optionsOfProvider — includes merged backend entries at runtime
+	readonly backends: Record<BackendId, BackendProviderSettings>; // source of truth for backend configs, merged into settingsOfProvider
 	readonly modelSelectionOfFeature: ModelSelectionOfFeature; // stateOfFeature
 	readonly optionsOfModelSelection: OptionsOfModelSelection;
 	readonly overridesOfModel: OverridesOfModel;
@@ -76,6 +77,10 @@ export interface IVoidSettingsService {
 	addModel(providerName: ProviderName, modelName: string): void;
 	deleteModel(providerName: ProviderName, modelName: string): boolean;
 	reorderCustomModel(providerName: ProviderName, modelName: string, targetModelName: string, position: 'before' | 'after'): boolean;
+
+	addBackend(displayName: string, protocol: BackendProtocol): Promise<BackendId>;
+	removeBackend(backendId: BackendId): Promise<void>;
+	setBackendSetting<K extends keyof BackendProviderSettings>(backendId: BackendId, settingName: K, newVal: BackendProviderSettings[K]): Promise<void>;
 
 	addMCPUserStateOfNames(userStateOfName: MCPUserStateOfName): Promise<void>;
 	removeMCPUserStateOfNames(serverNames: string[]): Promise<void>;
@@ -147,9 +152,18 @@ const _stateWithMergedDefaultModels = (state: VoidSettingsState): VoidSettingsSt
 
 const _validatedModelState = (state: Omit<VoidSettingsState, '_modelOptions'>): VoidSettingsState => {
 
-	let newSettingsOfProvider = state.settingsOfProvider
+	registerBackendDisplayNames(state.backends)
 
-	// recompute _didFillInProviderSettings
+	// merge backends into settingsOfProvider at runtime so all code can access them uniformly
+	let newSettingsOfProvider = { ...state.settingsOfProvider }
+	for (const key of Object.keys(newSettingsOfProvider)) {
+		if (isBackendId(key as ProviderName)) delete (newSettingsOfProvider as any)[key]
+	}
+	for (const [backendId, bs] of Object.entries(state.backends)) {
+		(newSettingsOfProvider as any)[backendId] = { ...bs, protocol: bs.protocol ?? 'openAI', models: bs.models ?? [], _didFillInProviderSettings: !!bs.endpoint }
+	}
+
+	// recompute _didFillInProviderSettings for built-in providers
 	for (const providerName of providerNames) {
 		const settingsAtProvider = newSettingsOfProvider[providerName]
 
@@ -167,11 +181,13 @@ const _validatedModelState = (state: Omit<VoidSettingsState, '_modelOptions'>): 
 	}
 
 	// update model options
+	const allProviderNames = Object.keys(newSettingsOfProvider) as ProviderName[]
 	let newModelOptions: ModelOption[] = []
-	for (const providerName of providerNames) {
-		const providerTitle = providerName // displayInfoOfProviderName(providerName).title.toLowerCase() // looks better lowercase, best practice to not use raw providerName
-		if (!newSettingsOfProvider[providerName]._didFillInProviderSettings) continue // if disabled, don't display model options
-		for (const { modelName, isHidden } of newSettingsOfProvider[providerName].models) {
+	for (const providerName of allProviderNames) {
+		const settings = newSettingsOfProvider[providerName]
+		if (!settings._didFillInProviderSettings) continue
+		const providerTitle = displayInfoOfProviderName(providerName).title
+		for (const { modelName, isHidden } of settings.models) {
 			if (isHidden) continue
 			newModelOptions.push({ name: `${modelName} (${providerTitle})`, selection: { providerName, modelName } })
 		}
@@ -216,6 +232,7 @@ const _validatedModelState = (state: Omit<VoidSettingsState, '_modelOptions'>): 
 const defaultState = () => {
 	const d: VoidSettingsState = {
 		settingsOfProvider: deepClone(defaultSettingsOfProvider),
+		backends: {},
 		modelSelectionOfFeature: { 'Chat': null, 'Ctrl+K': null, 'Autocomplete': null, 'Apply': null, 'SCM': null, 'VisionHelper': null },
 		globalSettings: deepClone(defaultGlobalSettings),
 		optionsOfModelSelection: { 'Chat': {}, 'Ctrl+K': {}, 'Autocomplete': {}, 'Apply': {}, 'SCM': {}, 'VisionHelper': {} },
@@ -306,9 +323,10 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			readS = {
 				...defaultState(),
 				...readS,
-				// no idea why this was here, seems like a bug
-				// ...defaultSettingsOfProvider,
-				// ...readS.settingsOfProvider,
+			}
+
+			if (!readS.backends || Array.isArray(readS.backends)) {
+				(readS as any).backends = {}
 			}
 
 			for (const providerName of providerNames) {
@@ -344,7 +362,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 		this.state = _stateWithMergedDefaultModels(this.state)
 		this.state = _validatedModelState(this.state);
 
-
+		await this._storeState();
 		this._resolver();
 		this._onDidChangeState.fire();
 
@@ -364,36 +382,26 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 
 
 	private async _storeState() {
-		const state = this.state
-		const encryptedState = await this._encryptionService.encrypt(JSON.stringify(state))
+		const cleanSettings = { ...this.state.settingsOfProvider }
+		for (const key of Object.keys(cleanSettings)) {
+			if (isBackendId(key as ProviderName)) delete (cleanSettings as any)[key]
+		}
+		const stateToStore = { ...this.state, settingsOfProvider: cleanSettings }
+		const encryptedState = await this._encryptionService.encrypt(JSON.stringify(stateToStore))
 		this._storageService.store(VOID_SETTINGS_STORAGE_KEY, encryptedState, StorageScope.APPLICATION, StorageTarget.USER);
 	}
 
 	setSettingOfProvider: SetSettingOfProviderFn = async (providerName, settingName, newVal) => {
 
-		const newModelSelectionOfFeature = this.state.modelSelectionOfFeature
-
-		const newOptionsOfModelSelection = this.state.optionsOfModelSelection
-
-		const newSettingsOfProvider: SettingsOfProvider = {
-			...this.state.settingsOfProvider,
-			[providerName]: {
-				...this.state.settingsOfProvider[providerName],
-				[settingName]: newVal,
-			}
-		}
-
-		const newGlobalSettings = this.state.globalSettings
-		const newOverridesOfModel = this.state.overridesOfModel
-		const newMCPUserStateOfName = this.state.mcpUserStateOfName
-
 		const newState = {
-			modelSelectionOfFeature: newModelSelectionOfFeature,
-			optionsOfModelSelection: newOptionsOfModelSelection,
-			settingsOfProvider: newSettingsOfProvider,
-			globalSettings: newGlobalSettings,
-			overridesOfModel: newOverridesOfModel,
-			mcpUserStateOfName: newMCPUserStateOfName,
+			...this.state,
+			settingsOfProvider: {
+				...this.state.settingsOfProvider,
+				[providerName]: {
+					...this.state.settingsOfProvider[providerName],
+					[settingName]: newVal,
+				}
+			},
 		}
 
 		this.state = _validatedModelState(newState)
@@ -502,11 +510,11 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 
 	setAutodetectedModels(providerName: ProviderName, autodetectedModelNames: string[], logging: object) {
 
-		const { models } = this.state.settingsOfProvider[providerName]
+		const models = this._getModels(providerName)
 		const oldModelNames = models.map(m => m.modelName)
 
 		const newModels = _modelsWithSwappedInNewModels({ existingModels: models, models: autodetectedModelNames, type: 'autodetected' })
-		this.setSettingOfProvider(providerName, 'models', newModels)
+		this._setModels(providerName, newModels)
 
 		// if the models changed, log it
 		const new_names = newModels.map(m => m.modelName)
@@ -516,10 +524,17 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			this._metricsService.capture('Autodetect Models', { providerName, newModels: newModels, ...logging })
 		}
 	}
+	private _getModels(providerName: ProviderName): VoidStatefulModelInfo[] {
+		if (isBackendId(providerName)) return this.state.backends[providerName]?.models ?? []
+		return this.state.settingsOfProvider[providerName].models
+	}
+	private _setModels(providerName: ProviderName, newModels: VoidStatefulModelInfo[]) {
+		if (isBackendId(providerName)) return this.setBackendSetting(providerName, 'models', newModels)
+		return this.setSettingOfProvider(providerName, 'models', newModels)
+	}
+
 	toggleModelHidden(providerName: ProviderName, modelName: string) {
-
-
-		const { models } = this.state.settingsOfProvider[providerName]
+		const models = this._getModels(providerName)
 		const modelIdx = models.findIndex(m => m.modelName === modelName)
 		if (modelIdx === -1) return
 		const newIsHidden = !models[modelIdx].isHidden
@@ -528,33 +543,33 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			{ ...models[modelIdx], isHidden: newIsHidden },
 			...models.slice(modelIdx + 1, Infinity)
 		]
-		this.setSettingOfProvider(providerName, 'models', newModels)
+		this._setModels(providerName, newModels)
 
 		this._metricsService.capture('Toggle Model Hidden', { providerName, modelName, newIsHidden })
 
 	}
 	addModel(providerName: ProviderName, modelName: string) {
-		const { models } = this.state.settingsOfProvider[providerName]
+		const models = this._getModels(providerName)
 		const existingIdx = models.findIndex(m => m.modelName === modelName)
 		if (existingIdx !== -1) return // if exists, do nothing
 		const newModels = [
 			...models,
 			{ modelName, type: 'custom', isHidden: false } as const
 		]
-		this.setSettingOfProvider(providerName, 'models', newModels)
+		this._setModels(providerName, newModels)
 
 		this._metricsService.capture('Add Model', { providerName, modelName })
 
 	}
 	deleteModel(providerName: ProviderName, modelName: string): boolean {
-		const { models } = this.state.settingsOfProvider[providerName]
+		const models = this._getModels(providerName)
 		const delIdx = models.findIndex(m => m.modelName === modelName)
 		if (delIdx === -1) return false
 		const newModels = [
 			...models.slice(0, delIdx), // delete the idx
 			...models.slice(delIdx + 1, Infinity)
 		]
-		this.setSettingOfProvider(providerName, 'models', newModels)
+		this._setModels(providerName, newModels)
 
 		this._metricsService.capture('Delete Model', { providerName, modelName })
 
@@ -568,7 +583,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 	reorderCustomModel(providerName: ProviderName, modelName: string, targetModelName: string, position: 'before' | 'after'): boolean {
 		if (modelName === targetModelName) return false
 
-		const { models } = this.state.settingsOfProvider[providerName]
+		const models = this._getModels(providerName)
 		const fromIdx = models.findIndex(m => m.modelName === modelName)
 		const toIdx = models.findIndex(m => m.modelName === targetModelName)
 		if (fromIdx === -1 || toIdx === -1) return false
@@ -584,10 +599,56 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			moving,
 			...without.slice(insertAt),
 		]
-		this.setSettingOfProvider(providerName, 'models', newModels)
+		this._setModels(providerName, newModels)
 
 		this._metricsService.capture('Reorder Custom Model', { providerName, modelName, targetModelName, position })
 		return true
+	}
+
+	// Backend CRUD — writes to state.backends, merged into settingsOfProvider by _validatedModelState
+	addBackend = async (displayName: string, protocol: BackendProtocol): Promise<BackendId> => {
+		const backendId: BackendId = `backend_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+		const backendSettings: BackendProviderSettings = {
+			endpoint: '',
+			apiKey: '',
+			headersJSON: '{}',
+			protocol,
+			displayName,
+			models: [],
+			_didFillInProviderSettings: undefined,
+		}
+		const newState: VoidSettingsState = {
+			...this.state,
+			backends: { ...this.state.backends, [backendId]: backendSettings },
+		}
+		this.state = _validatedModelState(newState)
+		await this._storeState()
+		this._onDidChangeState.fire()
+		this._metricsService.capture('Add Backend', { backendId, displayName, protocol })
+		return backendId
+	}
+
+	removeBackend = async (backendId: BackendId): Promise<void> => {
+		const { [backendId]: _, ...rest } = this.state.backends
+		const newState: VoidSettingsState = {
+			...this.state,
+			backends: rest,
+		}
+		this.state = _validatedModelState(newState)
+		await this._storeState()
+		this._onDidChangeState.fire()
+		this._metricsService.capture('Remove Backend', { backendId })
+	}
+
+	setBackendSetting = async <K extends keyof BackendProviderSettings>(backendId: BackendId, settingName: K, newVal: BackendProviderSettings[K]): Promise<void> => {
+		const current = this.state.backends[backendId]
+		const newState: VoidSettingsState = {
+			...this.state,
+			backends: { ...this.state.backends, [backendId]: { ...current, [settingName]: newVal } },
+		}
+		this.state = _validatedModelState(newState)
+		await this._storeState()
+		this._onDidChangeState.fire()
 	}
 
 	// MCP Server State

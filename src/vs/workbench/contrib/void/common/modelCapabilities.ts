@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { FeatureName, ModelSelectionOptions, OverridesOfModel, ProviderName } from './voidSettingsTypes.js';
+import { BuiltInProviderName, FeatureName, ModelSelectionOptions, OverridesOfModel, ProviderName } from './voidSettingsTypes.js';
 
 
 
@@ -1541,7 +1541,8 @@ const modelSettingsOfProvider: { [providerName in ProviderName]: VoidStaticProvi
 export const getModelCapabilities = (
 	providerName: ProviderName,
 	modelName: string,
-	overridesOfModel: OverridesOfModel | undefined
+	overridesOfModel: OverridesOfModel | undefined,
+	protocol?: BuiltInProviderName,
 ): VoidStaticModelInfo & (
 	| { modelName: string; recognizedModelName: string; isUnrecognizedModel: false }
 	| { modelName: string; recognizedModelName?: undefined; isUnrecognizedModel: true }
@@ -1549,7 +1550,10 @@ export const getModelCapabilities = (
 
 	const lowercaseModelName = modelName.toLowerCase()
 
-	const { modelOptions, modelOptionsFallback, defaultSpecialToolFormat } = modelSettingsOfProvider[providerName]
+	const lookupKey = (providerName as BuiltInProviderName) in modelSettingsOfProvider
+		? providerName as BuiltInProviderName
+		: protocol ?? 'openAI'
+	const { modelOptions, modelOptionsFallback, defaultSpecialToolFormat } = modelSettingsOfProvider[lookupKey]
 
 	// Get any override settings for this model
 	const overrides = overridesOfModel?.[providerName]?.[modelName];
@@ -1582,8 +1586,11 @@ export const getModelCapabilities = (
 }
 
 // non-model settings
-export const getProviderCapabilities = (providerName: ProviderName) => {
-	const { providerReasoningIOSettings } = modelSettingsOfProvider[providerName]
+export const getProviderCapabilities = (providerName: ProviderName, protocol?: BuiltInProviderName) => {
+	const lookupKey = (providerName as BuiltInProviderName) in modelSettingsOfProvider
+		? providerName as BuiltInProviderName
+		: protocol ?? 'openAI'
+	const { providerReasoningIOSettings } = modelSettingsOfProvider[lookupKey]
 	return { providerReasoningIOSettings }
 }
 

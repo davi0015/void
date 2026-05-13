@@ -16,7 +16,7 @@ import { GoogleAuth } from 'google-auth-library'
 
 import { AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, type LLMUsage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js';
 import type { ToolName } from '../../common/toolsServiceTypes.js';
-import { ChatMode, displayInfoOfProviderName, ModelSelectionOptions, OverridesOfModel, ProviderName, SettingsOfProvider } from '../../common/voidSettingsTypes.js';
+import { BackendProviderSettings, ChatMode, displayInfoOfProviderName, isBackendId, ModelSelectionOptions, OverridesOfModel, ProviderName, SettingsOfProvider } from '../../common/voidSettingsTypes.js';
 import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, defaultProviderSettings, getReservedOutputTokenSpace } from '../../common/modelCapabilities.js';
 import { extractReasoningWrapper, extractXMLToolsWrapper } from './extractGrammar.js';
 import { availableTools, InternalToolInfo } from '../../common/prompt/prompts.js';
@@ -55,7 +55,11 @@ type SendFIMParams_Internal = InternalCommonMessageParams & { messages: LLMFIMMe
 export type ListParams_Internal<ModelResponse> = ModelListParams<ModelResponse>
 
 
-const invalidApiKeyMessage = (providerName: ProviderName) => `Invalid ${displayInfoOfProviderName(providerName).title} API key.`
+const authErrorMessage = (providerName: ProviderName, error?: any) => {
+	const serverMsg = error?.error?.message || error?.message
+	if (serverMsg) return `${displayInfoOfProviderName(providerName).title}: ${serverMsg}`
+	return `Invalid ${displayInfoOfProviderName(providerName).title} API key.`
+}
 
 // ------------ OPENAI-COMPATIBLE (HELPERS) ------------
 
@@ -168,6 +172,11 @@ const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includ
 		const thisConfig = settingsOfProvider[providerName]
 		return new OpenAI({ baseURL: 'https://api.mistral.ai/v1', apiKey: thisConfig.apiKey, ...commonPayloadOpts })
 	}
+	else if (isBackendId(providerName)) {
+		const thisConfig = settingsOfProvider[providerName] as BackendProviderSettings
+		const headers = parseHeadersJSON(thisConfig.headersJSON)
+		return new OpenAI({ baseURL: thisConfig.endpoint, apiKey: thisConfig.apiKey, defaultHeaders: headers, ...commonPayloadOpts })
+	}
 
 	else throw new Error(`Void providerName was invalid: ${providerName}.`)
 }
@@ -203,7 +212,7 @@ const _sendOpenAICompatibleFIM = async ({ messages: { prefix, suffix, stopTokens
 			onFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null });
 		})
 		.catch(error => {
-			if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: invalidApiKeyMessage(providerName), fullError: error }); }
+			if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: authErrorMessage(providerName, error), fullError: error }); }
 			else { onError({ message: error + '', fullError: error }); }
 		})
 }
@@ -476,7 +485,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		})
 		// when error/fail - this catches errors of both .create() and .then(for await)
 		.catch(error => {
-			if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: invalidApiKeyMessage(providerName), fullError: error }); }
+			if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: authErrorMessage(providerName, error), fullError: error }); }
 			else { onError({ message: error + '', fullError: error }); }
 		})
 }
@@ -555,7 +564,7 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 		specialToolFormat,
 	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
 
-	const thisConfig = settingsOfProvider.anthropic
+	const thisConfig = settingsOfProvider[providerName] as { apiKey: string; endpoint?: string }
 	const { providerReasoningIOSettings } = getProviderCapabilities(providerName)
 
 	// reasoning
@@ -575,7 +584,8 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 	// instance
 	const anthropic = new Anthropic({
 		apiKey: thisConfig.apiKey,
-		dangerouslyAllowBrowser: true
+		dangerouslyAllowBrowser: true,
+		...(isBackendId(providerName) && thisConfig.endpoint ? { baseURL: thisConfig.endpoint } : {}),
 	});
 
 	const stream = anthropic.messages.stream({
@@ -691,7 +701,7 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 	})
 	// on error
 	stream.on('error', (error) => {
-		if (error instanceof Anthropic.APIError && error.status === 401) { onError({ message: invalidApiKeyMessage(providerName), fullError: error }) }
+		if (error instanceof Anthropic.APIError && error.status === 401) { onError({ message: authErrorMessage(providerName, error), fullError: error }) }
 		else { onError({ message: error + '', fullError: error }) }
 	})
 	_setAborter(() => stream.controller.abort())
@@ -849,9 +859,7 @@ const sendGeminiChat = async ({
 	mcpTools,
 }: SendChatParams_Internal) => {
 
-	if (providerName !== 'gemini') throw new Error(`Sending Gemini chat, but provider was ${providerName}`)
-
-	const thisConfig = settingsOfProvider[providerName]
+	const thisConfig = settingsOfProvider[providerName] as { apiKey: string }
 
 	const {
 		modelName,
@@ -1011,7 +1019,7 @@ const sendGeminiChat = async ({
 			if (typeof message === 'string') {
 
 				if (error.message?.includes('API key')) {
-					onError({ message: invalidApiKeyMessage(providerName), fullError: error });
+					onError({ message: authErrorMessage(providerName, error), fullError: error });
 				}
 				else if (error?.message?.includes('429')) {
 					onError({ message: 'Rate limit reached. ' + error, fullError: error });
