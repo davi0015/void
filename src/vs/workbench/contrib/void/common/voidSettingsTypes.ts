@@ -481,6 +481,7 @@ export type GlobalSettings = {
 	disableSystemMessage: boolean;
 	autoAcceptLLMChanges: boolean;
 	autoOutlineReadFile: boolean;
+	rulesPaths: string;
 }
 
 export const defaultGlobalSettings: GlobalSettings = {
@@ -498,6 +499,7 @@ export const defaultGlobalSettings: GlobalSettings = {
 	disableSystemMessage: false,
 	autoAcceptLLMChanges: false,
 	autoOutlineReadFile: true,
+	rulesPaths: '',
 }
 
 export type GlobalSettingName = keyof GlobalSettings

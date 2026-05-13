@@ -313,6 +313,8 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			if (readS.globalSettings.autoAcceptLLMChanges === undefined) readS.globalSettings.autoAcceptLLMChanges = false;
 
 			if (readS.globalSettings.autoOutlineReadFile === undefined) readS.globalSettings.autoOutlineReadFile = true;
+
+			if (readS.globalSettings.rulesPaths === undefined) readS.globalSettings.rulesPaths = '';
 		}
 		catch (e) {
 			readS = defaultState()

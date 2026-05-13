@@ -1193,6 +1193,72 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		return combined
 	}
 
+	// Read rules from configured paths (comma-separated). Each path can be a
+	// folder (reads all .md/.mdc files inside) or an individual file. Supports
+	// `.mdc` frontmatter (description, alwaysApply, globs). Only files with
+	// `alwaysApply: true` (or no frontmatter) are included.
+	private async _getRulesPathsContents(): Promise<string> {
+		const rulesPaths = this.voidSettingsService.state.globalSettings.rulesPaths
+		if (!rulesPaths) return ''
+
+		const entries = rulesPaths.split(',').map(s => s.trim()).filter(Boolean)
+		if (!entries.length) return ''
+
+		const workspaceFolders = this.workspaceContextService.getWorkspace().folders
+		const parts: string[] = []
+
+		for (const wsFolder of workspaceFolders) {
+			for (const entry of entries) {
+				const uri = URI.joinPath(wsFolder.uri, entry)
+				try {
+					if (!(await this.fileService.exists(uri))) continue
+					const stat = await this.fileService.resolve(uri)
+
+					if (stat.isDirectory) {
+						if (!stat.children) continue
+						for (const child of stat.children) {
+							if (child.isDirectory) continue
+							if (!child.name.endsWith('.md') && !child.name.endsWith('.mdc')) continue
+							try {
+								const content = await this.fileService.readFile(child.resource)
+								const parsed = this._parseMdcFile(content.value.toString(), child.name)
+								if (parsed) parts.push(parsed)
+							} catch { /* unreadable file — skip */ }
+						}
+					} else {
+						const content = await this.fileService.readFile(uri)
+						const name = uri.path.split('/').pop() || entry
+						const parsed = this._parseMdcFile(content.value.toString(), name)
+						if (parsed) parts.push(parsed)
+					}
+				} catch { /* path not readable — skip */ }
+			}
+		}
+
+		return parts.join('\n\n').trim()
+	}
+
+	// Parse .mdc frontmatter. Returns the body if alwaysApply is true (or
+	// no frontmatter present). Returns null to skip the file.
+	private _parseMdcFile(content: string, filename: string): string | null {
+		const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/)
+		if (!fmMatch) return content.trim() || null // no frontmatter — include as-is
+
+		const frontmatter = fmMatch[1]
+		const body = fmMatch[2].trim()
+		if (!body) return null
+
+		const alwaysApplyMatch = frontmatter.match(/alwaysApply\s*:\s*(true|false)/)
+		const alwaysApply = alwaysApplyMatch ? alwaysApplyMatch[1] === 'true' : true
+
+		if (!alwaysApply) return null
+
+		const descMatch = frontmatter.match(/description\s*:\s*(.+)/)
+		const desc = descMatch ? descMatch[1].trim() : filename.replace(/\.(md|mdc)$/, '')
+
+		return `[${desc}]\n${body}`
+	}
+
 	// Legacy sync reader — preserved for `prepareLLMSimpleMessages` call sites
 	// (Fast Apply / Quick Edit / SCM) that run from sync control flow. Uses the
 	// cached ITextModel populated by the workbench contribution at startup; picks
@@ -1223,10 +1289,12 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	private async _getCombinedAIInstructionsAsync(): Promise<string> {
 		const globalAIInstructions = this.voidSettingsService.state.globalSettings.aiInstructions;
 		const voidRulesFileContent = await this._getVoidRulesFileContentsFromDisk();
+		const folderRulesContent = await this._getRulesPathsContents();
 
 		const ans: string[] = []
 		if (globalAIInstructions) ans.push(globalAIInstructions)
 		if (voidRulesFileContent) ans.push(voidRulesFileContent)
+		if (folderRulesContent) ans.push(folderRulesContent)
 		return ans.join('\n\n')
 	}
 
@@ -1248,7 +1316,12 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	// when content differs. Purely a UI affordance — the rule content reaches the
 	// LLM via the system message in `prepareLLMChatMessages` regardless.
 	getCurrentVoidRulesContent: IConvertToLLMMessageService['getCurrentVoidRulesContent'] = async () => {
-		return this._getVoidRulesFileContentsFromDisk();
+		const parts: string[] = []
+		const voidRules = await this._getVoidRulesFileContentsFromDisk()
+		const folderRules = await this._getRulesPathsContents()
+		if (voidRules) parts.push(voidRules)
+		if (folderRules) parts.push(folderRules)
+		return parts.join('\n\n')
 	}
 
 	getCombinedAIInstructionsAsync: IConvertToLLMMessageService['getCombinedAIInstructionsAsync'] = async () => {

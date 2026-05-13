@@ -1311,6 +1311,15 @@ Files: `prompts.ts` (`chat_systemMessage` — `header` const, lines 512-520).
 - **Text box draft preservation**: Draft text is saved per thread in a ref map. Switching tabs restores the previous draft instead of clearing the input. The draft is cleared on submit.
 - **Per-thread reasoning toggle**: Thinking on/off and reasoning effort/budget are now independent per tab. Toggling reasoning in one thread no longer affects other threads using the same model. Per-thread reasoning options override global settings at send time via `modelSelectionOptionsOverride`.
 
+### Rules paths (custom rule sources) ✅ *Implemented*
+
+- **`rulesPaths` global setting**: comma-separated list of relative paths (folders or individual files) to load rule files from. Configured in Settings → AI Instructions.
+- **Folder paths**: reads all `.md`/`.mdc` files in the folder (non-recursive).
+- **File paths**: reads the individual file directly.
+- **`.mdc` frontmatter support**: parses YAML frontmatter (`---...---`) with `description` and `alwaysApply` fields. Only files with `alwaysApply: true` (or no frontmatter) are included in system instructions. The `description` field is used as a label prefix; falls back to the filename.
+- **Merged with existing rules**: folder/file rules are appended alongside `.voidrules` and AI Instructions in the system message. The `getCurrentVoidRulesContent()` also includes them for per-thread rule-change detection.
+- **Use case**: point at `.cursor/rules` to reuse Cursor rule files, or any project-specific rules folder.
+
 ### Reference — Zed agent comparison (read for inspiration, partial harvest planned via E5/E6)
 
 Audited Zed's `crates/agent` (added to workspace as `Projects/zed`) against ours in Apr 2026. The user's hypothesis going in was "Zed feels more token-efficient." Confirmed; here's where the gap actually lives.
