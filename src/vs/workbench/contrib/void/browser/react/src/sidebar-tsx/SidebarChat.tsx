@@ -2845,9 +2845,11 @@ export const SidebarChat = () => {
 
 	// ----- SIDEBAR CHAT state (local) -----
 
-	// state of current message
-	const initVal = ''
-	const [instructionsAreEmpty, setInstructionsAreEmpty] = useState(!initVal)
+	// Per-thread draft text. Survives tab switches so the user doesn't lose
+	// what they were typing. Stored as a ref so writes don't trigger re-renders.
+	const draftsRef = useRef(new Map<string, string>())
+	const draftForCurrentThread = draftsRef.current.get(currentThread.id) ?? ''
+	const [instructionsAreEmpty, setInstructionsAreEmpty] = useState(!draftForCurrentThread)
 
 	// Phase E commit 4 — read-only fires for foreign threads only.
 	// Unscoped threads stay editable (claim-on-engagement still works);
@@ -2950,6 +2952,7 @@ export const SidebarChat = () => {
 		const _chatSelections = [...selections] // snapshot before clearing
 		setSelections([]) // clear staging
 		textAreaFnsRef.current?.setValue('')
+		draftsRef.current.delete(chatThreadsService.state.currentThreadId)
 
 		isSubmittingRef.current = true
 
@@ -3002,14 +3005,10 @@ export const SidebarChat = () => {
 
 	}, [chatThreadsState, threadId, textAreaRef, scrollContainerRef, isResolved])
 
-	// Reset the "input is empty" flag on thread switch. Previously the outer
-	// Fragment key={threadId} nuked everything including this useState, which
-	// side-effectively reset the submit button's disabled state. Now that the
-	// parallel-thread cache keeps SidebarChat mounted across switches, we have
-	// to reset this explicitly. The textarea itself is still cleared via the
-	// keyed `threadPageInput` below.
+	// Sync the "input is empty" flag with the draft for the new thread.
 	useEffect(() => {
-		setInstructionsAreEmpty(true)
+		const draft = draftsRef.current.get(currentThread.id) ?? ''
+		setInstructionsAreEmpty(!draft)
 	}, [currentThread.id])
 
 	// Render one ThreadMessagesView per cached thread id, with only the active
@@ -3044,7 +3043,8 @@ export const SidebarChat = () => {
 
 	const onChangeText = useCallback((newStr: string) => {
 		setInstructionsAreEmpty(!newStr)
-	}, [setInstructionsAreEmpty])
+		draftsRef.current.set(currentThread.id, newStr)
+	}, [setInstructionsAreEmpty, currentThread.id])
 	const onKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
 		if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
 			onSubmit()
@@ -3079,6 +3079,7 @@ export const SidebarChat = () => {
 		>
 			<VoidInputBox2
 				enableAtToMention
+				initValue={draftForCurrentThread || null}
 				className={`min-h-[81px] px-0.5 py-0.5`}
 				placeholder={`@ to mention, ${keybindingString ? `${keybindingString} to add a selection. ` : ''}Enter instructions...`}
 				onChangeText={onChangeText}
