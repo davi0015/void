@@ -1936,7 +1936,7 @@ export const Settings = () => {
 									<h4 className={`text-void-fg-3 mb-4`}>
 										<ChatMarkdownRender inPTag={true} string={`
 System instructions to include with all AI requests.
-Alternatively, place a \`.voidrules\` file in the root of your workspace.
+Alternatively, place a \`.voidrules\` file in the root of your workspace, or configure rules paths below.
 								`} chatMessageLocation={undefined} />
 									</h4>
 									<ErrorBoundary>
@@ -1960,6 +1960,28 @@ Alternatively, place a \`.voidrules\` file in the root of your workspace.
 										</ErrorBoundary>
 										<div className='text-void-fg-3 text-xs mt-1'>
 											{`When disabled, Void will not include anything in the system message except for content you specified above.`}
+										</div>
+									</div>
+									{/* --- Rules Paths --- */}
+									<div className='my-4'>
+										<ErrorBoundary>
+											<div className='flex flex-col gap-y-1'>
+												<span className='text-void-fg-3 text-xs'>
+													{'Rules paths (relative to workspace root, comma-separated)'}
+												</span>
+												<VoidInputBox2
+													className='p-2 rounded-sm'
+													initValue={settingsState.globalSettings.rulesPaths}
+													placeholder={`.cursor/rules, docs/guidelines.md`}
+													multiline={false}
+													onChangeText={(newText) => {
+														voidSettingsService.setGlobalSetting('rulesPaths', newText)
+													}}
+												/>
+											</div>
+										</ErrorBoundary>
+										<div className='text-void-fg-3 text-xs mt-1'>
+											{`Comma-separated paths to folders or files. Folders include all .md/.mdc files inside. Files with alwaysApply: true (or no frontmatter) are included in system instructions.`}
 										</div>
 									</div>
 								</div>
