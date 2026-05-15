@@ -1446,6 +1446,86 @@ After each prompt phase, rerun the benchmark tasks (see Benchmark section) on Ge
 - The vision helper is a separate, isolated LLM call — it doesn't share context with the main conversation. This keeps it simple but means it can't tailor descriptions to the conversation.
 - Token cost: a 512x512 image costs ~250-500 tokens as a vision input. A text description from the helper is typically 200-500 chars (~50-100 tokens). The helper approach is ~5x cheaper in subsequent turns since the description doesn't grow with re-reads.
 
+### Design: Prefix-preserved memory system (not yet implemented)
+
+**Objective:** reduce token cost by keeping conversation context in a compact, immutable memory prefix rather than a growing message history. The memory prefix is always prefix-cached by providers (OpenAI, Gemini, DeepSeek), so the cost of carrying context across turns is near-zero.
+
+**Core insight:** the conversation isn't the message history — the conversation IS the memory. The message history is just a temporary working buffer. Everything meaningful gets absorbed into memory; raw messages are deleted.
+
+**Three-tier architecture:**
+
+```
+[system message]  [memory (immutable)]  [candidate memory (mutable)]  [suffix (2-3 turns)]  [new user msg]
+     always cached    always cached          mostly cached               small, uncached
+```
+
+- **Memory** — immutable once written. Only grows via promotion from candidate. Because it never changes, it's always prefix-cached. This is the key cost saver.
+- **Candidate Memory** — accumulates `<memory_update>` extractions from recent turns. Mutable, changes every 1-3 turns. Small, so cache misses are cheap.
+- **Suffix** — raw recent turns, max 2-3. Oldest deleted after their content has been extracted to candidate.
+
+**Promotion trigger (candidate → memory):** whichever comes first:
+- Turn count since last promotion (e.g. every 5 turns), OR
+- Candidate exceeds a token threshold (e.g. 1-2k tokens)
+
+On promotion, candidate content is appended to memory (immutable) and candidate is cleared. One-turn cache miss at the append point, then the new longer memory is cached indefinitely.
+
+**Self-extraction mechanism:** the main chat model produces memory updates as part of its normal response — no extra LLM call. System prompt instruction:
+
+> "At the end of your response, if this exchange produced any new decisions, file changes, user preferences, or meaningful state changes not already captured in the conversation memory, emit them inside a `<memory_update>` block. If nothing new was learned, omit the block entirely."
+
+Model response example:
+```
+Here's the fix for the auth middleware:
+[... normal response ...]
+
+<memory_update>
+- Fixed auth middleware race condition in src/auth.ts by adding mutex lock
+- User confirmed: prefer mutex over queue-based approach
+</memory_update>
+```
+
+Void strips `<memory_update>` from display (same pattern as `<think>` reasoning), appends content to candidate memory. User can see memory (read-only, not editable) — memory is fixed for caching purposes.
+
+**Why self-extraction works:**
+- No extra LLM call — zero additional token cost for extraction
+- The model has full context (memory + candidate + suffix) so it naturally avoids overlapping/redundant updates
+- If nothing meaningful happened (trivial exchange), model omits the block — memory doesn't grow with noise
+- Same infrastructure pattern as reasoning/thinking block stripping
+
+**Non-overlapping extraction:** the model sees current memory AND candidate in its context, so it won't re-state information already captured. The instruction says "not already captured" — the model can verify because memory is right there in the prompt.
+
+**Cache behavior per tier:**
+
+| Tier | Changes how often | Cache status |
+|------|------------------|-------------|
+| System message | Never | Always cached |
+| Memory | Every 5-10 turns (promotion) | Almost always cached |
+| Candidate | Every 1-3 turns | Mostly cached |
+| Suffix + new msg | Every turn | Uncached (but small ~5-6k) |
+
+**Cost savings estimate (50-turn coding session):**
+- Current (growing history): turn 50 input ~120-150k tokens; cumulative ~2-3M input tokens
+- With memory: turn 50 input ~21k tokens (5k sys + 10k mem + 1k cand + 5k suffix); cumulative ~500-700k input tokens
+- Reduction: ~60-75% fewer input tokens, with higher cache hit rate on what remains
+- Extra output cost: ~50 tokens/turn for `<memory_update>` blocks = ~2.5k total — far less than savings
+
+**Thread lifecycle under this model:**
+- No need for new threads due to context pressure — memory stays compact, suffix stays small
+- Even a 1000-turn marathon session produces ~15-25k tokens of memory (well within 128k)
+- New threads can optionally be seeded with accumulated memory from prior threads (cross-thread persistence — Layer 3)
+
+**Relationship to current Perf 2 compaction:**
+- If memory extraction works well, Perf 2 Light tier (tool result body trimming) becomes unnecessary — the suffix is so small that per-message trimming has negligible impact
+- Perf 2 can be kept as a safety net but shouldn't be the primary mechanism
+
+**Open questions / risks:**
+- **Model compliance** — weaker models (Gemma, Nemotron) may not reliably produce `<memory_update>` blocks. Needs empirical testing across model tiers. Fallback: suffix grows until model complies or context pressure forces emergency trim.
+- **Information loss** — the model loses access to detailed conversation history beyond the last 2-3 turns. If it needs specific details from earlier (exact error messages, specific code), it either has them in memory or must re-derive them (re-read file, re-run command). The bet: if memory captures meaningful content well, lost details can be re-derived cheaply.
+- **Memory quality** — hallucinated or inaccurate memory entries could mislead the model in future turns. Mitigated by: (a) model sees current memory when producing updates, so errors compound slowly, (b) user can inspect memory (read-only) and flag issues.
+- **Cross-thread memory (Layer 3)** — not designed yet. The accumulated memory from a session could seed new threads in the same workspace. Storage location (workspace file vs. internal storage) undecided.
+
+**Inspiration source:** jcode repo (`/Users/david.halim/Documents/Projects/jcode`) has a memory system (`memory_prompt` in `src/prompt.rs`, `src/tui/app/turn_memory.rs`) that injects persistent memory into the dynamic system context. Their compaction system (`crates/jcode-compaction-core`, `src/compaction.rs`) uses LLM-powered summarization with reactive/proactive/semantic modes. The prefix-preservation design here is a synthesis of jcode's memory approach with automatic prefix caching behavior of Gemini/OpenAI/DeepSeek providers.
+
 ### Backlog / Open ideas
 
 - **`read_file` contract clarity** — the tool description claims "Returns full contents of a given file" but actually paginates at `MAX_FILE_CHARS_PAGE`. Weak models distrust the "truncated" output and fall back to terminal `cat`. Fix: update description to "Returns contents of a file, paginated. If truncated, increment `page_number` to continue." and document `page_number` properly. User deprioritized this for now since most daily files fit in one page; revisit if cross-chunk reads start causing friction.
