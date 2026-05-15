@@ -42,6 +42,10 @@ type SimpleLLMMessage = {
 	// only). When present, used verbatim on replay to keep the provider's prefix cache
 	// matching across turns. Falls back to JSON.stringify(rawParams) when absent.
 	rawParamsStr?: string;
+	// True when the tool call failed (tool_error, invalid_params, rejected).
+	// Used to set `is_error` on Anthropic tool_result blocks and to prefix
+	// error content for OpenAI/XML formats so the model clearly recognises failures.
+	isError?: boolean;
 } | {
 	role: 'user';
 	content: string;
@@ -439,11 +443,11 @@ const prepareMessages_openai_tools = (
 			asstMsg.tool_calls = [...(asstMsg.tool_calls ?? []), newCall]
 		}
 
-		// add the tool
+		// add the tool — prefix errors so the model can distinguish them from success
 		newMessages.push({
 			role: 'tool',
 			tool_call_id: currMsg.id,
-			content: currMsg.content,
+			content: currMsg.isError ? `[TOOL ERROR]\n${currMsg.content}` : currMsg.content,
 		})
 	}
 	return newMessages
@@ -540,10 +544,12 @@ const prepareMessages_anthropic_tools = (messages: SimpleLLMMessage[], supportsA
 				asstMsg.content.push({ type: 'tool_use', id: currMsg.id, name: currMsg.name, input: currMsg.rawParams })
 			}
 
-			// turn each tool into a user message with tool results at the end
+			const toolResult: { type: 'tool_result', tool_use_id: string, content: string, is_error?: boolean } = { type: 'tool_result', tool_use_id: currMsg.id, content: currMsg.content }
+			if (currMsg.isError) toolResult.is_error = true
+
 			newMessages[i] = {
 				role: 'user',
-				content: [{ type: 'tool_result', tool_use_id: currMsg.id, content: currMsg.content }]
+				content: [toolResult]
 			}
 			continue
 		}
@@ -590,8 +596,10 @@ const prepareMessages_XML_tools = (messages: SimpleLLMMessage[], supportsAnthrop
 		}
 		// add user or tool to the previous user message
 		else if (c.role === 'user' || c.role === 'tool') {
-			if (c.role === 'tool')
-				c.content = `<${c.name}_result>\n${c.content}\n</${c.name}_result>`
+			if (c.role === 'tool') {
+				const errorAttr = c.isError ? ' is_error="true"' : ''
+				c.content = `<${c.name}_result${errorAttr}>\n${c.content}\n</${c.name}_result>`
+			}
 
 			if (llmChatMessages.length === 0 || llmChatMessages[llmChatMessages.length - 1].role !== 'user')
 				llmChatMessages.push({
@@ -1392,6 +1400,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 					id: m.id,
 					rawParams: m.rawParams,
 					rawParamsStr: m.rawParamsStr,
+					isError: m.type === 'tool_error' || m.type === 'invalid_params' || m.type === 'rejected',
 				})
 			}
 			else if (m.role === 'user') {

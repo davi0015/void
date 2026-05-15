@@ -310,7 +310,7 @@ export const builtinTools: {
 
 	edit_file: {
 		name: 'edit_file',
-		description: `Edit the contents of a file. You must provide the file's URI as well as a SINGLE string of SEARCH/REPLACE block(s) that will be used to apply the edit.`,
+		description: `Edit the contents of a file. You must provide the file's URI as well as a SINGLE string of SEARCH/REPLACE block(s) that will be used to apply the edit. IMPORTANT: When editing a file multiple times, combine ALL changes into a SINGLE edit_file call with multiple SEARCH/REPLACE blocks. Do NOT call edit_file multiple times for the same file in one turn — each call modifies the file, making subsequent SEARCH blocks stale.`,
 		params: {
 			...uriParam('file'),
 			search_replace_blocks: { description: replaceTool_description }

@@ -1644,7 +1644,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		let descStr: string
 		switch (str) {
 			case 'Not found':
-				descStr = `The edit was not applied. The text in ORIGINAL must EXACTLY match lines of code in the file, but there was no match for:\n${problematicCode}. Ensure you have the latest version of the file, and ensure the ORIGINAL code matches a code excerpt exactly.`
+				descStr = `The edit was not applied. The text in ORIGINAL must EXACTLY match lines of code in the file, but there was no match for:\n${problematicCode}. This can happen when a previous edit_file call in the same batch already modified this file, making the ORIGINAL text stale. Re-read the file to get its current contents before retrying.`
 				break
 			case 'Not unique': {
 				let matchInfo = ''
@@ -1688,6 +1688,10 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 		const replacements: { origStart: number; origEnd: number; block: ExtractedSearchReplaceBlock }[] = []
 		for (const b of blocks) {
+			if (typeof b.orig !== 'string' || typeof b.final !== 'string')
+				throw new Error(`Invalid Search/Replace block: ORIGINAL and UPDATED must both be strings.`)
+			if (b.orig.length === 0)
+				throw new Error(`Invalid Search/Replace block: ORIGINAL must not be empty.`)
 			const idx = modelStr.indexOf(b.orig)
 			if (idx !== -1) {
 				const lastIdx = modelStr.lastIndexOf(b.orig)

@@ -557,6 +557,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// to the emitting rid. Ephemeral / not persisted.
 	private readonly _telemetryRidByThread = new Map<string, string>()
 	private readonly _pendingImageBytesByThread = new Map<string, Map<string, Uint8Array>>()
+	// Two-phase merge tracking for same-file edit_file batches:
+	// 1. _pendingMergeSiblingIds: maps the first tool's ID → IDs of siblings
+	//    whose blocks were merged into it. Persists until the tool runs.
+	// 2. _mergedEditToolOutcomes: maps sibling ID → outcome ('success' or
+	//    error string). Populated after the first tool runs, consumed when
+	//    _tryDrainPendingBatch encounters that sibling.
+	private readonly _pendingMergeSiblingIds = new Map<string, string[]>()
+	private readonly _mergedEditToolOutcomes = new Map<string, 'success' | string>()
 	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
@@ -1434,15 +1442,96 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	 *   - 'interrupted' if a tool was interrupted (agent should terminate)
 	 *   - 'done' if all pending tools ran to a terminal state
 	 */
+	/** After a merged edit_file tool finishes, record outcomes for its siblings. */
+	private _recordMergedSiblingOutcomes(threadId: string, toolId: string) {
+		const siblingIds = this._pendingMergeSiblingIds.get(toolId)
+		if (!siblingIds) return
+		this._pendingMergeSiblingIds.delete(toolId)
+		const messages = this.state.allThreads[threadId]?.messages ?? []
+		const toolMsg = messages.find(m => m.role === 'tool' && m.id === toolId)
+		const succeeded = toolMsg?.role === 'tool' && toolMsg.type === 'success'
+		const outcome: 'success' | string = succeeded
+			? 'success'
+			: (toolMsg?.role === 'tool' ? toolMsg.content : 'Merged edit_file operation failed.')
+		for (const id of siblingIds) {
+			this._mergedEditToolOutcomes.set(id, outcome)
+		}
+	}
+
+	private _resolvedMergedTool(threadId: string, tool: typeof this._getPendingBatchTools extends (...a: any) => (infer R)[] ? R : never): boolean {
+		const outcome = this._mergedEditToolOutcomes.get(tool.id)
+		if (outcome === undefined) return false
+		this._mergedEditToolOutcomes.delete(tool.id)
+		if (outcome === 'success') {
+			this._updateLatestTool(threadId, {
+				role: 'tool', type: 'success',
+				params: tool.rawParams as ToolCallParams<ToolName>,
+				result: { lintErrors: null } as any,
+				name: tool.name,
+				content: `Changes merged into a prior edit_file call for the same file and applied together.`,
+				id: tool.id, rawParams: tool.rawParams, rawParamsStr: tool.rawParamsStr, mcpServerName: tool.mcpServerName,
+			})
+		} else {
+			this._updateLatestTool(threadId, {
+				role: 'tool', type: 'tool_error',
+				params: tool.rawParams as ToolCallParams<ToolName>,
+				result: outcome,
+				name: tool.name,
+				content: `Changes were merged into a prior edit_file call for the same file, but it failed: ${outcome}`,
+				id: tool.id, rawParams: tool.rawParams, rawParamsStr: tool.rawParamsStr, mcpServerName: tool.mcpServerName,
+			})
+		}
+		return true
+	}
+
 	private _tryDrainPendingBatch = async (threadId: string): Promise<'done' | 'awaiting_user' | 'interrupted'> => {
 		while (true) {
 			const pending = this._getPendingBatchTools(threadId)
 			if (pending.length === 0) return 'done'
 			const next = pending[0]
+
+			// If this tool was already merged into a prior tool, resolve it
+			// immediately without re-running.
+			if (this._resolvedMergedTool(threadId, next)) continue
+
+			// Merge same-file edit_file calls so all SEARCH/REPLACE blocks run
+			// atomically against the original file content. Without this, the 2nd
+			// edit_file would see a modified file and its SEARCH blocks would fail.
+			let mergedParams = next.rawParams
+			const mergedSiblingIds: string[] = []
+			if (next.name === 'edit_file' && typeof next.rawParams?.search_replace_blocks === 'string') {
+				const targetUri = next.rawParams.uri
+				let mergedBlocks = next.rawParams.search_replace_blocks
+				for (let i = 1; i < pending.length; i++) {
+					const sib = pending[i]
+					if (sib.name !== 'edit_file' || sib.rawParams?.uri !== targetUri) continue
+					const sibBlocks = sib.rawParams?.search_replace_blocks
+					if (typeof sibBlocks !== 'string') continue
+					mergedBlocks += '\n' + sibBlocks
+					mergedSiblingIds.push(sib.id)
+				}
+				if (mergedSiblingIds.length > 0) {
+					mergedParams = { ...next.rawParams, search_replace_blocks: mergedBlocks }
+					// Persist merged params so the approval path (which re-reads
+					// rawParams from the thread message) also uses merged blocks.
+					next.rawParams = mergedParams
+				}
+			}
+
 			const { awaitingUserApproval, interrupted } = await this._runToolCall(
 				threadId, next.name, next.id, next.mcpServerName,
-				{ preapproved: false, unvalidatedToolParams: next.rawParams, rawParamsStr: next.rawParamsStr }
+				{ preapproved: false, unvalidatedToolParams: mergedParams, rawParamsStr: next.rawParamsStr }
 			)
+
+			// Track merged siblings so their outcomes can be recorded after the
+			// first tool runs — whether immediately or after user approval.
+			if (mergedSiblingIds.length > 0) {
+				this._pendingMergeSiblingIds.set(next.id, mergedSiblingIds)
+			}
+			if (!awaitingUserApproval && !interrupted) {
+				this._recordMergedSiblingOutcomes(threadId, next.id)
+			}
+
 			if (interrupted) return 'interrupted'
 			if (awaitingUserApproval) return 'awaiting_user'
 		}
@@ -1521,6 +1610,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				params: p.params, name: p.name, content, result: null,
 				id: p.id, rawParams: p.rawParams, rawParamsStr: p.rawParamsStr, mcpServerName: p.mcpServerName,
 			})
+			// Clean up any stale merge tracking for rejected tools
+			this._pendingMergeSiblingIds.delete(p.id)
+			this._mergedEditToolOutcomes.delete(p.id)
 		}
 
 		if (resumeAgent) {
@@ -1864,6 +1956,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				this._addUserCheckpoint({ threadId })
 				return
 			}
+			// If this tool had merged siblings from a pre-approval merge, record
+			// their outcomes now that the tool has actually run.
+			this._recordMergedSiblingOutcomes(threadId, callThisToolFirst.id)
 			// Drain the remaining pending batch (if there are other tools from this turn
 			// that still need to run). If any of them pauses for approval, stop here — the
 			// agent will resume when the user next approves or rejects.
