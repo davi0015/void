@@ -4020,32 +4020,57 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const chatMessages = thread.messages
 		const boundaryIdx = this._computeManualCompactionBoundary(chatMessages, protectTurns, protectMessages)
 		if (boundaryIdx <= 0) {
-			return 'Not enough messages outside the protection zone (last 5 user turns / 30 messages).'
+			return `Not enough messages outside the protection zone (last ${protectTurns} user turns / ${protectMessages} messages).`
 		}
 
 		const targetPercent = Math.max(1, Math.round(100 - compactPercent))
+
+		// Estimate the character count of the compactable region so we can
+		// give the LLM a concrete target length instead of a vague percentage.
+		let compactableChars = 0
+		for (let i = 0; i < boundaryIdx && i < chatMessages.length; i++) {
+			const msg = chatMessages[i]
+			if (msg.role !== 'checkpoint' && msg.role !== 'interrupted_streaming_tool') {
+				if (msg.role === 'user') compactableChars += (msg.content?.length ?? 0)
+				else if (msg.role === 'assistant') compactableChars += (msg.displayContent?.length ?? 0) + (msg.reasoning?.length ?? 0)
+				else if (msg.role === 'tool') {
+					const r = msg.result
+					if (typeof r === 'string') compactableChars += r.length
+					else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') compactableChars += ((r as { content: string }).content.length)
+				}
+			}
+		}
+		const targetChars = Math.max(500, Math.round(compactableChars * targetPercent / 100))
+		const charsPerToken = this._convertToLLMMessagesService.getCharsPerToken(modelSelection.providerName, modelSelection.modelName)
+		const targetTokens = Math.round(targetChars / charsPerToken)
 
 		// The conversation is already in the LLM messages (prefix-cached).
 		// The summarization instruction just tells the LLM what to do with it.
 		const summarizationPrompt = [
 			'Summarize our conversation so far to reduce context size.',
-			'The system prompt and rules are preserved separately.',
+			'The system prompt and rules are preserved separately — do NOT summarize them.',
 			'',
-			'Extract and preserve:',
-			'1. Task context — what the user is working on, the overall goal',
-			'2. Decisions made — approaches chosen, tradeoffs discussed',
-			'3. Files modified — which files were changed and what was done',
-			'4. Current state — what is completed, what is pending',
-			'5. User preferences — any conventions or rules stated in the conversation',
+			'Extract and preserve IN DETAIL:',
+			'1. Task context — what the user is working on, the overall goal, background decisions',
+			'2. Every decision made — approaches chosen, tradeoffs discussed, options rejected and why',
+			'3. All files modified — which files were changed, what functions/types were added/modified/removed, and the reasoning',
+			'4. Current state — what is completed, what is pending, what was attempted but failed',
+			'5. User preferences — any conventions, rules, or explicit instructions stated in the conversation',
+			'6. Key code patterns — important implementation details, data structures, APIs used',
+			'7. Errors encountered — what went wrong, how it was diagnosed, how it was fixed',
 			'',
 			'Rules:',
-			'- Be concise — this summary replaces the full conversation history',
-			'- Include specific file paths and function/type names',
-			'- Describe changes, not full code',
-			'- If tool calls read files, summarize what was learned, not the file contents',
-			`- Target approximately ${targetPercent}% of the original conversation length`,
+			'- This summary REPLACES the full conversation, so include everything needed to continue the work',
+			'- Include specific file paths, function names, type names, and variable names',
+			'- Describe what changed and WHY, not full code blocks',
+			'- If tool calls read files, summarize the key information learned',
+			'- Preserve exact error messages and their resolutions',
+			'- Use structured sections with headers',
+			`- IMPORTANT: Your summary must be approximately ${targetTokens.toLocaleString()} tokens (~${targetChars.toLocaleString()} characters).`,
+			`  The compactable region is ~${Math.round(compactableChars / charsPerToken).toLocaleString()} tokens (~${compactableChars.toLocaleString()} characters). Do NOT over-compress.`,
+			`  Err on the side of including MORE detail rather than less.`,
 			'',
-			'Write a structured summary.',
+			'Write a detailed, structured summary now.',
 		].join('\n')
 
 		// Send compaction as a normal chat continuation so the system prompt +
@@ -4060,23 +4085,23 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const manualCompaction = currentThread?.compactionSummary && currentThread?.compactionBoundaryIdx
 			? { summary: currentThread.compactionSummary, boundaryIdx: currentThread.compactionBoundaryIdx }
 			: undefined
-		const { messages: llmMessages, separateSystemMessage } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
-			chatMessages: compactionMessages,
-			modelSelection,
-			chatMode: 'agent',
-			frozenAiInstructions,
-			manualCompaction,
-		})
 
 		const { overridesOfModel } = this._settingsService.state
 		const modelSelectionOptions = this._settingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
-		try {
-			const summary = await new Promise<string>((resolve, reject) => {
+		const sendCompactionFromChatMessages = async (chatMsgs: ChatMessage[], label: string) => {
+			const { messages: msgs, separateSystemMessage: sysMsg } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
+				chatMessages: chatMsgs,
+				modelSelection,
+				chatMode: 'agent',
+				frozenAiInstructions,
+				manualCompaction,
+			})
+			return new Promise<string>((resolve, reject) => {
 				this._llmMessageService.sendLLMMessage({
 					messagesType: 'chatMessages',
-					messages: llmMessages,
-					separateSystemMessage,
+					messages: msgs,
+					separateSystemMessage: sysMsg,
 					chatMode: null,
 					modelSelection,
 					modelSelectionOptions,
@@ -4085,12 +4110,49 @@ We only need to do it for files that were edited since `from`, ie files between 
 					onFinalMessage: ({ fullText }) => { resolve(fullText) },
 					onError: (err) => { reject(new Error(err.message)) },
 					onAbort: () => { reject(new Error('Compaction aborted')) },
-					logging: { loggingName: 'Manual Compaction', loggingExtras: { threadId, compactPercent } },
+					logging: { loggingName: label, loggingExtras: { threadId, compactPercent } },
 				})
 			})
+		}
+
+		try {
+			let summary = await sendCompactionFromChatMessages(compactionMessages, 'Manual Compaction')
 
 			if (!summary || summary.trim().length === 0) {
 				return 'The model returned an empty summary.'
+			}
+
+			// If the summary is drastically shorter than the target, ask the
+			// model to expand it. LLMs tend to over-compress when summarizing.
+			const minAcceptableChars = Math.round(targetChars * 0.3)
+			if (summary.trim().length < minAcceptableChars && targetChars > 1000) {
+				const expansionMessages: ChatMessage[] = [
+					...compactionMessages,
+					{ role: 'assistant', displayContent: summary.trim(), reasoning: '', anthropicReasoning: null } as ChatMessage,
+					{
+						role: 'user',
+						content: [
+							'Your summary is too short. It is only ' + summary.trim().length.toLocaleString() + ' characters but the target is ~' + targetChars.toLocaleString() + ' characters.',
+							'',
+							'Please rewrite and EXPAND the summary significantly. Include:',
+							'- More detail about each file that was read or modified',
+							'- Specific function names, type definitions, and variable names discussed',
+							'- The exact reasoning behind each decision',
+							'- Error messages and their resolutions verbatim',
+							'- Code patterns and implementation details',
+							'',
+							'Here is your previous summary to expand upon:',
+							'',
+							summary.trim(),
+						].join('\n'),
+						displayContent: '',
+						selections: null,
+					} as ChatMessage,
+				]
+				const expanded = await sendCompactionFromChatMessages(expansionMessages, 'Manual Compaction (expansion)')
+				if (expanded && expanded.trim().length > summary.trim().length) {
+					summary = expanded
+				}
 			}
 
 			// Write compaction log for analysis
@@ -4102,8 +4164,9 @@ We only need to do it for files that were edited since `from`, ie files between 
 				model: `${modelSelection.providerName}/${modelSelection.modelName}`,
 				inputTranscript: summarizationPrompt,
 				outputSummary: summary.trim(),
-				inputChars: summarizationPrompt.length,
+				inputChars: compactableChars,
 				outputChars: summary.trim().length,
+				targetChars,
 			})
 
 			const updatedThread: ThreadType = {
@@ -4146,6 +4209,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 		threadId: string, compactPercent: number, boundaryIdx: number,
 		totalMessages: number, model: string, inputTranscript: string,
 		outputSummary: string, inputChars: number, outputChars: number,
+		targetChars?: number,
 	}) {
 		const ts = new Date().toISOString().replace(/[:.]/g, '-')
 		const fileName = `compaction-${opts.threadId.slice(0, 8)}-${ts}.md`
@@ -4163,11 +4227,12 @@ We only need to do it for files that were edited since `from`, ie files between 
 			`- **Thread**: ${opts.threadId}`,
 			`- **Timestamp**: ${new Date().toISOString()}`,
 			`- **Model**: ${opts.model}`,
-			`- **Compression target**: ${opts.compactPercent}%`,
+			`- **Compression target**: ${opts.compactPercent}% (keep ~${100 - opts.compactPercent}%)`,
 			`- **Compression actual**: ${compressionActual}%`,
+			`- **Target chars**: ${(opts.targetChars ?? 0).toLocaleString()}`,
 			`- **Boundary index**: ${opts.boundaryIdx} / ${opts.totalMessages} messages`,
-			`- **Input chars**: ${opts.inputChars.toLocaleString()}`,
-			`- **Output chars**: ${opts.outputChars.toLocaleString()}`,
+			`- **Compactable region chars**: ${opts.inputChars.toLocaleString()}`,
+			`- **Output summary chars**: ${opts.outputChars.toLocaleString()}`,
 			``,
 			`## Output Summary`,
 			``,

@@ -925,7 +925,7 @@ export const ButtonStop = ({ className, ...props }: ButtonHTMLAttributes<HTMLBut
 
 // ── Manual compaction dialog ──────────────────────────────────────────
 const CompactDialog = ({ onConfirm, onCancel }: { onConfirm: (percent: number, protectTurns: number) => void, onCancel: () => void }) => {
-	const [percent, setPercent] = useState(90)
+	const [percent, setPercent] = useState(70)
 	const [protectTurns, setProtectTurns] = useState(3)
 	return (
 		<div className='flex flex-col gap-2 p-3 rounded-md border border-void-border-1 bg-void-bg-1 text-sm'>

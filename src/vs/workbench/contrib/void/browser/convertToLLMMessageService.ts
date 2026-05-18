@@ -1077,6 +1077,7 @@ export interface IConvertToLLMMessageService {
 	// missing/invalid inputs so callers can pass what they have without
 	// guarding every field.
 	recordTokenUsageCalibration(opts: { providerName: string, modelName: string, sentChars: number, reportedInputTokens: number | undefined }): void
+	getCharsPerToken(providerName: string, modelName: string): number
 
 	// Returns the current combined `.voidrules` file content (all workspace
 	// folders concatenated, `\n\n` separated). Reads fresh from disk on every
@@ -1129,6 +1130,10 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	// request against this model yet in the current session.
 	private _getCharsPerToken(providerName: string, modelName: string): number {
 		return this._charsPerTokenByModel.get(this._calibrationKey(providerName, modelName)) ?? CHARS_PER_TOKEN
+	}
+
+	getCharsPerToken: IConvertToLLMMessageService['getCharsPerToken'] = (providerName, modelName) => {
+		return this._getCharsPerToken(providerName, modelName)
 	}
 
 	recordTokenUsageCalibration: IConvertToLLMMessageService['recordTokenUsageCalibration'] = ({ providerName, modelName, sentChars, reportedInputTokens }) => {
