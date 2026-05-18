@@ -232,7 +232,9 @@ const _computeProtectionBoundary = (messages: SimpleLLMMessage[]): number => {
 // tooltip so the user has visibility into when/why requests shrunk).
 // Pure function — does not mutate the input. `info === null` means no compaction
 // happened this request (size gate not met, or no trim-eligible messages).
-const compactToolResultsForRequest = (
+// Currently disabled — see `prepareLLMChatMessages`. Kept for future use.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _compactToolResultsForRequest = (
 	messages: SimpleLLMMessage[],
 	{ contextWindow, charsPerToken, priorContentTokens }: { contextWindow: number, charsPerToken: number, priorContentTokens?: number },
 ): { messages: SimpleLLMMessage[], info: CompactionInfo | null } => {
@@ -1509,14 +1511,13 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// byte-identical to what was sent before, keeping the provider's prefix
 		// cache warm across turns.
 		const llmMessagesRaw = await this._chatMessagesToSimpleMessages(chatMessages, { supportsVision, pendingImageBytes })
-		// Perf 2 — Light-tier history compaction. Trims bodies of old data-fetching
-		// tool results (read_file / grep / ls_dir / run_command / …) outside the
-		// protection zone (larger of "last 5 user turns" and "last 30 messages").
-		// Only fires once the request crosses `sizeTriggerRatio * contextWindow`
-		// so short threads keep a pristine prefix cache. Keeps envelopes
-		// (tool_call_id linking) intact so protocol replay stays valid; UI
-		// continues to show originals.
-		const { messages: llmMessages, info: compactionInfo } = compactToolResultsForRequest(llmMessagesRaw, { contextWindow, charsPerToken, priorContentTokens })
+		// Perf 2 — Light-tier history compaction DISABLED.
+		// Trimming tool result bodies breaks the provider's prefix cache at the
+		// trim point. At large context sizes (500k+) the cache miss cost far
+		// outweighs the token savings from trimming, since the entire prefix
+		// must be re-ingested.
+		const llmMessages = llmMessagesRaw
+		const compactionInfo: CompactionInfo | null = null
 
 		const { messages, separateSystemMessage, emergencyInfo } = prepareMessages({
 			messages: llmMessages,
