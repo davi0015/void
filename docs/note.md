@@ -1536,6 +1536,33 @@ Light-tier tool result compaction (`compactToolResultsForRequest`) has been disa
 
 **When to re-enable:** Only if paired with a prefix-preserving architecture (e.g., the memory system design above) where compacted content is moved into an immutable prefix, not rewritten in-place. Alternatively, compaction makes sense for models without prefix caching or with very small context windows where you'd hit the hard limit before cache savings matter.
 
+### Manual LLM-powered compaction ✅
+
+User-triggered conversation compaction that sends old messages to the current model for summarization. Designed for models with 100-200k context windows where automatic compaction was counterproductive (broke prefix cache, saved too few tokens).
+
+**How it works:**
+1. User clicks "Compact" button (scissors icon) above the chat input — only shown when thread has 10+ messages and is not streaming
+2. A dialog appears with a compression slider (50-95%, default 90%) — 90% means the summary targets ~10% of the original token count
+3. System computes a protection boundary (last 5 user turns or last 30 messages, whichever protects more — same policy as the disabled light-tier compaction)
+4. Messages before the boundary are formatted as a transcript and sent to the current model with a summarization prompt
+5. The LLM returns a structured summary extracting: task context, decisions, files modified, current state, user preferences
+6. Summary is stored on `ThreadType.compactionSummary`; boundary stored as `compactionBoundaryIdx`
+7. On subsequent LLM calls, `prepareLLMChatMessages` replaces messages before the boundary with the summary (user message + assistant ack), keeping messages after the boundary as-is
+8. UI shows all original messages but disables edit on compacted messages (before the boundary). A thin "Compacted" divider appears at the boundary
+
+**Key design decisions:**
+- **ChatMessage[] is never mutated** — the summary only affects the LLM view (`SimpleLLMMessage[]`), mirroring the existing light-tier compaction approach. All original bubbles remain visible in the UI.
+- **System prompt excluded** — only conversation messages are compacted. System prompt, rules, and AI instructions are never part of the summarization input.
+- **Edit gating** — messages in the compacted region have their edit button hidden. Editing them would be meaningless since the LLM no longer sees the original content. The service also blocks `editUserMessageAndStreamResponse` for `messageIdx < compactionBoundaryIdx`.
+- **Re-compaction** — user can compact again; the boundary and summary are updated. The new summarization runs over the entire old region (including the previous summary if any messages were added between compactions).
+
+**Compaction logging:** Each compaction writes a markdown file to `voidRequestLogs/compaction-{threadId}-{timestamp}.md` containing: settings (model, compression %, message counts, char counts), the output summary, and the input transcript. This enables analysis of how the LLM compacts conversations.
+
+**Files:**
+- `chatThreadService.ts` — `compactCurrentThread()`, boundary computation, transcript formatting, log writing
+- `convertToLLMMessageService.ts` — summary substitution in `prepareLLMChatMessages` via `manualCompaction` parameter
+- `SidebarChat.tsx` — Compact button, CompactDialog, edit gating via `compactionBoundaryIdx` prop, "Compacted" divider
+
 ### Backlog / Open ideas
 
 - **`read_file` contract clarity** — the tool description claims "Returns full contents of a given file" but actually paginates at `MAX_FILE_CHARS_PAGE`. Weak models distrust the "truncated" output and fall back to terminal `cat`. Fix: update description to "Returns contents of a file, paginated. If truncated, increment `page_number` to continue." and document `page_number` properly. User deprioritized this for now since most daily files fit in one page; revisit if cross-chunk reads start causing friction.

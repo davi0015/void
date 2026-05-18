@@ -38,7 +38,8 @@ import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { RunOnceScheduler, timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { IWorkspaceContextService, toWorkspaceIdentifier } from '../../../../platform/workspace/common/workspace.js';
-import { basename as resourceBasename } from '../../../../base/common/resources.js';
+import { basename as resourceBasename, joinPath } from '../../../../base/common/resources.js';
+import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
 import { buildTestMessages, runSimulatedStream } from './chatThreadDevTools.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
@@ -615,6 +616,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IFileService private readonly _fileService: IFileService,
 		@IMCPService private readonly _mcpService: IMCPService,
 		@IRequestTelemetryService private readonly _requestTelemetryService: IRequestTelemetryService,
+		@IEnvironmentService private readonly _environmentService: IEnvironmentService,
 	) {
 		super()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string, pinnedThreadIds: [] } // default state
@@ -4061,6 +4063,19 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 			if (!summary || summary.trim().length === 0) return false
 
+			// Write compaction log for analysis
+			this._writeCompactionLog({
+				threadId,
+				compactPercent,
+				boundaryIdx,
+				totalMessages: chatMessages.length,
+				model: `${modelSelection.providerName}/${modelSelection.modelName}`,
+				inputTranscript: transcript,
+				outputSummary: summary.trim(),
+				inputChars: transcript.length,
+				outputChars: summary.trim().length,
+			})
+
 			const updatedThread: ThreadType = {
 				...thread,
 				lastModified: new Date().toISOString(),
@@ -4119,6 +4134,48 @@ We only need to do it for files that were edited since `from`, ie files between 
 			// skip checkpoint and interrupted_streaming_tool
 		}
 		return lines.join('\n\n')
+	}
+
+	private _writeCompactionLog(opts: {
+		threadId: string, compactPercent: number, boundaryIdx: number,
+		totalMessages: number, model: string, inputTranscript: string,
+		outputSummary: string, inputChars: number, outputChars: number,
+	}) {
+		const ts = new Date().toISOString().replace(/[:.]/g, '-')
+		const fileName = `compaction-${opts.threadId.slice(0, 8)}-${ts}.md`
+		const logDir = joinPath(this._environmentService.userRoamingDataHome, 'voidRequestLogs')
+		const logUri = joinPath(logDir, fileName)
+
+		const compressionActual = opts.inputChars > 0
+			? Math.round((1 - opts.outputChars / opts.inputChars) * 100)
+			: 0
+
+		const content = [
+			`# Compaction Log`,
+			``,
+			`## Settings`,
+			`- **Thread**: ${opts.threadId}`,
+			`- **Timestamp**: ${new Date().toISOString()}`,
+			`- **Model**: ${opts.model}`,
+			`- **Compression target**: ${opts.compactPercent}%`,
+			`- **Compression actual**: ${compressionActual}%`,
+			`- **Boundary index**: ${opts.boundaryIdx} / ${opts.totalMessages} messages`,
+			`- **Input chars**: ${opts.inputChars.toLocaleString()}`,
+			`- **Output chars**: ${opts.outputChars.toLocaleString()}`,
+			``,
+			`## Output Summary`,
+			``,
+			opts.outputSummary,
+			``,
+			`## Input Transcript`,
+			``,
+			opts.inputTranscript,
+		].join('\n')
+
+		this._fileService.writeFile(logUri, VSBuffer.fromString(content)).catch(e => {
+			console.error('[Compaction] Failed to write log:', e)
+		})
+		console.log(`[Compaction] Log written to ${logUri.fsPath}`)
 	}
 
 	// ── Dev-only: perf testing helpers (see chatThreadDevTools.ts) ──────
