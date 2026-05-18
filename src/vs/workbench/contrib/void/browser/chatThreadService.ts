@@ -232,6 +232,11 @@ export type ThreadType = {
 	compactionBoundaryIdx?: number;
 	compactionPercent?: number;
 
+	// Snapshot of workspace file paths from the last directory listing sent to
+	// the LLM. Used to compute a compact diff on subsequent turns instead of
+	// repeating the full directory tree. Persisted so it survives reload.
+	directorySnapshot?: string[];
+
 	// User-provided override of the auto-derived tab / history label. When
 	// non-empty, used as the display label everywhere; when undefined or
 	// whitespace-only, the UI falls back to the first user message's
@@ -551,8 +556,10 @@ export interface IChatThreadService {
 	// summarization at the given compression ratio. The summary replaces those
 	// messages in the LLM view; the UI keeps showing the original bubbles.
 	// `compactPercent` is how much to compress (e.g. 90 → summary ≈ 10% of
-	// original tokens). Returns null on success, or an error message string.
-	compactCurrentThread(opts: { compactPercent: number }): Promise<string | null>;
+	// original tokens). `protectTurns` / `protectMessages` control how many
+	// recent user turns / messages are kept uncompacted (defaults: 3 / 10).
+	// Returns null on success, or an error message string.
+	compactCurrentThread(opts: { compactPercent: number, protectTurns?: number, protectMessages?: number }): Promise<string | null>;
 
 	// Dev-only: populate the current thread with a large fake conversation
 	// for performance testing.
@@ -2678,13 +2685,25 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 		const userMessageContent = await chat_userMessageContent(instructions, currSelns, { directoryStrService: this._directoryStringService, fileService: this._fileService }) // user message + names of files (NOT content)
 
-		// Snapshot the volatile runtime context (date, open files, active URI,
-		// directory listing, terminal IDs) into this user message's stored content
-		// so past turns stay byte-identical across subsequent requests. The volatile
-		// block goes into `content` (what the LLM sees) but NOT into `displayContent`
-		// (what the UI renders), so the chat bubble shows only the user's words.
+		// Turn 1 gets the full directory listing (~20k chars / ~5k tokens).
+		// Subsequent turns get lightweight volatile (active file, open files,
+		// date, terminals — ~200-300 chars) plus a compact diff of any
+		// files/directories that changed since the last snapshot (persisted on
+		// the thread so it survives window reload).
 		const { chatMode } = this._settingsService.state.globalSettings
-		const volatileBlock = await this._convertToLLMMessagesService.generateChatVolatileContext({ chatMode })
+		const isFirstUserMessage = !thread.messages.some(m => m.role === 'user')
+		const needsFullListing = isFirstUserMessage || !thread.directorySnapshot
+		const { volatile: volatileBlock, directorySnapshot } = await this._convertToLLMMessagesService.generateChatVolatileContext({
+			chatMode,
+			includeDirectoryListing: needsFullListing,
+			prevDirectorySnapshot: thread.directorySnapshot,
+		})
+		if (directorySnapshot) {
+			const updatedThread: ThreadType = { ...thread, directorySnapshot }
+			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
+			this._storeThread(threadId, updatedThread)
+			this._setState({ allThreads: newThreads })
+		}
 		const contentWithVolatile = volatileBlock
 			? `${volatileBlock}\n\n${userMessageContent}`
 			: userMessageContent
@@ -3990,7 +4009,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 	// ── Manual compaction ────────────────────────────────────────────────
 
-	async compactCurrentThread({ compactPercent }: { compactPercent: number }): Promise<string | null> {
+	async compactCurrentThread({ compactPercent, protectTurns = 3, protectMessages = 10 }: { compactPercent: number, protectTurns?: number, protectMessages?: number }): Promise<string | null> {
 		const threadId = this.state.currentThreadId
 		const thread = this.state.allThreads[threadId]
 		if (!thread || thread.messages.length < 10) return 'Not enough messages to compact.'
@@ -3998,10 +4017,8 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const modelSelection = this._settingsService.state.modelSelectionOfFeature['Chat']
 		if (!modelSelection) return 'No model selected for Chat.'
 
-		// Compute the boundary: protect the last few conversations (reuse the
-		// same policy as the existing light-tier compaction).
 		const chatMessages = thread.messages
-		const boundaryIdx = this._computeManualCompactionBoundary(chatMessages)
+		const boundaryIdx = this._computeManualCompactionBoundary(chatMessages, protectTurns, protectMessages)
 		if (boundaryIdx <= 0) {
 			return 'Not enough messages outside the protection zone (last 5 user turns / 30 messages).'
 		}
@@ -4098,27 +4115,21 @@ We only need to do it for files that were edited since `from`, ie files between 
 		}
 	}
 
-	private _computeManualCompactionBoundary(messages: ChatMessage[]): number {
-		// Protect the last N user turns or last N messages — same logic as the
-		// light-tier compaction's `_computeProtectionBoundary`, but operating
-		// on ChatMessage[] instead of SimpleLLMMessage[].
-		const PROTECT_USER_TURNS = 5
-		const PROTECT_MESSAGES = 30
-
+	private _computeManualCompactionBoundary(messages: ChatMessage[], protectTurns: number, protectMessages: number): number {
 		let userCount = 0
 		let userTurnBoundary = 0
 		for (let i = messages.length - 1; i >= 0; i--) {
 			if (messages[i].role === 'user') {
 				userCount++
-				if (userCount >= PROTECT_USER_TURNS) {
+				if (userCount >= protectTurns) {
 					userTurnBoundary = i
 					break
 				}
 			}
 		}
-		if (userCount < PROTECT_USER_TURNS) userTurnBoundary = 0
+		if (userCount < protectTurns) userTurnBoundary = 0
 
-		const messageCountBoundary = Math.max(0, messages.length - PROTECT_MESSAGES)
+		const messageCountBoundary = Math.max(0, messages.length - protectMessages)
 		return Math.max(userTurnBoundary, messageCountBoundary)
 	}
 

@@ -924,8 +924,9 @@ export const ButtonStop = ({ className, ...props }: ButtonHTMLAttributes<HTMLBut
 
 
 // ── Manual compaction dialog ──────────────────────────────────────────
-const CompactDialog = ({ onConfirm, onCancel }: { onConfirm: (percent: number) => void, onCancel: () => void }) => {
+const CompactDialog = ({ onConfirm, onCancel }: { onConfirm: (percent: number, protectTurns: number) => void, onCancel: () => void }) => {
 	const [percent, setPercent] = useState(90)
+	const [protectTurns, setProtectTurns] = useState(3)
 	return (
 		<div className='flex flex-col gap-2 p-3 rounded-md border border-void-border-1 bg-void-bg-1 text-sm'>
 			<div className='flex items-center justify-between'>
@@ -935,7 +936,7 @@ const CompactDialog = ({ onConfirm, onCancel }: { onConfirm: (percent: number) =
 				</button>
 			</div>
 			<div className='text-void-fg-3 text-xs'>
-				Summarize old messages using the current model. The last few conversations are kept intact.
+				Summarize old messages using the current model. Recent conversations are kept intact.
 			</div>
 			<div className='flex items-center gap-2'>
 				<span className='text-void-fg-3 text-xs w-20 shrink-0'>Compression</span>
@@ -953,6 +954,19 @@ const CompactDialog = ({ onConfirm, onCancel }: { onConfirm: (percent: number) =
 			<div className='text-void-fg-3 text-xs'>
 				Summary will target ~{Math.round(100 - percent)}% of original size
 			</div>
+			<div className='flex items-center gap-2'>
+				<span className='text-void-fg-3 text-xs w-20 shrink-0'>Keep last</span>
+				<input
+					type='range'
+					min={1}
+					max={10}
+					step={1}
+					value={protectTurns}
+					onChange={(e) => setProtectTurns(Number(e.target.value))}
+					className='flex-1 accent-white h-1 cursor-pointer'
+				/>
+				<span className='text-void-fg-3 text-xs w-10 text-right'>{protectTurns} turn{protectTurns !== 1 ? 's' : ''}</span>
+			</div>
 			<div className='flex justify-end gap-2 mt-1'>
 				<button
 					type='button'
@@ -963,7 +977,7 @@ const CompactDialog = ({ onConfirm, onCancel }: { onConfirm: (percent: number) =
 				</button>
 				<button
 					type='button'
-					onClick={() => onConfirm(percent)}
+					onClick={() => onConfirm(percent, protectTurns)}
 					className='px-2 py-1 text-xs text-white bg-void-fg-3 hover:bg-void-fg-2 cursor-pointer rounded'
 				>
 					Compact
@@ -2971,12 +2985,12 @@ export const SidebarChat = () => {
 	const [isCompacting, setIsCompacting] = useState(false)
 	const [compactError, setCompactError] = useState<string | null>(null)
 	const canCompact = previousMessages.length >= 10 && !isRunning && !isCurrentThreadReadOnly
-	const onCompact = useCallback(async (percent: number) => {
+	const onCompact = useCallback(async (percent: number, protectTurns: number) => {
 		setShowCompactDialog(false)
 		setCompactError(null)
 		setIsCompacting(true)
 		try {
-			const error = await chatThreadsService.compactCurrentThread({ compactPercent: percent })
+			const error = await chatThreadsService.compactCurrentThread({ compactPercent: percent, protectTurns })
 			if (error) setCompactError(error)
 		} finally {
 			setIsCompacting(false)

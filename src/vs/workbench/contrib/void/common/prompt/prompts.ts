@@ -471,7 +471,7 @@ export type ChatPromptContext = {
 // should prepend this to the latest user message (Phase B caching layout) rather
 // than embed it in the system message — keeping it out of the system message lets
 // the stable prefix and the full conversation history be prefix-cached across turns.
-export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode: mode }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'persistentTerminalIDs' | 'chatMode'>) => {
+export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode: mode, includeDirectoryListing = true, directoryDiff }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'persistentTerminalIDs' | 'chatMode'> & { includeDirectoryListing?: boolean, directoryDiff?: string | null }) => {
 	const sysInfo = (`Here is the user's system information:
 <system_info>
 - ${os}
@@ -489,21 +489,20 @@ ${openedURIs.join('\n') || 'NO OPENED FILES'}${''/* separator */}${mode === 'age
 </system_info>`)
 
 
-	const fsInfo = (`Here is an overview of the user's file system:
+	const fsInfo = includeDirectoryListing ? (`Here is an overview of the user's file system:
 <files_overview>
 ${directoryStr}
-</files_overview>`)
+</files_overview>`) : null
+
+	const diffInfo = directoryDiff ? (`<directory_changes>
+${directoryDiff}
+</directory_changes>`) : null
 
 
-	// XML tag is self-describing; no narration prefix. Keep field order stable
-	// so that on turns where volatile fields happen to match the previous turn,
-	// the cache can extend further into the prefix.
 	return (`<volatile_context>
 Today's date is ${new Date().toDateString()}.
 
-${sysInfo}
-
-${fsInfo}
+${sysInfo}${fsInfo ? `\n\n${fsInfo}` : ''}${diffInfo ? `\n\n${diffInfo}` : ''}
 </volatile_context>`)
 }
 

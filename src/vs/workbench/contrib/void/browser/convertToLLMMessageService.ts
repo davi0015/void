@@ -1065,10 +1065,10 @@ export interface IConvertToLLMMessageService {
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 	// Called by chat creation paths to snapshot runtime grounding (date, open files,
 	// active URI, directory listing, terminal IDs) into a user message at storage time.
-	// Baking volatile into the stored content (rather than prepending at send time)
-	// keeps prior turns byte-identical across requests so the provider's prefix cache
-	// stays warm turn-over-turn.
-	generateChatVolatileContext: (opts: { chatMode: ChatMode }) => Promise<string>
+	// Turn 1 includes the full directory listing; subsequent turns include only a
+	// compact diff of added/removed files (compared against prevDirectorySnapshot).
+	// Returns the volatile string and the updated snapshot for the caller to persist.
+	generateChatVolatileContext: (opts: { chatMode: ChatMode, includeDirectoryListing?: boolean, prevDirectorySnapshot?: string[] }) => Promise<{ volatile: string, directorySnapshot: string[] | undefined }>
 
 	// Called by `chatThreadService` after each LLM response resolves with a
 	// reported `inputTokens`. Updates the per-model chars/token ratio via EMA
@@ -1353,17 +1353,63 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		return chat_systemMessage({ chatMode, mcpTools, includeXMLToolDefinitions })
 	}
 
-	generateChatVolatileContext: IConvertToLLMMessageService['generateChatVolatileContext'] = async ({ chatMode }) => {
+	private async _getDirectoryPaths(): Promise<string[]> {
+		const paths: string[] = []
+		const folders = this.workspaceContextService.getWorkspace().folders
+		for (const f of folders) {
+			try {
+				const uris = await this.directoryStrService.getAllURIsInDirectory(f.uri, { maxResults: 2000 })
+				for (const u of uris) paths.push(u.fsPath)
+			} catch { /* folder may not exist */ }
+		}
+		return paths
+	}
+
+	private _computeDirectoryDiff(prev: Set<string>, curr: Set<string>): string | null {
+		const added: string[] = []
+		const removed: string[] = []
+		for (const p of curr) { if (!prev.has(p)) added.push(p) }
+		for (const p of prev) { if (!curr.has(p)) removed.push(p) }
+		if (added.length === 0 && removed.length === 0) return null
+		const lines: string[] = []
+		if (added.length > 0) {
+			lines.push(`New files/directories since last turn:`)
+			for (const p of added.slice(0, 50)) lines.push(`  + ${p}`)
+			if (added.length > 50) lines.push(`  ... and ${added.length - 50} more`)
+		}
+		if (removed.length > 0) {
+			lines.push(`Removed files/directories since last turn:`)
+			for (const p of removed.slice(0, 50)) lines.push(`  - ${p}`)
+			if (removed.length > 50) lines.push(`  ... and ${removed.length - 50} more`)
+		}
+		return lines.join('\n')
+	}
+
+	generateChatVolatileContext: IConvertToLLMMessageService['generateChatVolatileContext'] = async ({ chatMode, includeDirectoryListing = true, prevDirectorySnapshot }) => {
 		const workspaceFolders = this.workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath)
 		const openedURIs = this.modelService.getModels().filter(m => m.isAttachedToEditor()).map(m => m.uri.fsPath) || [];
 		const activeURI = this.editorService.activeEditor?.resource?.fsPath;
-		const directoryStr = await this.directoryStrService.getAllDirectoriesStr({
-			cutOffMessage: chatMode === 'agent' || chatMode === 'gather' ?
-				`...Directories string cut off, use tools to read more...`
-				: `...Directories string cut off, ask user for more if necessary...`
-		})
 		const persistentTerminalIDs = this.terminalToolService.listPersistentTerminalIds()
-		return chat_volatileContext({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode })
+
+		let directoryStr = ''
+		let directoryDiff: string | null = null
+		let directorySnapshot: string[] | undefined
+
+		if (includeDirectoryListing) {
+			directoryStr = await this.directoryStrService.getAllDirectoriesStr({
+				cutOffMessage: chatMode === 'agent' || chatMode === 'gather' ?
+					`...Directories string cut off, use tools to read more...`
+					: `...Directories string cut off, ask user for more if necessary...`
+			})
+			directorySnapshot = await this._getDirectoryPaths()
+		} else if (prevDirectorySnapshot) {
+			const currPaths = await this._getDirectoryPaths()
+			directoryDiff = this._computeDirectoryDiff(new Set(prevDirectorySnapshot), new Set(currPaths))
+			directorySnapshot = currPaths
+		}
+
+		const volatile = chat_volatileContext({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode, includeDirectoryListing, directoryDiff })
+		return { volatile, directorySnapshot }
 	}
 
 
@@ -1517,18 +1563,46 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// replace all messages before the boundary with a single user message
 		// containing the summary + an assistant acknowledgement. Messages at/
 		// after the boundary pass through unchanged.
+		//
+		// `boundaryIdx` is an index into the ChatMessage[] array, but
+		// `llmMessagesRaw` is a SimpleLLMMessage[] where checkpoint and
+		// interrupted_streaming_tool entries are skipped. We must map the
+		// ChatMessage boundary to the corresponding SimpleLLMMessage index.
 		let llmMessages: SimpleLLMMessage[]
-		if (manualCompaction && manualCompaction.boundaryIdx > 0 && manualCompaction.boundaryIdx <= llmMessagesRaw.length) {
-			const summaryUser: SimpleLLMMessage = {
-				role: 'user',
-				content: `[Conversation compacted — summary of prior context]\n\n${manualCompaction.summary}`,
+		if (manualCompaction && manualCompaction.boundaryIdx > 0) {
+			let llmBoundary = 0
+			for (let ci = 0; ci < Math.min(manualCompaction.boundaryIdx, chatMessages.length); ci++) {
+				const role = chatMessages[ci].role
+				if (role !== 'checkpoint' && role !== 'interrupted_streaming_tool') {
+					llmBoundary++
+				}
 			}
-			const summaryAssistant: SimpleLLMMessage = {
-				role: 'assistant',
-				content: 'Understood. Continuing with the context above.',
-				anthropicReasoning: null,
+			if (llmBoundary > 0 && llmBoundary <= llmMessagesRaw.length) {
+				// The first user message (which carried the directory listing) is
+				// now inside the compacted region. Re-inject a fresh volatile
+				// context (with directory listing) so the LLM retains awareness
+				// of the workspace structure after compaction.
+				const { volatile: freshVolatile } = await this.generateChatVolatileContext({ chatMode, includeDirectoryListing: true })
+				const summaryContent = [
+					freshVolatile,
+					'',
+					'[Conversation compacted — summary of prior context]',
+					'',
+					manualCompaction.summary,
+				].join('\n')
+				const summaryUser: SimpleLLMMessage = {
+					role: 'user',
+					content: summaryContent,
+				}
+				const summaryAssistant: SimpleLLMMessage = {
+					role: 'assistant',
+					content: 'Understood. Continuing with the context above.',
+					anthropicReasoning: null,
+				}
+				llmMessages = [summaryUser, summaryAssistant, ...llmMessagesRaw.slice(llmBoundary)]
+			} else {
+				llmMessages = llmMessagesRaw
 			}
-			llmMessages = [summaryUser, summaryAssistant, ...llmMessagesRaw.slice(manualCompaction.boundaryIdx)]
 		} else {
 			llmMessages = llmMessagesRaw
 		}
