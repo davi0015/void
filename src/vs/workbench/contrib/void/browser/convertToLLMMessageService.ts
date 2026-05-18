@@ -1061,7 +1061,7 @@ export interface IConvertToLLMMessageService {
 	// can route the entry to the right thread file. `telemetryRequestId` in the
 	// result is the rid the caller must echo back to `IRequestTelemetryService.logResponse`
 	// so request and response lines can be paired during analysis.
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string, pendingImageBytes?: Map<string, Uint8Array>, frozenAiInstructions?: string }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string, pendingImageBytes?: Map<string, Uint8Array>, frozenAiInstructions?: string, manualCompaction?: { summary: string, boundaryIdx: number } }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 	// Called by chat creation paths to snapshot runtime grounding (date, open files,
 	// active URI, directory listing, terminal IDs) into a user message at storage time.
@@ -1474,7 +1474,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		})
 		return { messages, separateSystemMessage };
 	}
-	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId, pendingImageBytes, frozenAiInstructions }) => {
+	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId, pendingImageBytes, frozenAiInstructions, manualCompaction }) => {
 		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined, compactionInfo: null, sentChars: 0 }
 
 		const { overridesOfModel } = this.voidSettingsService.state
@@ -1512,12 +1512,32 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// byte-identical to what was sent before, keeping the provider's prefix
 		// cache warm across turns.
 		const llmMessagesRaw = await this._chatMessagesToSimpleMessages(chatMessages, { supportsVision, pendingImageBytes })
+
+		// Manual compaction — if the thread has an LLM-generated summary,
+		// replace all messages before the boundary with a single user message
+		// containing the summary + an assistant acknowledgement. Messages at/
+		// after the boundary pass through unchanged.
+		let llmMessages: SimpleLLMMessage[]
+		if (manualCompaction && manualCompaction.boundaryIdx > 0 && manualCompaction.boundaryIdx <= llmMessagesRaw.length) {
+			const summaryUser: SimpleLLMMessage = {
+				role: 'user',
+				content: `[Conversation compacted — summary of prior context]\n\n${manualCompaction.summary}`,
+			}
+			const summaryAssistant: SimpleLLMMessage = {
+				role: 'assistant',
+				content: 'Understood. Continuing with the context above.',
+				anthropicReasoning: null,
+			}
+			llmMessages = [summaryUser, summaryAssistant, ...llmMessagesRaw.slice(manualCompaction.boundaryIdx)]
+		} else {
+			llmMessages = llmMessagesRaw
+		}
+
 		// Perf 2 — Light-tier history compaction DISABLED.
 		// Trimming tool result bodies breaks the provider's prefix cache at the
 		// trim point. At large context sizes (500k+) the cache miss cost far
 		// outweighs the token savings from trimming, since the entire prefix
 		// must be re-ingested.
-		const llmMessages = llmMessagesRaw
 		const compactionInfo: CompactionInfo | null = null
 
 		const { messages, separateSystemMessage, emergencyInfo } = prepareMessages({

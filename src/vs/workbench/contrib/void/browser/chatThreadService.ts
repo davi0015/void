@@ -218,6 +218,19 @@ export type ThreadType = {
 	importedFromThreadId?: string;
 	importedAt?: number; // unix ms
 
+	// ===== Manual compaction (LLM-powered summarization) =====
+	// Set when the user triggers manual compaction. `compactionSummary` holds
+	// the LLM-generated summary text; `compactionBoundaryIdx` is the message
+	// index where the compacted region ends — messages before this index are
+	// replaced by the summary in the LLM view (but still visible as bubbles
+	// in the UI). Messages at/after this index are sent to the LLM as-is.
+	// `compactionPercent` records the compression ratio used (e.g. 90 means
+	// the summary targets ~10% of the original token count).
+	// Both undefined when no compaction has been performed.
+	compactionSummary?: string;
+	compactionBoundaryIdx?: number;
+	compactionPercent?: number;
+
 	// User-provided override of the auto-derived tab / history label. When
 	// non-empty, used as the display label everywhere; when undefined or
 	// whitespace-only, the UI falls back to the first user message's
@@ -531,6 +544,14 @@ export interface IChatThreadService {
 
 	focusCurrentChat: () => Promise<void>
 	blurCurrentChat: () => Promise<void>
+
+	// Manual compaction — user-triggered LLM-powered summarization. Sends the
+	// oldest messages (before the protection boundary) to the current model for
+	// summarization at the given compression ratio. The summary replaces those
+	// messages in the LLM view; the UI keeps showing the original bubbles.
+	// `compactPercent` is how much to compress (e.g. 90 → summary ≈ 10% of
+	// original tokens). Returns true on success, false on abort/error.
+	compactCurrentThread(opts: { compactPercent: number }): Promise<boolean>;
 
 	// Dev-only: populate the current thread with a large fake conversation
 	// for performance testing.
@@ -2015,7 +2036,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const lastUsage = this.latestUsageOfThreadId[threadId]
 			const priorContentTokens = lastUsage ? (lastUsage.inputTokens ?? 0) + (lastUsage.outputTokens ?? 0) : undefined
 			const pendingImageBytes = this._pendingImageBytesByThread.get(threadId)
-			const frozenAiInstructions = this.state.allThreads[threadId]?.frozenAiInstructions
+			const currentThread = this.state.allThreads[threadId]
+			const frozenAiInstructions = currentThread?.frozenAiInstructions
+			const manualCompaction = currentThread?.compactionSummary && currentThread?.compactionBoundaryIdx
+				? { summary: currentThread.compactionSummary, boundaryIdx: currentThread.compactionBoundaryIdx }
+				: undefined
 			const { messages, separateSystemMessage, compactionInfo, sentChars, telemetryRequestId } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages,
 				modelSelection,
@@ -2024,6 +2049,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				threadId,
 				pendingImageBytes,
 				frozenAiInstructions,
+				manualCompaction,
 			})
 			// Images are only attached on the first user message of a turn;
 			// clear after the first prepare so subsequent tool-loop iterations
@@ -2864,6 +2890,11 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
+
+		// Block editing messages in the compacted region — the LLM no longer
+		// sees their original content (only the summary), so re-sending from
+		// this point would produce degraded results.
+		if (thread.compactionBoundaryIdx !== undefined && messageIdx < thread.compactionBoundaryIdx) return
 
 		const editedMessage = thread.messages[messageIdx]
 		if (editedMessage?.role !== 'user') {
@@ -3954,6 +3985,141 @@ We only need to do it for files that were edited since `from`, ie files between 
 		this._setCurrentMessageState(newState, messageIdx)
 	}
 
+
+	// ── Manual compaction ────────────────────────────────────────────────
+
+	async compactCurrentThread({ compactPercent }: { compactPercent: number }): Promise<boolean> {
+		const threadId = this.state.currentThreadId
+		const thread = this.state.allThreads[threadId]
+		if (!thread || thread.messages.length < 10) return false
+
+		const modelSelection = this._settingsService.state.modelSelectionOfFeature['Chat']
+		if (!modelSelection) return false
+
+		// Compute the boundary: protect the last few conversations (reuse the
+		// same policy as the existing light-tier compaction).
+		const chatMessages = thread.messages
+		const boundaryIdx = this._computeManualCompactionBoundary(chatMessages)
+		if (boundaryIdx <= 0) return false
+
+		const oldMessages = chatMessages.slice(0, boundaryIdx)
+		const transcript = this._formatChatMessagesAsTranscript(oldMessages)
+		const targetPercent = Math.max(1, Math.round(100 - compactPercent))
+
+		const summarizationPrompt = [
+			'You are summarizing a coding conversation to reduce context size.',
+			'The system prompt and rules are preserved separately — they are NOT included below.',
+			'',
+			'Extract and preserve:',
+			'1. Task context — what the user is working on, the overall goal',
+			'2. Decisions made — approaches chosen, tradeoffs discussed',
+			'3. Files modified — which files were changed and what was done',
+			'4. Current state — what is completed, what is pending',
+			'5. User preferences — any conventions or rules stated in the conversation',
+			'',
+			'Rules:',
+			'- Be concise — this summary replaces the full conversation history',
+			'- Include specific file paths and function/type names',
+			'- Describe changes, not full code',
+			'- If tool calls read files, summarize what was learned, not the file contents',
+			`- Target approximately ${targetPercent}% of the original length`,
+			'',
+			'<conversation>',
+			transcript,
+			'</conversation>',
+			'',
+			'Write a structured summary.',
+		].join('\n')
+
+		const { messages: llmMessages, separateSystemMessage } = this._convertToLLMMessagesService.prepareLLMSimpleMessages({
+			simpleMessages: [{ role: 'user', content: summarizationPrompt }],
+			systemMessage: 'You are a precise summarizer. Follow the instructions exactly.',
+			modelSelection,
+			featureName: 'Chat',
+		})
+
+		const { overridesOfModel } = this._settingsService.state
+		const modelSelectionOptions = this._settingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
+
+		try {
+			const summary = await new Promise<string>((resolve, reject) => {
+				this._llmMessageService.sendLLMMessage({
+					messagesType: 'chatMessages',
+					messages: llmMessages,
+					separateSystemMessage,
+					chatMode: null,
+					modelSelection,
+					modelSelectionOptions,
+					overridesOfModel,
+					onText: () => { },
+					onFinalMessage: ({ fullText }) => { resolve(fullText) },
+					onError: (err) => { reject(new Error(err.message)) },
+					onAbort: () => { reject(new Error('Compaction aborted')) },
+					logging: { loggingName: 'Manual Compaction', loggingExtras: { threadId, compactPercent } },
+				})
+			})
+
+			if (!summary || summary.trim().length === 0) return false
+
+			const updatedThread: ThreadType = {
+				...thread,
+				lastModified: new Date().toISOString(),
+				compactionSummary: summary.trim(),
+				compactionBoundaryIdx: boundaryIdx,
+				compactionPercent: compactPercent,
+			}
+			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
+			this._storeThread(threadId, updatedThread)
+			this._setState({ allThreads: newThreads })
+			return true
+		} catch (e) {
+			console.error('[Compaction] Failed:', e)
+			return false
+		}
+	}
+
+	private _computeManualCompactionBoundary(messages: ChatMessage[]): number {
+		// Protect the last N user turns or last N messages — same logic as the
+		// light-tier compaction's `_computeProtectionBoundary`, but operating
+		// on ChatMessage[] instead of SimpleLLMMessage[].
+		const PROTECT_USER_TURNS = 5
+		const PROTECT_MESSAGES = 30
+
+		let userCount = 0
+		let userTurnBoundary = 0
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i].role === 'user') {
+				userCount++
+				if (userCount >= PROTECT_USER_TURNS) {
+					userTurnBoundary = i
+					break
+				}
+			}
+		}
+		if (userCount < PROTECT_USER_TURNS) userTurnBoundary = 0
+
+		const messageCountBoundary = Math.max(0, messages.length - PROTECT_MESSAGES)
+		return Math.max(userTurnBoundary, messageCountBoundary)
+	}
+
+	private _formatChatMessagesAsTranscript(messages: ChatMessage[]): string {
+		const lines: string[] = []
+		for (const m of messages) {
+			if (m.role === 'user') {
+				lines.push(`[User]: ${m.content || m.displayContent || '(empty)'}`)
+			} else if (m.role === 'assistant') {
+				lines.push(`[Assistant]: ${m.displayContent || '(empty)'}`)
+			} else if (m.role === 'tool') {
+				const status = m.type === 'success' ? 'OK' : m.type
+				const contentPreview = m.content.length > 500
+					? m.content.slice(0, 250) + '\n...[truncated]...\n' + m.content.slice(-250)
+					: m.content
+				lines.push(`[Tool ${m.name} (${status})]: ${contentPreview}`)
+			}
+			// skip checkpoint and interrupted_streaming_tool
+		}
+		return lines.join('\n\n')
+	}
 
 	// ── Dev-only: perf testing helpers (see chatThreadDevTools.ts) ──────
 
