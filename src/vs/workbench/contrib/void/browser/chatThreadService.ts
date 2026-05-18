@@ -551,8 +551,8 @@ export interface IChatThreadService {
 	// summarization at the given compression ratio. The summary replaces those
 	// messages in the LLM view; the UI keeps showing the original bubbles.
 	// `compactPercent` is how much to compress (e.g. 90 → summary ≈ 10% of
-	// original tokens). Returns true on success, false on abort/error.
-	compactCurrentThread(opts: { compactPercent: number }): Promise<boolean>;
+	// original tokens). Returns null on success, or an error message string.
+	compactCurrentThread(opts: { compactPercent: number }): Promise<string | null>;
 
 	// Dev-only: populate the current thread with a large fake conversation
 	// for performance testing.
@@ -3990,19 +3990,21 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 	// ── Manual compaction ────────────────────────────────────────────────
 
-	async compactCurrentThread({ compactPercent }: { compactPercent: number }): Promise<boolean> {
+	async compactCurrentThread({ compactPercent }: { compactPercent: number }): Promise<string | null> {
 		const threadId = this.state.currentThreadId
 		const thread = this.state.allThreads[threadId]
-		if (!thread || thread.messages.length < 10) return false
+		if (!thread || thread.messages.length < 10) return 'Not enough messages to compact.'
 
 		const modelSelection = this._settingsService.state.modelSelectionOfFeature['Chat']
-		if (!modelSelection) return false
+		if (!modelSelection) return 'No model selected for Chat.'
 
 		// Compute the boundary: protect the last few conversations (reuse the
 		// same policy as the existing light-tier compaction).
 		const chatMessages = thread.messages
 		const boundaryIdx = this._computeManualCompactionBoundary(chatMessages)
-		if (boundaryIdx <= 0) return false
+		if (boundaryIdx <= 0) {
+			return 'Not enough messages outside the protection zone (last 5 user turns / 30 messages).'
+		}
 
 		const oldMessages = chatMessages.slice(0, boundaryIdx)
 		const transcript = this._formatChatMessagesAsTranscript(oldMessages)
@@ -4061,7 +4063,9 @@ We only need to do it for files that were edited since `from`, ie files between 
 				})
 			})
 
-			if (!summary || summary.trim().length === 0) return false
+			if (!summary || summary.trim().length === 0) {
+				return 'The model returned an empty summary.'
+			}
 
 			// Write compaction log for analysis
 			this._writeCompactionLog({
@@ -4086,10 +4090,11 @@ We only need to do it for files that were edited since `from`, ie files between 
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 			this._storeThread(threadId, updatedThread)
 			this._setState({ allThreads: newThreads })
-			return true
+			return null
 		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e)
 			console.error('[Compaction] Failed:', e)
-			return false
+			return msg
 		}
 	}
 

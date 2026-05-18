@@ -2969,12 +2969,15 @@ export const SidebarChat = () => {
 	// Manual compaction state
 	const [showCompactDialog, setShowCompactDialog] = useState(false)
 	const [isCompacting, setIsCompacting] = useState(false)
+	const [compactError, setCompactError] = useState<string | null>(null)
 	const canCompact = previousMessages.length >= 10 && !isRunning && !isCurrentThreadReadOnly
 	const onCompact = useCallback(async (percent: number) => {
 		setShowCompactDialog(false)
+		setCompactError(null)
 		setIsCompacting(true)
 		try {
-			await chatThreadsService.compactCurrentThread({ compactPercent: percent })
+			const error = await chatThreadsService.compactCurrentThread({ compactPercent: percent })
+			if (error) setCompactError(error)
 		} finally {
 			setIsCompacting(false)
 		}
@@ -3243,6 +3246,16 @@ export const SidebarChat = () => {
 				<CompactDialog
 					onConfirm={onCompact}
 					onCancel={() => setShowCompactDialog(false)}
+				/>
+			</div>
+		)}
+		{compactError && (
+			<div className='px-2 pb-2'>
+				<ErrorDisplay
+					message={compactError}
+					fullError={null}
+					onDismiss={() => setCompactError(null)}
+					showDismiss={true}
 				/>
 			</div>
 		)}
