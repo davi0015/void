@@ -23,7 +23,7 @@ import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
-import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning } from 'lucide-react';
+import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning, Scissors } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { generateUuid } from '../../../../../../../base/common/uuid.js';
 import { VSBuffer } from '../../../../../../../base/common/buffer.js';
@@ -922,6 +922,56 @@ export const ButtonStop = ({ className, ...props }: ButtonHTMLAttributes<HTMLBut
 }
 
 
+
+// ── Manual compaction dialog ──────────────────────────────────────────
+const CompactDialog = ({ onConfirm, onCancel }: { onConfirm: (percent: number) => void, onCancel: () => void }) => {
+	const [percent, setPercent] = useState(90)
+	return (
+		<div className='flex flex-col gap-2 p-3 rounded-md border border-void-border-1 bg-void-bg-1 text-sm'>
+			<div className='flex items-center justify-between'>
+				<span className='text-void-fg-2 font-medium'>Compact conversation</span>
+				<button type='button' onClick={onCancel} className='text-void-fg-3 hover:text-void-fg-1 cursor-pointer'>
+					<X size={14} />
+				</button>
+			</div>
+			<div className='text-void-fg-3 text-xs'>
+				Summarize old messages using the current model. The last few conversations are kept intact.
+			</div>
+			<div className='flex items-center gap-2'>
+				<span className='text-void-fg-3 text-xs w-20 shrink-0'>Compression</span>
+				<input
+					type='range'
+					min={50}
+					max={95}
+					step={5}
+					value={percent}
+					onChange={(e) => setPercent(Number(e.target.value))}
+					className='flex-1 accent-white h-1 cursor-pointer'
+				/>
+				<span className='text-void-fg-3 text-xs w-10 text-right'>{percent}%</span>
+			</div>
+			<div className='text-void-fg-3 text-xs'>
+				Summary will target ~{Math.round(100 - percent)}% of original size
+			</div>
+			<div className='flex justify-end gap-2 mt-1'>
+				<button
+					type='button'
+					onClick={onCancel}
+					className='px-2 py-1 text-xs text-void-fg-3 hover:text-void-fg-1 cursor-pointer rounded border border-void-border-2 hover:border-void-border-1'
+				>
+					Cancel
+				</button>
+				<button
+					type='button'
+					onClick={() => onConfirm(percent)}
+					className='px-2 py-1 text-xs text-white bg-void-fg-3 hover:bg-void-fg-2 cursor-pointer rounded'
+				>
+					Compact
+				</button>
+			</div>
+		</div>
+	)
+}
 
 const scrollToBottom = (divRef: { current: HTMLElement | null }) => {
 	if (divRef.current) {
@@ -1892,6 +1942,9 @@ type ChatBubbleProps = {
 	// should render the buttons; the others are "waiting their turn". undefined = no
 	// pending approval anywhere in the thread.
 	firstPendingToolRequestIdx?: number,
+	// Manual compaction — messages before this index had their LLM content
+	// replaced with a summary. Edit is disabled for those messages.
+	compactionBoundaryIdx?: number,
 }
 
 const ChatBubble = React.memo((props: ChatBubbleProps) => {
@@ -1900,29 +1953,42 @@ const ChatBubble = React.memo((props: ChatBubbleProps) => {
 	</ErrorBoundary>
 })
 
-const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, messageIdx, chatIsRunning, _scrollToBottom, firstPendingToolRequestIdx, threadIsReadOnly }: ChatBubbleProps) => {
+const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, messageIdx, chatIsRunning, _scrollToBottom, firstPendingToolRequestIdx, threadIsReadOnly, compactionBoundaryIdx }: ChatBubbleProps) => {
 
 	const role = chatMessage.role
 
 	const isCheckpointGhost = messageIdx > (currCheckpointIdx ?? Infinity) && !chatIsRunning // whether to show as gray (if chat is running, for good measure just dont show any ghosts)
+	const isCompactedMessage = compactionBoundaryIdx !== undefined && messageIdx < compactionBoundaryIdx
+	const showCompactionDivider = compactionBoundaryIdx !== undefined && messageIdx === compactionBoundaryIdx
+
+	const compactionDivider = showCompactionDivider ? (
+		<div className='flex items-center gap-2 px-2 py-1 select-none'>
+			<div className='flex-1 border-t border-void-border-2' />
+			<span className='text-[10px] text-void-fg-3 flex items-center gap-1'>
+				<Scissors size={10} className='stroke-[1.5]' />
+				Compacted
+			</span>
+			<div className='flex-1 border-t border-void-border-2' />
+		</div>
+	) : null
 
 	if (role === 'user') {
-		return <UserMessageComponent
+		return <>{compactionDivider}<UserMessageComponent
 			chatMessage={chatMessage}
 			isCheckpointGhost={isCheckpointGhost}
 			currCheckpointIdx={currCheckpointIdx}
 			messageIdx={messageIdx}
 			_scrollToBottom={_scrollToBottom}
-			isReadOnly={threadIsReadOnly}
-		/>
+			isReadOnly={threadIsReadOnly || isCompactedMessage}
+		/></>
 	}
 	else if (role === 'assistant') {
-		return <AssistantMessageComponent
+		return <>{compactionDivider}<AssistantMessageComponent
 			chatMessage={chatMessage}
 			isCheckpointGhost={isCheckpointGhost}
 			messageIdx={messageIdx}
 			isCommitted={isCommitted}
-		/>
+		/></>
 	}
 	else if (role === 'tool') {
 
@@ -2301,6 +2367,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	// in `SidebarChat`. Computed here (rather than in `_ChatBubble`) to
 	// avoid one `useChatThreadsState` subscription per message.
 	const threadIsReadOnly = isThreadReadOnly(thread, currentWorkspaceUri)
+	const compactionBoundaryIdx = thread?.compactionBoundaryIdx
 
 	const streamState = useChatThreadsStreamState(threadId)
 	const isRunning = streamState?.isRunning
@@ -2631,7 +2698,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	// Incremental JSX cache for the mounted slice. When only messages are
 	// appended (streaming commit) and mountStart hasn't changed, reuse
 	// existing elements and only createElement for the new ones.
-	const prevMsgCacheRef = useRef<{ html: React.ReactNode[], len: number, mountStart: number, msgs: typeof previousMessages, threadId: string, checkpointIdx: typeof currCheckpointIdx, scrollCb: typeof scrollToBottomCb, pendingIdx: typeof firstPendingToolRequestIdx, readOnly: boolean } | null>(null)
+	const prevMsgCacheRef = useRef<{ html: React.ReactNode[], len: number, mountStart: number, msgs: typeof previousMessages, threadId: string, checkpointIdx: typeof currCheckpointIdx, scrollCb: typeof scrollToBottomCb, pendingIdx: typeof firstPendingToolRequestIdx, readOnly: boolean, compactBoundary: typeof compactionBoundaryIdx } | null>(null)
 
 	const previousMessagesHTML = (() => {
 		const cache = prevMsgCacheRef.current
@@ -2643,6 +2710,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			&& cache.scrollCb === scrollToBottomCb
 			&& cache.pendingIdx === firstPendingToolRequestIdx
 			&& cache.readOnly === threadIsReadOnly
+			&& cache.compactBoundary === compactionBoundaryIdx
 
 		if (depsMatch && previousMessages.length === cache.len) {
 			return cache.html
@@ -2662,6 +2730,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					_scrollToBottom={scrollToBottomCb}
 					firstPendingToolRequestIdx={firstPendingToolRequestIdx}
 					threadIsReadOnly={threadIsReadOnly}
+					compactionBoundaryIdx={compactionBoundaryIdx}
 				/>)
 			}
 			const merged = [...cache.html, ...newElements]
@@ -2685,10 +2754,11 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				_scrollToBottom={scrollToBottomCb}
 				firstPendingToolRequestIdx={firstPendingToolRequestIdx}
 				threadIsReadOnly={threadIsReadOnly}
+				compactionBoundaryIdx={compactionBoundaryIdx}
 			/>)
 		}
 
-		prevMsgCacheRef.current = { html: result, len: previousMessages.length, mountStart, msgs: previousMessages, threadId, checkpointIdx: currCheckpointIdx, scrollCb: scrollToBottomCb, pendingIdx: firstPendingToolRequestIdx, readOnly: threadIsReadOnly }
+		prevMsgCacheRef.current = { html: result, len: previousMessages.length, mountStart, msgs: previousMessages, threadId, checkpointIdx: currCheckpointIdx, scrollCb: scrollToBottomCb, pendingIdx: firstPendingToolRequestIdx, readOnly: threadIsReadOnly, compactBoundary: compactionBoundaryIdx }
 		return result
 	})()
 
@@ -2895,6 +2965,20 @@ export const SidebarChat = () => {
 	const showCurrentThreadBanner = !!currentThread && shouldShowOwnershipBanner(currentThread, chatThreadsState.currentWorkspaceUri)
 
 	const isDisabled = instructionsAreEmpty || !!isFeatureNameDisabled('Chat', settingsState) || isCurrentThreadReadOnly
+
+	// Manual compaction state
+	const [showCompactDialog, setShowCompactDialog] = useState(false)
+	const [isCompacting, setIsCompacting] = useState(false)
+	const canCompact = previousMessages.length >= 10 && !isRunning && !isCurrentThreadReadOnly
+	const onCompact = useCallback(async (percent: number) => {
+		setShowCompactDialog(false)
+		setIsCompacting(true)
+		try {
+			await chatThreadsService.compactCurrentThread({ compactPercent: percent })
+		} finally {
+			setIsCompacting(false)
+		}
+	}, [chatThreadsService])
 
 	const sidebarRef = useRef<HTMLDivElement>(null)
 
@@ -3154,7 +3238,35 @@ export const SidebarChat = () => {
 		<div className='px-4'>
 			<CommandBarInChat />
 		</div>
+		{showCompactDialog && (
+			<div className='px-2 pb-2'>
+				<CompactDialog
+					onConfirm={onCompact}
+					onCancel={() => setShowCompactDialog(false)}
+				/>
+			</div>
+		)}
 		<div className='px-2 pb-2'>
+			<div className='flex items-center justify-between mb-1'>
+				{canCompact && !showCompactDialog && (
+					<button
+						type='button'
+						onClick={() => setShowCompactDialog(true)}
+						disabled={isCompacting}
+						className='flex items-center gap-1 text-xs text-void-fg-3 hover:text-void-fg-1 cursor-pointer disabled:opacity-50 disabled:cursor-default transition-colors'
+						data-tooltip-id='void-tooltip'
+						data-tooltip-content={isCompacting ? 'Compacting...' : 'Compact conversation'}
+						data-tooltip-place='top'
+					>
+						{isCompacting
+							? <IconLoading className='w-3 h-3' />
+							: <Scissors size={12} className='stroke-[1.5]' />
+						}
+						<span>{isCompacting ? 'Compacting...' : 'Compact'}</span>
+					</button>
+				)}
+				{!canCompact && !showCompactDialog && <div />}
+			</div>
 			{inputChatArea}
 		</div>
 	</div>
