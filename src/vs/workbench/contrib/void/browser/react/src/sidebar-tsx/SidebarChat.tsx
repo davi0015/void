@@ -324,6 +324,7 @@ interface TokenUsageRingProps {
 	latestCompaction?: CompactionInfo | undefined;
 	cumulativeCompactionThisTurn?: CompactionInfo | undefined;
 	cumulativeCompactionThisThread?: CompactionInfo | undefined;
+	manualCompactionSavedTokens?: number;
 	children: React.ReactNode;
 	size?: number;
 }
@@ -405,7 +406,7 @@ const formatCompactionBlock = (label: string, c: CompactionInfo | undefined): st
 	return [totalLine, lightLine, emLine]
 }
 
-const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, cumulativeThisTurn, cumulativeThisThread, latestCompaction, cumulativeCompactionThisTurn, cumulativeCompactionThisThread, children, size = 34 }) => {
+const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, cumulativeThisTurn, cumulativeThisThread, latestCompaction, cumulativeCompactionThisTurn, cumulativeCompactionThisThread, manualCompactionSavedTokens, children, size = 34 }) => {
 	const strokeWidth = 3
 	const radius = (size - strokeWidth) / 2
 	const hasData = !!usage && contextWindow > 0
@@ -440,6 +441,9 @@ const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, c
 		// compacted on this thread — on short threads with no compaction this
 		// keeps the tooltip compact. We gate on cumulative-this-thread because
 		// per-turn and latest reset to undefined during quiet periods.
+		const manualCompactionLines = manualCompactionSavedTokens && manualCompactionSavedTokens > 0
+			? [``, `Manual compaction: saved ~${formatTokenCount(manualCompactionSavedTokens)} tokens per turn`]
+			: []
 		const hasAnyCompaction = !!cumulativeCompactionThisThread && cumulativeCompactionThisThread.trimmedCount > 0
 		// Each `formatCompactionBlock` returns 1–2 lines (2 when the emergency
 		// trim fired — see block comment on that fn). Flatten + indent here so
@@ -472,6 +476,7 @@ const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, c
 			...formatUsageBlock('Cumulative this turn', effectiveThisTurn),
 			``,
 			...formatUsageBlock('Cumulative this thread', cumulativeThisThread),
+			...manualCompactionLines,
 			...compactionLines,
 		].filter(s => s !== null).join('\n')
 
@@ -527,6 +532,8 @@ const SubmitButtonWithUsageRing: React.FC<{ threadId: string; featureName: Featu
 	const usage = useChatThreadLatestUsage(threadId)
 	const cumulative = useChatThreadCumulativeUsage(threadId)
 	const compaction = useChatThreadCompaction(threadId)
+	const { allThreads } = useChatThreadsState()
+	const manualCompactionSavedTokens = allThreads[threadId]?.compactionSavedTokens
 
 	const modelSelection = settingsState.modelSelectionOfFeature[featureName]
 	// Always render the wrapper so the send button doesn't jump sideways when
@@ -545,6 +552,7 @@ const SubmitButtonWithUsageRing: React.FC<{ threadId: string; featureName: Featu
 			latestCompaction={compaction.latest}
 			cumulativeCompactionThisTurn={compaction.thisTurn}
 			cumulativeCompactionThisThread={compaction.thisThread}
+			manualCompactionSavedTokens={manualCompactionSavedTokens}
 		>
 			{children}
 		</TokenUsageRing>
@@ -996,23 +1004,19 @@ const scrollToBottom = (divRef: { current: HTMLElement | null }) => {
 
 
 const ScrollToBottomContainer = ({ children, className, style, scrollContainerRef }: { children: React.ReactNode, className?: string, style?: React.CSSProperties, scrollContainerRef: React.MutableRefObject<HTMLDivElement | null> }) => {
-	const isAtBottomRef = useRef(true);
+	const prevScrollHeightRef = useRef(0);
 
 	const divRef = scrollContainerRef
 
-	const onScroll = useCallback(() => {
+	useEffect(() => {
 		const div = divRef.current;
 		if (!div) return;
-
-		isAtBottomRef.current = Math.abs(
-			div.scrollHeight - div.clientHeight - div.scrollTop
-		) < 40;
-	}, [divRef]);
-
-	useEffect(() => {
-		if (isAtBottomRef.current) {
+		const currH = div.scrollHeight;
+		const distFromBottom = div.scrollHeight - div.clientHeight - div.scrollTop;
+		if (currH > prevScrollHeightRef.current && distFromBottom < 5) {
 			scrollToBottom(divRef);
 		}
+		prevScrollHeightRef.current = currH;
 	}, [children]);
 
 	useEffect(() => {
@@ -1022,7 +1026,6 @@ const ScrollToBottomContainer = ({ children, className, style, scrollContainerRe
 	return (
 		<div
 			ref={divRef}
-			onScroll={onScroll}
 			className={className}
 			style={style}
 		>
@@ -1762,8 +1765,6 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 			</div>
 		}
 
-		{/* assistant message — during streaming, keep mounted but hidden until content arrives
-		    so the DOM structure doesn't change on the reasoning→text transition */}
 		{(chatMessage.displayContent || !isCommitted) &&
 			<div className={`${isCheckpointGhost ? 'opacity-50' : ''}`} style={!chatMessage.displayContent ? { display: 'none' } : undefined}>
 				<ProseWrapper>
@@ -2363,8 +2364,6 @@ const EditToolSoFar = ({ toolCallSoFar, }: { toolCallSoFar: RawToolCallObj }) =>
 // state, so a background thread can keep streaming while the user is looking at a
 // different one.
 
-const VIEWPORT_FILL_FACTOR = 3
-
 const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef }: {
 	threadId: string
 	isActive: boolean
@@ -2460,25 +2459,70 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		return Math.max(1, Math.ceil(px / avg))
 	}, [getAvgHeight])
 
-	// Adaptive initial mount: start with 1, measure, fill viewport.
+	const estimateMsgHeight = useCallback((msg: ChatMessage, containerWidth: number): number => {
+		const LINE_H = 22
+		const CHAR_W = 7.2
+		const BUBBLE_PADDING = 32
+		const charsPerLine = Math.max(1, Math.floor(containerWidth / CHAR_W))
+
+		let text = ''
+		if (msg.role === 'assistant') {
+			text = (msg.displayContent || '') + (msg.reasoning || '')
+		} else if (msg.role === 'user') {
+			text = msg.content || ''
+		} else {
+			return 60
+		}
+		if (!text) return 40
+
+		let lines = 0
+		const parts = text.split('\n')
+		for (let i = 0; i < parts.length; i++) {
+			lines += Math.max(1, Math.ceil(parts[i].length / charsPerLine))
+		}
+		return lines * LINE_H + BUBBLE_PADDING
+	}, [])
+
+	const VIEWPORT_FILL_FACTOR = 3
+
+	// Two-phase initial mount:
+	// Phase 1: estimate heights from content, set mountStart in one shot
+	// Phase 2: after render, measure actual content, set spacer, scroll to bottom
 	const initialFillDoneRef = useRef(false)
+	const estimationDoneRef = useRef(false)
+	const previousMessagesForEstimation = useRef(previousMessages)
+	previousMessagesForEstimation.current = previousMessages
 	useLayoutEffect(() => {
 		if (initialFillDoneRef.current) return
 		const scrollEl = scrollContainerRef.current
 		if (!scrollEl || !isActive) return
 		if (scrollEl.clientHeight === 0) return
-		const target = scrollEl.clientHeight * VIEWPORT_FILL_FACTOR
-		const contentH = getContentHeight()
-		if (contentH >= target || mountStart === 0) {
-			initialFillDoneRef.current = true
-			spacerHeightRef.current = contentH
-			if (spacerRef.current) spacerRef.current.style.height = contentH + 'px'
-			return
+
+		if (!estimationDoneRef.current) {
+			estimationDoneRef.current = true
+			const target = scrollEl.clientHeight * VIEWPORT_FILL_FACTOR
+			const containerW = scrollEl.clientWidth - 40
+			let estH = 0
+			let newMountStart = totalCount - 1
+			const msgs = previousMessagesForEstimation.current
+			for (let i = totalCount - 1; i >= 0; i--) {
+				estH += estimateMsgHeight(msgs[i], containerW)
+				newMountStart = i
+				if (estH >= target) break
+			}
+			if (newMountStart !== mountStart) {
+				setMountStart(newMountStart)
+				return
+			}
 		}
-		const deficit = target - contentH
-		const needed = msgsForPx(deficit)
-		setMountStart(prev => Math.max(0, prev - needed))
-	}, [mountStart, totalCount, isActive, scrollContainerRef, msgsForPx, getContentHeight])
+
+		initialFillDoneRef.current = true
+		const contentH = getContentHeight()
+		spacerHeightRef.current = contentH
+		if (spacerRef.current) spacerRef.current.style.height = contentH + 'px'
+		scrollEl.scrollTop = 1e10
+		lastScrollTopRef.current = scrollEl.scrollTop
+	}, [mountStart, totalCount, isActive, scrollContainerRef, getContentHeight, estimateMsgHeight])
 
 	// Sync wrapper height + scrollTop after expand/trim.
 	// Expand (delta > 0): grow wrapper first, then adjust scrollTop.
@@ -2507,6 +2551,14 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				spacerEl.style.height = contentH + 'px'
 				scrollEl.scrollTop += delta
 			} else {
+				// If removing content would leave less than viewport, undo
+				if (contentH < scrollEl.clientHeight && mountStart > 0) {
+					spacerEl.style.height = oldH + 'px'
+					spacerHeightRef.current = oldH
+					setMountStart(prev => Math.max(0, prev - 1))
+					requestAnimationFrame(() => { mountChangeRef.current = false })
+					return
+				}
 				scrollEl.scrollTop += delta
 				spacerEl.style.height = contentH + 'px'
 			}
@@ -2673,13 +2725,8 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				}
 				if (scrollingDown && currScrollTop > el.clientHeight * 3) {
 					const mounted = totalCountRef.current - mountStartRef.current
-					const avgH = mounted > 0 ? (contentRef.current?.offsetHeight ?? el.scrollHeight) / mounted : 200
-					const msgsAbove = Math.floor(currScrollTop / avgH)
-					const msgsToKeepAbove = Math.ceil((el.clientHeight * 2) / avgH)
-					const msgsToRemove = msgsAbove - msgsToKeepAbove
-					if (msgsToRemove > 0) {
-						flushSync(() => setMountStart(prev => Math.min(prev + msgsToRemove, Math.max(0, totalCountRef.current - 1))))
-					}
+					if (mounted <= 2) return
+					flushSync(() => setMountStart(prev => Math.min(prev + 1, Math.max(0, totalCountRef.current - 1))))
 				}
 			})
 		}
