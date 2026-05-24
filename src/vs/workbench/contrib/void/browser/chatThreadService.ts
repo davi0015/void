@@ -231,6 +231,7 @@ export type ThreadType = {
 	compactionSummary?: string;
 	compactionBoundaryIdx?: number;
 	compactionPercent?: number;
+	compactionSavedTokens?: number;
 
 	// Snapshot of workspace file paths from the last directory listing sent to
 	// the LLM. Used to compute a compact diff on subsequent turns instead of
@@ -656,7 +657,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		for (const id in allThreads) {
 			const t = allThreads[id]
 			if (t?.latestUsage) this.latestUsageOfThreadId[id] = t.latestUsage
-			if (t?.cumulativeUsageThisThread) this.cumulativeUsageThisThreadOfThreadId[id] = t.cumulativeUsageThisThread
+			if (t?.cumulativeUsageThisThread) {
+				this.cumulativeUsageThisThreadOfThreadId[id] = t.cumulativeUsageThisThread
+				// Restore the baseline so the first _setLatestUsage after reload
+				// adds on top of the persisted total instead of overwriting it.
+				this._cumulativeThisThreadBaselineOfThreadId[id] = t.cumulativeUsageThisThread
+			}
 			if (t?.latestCompaction) this.latestCompactionOfThreadId[id] = t.latestCompaction
 			if (t?.cumulativeCompactionThisThread) this.cumulativeCompactionThisThreadOfThreadId[id] = t.cumulativeCompactionThisThread
 		}
@@ -2088,6 +2094,47 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				return
 			}
 
+			// Prefix-cache investigation log: dump each message's role, char length,
+			// content hash, and cumulative hash so we can spot where the prefix diverges
+			// between turns. The cumulative hash represents the byte-identical prefix
+			// up to (and including) that message — if it matches the previous turn's
+			// cumulative hash at the same index, the provider can reuse its KV cache.
+			{
+				const djb2 = (s: string): string => {
+					let h = 5381
+					for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
+					return (h >>> 0).toString(16).padStart(8, '0')
+				}
+				const msgContent = (m: typeof messages[number]): string => {
+					if ('content' in m) {
+						const c = m.content
+						if (typeof c === 'string') return c
+						if (Array.isArray(c)) return c.map(p => {
+							if ('text' in p && typeof p.text === 'string') return p.text
+							if ('content' in p && typeof p.content === 'string') return p.content
+							if ('type' in p) return `[${p.type}]`
+							return ''
+						}).join('|')
+					}
+					if ('parts' in m) return m.parts.map(p => 'text' in p && typeof p.text === 'string' ? p.text : '[part]').join('|')
+					return ''
+				}
+				let cumStr = ''
+				const sysMsg = separateSystemMessage || ''
+				if (sysMsg) cumStr += sysMsg
+				const lines: string[] = []
+				if (sysMsg) lines.push(`  [sys] len=${sysMsg.length} hash=${djb2(sysMsg)} cumHash=${djb2(cumStr)}`)
+				for (let i = 0; i < messages.length; i++) {
+					const m = messages[i]
+					const role = ('role' in m) ? (m as { role: string }).role : '?'
+					const content = msgContent(m)
+					cumStr += content
+					const preview = content.slice(0, 60).replace(/\n/g, '\\n')
+					lines.push(`  [${i}] ${role} len=${content.length} hash=${djb2(content)} cumHash=${djb2(cumStr)} "${preview}..."`)
+				}
+				console.log(`[PrefixCache] thread=${threadId.slice(0, 8)} turn=${nMessagesSent} msgs=${messages.length} totalChars=${sentChars}\n${lines.join('\n')}`)
+			}
+
 			let shouldRetryLLM = true
 			let nAttempts = 0
 			while (shouldRetryLLM) {
@@ -2119,7 +2166,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						this._scheduleStreamTextUpdate(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallsSoFar: toolCalls ?? [] }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
 					},
 					onFinalMessage: async ({ fullText, fullReasoning, toolCalls, anthropicReasoning, usage, finishReason }) => {
-						if (usage) this._setLatestUsage(threadId, usage)
+						console.log(`[PrefixCache:final] thread=${threadId.slice(0, 8)} finishReason=${finishReason} fullReasoning.len=${fullReasoning?.length ?? 0} fullText.len=${fullText?.length ?? 0} toolCalls=${toolCalls?.length ?? 0} anthropicReasoning=${anthropicReasoning?.length ?? 0}`)
+						if (fullReasoning) console.log(`[PrefixCache:reasoning] "${fullReasoning}"`)
+						if (usage) {
+							console.log(`[PrefixCache:usage] thread=${threadId.slice(0, 8)} input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens} reasoning=${usage.reasoningTokens} total=${usage.totalTokens}`)
+							this._setLatestUsage(threadId, usage)
+						}
 						// Lock in this request's usage so the next loop iteration's
 						// running total is added to (not replacing) what we already counted.
 						this._lockInCurrentRequestUsage(threadId)
@@ -4034,6 +4086,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 				if (msg.role === 'user') compactableChars += (msg.content?.length ?? 0)
 				else if (msg.role === 'assistant') compactableChars += (msg.displayContent?.length ?? 0) + (msg.reasoning?.length ?? 0)
 				else if (msg.role === 'tool') {
+					compactableChars += (msg.rawParamsStr?.length ?? 0)
 					const r = msg.result
 					if (typeof r === 'string') compactableChars += r.length
 					else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') compactableChars += ((r as { content: string }).content.length)
@@ -4045,32 +4098,58 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const targetTokens = Math.round(targetChars / charsPerToken)
 
 		// The conversation is already in the LLM messages (prefix-cached).
-		// The summarization instruction just tells the LLM what to do with it.
+		// The extraction instruction tells the LLM what to do with it.
+		// Framed as "extract and organize" rather than "summarize" — LLMs
+		// compress much less aggressively when asked to extract vs summarize.
+		// Per-section minimum word counts give granular targets that are easier
+		// for the model to hit than a single overall length.
+		const wordsPerSection = Math.max(50, Math.round(targetTokens / 10))
 		const summarizationPrompt = [
-			'Summarize our conversation so far to reduce context size.',
-			'The system prompt and rules are preserved separately — do NOT summarize them.',
+			'Extract and organize the key information from our conversation into a structured reference document.',
+			'The system prompt and rules are preserved separately — do NOT include them.',
+			'This document REPLACES the full conversation history, so it must contain everything needed to continue the work.',
 			'',
-			'Extract and preserve IN DETAIL:',
-			'1. Task context — what the user is working on, the overall goal, background decisions',
-			'2. Every decision made — approaches chosen, tradeoffs discussed, options rejected and why',
-			'3. All files modified — which files were changed, what functions/types were added/modified/removed, and the reasoning',
-			'4. Current state — what is completed, what is pending, what was attempted but failed',
-			'5. User preferences — any conventions, rules, or explicit instructions stated in the conversation',
-			'6. Key code patterns — important implementation details, data structures, APIs used',
-			'7. Errors encountered — what went wrong, how it was diagnosed, how it was fixed',
+			`TARGET LENGTH: ~${targetTokens.toLocaleString()} tokens (~${targetChars.toLocaleString()} characters). The conversation being compressed is ~${Math.round(compactableChars / charsPerToken).toLocaleString()} tokens.`,
 			'',
-			'Rules:',
-			'- This summary REPLACES the full conversation, so include everything needed to continue the work',
-			'- Include specific file paths, function names, type names, and variable names',
-			'- Describe what changed and WHY, not full code blocks',
-			'- If tool calls read files, summarize the key information learned',
-			'- Preserve exact error messages and their resolutions',
-			'- Use structured sections with headers',
-			`- IMPORTANT: Your summary must be approximately ${targetTokens.toLocaleString()} tokens (~${targetChars.toLocaleString()} characters).`,
-			`  The compactable region is ~${Math.round(compactableChars / charsPerToken).toLocaleString()} tokens (~${compactableChars.toLocaleString()} characters). Do NOT over-compress.`,
-			`  Err on the side of including MORE detail rather than less.`,
+			`Write each section below. Each section must be AT LEAST ${wordsPerSection} words unless the conversation has no content for it.`,
 			'',
-			'Write a detailed, structured summary now.',
+			'## 1. Primary Request and Intent',
+			'What is the user working on? What is the overall goal? What triggered this conversation?',
+			'',
+			'## 2. Key Technical Concepts',
+			'List every technical concept, architecture pattern, data structure, API, and library discussed. Include specific names.',
+			'',
+			'## 3. Files and Code Sections',
+			'For EACH file that was read, modified, or discussed:',
+			'- Full file path',
+			'- Why it is important / what role it plays',
+			'- What was learned from reading it (key functions, types, patterns found)',
+			'- What modifications were made (if any) and why',
+			'- Include specific function names, type names, variable names, and line ranges',
+			'',
+			'## 4. Errors and fixes',
+			'For each error encountered:',
+			'- The exact error message or symptom',
+			'- Root cause analysis',
+			'- The fix applied',
+			'',
+			'## 5. Problem Solving',
+			'Document the reasoning chain: what approaches were considered, which were chosen and why, what was rejected and why.',
+			'',
+			'## 6. All user messages',
+			'List every distinct request/instruction the user gave (paraphrase if long, quote if short).',
+			'',
+			'## 7. Pending Tasks',
+			'What is not yet done? What was discussed but not implemented?',
+			'',
+			'## 8. Current Work',
+			'Describe exactly what was being worked on immediately before this extraction.',
+			'',
+			'## 9. Optional Next Step',
+			'What is the most likely next action based on conversation context?',
+			'',
+			'CRITICAL: Write a LONG, detailed document. Do NOT summarize briefly. Include specific names, paths, and details.',
+			`Your output must be close to ${targetTokens.toLocaleString()} tokens. If a section has extensive content, write more. Do not truncate.`,
 		].join('\n')
 
 		// Send compaction as a normal chat continuation so the system prompt +
@@ -4089,6 +4168,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const { overridesOfModel } = this._settingsService.state
 		const modelSelectionOptions = this._settingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
+		let systemMessageChars = 0
 		const sendCompactionFromChatMessages = async (chatMsgs: ChatMessage[], label: string) => {
 			const { messages: msgs, separateSystemMessage: sysMsg } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages: chatMsgs,
@@ -4097,6 +4177,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 				frozenAiInstructions,
 				manualCompaction,
 			})
+			if (sysMsg) systemMessageChars = sysMsg.length
 			return new Promise<string>((resolve, reject) => {
 				this._llmMessageService.sendLLMMessage({
 					messagesType: 'chatMessages',
@@ -4106,8 +4187,14 @@ We only need to do it for files that were edited since `from`, ie files between 
 					modelSelection,
 					modelSelectionOptions,
 					overridesOfModel,
-					onText: () => { },
-					onFinalMessage: ({ fullText }) => { resolve(fullText) },
+					onText: ({ usage }) => {
+						if (usage) this._setLatestUsage(threadId, usage)
+					},
+					onFinalMessage: ({ fullText, usage }) => {
+						if (usage) this._setLatestUsage(threadId, usage)
+						this._lockInCurrentRequestUsage(threadId)
+						resolve(fullText)
+					},
 					onError: (err) => { reject(new Error(err.message)) },
 					onAbort: () => { reject(new Error('Compaction aborted')) },
 					logging: { loggingName: label, loggingExtras: { threadId, compactPercent } },
@@ -4115,44 +4202,14 @@ We only need to do it for files that were edited since `from`, ie files between 
 			})
 		}
 
+		// Block message input during compaction (same as running agent)
+		this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '', reasoningSoFar: '', toolCallsSoFar: [] }, interrupt: Promise.resolve(() => { }) })
+
 		try {
-			let summary = await sendCompactionFromChatMessages(compactionMessages, 'Manual Compaction')
+			const summary = await sendCompactionFromChatMessages(compactionMessages, 'Manual Compaction')
 
 			if (!summary || summary.trim().length === 0) {
 				return 'The model returned an empty summary.'
-			}
-
-			// If the summary is drastically shorter than the target, ask the
-			// model to expand it. LLMs tend to over-compress when summarizing.
-			const minAcceptableChars = Math.round(targetChars * 0.3)
-			if (summary.trim().length < minAcceptableChars && targetChars > 1000) {
-				const expansionMessages: ChatMessage[] = [
-					...compactionMessages,
-					{ role: 'assistant', displayContent: summary.trim(), reasoning: '', anthropicReasoning: null } as ChatMessage,
-					{
-						role: 'user',
-						content: [
-							'Your summary is too short. It is only ' + summary.trim().length.toLocaleString() + ' characters but the target is ~' + targetChars.toLocaleString() + ' characters.',
-							'',
-							'Please rewrite and EXPAND the summary significantly. Include:',
-							'- More detail about each file that was read or modified',
-							'- Specific function names, type definitions, and variable names discussed',
-							'- The exact reasoning behind each decision',
-							'- Error messages and their resolutions verbatim',
-							'- Code patterns and implementation details',
-							'',
-							'Here is your previous summary to expand upon:',
-							'',
-							summary.trim(),
-						].join('\n'),
-						displayContent: '',
-						selections: null,
-					} as ChatMessage,
-				]
-				const expanded = await sendCompactionFromChatMessages(expansionMessages, 'Manual Compaction (expansion)')
-				if (expanded && expanded.trim().length > summary.trim().length) {
-					summary = expanded
-				}
 			}
 
 			// Write compaction log for analysis
@@ -4169,12 +4226,37 @@ We only need to do it for files that were edited since `from`, ie files between 
 				targetChars,
 			})
 
+			// saved = lastInputTokens - systemTokens - recentTokens - summaryTokens
+			const summaryTokens = Math.round(summary.trim().length / charsPerToken)
+			const lastInputTokens = this.latestUsageOfThreadId[threadId]?.inputTokens
+			let savedTokens: number
+			if (lastInputTokens && systemMessageChars > 0) {
+				let recentChars = 0
+				for (let i = boundaryIdx; i < chatMessages.length; i++) {
+					const m = chatMessages[i]
+					if (m.role === 'user') recentChars += (m.content?.length ?? 0)
+					else if (m.role === 'assistant') recentChars += (m.displayContent?.length ?? 0) + (m.reasoning?.length ?? 0)
+					else if (m.role === 'tool') {
+						recentChars += (m.rawParamsStr?.length ?? 0)
+						const r = m.result
+						if (typeof r === 'string') recentChars += r.length
+						else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') recentChars += ((r as { content: string }).content.length)
+					}
+				}
+				const recentTokens = Math.round(recentChars / charsPerToken)
+				const systemTokens = Math.round(systemMessageChars / charsPerToken)
+				savedTokens = Math.max(0, lastInputTokens - systemTokens - recentTokens - summaryTokens)
+			} else {
+				savedTokens = Math.max(0, Math.round((compactableChars - summary.trim().length) / charsPerToken))
+			}
+
 			const updatedThread: ThreadType = {
 				...thread,
 				lastModified: new Date().toISOString(),
 				compactionSummary: summary.trim(),
 				compactionBoundaryIdx: boundaryIdx,
 				compactionPercent: compactPercent,
+				compactionSavedTokens: savedTokens,
 			}
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 			this._storeThread(threadId, updatedThread)
@@ -4184,6 +4266,8 @@ We only need to do it for files that were edited since `from`, ie files between 
 			const msg = e instanceof Error ? e.message : String(e)
 			console.error('[Compaction] Failed:', e)
 			return msg
+		} finally {
+			this._setStreamState(threadId, undefined)
 		}
 	}
 

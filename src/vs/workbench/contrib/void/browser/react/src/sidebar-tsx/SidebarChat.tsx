@@ -1004,19 +1004,23 @@ const scrollToBottom = (divRef: { current: HTMLElement | null }) => {
 
 
 const ScrollToBottomContainer = ({ children, className, style, scrollContainerRef }: { children: React.ReactNode, className?: string, style?: React.CSSProperties, scrollContainerRef: React.MutableRefObject<HTMLDivElement | null> }) => {
-	const prevScrollHeightRef = useRef(0);
+	const isAtBottomRef = useRef(true);
 
 	const divRef = scrollContainerRef
 
-	useEffect(() => {
+	const onScroll = useCallback(() => {
 		const div = divRef.current;
 		if (!div) return;
-		const currH = div.scrollHeight;
-		const distFromBottom = div.scrollHeight - div.clientHeight - div.scrollTop;
-		if (currH > prevScrollHeightRef.current && distFromBottom < 5) {
+
+		isAtBottomRef.current = Math.abs(
+			div.scrollHeight - div.clientHeight - div.scrollTop
+		) < 40;
+	}, [divRef]);
+
+	useEffect(() => {
+		if (isAtBottomRef.current) {
 			scrollToBottom(divRef);
 		}
-		prevScrollHeightRef.current = currH;
 	}, [children]);
 
 	useEffect(() => {
@@ -1026,6 +1030,7 @@ const ScrollToBottomContainer = ({ children, className, style, scrollContainerRe
 	return (
 		<div
 			ref={divRef}
+			onScroll={onScroll}
 			className={className}
 			style={style}
 		>
@@ -2520,14 +2525,10 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		const contentH = getContentHeight()
 		spacerHeightRef.current = contentH
 		if (spacerRef.current) spacerRef.current.style.height = contentH + 'px'
-		scrollEl.scrollTop = 1e10
-		lastScrollTopRef.current = scrollEl.scrollTop
 	}, [mountStart, totalCount, isActive, scrollContainerRef, getContentHeight, estimateMsgHeight])
 
-	// Sync wrapper height + scrollTop after expand/trim.
+	// Sync wrapper height + scrollTop after expand or new messages.
 	// Expand (delta > 0): grow wrapper first, then adjust scrollTop.
-	// Trim (delta < 0): adjust scrollTop first, then shrink wrapper.
-	// This ordering prevents the browser from clamping scrollTop.
 	const prevMountStartRef = useRef(mountStart)
 	useLayoutEffect(() => {
 		if (!initialFillDoneRef.current) return
@@ -2544,26 +2545,20 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		if (Math.abs(delta) < 1) return
 
 		spacerHeightRef.current = contentH
-		mountChangeRef.current = true
 
 		if (mountStartChanged) {
 			if (delta > 0) {
 				spacerEl.style.height = contentH + 'px'
 				scrollEl.scrollTop += delta
 			} else {
-				// If removing content would leave less than viewport, undo
-				if (contentH < scrollEl.clientHeight && mountStart > 0) {
-					spacerEl.style.height = oldH + 'px'
-					spacerHeightRef.current = oldH
-					setMountStart(prev => Math.max(0, prev - 1))
-					requestAnimationFrame(() => { mountChangeRef.current = false })
-					return
-				}
 				scrollEl.scrollTop += delta
 				spacerEl.style.height = contentH + 'px'
 			}
 			lastScrollTopRef.current = scrollEl.scrollTop
 		} else {
+			// Check wasAtBottom BEFORE updating spacer height — reading
+			// scrollHeight after the spacer grows would make us appear
+			// far from bottom, breaking auto-scroll on message commit.
 			const wasAtBottom = Math.abs(scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop) < 40
 			spacerEl.style.height = contentH + 'px'
 			if (wasAtBottom) {
@@ -2571,15 +2566,12 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			}
 			lastScrollTopRef.current = scrollEl.scrollTop
 		}
-		requestAnimationFrame(() => { mountChangeRef.current = false })
 	}, [mountStart, totalCount, scrollContainerRef, getContentHeight])
 
 	// ResizeObserver: sync wrapper height + scrollTop when content resizes
-	// outside of expand/trim (e.g., LazyBlockCode placeholder → Monaco swap).
-	// Without this, the wrapper stays stale and accumulates delta until the
-	// next mount change, causing a big jump.
-	// Skip scrollTop compensation when width changed (panel resize / reflow).
-	const mountChangeRef = useRef(false)
+	// (e.g., LaTeX rendering, LazyBlockCode placeholder → Monaco swap).
+	// No mountChangeRef gate needed — spacerHeightRef already prevents
+	// double-counting with the useLayoutEffect above.
 	useEffect(() => {
 		const contentEl = contentRef.current
 		const spacerEl = spacerRef.current
@@ -2591,29 +2583,32 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 
 		const contentRo = new ResizeObserver(() => {
 			if (!initialFillDoneRef.current) return
-			if (mountChangeRef.current) return
 
 			const currWidth = scrollEl.clientWidth
 			const widthChanged = currWidth !== prevWidth
 			prevWidth = currWidth
 
 			const contentH = contentEl.offsetHeight
-			const oldH = spacerHeightRef.current
-			const delta = contentH - oldH
+			const delta = contentH - spacerHeightRef.current
 			if (Math.abs(delta) < 1) return
 
 			spacerHeightRef.current = contentH
 			spacerEl.style.height = contentH + 'px'
 
-			if (!widthChanged && !contentEl.hasAttribute('data-suppress-scroll')) {
-				scrollEl.scrollTop += delta
+			if (!widthChanged) {
+				const distFromBottom = scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop
+				if (distFromBottom < 100) {
+					// Near bottom (streaming/just committed) — stay at bottom
+					scrollEl.scrollTop = scrollEl.scrollHeight
+				} else {
+					// Scrolled away — compensate to keep viewport stable
+					scrollEl.scrollTop += delta
+				}
 				lastScrollTopRef.current = scrollEl.scrollTop
 			}
 		})
 		contentRo.observe(contentEl)
 
-		// Re-evaluate sticky question when the scroll container resizes
-		// (e.g., read-only banner appearing changes available height).
 		const scrollRo = new ResizeObserver(() => {
 			updateStickyQuestion(scrollEl)
 		})
@@ -2724,9 +2719,20 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					return
 				}
 				if (scrollingDown && currScrollTop > el.clientHeight * 3) {
+					// Skip trim when near the bottom — auto-scroll from streaming
+					// triggers scroll-down events and trimming here would desync
+					// ScrollToBottomContainer's isAtBottomRef, breaking auto-scroll.
+					const distFromBottom = el.scrollHeight - el.clientHeight - currScrollTop
+					if (distFromBottom < 100) return
+
 					const mounted = totalCountRef.current - mountStartRef.current
-					if (mounted <= 2) return
-					flushSync(() => setMountStart(prev => Math.min(prev + 1, Math.max(0, totalCountRef.current - 1))))
+					const avgH = mounted > 0 ? (contentRef.current?.offsetHeight ?? el.scrollHeight) / mounted : 200
+					const msgsAbove = Math.floor(currScrollTop / avgH)
+					const msgsToKeepAbove = Math.ceil((el.clientHeight * 2) / avgH)
+					const msgsToRemove = msgsAbove - msgsToKeepAbove
+					if (msgsToRemove > 0) {
+						flushSync(() => setMountStart(prev => Math.min(prev + msgsToRemove, Math.max(0, totalCountRef.current - 1))))
+					}
 				}
 			})
 		}

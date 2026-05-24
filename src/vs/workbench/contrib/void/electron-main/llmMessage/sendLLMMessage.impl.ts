@@ -75,8 +75,18 @@ const parseHeadersJSON = (s: string | undefined): Record<string, string | null |
 }
 
 const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includeInPayload }: { settingsOfProvider: SettingsOfProvider, providerName: ProviderName, includeInPayload?: { [s: string]: any } }) => {
+	const headerLoggingFetch = (async (url: any, init: any) => {
+		const resp = await fetch(url, init)
+		try {
+			const h: Record<string, string> = {}
+			resp.headers.forEach((v, k) => { h[k] = v })
+			console.log(`[PrefixCache:headers] ${providerName} ${JSON.stringify(h)}`)
+		} catch { /* ignore */ }
+		return resp
+	}) as unknown as ClientOptions['fetch']
 	const commonPayloadOpts: ClientOptions = {
 		dangerouslyAllowBrowser: true,
+		fetch: headerLoggingFetch,
 		...includeInPayload,
 	}
 	if (providerName === 'openAI') {
@@ -294,7 +304,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	const { providerReasoningIOSettings } = getProviderCapabilities(providerName)
 
 	// reasoning
-	const { canIOReasoning, openSourceThinkTags } = reasoningCapabilities || {}
+	const { openSourceThinkTags } = reasoningCapabilities || {}
 	const reasoningInfo = getSendableReasoningInfo('Chat', providerName, modelName_, modelSelectionOptions, overridesOfModel) // user's modelName_ here
 
 	const includeInPayload = {
@@ -338,8 +348,8 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	} as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming
 
 	// open source models - manually parse think tokens
-	const { needsManualParse: needsManualReasoningParse, nameOfFieldInDelta: nameOfReasoningFieldInDelta } = providerReasoningIOSettings?.output ?? {}
-	const manuallyParseReasoning = needsManualReasoningParse && canIOReasoning && openSourceThinkTags
+	const { nameOfFieldInDelta: nameOfReasoningFieldInDelta } = providerReasoningIOSettings?.output ?? {}
+	const manuallyParseReasoning = !!openSourceThinkTags
 	if (manuallyParseReasoning) {
 		const { newOnText, newOnFinalMessage } = extractReasoningWrapper(onText, onFinalMessage, openSourceThinkTags)
 		onText = newOnText
@@ -387,8 +397,14 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		.create(options)
 		.then(async response => {
 			_setAborter(() => response.controller.abort())
+
 			// when receive text
+			let chunkIdx = 0
 			for await (const chunk of response) {
+				if (chunkIdx < 3 || chunk.usage) {
+					console.log(`[PrefixCache:chunk#${chunkIdx}] ${JSON.stringify(chunk)}`)
+				}
+				chunkIdx++
 				// message
 				const newText = chunk.choices[0]?.delta?.content ?? ''
 				fullTextSoFar += newText

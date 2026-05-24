@@ -171,7 +171,7 @@ export type VoidStaticModelInfo = { // not stateful
 	supportsFIM: boolean; // whether the model was specifically designed for autocomplete or "FIM" ("fill-in-middle" format)
 	supportsVision?: boolean; // whether the model accepts image inputs (e.g. Gemini, GPT-4o, Claude)
 
-	additionalOpenAIPayload?: { [key: string]: string } // additional payload in the message body for requests that are openai-compatible (ollama, vllm, openai, openrouter, etc)
+	additionalOpenAIPayload?: { [key: string]: unknown } // additional payload in the message body for requests that are openai-compatible (ollama, vllm, openai, openrouter, etc)
 
 	// reasoning options
 	reasoningCapabilities: false | {
@@ -740,6 +740,7 @@ const openAISettings: VoidStaticProviderInfo = {
 	},
 	providerReasoningIOSettings: {
 		input: { includeInPayload: openAICompatIncludeInPayloadReasoning },
+		output: { nameOfFieldInDelta: ['reasoning_content', 'reasoning', 'thinking'] },
 	},
 }
 

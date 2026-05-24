@@ -7,7 +7,7 @@ import { createDecorator } from '../../../../platform/instantiation/common/insta
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IEditorService } from '../../../services/editor/common/editorService.js';
 import { ChatMessage, CompactionInfo } from '../common/chatThreadServiceTypes.js';
-import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities } from '../common/modelCapabilities.js';
+import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities, getProviderCapabilities } from '../common/modelCapabilities.js';
 import { reParsedToolXMLString, chat_systemMessage, chat_volatileContext } from '../common/prompt/prompts.js';
 import { AnthropicLLMChatMessage, AnthropicReasoning, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, OpenAILLMChatMessage, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
@@ -344,13 +344,6 @@ openai on developer system message - https://cdn.openai.com/spec/model-spec-2024
 
 const prepareMessages_openai_tools = (
 	messages: SimpleLLMMessage[],
-	// Emit `reasoning_content` on assistant messages that captured it. DeepSeek V4
-	// thinking mode REQUIRES this on every prior assistant turn that produced
-	// reasoning, regardless of whether the turn had tool calls (otherwise: 400).
-	// Other OpenAI-compat providers don't consume the field and might surface it
-	// as "unknown property" warnings, so we only opt in by provider.
-	// See note-deepseek.md §5 for the exact constraint and why we don't optimise
-	// non-tool turns away.
 	supportsOAICompatReasoningContent: boolean,
 ): AnthropicOrOpenAILLMMessage[] => {
 
@@ -369,25 +362,10 @@ const prepareMessages_openai_tools = (
 			}
 			if (supportsOAICompatReasoningContent && currMsg.reasoningContent !== undefined) {
 				// DeepSeek V4 thinking mode: replay reasoning_content on EVERY
-				// prior assistant turn captured under thinking mode, regardless
-				// of whether it had tool_calls AND regardless of whether the
-				// model actually produced any reasoning text. The published docs
-				// claim a "Case A vs Case B" split (only tool-call turns require
-				// it), but the live API returns 400 "The reasoning_content in
-				// the thinking mode must be passed back to the API" if the field
-				// is missing on ANY prior thinking-mode turn — including the
-				// short "Done."-style follow-ups that come back from the model
-				// with an empty reasoning blob after a tool round-trip.
-				// Hence the `!== undefined` gate (vs truthy): an explicit empty
-				// string means "captured, model said nothing" and must round-trip
-				// as `reasoning_content: ""`. Only `undefined` (= field never
-				// captured, e.g. legacy history or non-thinking turn) skips emit.
-				// The recommended pattern from the docs is to append
-				// `response.choices[0].message` verbatim, which carries content +
-				// reasoning_content + tool_calls together. We do exactly that.
-				// Cost trade-off: input tokens grow by the size of all stored
-				// reasoning blobs in the thread. The prefix cache mitigates this
-				// because the field bytes stay identical turn-to-turn.
+				// prior assistant turn. Required by their API — omitting it causes 400.
+				// For other providers using separate_reasoning=false, reasoning
+				// is already embedded in content as <think> tags by the server,
+				// so it naturally round-trips without this field.
 				out.reasoning_content = currMsg.reasoningContent
 			}
 			newMessages.push(out)
@@ -837,12 +815,15 @@ const prepareOpenAIOrAnthropicMessages = ({
 		llmChatMessages = prepareMessages_anthropic_tools(messages as SimpleLLMMessage[], supportsAnthropicReasoning)
 	}
 	else if (specialToolFormat === 'openai-style') {
-		// Per-provider opt-in for `reasoning_content` round-trip on assistant messages.
-		// Today: DeepSeek V4 (required for thinking + tools — see note-deepseek.md §5).
-		// Other providers may need it later (e.g. OpenRouter routes that proxy to
-		// DeepSeek); extend this set rather than making it a model-level capability
-		// so we can flip whole providers at once.
-		const supportsOAICompatReasoningContent = providerName === 'deepseek'
+		// Opt-in for `reasoning_content` round-trip on assistant messages.
+		// Required by DeepSeek V4 (thinking + tools — see note-deepseek.md §5).
+		// Enabled for any provider whose output settings declare `reasoning_content`
+		// as a delta field, so custom providers via LiteLLM/vLLM/etc. that stream
+		// reasoning_content also get correct replay.
+		const { providerReasoningIOSettings: prios } = providerName ? getProviderCapabilities(providerName) : { providerReasoningIOSettings: undefined }
+		const deltaFields = prios?.output?.nameOfFieldInDelta
+		const deltaFieldList = Array.isArray(deltaFields) ? deltaFields : deltaFields ? [deltaFields] : []
+		const supportsOAICompatReasoningContent = providerName === 'deepseek' || deltaFieldList.includes('reasoning_content')
 		llmChatMessages = prepareMessages_openai_tools(messages as SimpleLLMMessage[], supportsOAICompatReasoningContent)
 	}
 	const llmMessages = llmChatMessages
