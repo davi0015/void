@@ -71,7 +71,7 @@ type SimpleLLMMessage = {
 // worse density than reality" — we'd rather compact/trim a bit too early than
 // overflow the context window.
 const CHARS_PER_TOKEN = 4
-const TRIM_TO_LEN = 120
+
 
 // Calibration policy — `ConvertToLLMMessageService` observes the provider's
 // reported `inputTokens` after each request and derives an actual chars/token
@@ -635,10 +635,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 	emergencyInfo?: { emergencyTrimmedCount: number, emergencySavedChars: number, emergencySavedTokens: number },
 } => {
 
-	reservedOutputTokenSpace = Math.max(
-		contextWindow * 1 / 2, // reserve at least 1/4 of the token window length
-		reservedOutputTokenSpace ?? 4_096 // defaults to 4096
-	)
+	reservedOutputTokenSpace = reservedOutputTokenSpace ?? 4_096
 	let messages: (SimpleLLMMessage | { role: 'system', content: string })[] = deepClone(messages_)
 
 	// ================ system message ================
@@ -654,150 +651,14 @@ const prepareOpenAIOrAnthropicMessages = ({
 	// ================ trim ================
 	messages = messages.map(m => ({ ...m, content: m.role !== 'tool' ? m.content.trim() : m.content }))
 
-	type MesType = (typeof messages)[0]
-
 	// ================ fit into context ================
-
-	// the higher the weight, the higher the desire to truncate - TRIM HIGHEST WEIGHT MESSAGES
-	const alreadyTrimmedIdxes = new Set<number>()
-	const weight = (message: MesType, messages: MesType[], idx: number) => {
-		const base = message.content.length
-
-		let multiplier: number
-		multiplier = 1 + (messages.length - 1 - idx) / messages.length // slow rampdown from 2 to 1 as index increases
-		if (message.role === 'user') {
-			multiplier *= 1
-		}
-		else if (message.role === 'system') {
-			multiplier *= .01 // very low weight
-		}
-		else {
-			multiplier *= 10 // llm tokens are far less valuable than user tokens
-		}
-
-		// any already modified message should not be trimmed again
-		if (alreadyTrimmedIdxes.has(idx)) {
-			multiplier = 0
-		}
-		// 1st and last messages should be very low weight
-		if (idx <= 1 || idx >= messages.length - 1 - 3) {
-			multiplier *= .05
-		}
-		return base * multiplier
-	}
-
-	const _findLargestByWeight = (messages_: MesType[]) => {
-		let largestIndex = -1
-		let largestWeight = -Infinity
-		for (let i = 0; i < messages.length; i += 1) {
-			const m = messages[i]
-			const w = weight(m, messages_, i)
-			if (w > largestWeight) {
-				largestWeight = w
-				largestIndex = i
-			}
-		}
-		return largestIndex
-	}
-
-	let totalLen = 0
-	for (const m of messages) { totalLen += m.content.length }
-
-	// TWO-STAGE DECISION:
-	//
-	// Stage 1 — "Do we need to trim?" — answered in TOKENS using the max of
-	//   (a) `priorContentTokens` (= last request's inputTokens + outputTokens =
-	//       exact token count of everything in the conversation at the moment
-	//       the last request completed — all of which is also in THIS request's
-	//       input since history is append-only), and
-	//   (b) `totalLen / calibratedRatio` — ratio-based estimate over the full
-	//       current message array, which covers the per-turn delta (new tool
-	//       results / user message) that (a) doesn't know about.
-	// Same reasoning as the compaction size gate in `compactToolResultsForRequest`.
-	const budgetTokens = contextWindow - reservedOutputTokenSpace
-	const estimatedTokens = Math.max(priorContentTokens ?? 0, totalLen / charsPerToken)
-	const willOverflow = estimatedTokens > budgetTokens
-
-	// Stage 2 — "How many chars to cut?" — answered in chars because the trim
-	// loop below operates on strings. Target remaining chars = budget-in-tokens
-	// × calibrated ratio, floored at 5_000 to guard against pathological
-	// budgets (malformed/zero contextWindow) causing us to trim everything.
-	// The ratio conversion here is unavoidable — you can only cut strings by
-	// character count, not by token count.
-	const charsNeedToTrim = willOverflow
-		? totalLen - Math.max(budgetTokens * charsPerToken, 5_000)
-		: 0
-
-
-	// <----------------------------------------->
-	// 0                      |    |             |
-	//                        |    contextWindow |
-	//                     contextWindow - maxOut|putTokens
-	//                                          totalLen
-	let remainingCharsToTrim = charsNeedToTrim
-	let i = 0
-
-	// Track what the emergency trim actually did so we can surface it in the
-	// CompactionInfo returned alongside the messages. Emergency trim is more
-	// destructive than Light tier (can truncate user messages / assistant replies
-	// to 120 chars, not just tool result bodies), so when it fires the user
-	// should see it in the tooltip — both for trust and for diagnostics (if this
-	// keeps firing, Perf 2's `sizeTriggerRatio` is too loose for this model).
-	//
-	// TODO(deepseek-thinking): emergency trim is NOT aware of `reasoningContent`
-	// weight on assistant messages. On thinking-mode threads, reasoning_content
-	// can be 5-10× larger than the visible `content` text, so trimming `content`
-	// to 120 chars saves almost nothing while the reasoning blob keeps the request
-	// over budget. Future option when we hit this: include `reasoningContent.length`
-	// in `weight()` and trim it directly. DeepSeek requires byte-exact replay of
-	// every prior reasoning blob (note-deepseek.md §5), so any trim of an old
-	// reasoning_content WILL produce a 400. The pragmatic stance is "trim and
-	// accept the 400; the user retries" — a deliberate degradation under context
-	// pressure rather than a bug. Defer until telemetry shows this firing.
-	let emergencyTrimmedCount = 0
-	let emergencySavedChars = 0
-
-	while (remainingCharsToTrim > 0) {
-		i += 1
-		if (i > 100) break
-
-		const trimIdx = _findLargestByWeight(messages)
-		const m = messages[trimIdx]
-		const origLen = m.content.length
-
-		// if can finish here, do
-		const numCharsWillTrim = m.content.length - TRIM_TO_LEN
-		if (numCharsWillTrim > remainingCharsToTrim) {
-			// trim remainingCharsToTrim + '...'.length chars
-			m.content = m.content.slice(0, m.content.length - remainingCharsToTrim - '...'.length).trim() + '...'
-			emergencyTrimmedCount += 1
-			emergencySavedChars += origLen - m.content.length
-			break
-		}
-
-		remainingCharsToTrim -= numCharsWillTrim
-		m.content = m.content.substring(0, TRIM_TO_LEN - '...'.length) + '...'
-		emergencyTrimmedCount += 1
-		emergencySavedChars += origLen - m.content.length
-		alreadyTrimmedIdxes.add(trimIdx)
-	}
-
-	// Token count is computed here with the calibrated ratio so the reported
-	// value matches how the compaction size gate / token-usage tooltip reason
-	// about tokens everywhere else. Deliberately NOT derived client-side from
-	// savedChars so cumulative counters preserve per-request accuracy (ratio can
-	// drift as more requests land and the EMA updates).
-	const emergencySavedTokens = Math.round(emergencySavedChars / charsPerToken)
-
-	if (emergencyTrimmedCount > 0) {
-		// Dev diagnostic — user-visible feedback goes through the tooltip, but
-		// logging here too helps when investigating "why did emergency trim fire
-		// despite Perf 2 being on?" — usually the answer is `sizeTriggerRatio`
-		// is too loose for this particular model's real context window.
-		try {
-			console.log(`[void emergency-trim] truncated ${emergencyTrimmedCount} message(s); saved ~${emergencySavedChars.toLocaleString()} chars (~${emergencySavedTokens.toLocaleString()} tokens @ ${charsPerToken.toFixed(2)} chars/tok)`)
-		} catch { }
-	}
+	// Emergency trim DISABLED — let the server reject if input exceeds context.
+	// Silently truncating messages breaks prefix cache and loses context without
+	// the user's knowledge. Better to let the request fail so the user can
+	// manually compact or start a new thread.
+	const emergencyTrimmedCount = 0
+	const emergencySavedChars = 0
+	const emergencySavedTokens = 0
 
 	// ================ system message hack ================
 	const newSysMsg = messages.shift()!.content
