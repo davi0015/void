@@ -1533,13 +1533,15 @@ Void strips `<memory_update>` from display (same pattern as `<think>` reasoning)
 
 **Inspiration source:** jcode repo (`/Users/david.halim/Documents/Projects/jcode`) has a memory system (`memory_prompt` in `src/prompt.rs`, `src/tui/app/turn_memory.rs`) that injects persistent memory into the dynamic system context. Their compaction system (`crates/jcode-compaction-core`, `src/compaction.rs`) uses LLM-powered summarization with reactive/proactive/semantic modes. The prefix-preservation design here is a synthesis of jcode's memory approach with automatic prefix caching behavior of Gemini/OpenAI/DeepSeek providers.
 
-### Compaction disabled ✅
+### All automatic compaction disabled ✅
 
-Light-tier tool result compaction (`compactToolResultsForRequest`) has been disabled. The function is preserved (prefixed with `_`) but no longer called.
+Light-tier tool result compaction (`compactToolResultsForRequest`) and emergency trim are both disabled.
 
-**Why it was removed:** Compaction trims old tool result bodies (read_file, grep, ls_dir, etc.) once the request exceeds `sizeTriggerRatio * contextWindow` (50%). On a 1M context model this fires at ~500k tokens, but only saves ~50k tokens — a ~10% reduction. The problem is that modifying any message in the history invalidates the provider's prefix cache at that point. The provider must re-process all tokens after the rewrite from scratch at full price. Net effect: saving 50k tokens but paying full price for 450k tokens that were previously cached for near-zero cost. Compaction is a net loss whenever prefix caching is available.
+**Why Light-tier was removed:** Compaction trims old tool result bodies (read_file, grep, ls_dir, etc.) once the request exceeds `sizeTriggerRatio * contextWindow` (50%). Modifying any message in the history invalidates the provider's prefix cache at that point. Net loss whenever prefix caching is available.
 
-**What remains:** Emergency trim is still active. It fires only when the request would overflow the model's context window (effectively ~100% minus output reservation) and is a last-resort safety net to prevent 400 errors.
+**Why emergency trim was removed:** The `reservedOutputTokenSpace` floor was `contextWindow * 0.5` (comment said 1/4 but code did 1/2), causing emergency trim to fire at 50% context usage regardless of the model's configured `reservedOutputTokenSpace`. The trim silently truncated messages to ~120 chars, breaking prefix cache and losing context without the user's knowledge. Removed entirely — if input exceeds context, the server rejects and the user can manually compact or start a new thread. The `reservedOutputTokenSpace` now uses the model's configured value directly (no floor override).
+
+**What remains:** Manual compaction (user-triggered via Compact button) is still available.
 
 **When to re-enable:** Only if paired with a prefix-preserving architecture (e.g., the memory system design above) where compacted content is moved into an immutable prefix, not rewritten in-place. Alternatively, compaction makes sense for models without prefix caching or with very small context windows where you'd hit the hard limit before cache savings matter.
 
