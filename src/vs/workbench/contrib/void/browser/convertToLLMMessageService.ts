@@ -7,7 +7,7 @@ import { createDecorator } from '../../../../platform/instantiation/common/insta
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IEditorService } from '../../../services/editor/common/editorService.js';
 import { ChatMessage, CompactionInfo } from '../common/chatThreadServiceTypes.js';
-import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities, getProviderCapabilities } from '../common/modelCapabilities.js';
+import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities } from '../common/modelCapabilities.js';
 import { reParsedToolXMLString, chat_systemMessage, chat_volatileContext } from '../common/prompt/prompts.js';
 import { AnthropicLLMChatMessage, AnthropicReasoning, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, OpenAILLMChatMessage, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
@@ -608,6 +608,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 	reservedOutputTokenSpace,
 	charsPerToken,
 	priorContentTokens,
+	replayReasoningInHistory,
 	providerName,
 }: {
 	messages: SimpleLLMMessage[],
@@ -620,9 +621,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 	reservedOutputTokenSpace: number | null | undefined,
 	charsPerToken: number,
 	priorContentTokens?: number,
-	// Threaded through so `prepareMessages_openai_tools` can opt-in to
-	// `reasoning_content` round-trip on assistant messages (DeepSeek V4 only,
-	// today). See `prepareMessages_openai_tools` for the gate.
+	replayReasoningInHistory?: boolean,
 	providerName?: ProviderName,
 }): {
 	messages: AnthropicOrOpenAILLMMessage[],
@@ -815,16 +814,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 		llmChatMessages = prepareMessages_anthropic_tools(messages as SimpleLLMMessage[], supportsAnthropicReasoning)
 	}
 	else if (specialToolFormat === 'openai-style') {
-		// Opt-in for `reasoning_content` round-trip on assistant messages.
-		// Required by DeepSeek V4 (thinking + tools — see note-deepseek.md §5).
-		// Enabled for any provider whose output settings declare `reasoning_content`
-		// as a delta field, so custom providers via LiteLLM/vLLM/etc. that stream
-		// reasoning_content also get correct replay.
-		const { providerReasoningIOSettings: prios } = providerName ? getProviderCapabilities(providerName) : { providerReasoningIOSettings: undefined }
-		const deltaFields = prios?.output?.nameOfFieldInDelta
-		const deltaFieldList = Array.isArray(deltaFields) ? deltaFields : deltaFields ? [deltaFields] : []
-		const supportsOAICompatReasoningContent = providerName === 'deepseek' || deltaFieldList.includes('reasoning_content')
-		llmChatMessages = prepareMessages_openai_tools(messages as SimpleLLMMessage[], supportsOAICompatReasoningContent)
+		llmChatMessages = prepareMessages_openai_tools(messages as SimpleLLMMessage[], !!replayReasoningInHistory)
 	}
 	const llmMessages = llmChatMessages
 
@@ -961,6 +951,7 @@ const prepareMessages = (params: {
 	supportsAnthropicReasoning: boolean,
 	contextWindow: number,
 	reservedOutputTokenSpace: number | null | undefined,
+	replayReasoningInHistory?: boolean,
 	providerName: ProviderName,
 	charsPerToken: number,
 	priorContentTokens?: number,
@@ -1482,6 +1473,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			specialToolFormat,
 			contextWindow,
 			supportsSystemMessage,
+			reasoningCapabilities,
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
 		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection[featureName]?.[modelSelection.providerName]?.[modelSelection.modelName]
@@ -1501,6 +1493,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			supportsAnthropicReasoning: providerName === 'anthropic',
 			contextWindow,
 			reservedOutputTokenSpace,
+			replayReasoningInHistory: reasoningCapabilities ? reasoningCapabilities.replayReasoningInHistory : false,
 			providerName,
 			charsPerToken: this._getCharsPerToken(providerName, modelName),
 		})
@@ -1517,6 +1510,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			contextWindow,
 			supportsSystemMessage,
 			supportsVision,
+			reasoningCapabilities,
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
 		const { disableSystemMessage } = this.voidSettingsService.state.globalSettings;
@@ -1609,6 +1603,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			supportsAnthropicReasoning: providerName === 'anthropic',
 			contextWindow,
 			reservedOutputTokenSpace,
+			replayReasoningInHistory: reasoningCapabilities ? reasoningCapabilities.replayReasoningInHistory : false,
 			providerName,
 			charsPerToken,
 			priorContentTokens,

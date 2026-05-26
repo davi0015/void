@@ -187,6 +187,11 @@ export type VoidStaticModelInfo = { // not stateful
 		// if it's open source and specifically outputs think tags, put the think tags here and we'll parse them out (e.g. ollama)
 		readonly openSourceThinkTags?: [string, string];
 
+		// whether to include reasoning_content on prior assistant messages when replaying conversation history.
+		// Required by DeepSeek V4 (their API returns 400 if omitted). Most providers ignore this field,
+		// so default is false to avoid sending unnecessary tokens.
+		readonly replayReasoningInHistory?: boolean;
+
 		// the only other field related to reasoning is "providerReasoningIOSettings", which varies by provider.
 	};
 
@@ -966,7 +971,7 @@ const _deepseekV4SharedCaps = {
 	supportsFIM: false, // FIM only available outside thinking mode; we don't expose FIM for V4 chat
 	supportsSystemMessage: 'system-role',
 	specialToolFormat: 'openai-style',
-	reasoningCapabilities: { supportsReasoning: true, canTurnOffReasoning: true, canIOReasoning: true, reasoningSlider: { type: 'effort_slider', values: ['high', 'max'], default: 'high' } },
+	reasoningCapabilities: { supportsReasoning: true, canTurnOffReasoning: true, canIOReasoning: true, replayReasoningInHistory: true, reasoningSlider: { type: 'effort_slider', values: ['high', 'max'], default: 'high' } },
 	downloadable: false,
 } as const satisfies Partial<VoidStaticModelInfo>
 
