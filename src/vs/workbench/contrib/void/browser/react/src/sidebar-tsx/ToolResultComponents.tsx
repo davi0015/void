@@ -304,6 +304,7 @@ export const titleOfBuiltinToolName = {
 	'search_for_files': { done: 'Searched', proposed: 'Search', running: loadingTitleWrapper('Searching') },
 	'create_file_or_folder': { done: `Created`, proposed: `Create`, running: loadingTitleWrapper(`Creating`) },
 	'delete_file_or_folder': { done: `Deleted`, proposed: `Delete`, running: loadingTitleWrapper(`Deleting`) },
+	'rename_file_or_folder': { done: `Renamed`, proposed: `Rename`, running: loadingTitleWrapper(`Renaming`) },
 	'edit_file': { done: `Edited file`, proposed: 'Edit file', running: loadingTitleWrapper('Editing file') },
 	'rewrite_file': { done: `Wrote file`, proposed: 'Write file', running: loadingTitleWrapper('Writing file') },
 	'run_command': { done: `Ran terminal`, proposed: 'Run terminal', running: loadingTitleWrapper('Running terminal') },
@@ -428,6 +429,13 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 			return {
 				desc1: toolParams.isFolder ? getFolderName(toolParams.uri.fsPath) ?? '/' : getBasename(toolParams.uri.fsPath),
 				desc1Info: getRelative(toolParams.uri, accessor),
+			}
+		},
+		'rename_file_or_folder': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['rename_file_or_folder']
+			return {
+				desc1: getBasename(toolParams.sourceUri.fsPath),
+				desc1Info: `→ ${getRelative(toolParams.targetUri, accessor)}`,
 			}
 		},
 		'rewrite_file': () => {
@@ -1370,6 +1378,37 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			else if (toolMessage.type === 'tool_request') {
 				const { result } = toolMessage
 				componentParams.onClick = () => { voidOpenFileFn(params.uri, accessor) }
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		}
+	},
+	'rename_file_or_folder': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const isError = false
+			const isRejected = toolMessage.type === 'rejected'
+			const title = getTitle(toolMessage)
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const icon = null
+
+			const { params } = toolMessage
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected, }
+
+			if (params) {
+				componentParams.info = `${getRelative(params.sourceUri, accessor)} → ${getRelative(params.targetUri, accessor)}`
+			}
+
+			if (toolMessage.type === 'success') {
+				componentParams.onClick = () => { voidOpenFileFn(params.targetUri, accessor) }
+			}
+			else if (toolMessage.type === 'tool_error') {
+				const { result } = toolMessage
+				componentParams.bottomChildren = <BottomChildren title='Error'>
+					<CodeChildren>
+						{result}
+					</CodeChildren>
+				</BottomChildren>
 			}
 
 			return <ToolHeaderWrapper {...componentParams} />

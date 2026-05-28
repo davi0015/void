@@ -308,6 +308,16 @@ export const builtinTools: {
 		},
 	},
 
+	rename_file_or_folder: {
+		name: 'rename_file_or_folder',
+		description: `Rename or move a file or folder from one path to another.`,
+		params: {
+			source_uri: { description: `Path of the existing file or folder to rename/move. Can be absolute or relative to the workspace root.` },
+			target_uri: { description: `New path for the file or folder. Can be absolute or relative to the workspace root.` },
+			overwrite: { description: 'Optional. Set to true to overwrite the target if it already exists. Default is false.' },
+		},
+	},
+
 	edit_file: {
 		name: 'edit_file',
 		description: `Edit the contents of a file. You must provide the file's URI as well as a SINGLE string of SEARCH/REPLACE block(s) that will be used to apply the edit. IMPORTANT: When editing a file multiple times, combine ALL changes into a SINGLE edit_file call with multiple SEARCH/REPLACE blocks. Do NOT call edit_file multiple times for the same file in one turn — each call modifies the file, making subsequent SEARCH blocks stale.`,

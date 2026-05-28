@@ -1855,7 +1855,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				} else if (mode === 'workspace') {
 					if (approvalIsWorkspaceScoped(approvalType) && isBuiltInTool) {
 						const targetUri = (toolParams as { uri?: URI } | undefined)?.uri
-						autoApprove = !!targetUri && this._workspaceContextService.isInsideWorkspace(targetUri)
+						const sourceUri = (toolParams as { sourceUri?: URI } | undefined)?.sourceUri
+						const targetUri2 = (toolParams as { targetUri?: URI } | undefined)?.targetUri
+						const urisToCheck = [targetUri, sourceUri, targetUri2].filter((u): u is URI => !!u)
+						autoApprove = urisToCheck.length > 0 && urisToCheck.every(u => this._workspaceContextService.isInsideWorkspace(u))
 					} else {
 						autoApprove = true
 					}

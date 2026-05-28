@@ -441,6 +441,14 @@ export class ToolsService implements IToolsService {
 				return { uri, isRecursive, isFolder }
 			},
 
+			rename_file_or_folder: (params: RawToolParamsObj) => {
+				const { source_uri: sourceUnknown, target_uri: targetUnknown, overwrite: overwriteUnknown } = params
+				const sourceUri = validateURI(sourceUnknown)
+				const targetUri = validateURI(targetUnknown)
+				const overwrite = validateBoolean(overwriteUnknown, { default: false })
+				return { sourceUri, targetUri, overwrite }
+			},
+
 			rewrite_file: (params: RawToolParamsObj) => {
 				const { uri: uriStr, new_content: newContentUnknown } = params
 				const uri = validateURI(uriStr)
@@ -714,6 +722,19 @@ export class ToolsService implements IToolsService {
 				return { result: {} }
 			},
 
+			rename_file_or_folder: async ({ sourceUri, targetUri, overwrite }) => {
+				// Clean up any pending diffs for the source before moving
+				const sourcePath = sourceUri.fsPath
+				for (const trackedPath of Object.keys(editCodeService.diffAreasOfURI)) {
+					if (trackedPath === sourcePath || trackedPath.startsWith(sourcePath + '/')) {
+						const trackedUri = URI.file(trackedPath)
+						editCodeService.acceptOrRejectAllDiffAreas({ uri: trackedUri, removeCtrlKs: true, behavior: 'accept', _addToHistory: false })
+					}
+				}
+				await fileService.move(sourceUri, targetUri, overwrite)
+				return { result: {} }
+			},
+
 			rewrite_file: async ({ uri, newContent }) => {
 				// Check file existence BEFORE `initializeModel` — the latter silently
 				// swallows FileNotFound (catches and logs) and returns void, making the
@@ -878,6 +899,9 @@ export class ToolsService implements IToolsService {
 			},
 			delete_file_or_folder: (params, result) => {
 				return `URI ${params.uri.fsPath} successfully deleted.`
+			},
+			rename_file_or_folder: (params, result) => {
+				return `Successfully renamed ${params.sourceUri.fsPath} to ${params.targetUri.fsPath}.`
 			},
 			edit_file: (params, result) => {
 				const lintErrsString = (
