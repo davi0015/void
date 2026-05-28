@@ -42,3 +42,9 @@ export const LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY = 'void.chatLastActiveT
 
 
 export const OPT_OUT_KEY = 'void.app.optOutAll'
+
+
+// Pending diff zones (green/red AI edits not yet accepted/rejected) that
+// existed when the window was shut down. Rehydrated on next startup so the
+// user doesn't lose the ability to review/reject edits after a restart.
+export const PENDING_DIFFS_STORAGE_KEY = 'void.pendingDiffsI'

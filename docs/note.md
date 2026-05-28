@@ -789,6 +789,14 @@ Deferred fixes (still not shipped; re-open only if symptoms return):
 - Fix 2: wrapped `ToolResultWrapper` rendering in its own `ErrorBoundary` with a graceful fallback (`"Tool: {name} ⚠ Render error"`). Any future rendering crash in a tool result component now degrades to a compact error indicator instead of crashing the entire chat bubble. The tool's execution result (success/error) remains correctly communicated to the LLM regardless of rendering failures.
 - Files: `editCodeService.ts`, `SidebarChat.tsx`
 
+**Pending diffs persistence across restarts** ✅ DONE
+- Problem: when the window restarted, all pending diffs (green/red AI edits not yet accepted/rejected) silently disappeared. The file on disk kept the new content but the user lost the UI to review/reject individual changes.
+- Root cause: `diffAreaOfId` / `diffAreasOfURI` are in-memory only — not persisted or rehydrated on startup.
+- Fix: persist `VoidFileSnapshot` for all URIs with pending DiffZones to `IStorageService` on every change (debounced 1s). On startup, `_rehydratePendingDiffs` reads the snapshots and recreates the DiffZone objects WITHOUT changing file content (unlike `_restoreVoidFileSnapshot` which reverts the file). Then `_refreshStylesAndDiffsInURI` recomputes and renders the green/red diffs by comparing `originalCode` against current file content.
+- CtrlKZones and TrackingZones are intentionally not rehydrated — they're transient UI elements.
+- Storage key: `void.pendingDiffsI` (in `common/storageKeys.ts`). Auto-cleared when all diffs are accepted/rejected.
+- Files: `editCodeService.ts`, `storageKeys.ts`
+
 ### Next — Workspace-scoped chats (in progress, 5 commits)
 
 Goal: chat history lives "in the workspace", not as one global pile. Default thread list shows current workspace's chats + legacy unscoped; other workspaces' chats are visible as **read-only** in an "Other workspaces" group, with explicit Copy/Move actions to bring them into the current workspace.

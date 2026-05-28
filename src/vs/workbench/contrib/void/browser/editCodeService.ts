@@ -46,6 +46,8 @@ import { deepClone } from '../../../../base/common/objects.js';
 import { acceptBg, acceptBorder, buttonFontSize, buttonTextColor, rejectBg, rejectBorder } from '../common/helpers/colors.js';
 import { DiffArea, Diff, CtrlKZone, VoidFileSnapshot, DiffAreaSnapshotEntry, diffAreaSnapshotKeys, DiffZone, TrackingZone, ComputedDiff } from '../common/editCodeServiceTypes.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
+import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
+import { PENDING_DIFFS_STORAGE_KEY } from '../common/storageKeys.js';
 // import { isMacintosh } from '../../../../base/common/platform.js';
 // import { VOID_OPEN_SETTINGS_ACTION_ID } from './voidSettingsPane.js';
 
@@ -205,6 +207,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		// @IFileService private readonly _fileService: IFileService,
 		@IVoidModelService private readonly _voidModelService: IVoidModelService,
 		@IConvertToLLMMessageService private readonly _convertToLLMMessageService: IConvertToLLMMessageService,
+		@IStorageService private readonly _storageService: IStorageService,
 	) {
 		super();
 
@@ -249,6 +252,16 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		// add listeners for all existing editors + listen for editor being added
 		for (let editor of this._codeEditorService.listCodeEditors()) { initializeEditor(editor) }
 		this._register(this._codeEditorService.onCodeEditorAdd(editor => { initializeEditor(editor) }))
+
+
+		// Persist pending diffs on every change (survives crashes); rehydrate on startup.
+		// Debounced to avoid excessive writes during streaming.
+		this._rehydratePendingDiffs()
+		let persistTimer: ReturnType<typeof setTimeout> | undefined
+		this._register(this.onDidAddOrDeleteDiffZones(() => {
+			if (persistTimer) clearTimeout(persistTimer)
+			persistTimer = setTimeout(() => this._persistPendingDiffs(), 1000)
+		}))
 
 
 	}
@@ -746,6 +759,82 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			{ shouldRealignDiffAreas: false }
 		)
 		// this._noLongerNeedModelReference(uri)
+	}
+
+	// --- Pending diffs persistence ---
+
+	// Only DiffZones are persisted — CtrlKZones are transient UI elements.
+	private _persistPendingDiffs(): void {
+		const pendingSnapshotsOfURI: { [fsPath: string]: VoidFileSnapshot } = {}
+
+		for (const fsPath in this.diffAreasOfURI) {
+			const diffAreaIds = this.diffAreasOfURI[fsPath]
+			if (!diffAreaIds?.size) continue
+			if (![...diffAreaIds].some(id => this.diffAreaOfId[id]?.type === 'DiffZone')) continue
+			pendingSnapshotsOfURI[fsPath] = this._getCurrentVoidFileSnapshot(URI.file(fsPath))
+		}
+
+		if (Object.keys(pendingSnapshotsOfURI).length === 0) {
+			this._storageService.remove(PENDING_DIFFS_STORAGE_KEY, StorageScope.APPLICATION)
+			return
+		}
+
+		this._storageService.store(PENDING_DIFFS_STORAGE_KEY, JSON.stringify(pendingSnapshotsOfURI), StorageScope.APPLICATION, StorageTarget.USER)
+	}
+
+	private async _rehydratePendingDiffs(): Promise<void> {
+		const raw = this._storageService.get(PENDING_DIFFS_STORAGE_KEY, StorageScope.APPLICATION)
+		if (!raw) return
+
+		let parsed: unknown
+		try {
+			parsed = JSON.parse(raw, (key, value) =>
+				value && typeof value === 'object' && value.$mid === 1 ? URI.from(value) : value
+			)
+		} catch { return }
+
+		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return
+
+		for (const [fsPath, snapshot] of Object.entries(parsed as { [fsPath: string]: VoidFileSnapshot })) {
+			const uri = URI.file(fsPath)
+			// getModelSafe ensures the model is initialized (loads from disk if needed)
+			const { model } = await this._voidModelService.getModelSafe(uri)
+			if (model) {
+				this._rehydratePendingDiffsForURI(uri, snapshot)
+			}
+		}
+	}
+
+	// Recreate DiffZones from a snapshot WITHOUT changing the file content.
+	// Unlike _restoreVoidFileSnapshot (which reverts the file), this keeps
+	// the current file content and just recreates the green/red UI.
+	// CtrlKZones and TrackingZones are transient — not rehydrated.
+	private _rehydratePendingDiffsForURI(uri: URI, snapshot: VoidFileSnapshot): void {
+		const { snapshottedDiffAreaOfId } = deepClone(snapshot)
+
+		for (const diffareaid in snapshottedDiffAreaOfId) {
+			const snapshottedDiffArea = snapshottedDiffAreaOfId[diffareaid]
+			if (snapshottedDiffArea.type !== 'DiffZone') continue
+
+			this.diffAreaOfId[diffareaid] = {
+				...snapshottedDiffArea as DiffAreaSnapshotEntry<DiffZone>,
+				type: 'DiffZone',
+				_diffOfId: {},
+				_URI: uri,
+				_streamState: { isStreaming: false },
+				_removeStylesFns: new Set(),
+			}
+			this._addOrInitializeDiffAreaAtURI(uri, diffareaid)
+
+			// Advance the ID pool past rehydrated IDs to avoid collisions
+			const numericId = parseInt(diffareaid, 10)
+			if (!isNaN(numericId) && numericId >= this._diffareaidPool) {
+				this._diffareaidPool = numericId + 1
+			}
+		}
+
+		this._onDidAddOrDeleteDiffZones.fire({ uri })
+		this._refreshStylesAndDiffsInURI(uri)
 	}
 
 	private _addToHistory(uri: URI, opts?: { onWillUndo?: () => void }) {
