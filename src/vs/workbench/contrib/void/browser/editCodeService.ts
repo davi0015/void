@@ -2397,7 +2397,7 @@ class AcceptRejectInlineWidget extends Widget implements IOverlayWidget {
 
 			const commandBarStateAtUri = this._voidCommandBarService.stateOfURI[uri.fsPath];
 			const selectedDiffIdx = commandBarStateAtUri?.diffIdx ?? 0; // 0th item is selected by default
-			const thisDiffIdx = commandBarStateAtUri?.sortedDiffIds.indexOf(diffid) ?? null;
+			const thisDiffIdx = commandBarStateAtUri?.sortedDiffIds?.indexOf(diffid) ?? null;
 
 			const showLabel = thisDiffIdx === selectedDiffIdx
 

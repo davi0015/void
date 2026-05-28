@@ -23,7 +23,7 @@ import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
-import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning, Scissors } from 'lucide-react';
+import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning, Scissors, AlertTriangle } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { generateUuid } from '../../../../../../../base/common/uuid.js';
 import { VSBuffer } from '../../../../../../../base/common/buffer.js';
@@ -2026,11 +2026,21 @@ const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, me
 		if (ToolResultWrapper)
 			return <>
 				<div className={`${isCheckpointGhost ? 'opacity-50' : ''}`}>
-					<ToolResultWrapper
-						toolMessage={chatMessage}
-						messageIdx={messageIdx}
-						threadId={threadId}
-					/>
+					<ErrorBoundary fallback={
+						<div className='w-full border border-void-border-3 rounded px-2 py-1 bg-void-bg-3'>
+							<div className='flex items-center gap-x-2 min-h-[24px]'>
+								<span className='text-void-fg-3 text-xs'>Tool: {chatMessage.name}</span>
+								<AlertTriangle className='text-void-warning opacity-90 flex-shrink-0' size={14} />
+								<span className='text-void-warning text-xs opacity-90'>Render error</span>
+							</div>
+						</div>
+					}>
+						<ToolResultWrapper
+							toolMessage={chatMessage}
+							messageIdx={messageIdx}
+							threadId={threadId}
+						/>
+					</ErrorBoundary>
 				</div>
 				{chatMessage.type === 'tool_request' && messageIdx === firstPendingToolRequestIdx ?
 					<div className={`${isCheckpointGhost ? 'opacity-50 pointer-events-none' : ''}`}>
