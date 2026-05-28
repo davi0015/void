@@ -797,6 +797,14 @@ Deferred fixes (still not shipped; re-open only if symptoms return):
 - Storage key: `void.pendingDiffsI` (in `common/storageKeys.ts`). Auto-cleared when all diffs are accepted/rejected.
 - Files: `editCodeService.ts`, `storageKeys.ts`
 
+**Manual compaction prefix cache fix** ✅ DONE
+- Problem: after manual compaction, the LLM provider's prefix cache became unstable on every subsequent turn, causing the entire prefix to be re-ingested instead of hitting the cache.
+- Root cause: the compaction summary user message prepended a freshly-generated volatile context via `generateChatVolatileContext` on every call to `prepareLLMChatMessages`. Since volatile context changes each turn, the summary user message content shifted, breaking the prefix cache.
+- Fix: bake the directory listing into `compactionSummary` at compaction time (same pattern as normal chat bakes it into the first user message at send time). The summary user message is then stable across turns. Two cases:
+  - No compaction: system + [directory+content user] + assistant + ...
+  - Compaction: system + [directory+summary user] + [ack assistant] + ...
+- Files: `convertToLLMMessageService.ts`, `chatThreadService.ts`
+
 ### Next — Workspace-scoped chats (in progress, 5 commits)
 
 Goal: chat history lives "in the workspace", not as one global pile. Default thread list shows current workspace's chats + legacy unscoped; other workspaces' chats are visible as **read-only** in an "Other workspaces" group, with explicit Copy/Move actions to bring them into the current workspace.

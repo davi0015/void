@@ -1419,21 +1419,12 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 				}
 			}
 			if (llmBoundary > 0 && llmBoundary <= llmMessagesRaw.length) {
-				// The first user message (which carried the directory listing) is
-				// now inside the compacted region. Re-inject a fresh volatile
-				// context (with directory listing) so the LLM retains awareness
-				// of the workspace structure after compaction.
-				const { volatile: freshVolatile } = await this.generateChatVolatileContext({ chatMode, includeDirectoryListing: true })
-				const summaryContent = [
-					freshVolatile,
-					'',
-					'[Conversation compacted — summary of prior context]',
-					'',
-					manualCompaction.summary,
-				].join('\n')
+				// The summary user message already has the directory listing
+				// baked in at compaction time (same pattern as the first user
+				// message in normal chat). Content is stable across turns.
 				const summaryUser: SimpleLLMMessage = {
 					role: 'user',
-					content: summaryContent,
+					content: manualCompaction.summary,
 				}
 				const summaryAssistant: SimpleLLMMessage = {
 					role: 'assistant',

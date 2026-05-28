@@ -233,6 +233,7 @@ export type ThreadType = {
 	compactionPercent?: number;
 	compactionSavedTokens?: number;
 
+
 	// Snapshot of workspace file paths from the last directory listing sent to
 	// the LLM. Used to compute a compact diff on subsequent turns instead of
 	// repeating the full directory tree. Persisted so it survives reload.
@@ -4172,11 +4173,12 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const modelSelectionOptions = this._settingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
 		let systemMessageChars = 0
+		const { chatMode } = this._settingsService.state.globalSettings
 		const sendCompactionFromChatMessages = async (chatMsgs: ChatMessage[], label: string) => {
 			const { messages: msgs, separateSystemMessage: sysMsg } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages: chatMsgs,
 				modelSelection,
-				chatMode: 'agent',
+				chatMode,
 				frozenAiInstructions,
 				manualCompaction,
 			})
@@ -4253,10 +4255,21 @@ We only need to do it for files that were edited since `from`, ie files between 
 				savedTokens = Math.max(0, Math.round((compactableChars - summary.trim().length) / charsPerToken))
 			}
 
+			// Store the directory listing at compaction time so it can be
+			// appended to the system message on every turn (prefix cache stays
+			// stable). The summary stays clean — just conversation history.
+			// Bake the directory listing into the summary at compaction time,
+			// same pattern as the first user message in normal chat.
+			// This keeps the summary user message stable across turns.
+			const { volatile: directoryListing } = await this._convertToLLMMessagesService.generateChatVolatileContext({ chatMode: 'agent', includeDirectoryListing: true })
+			const summaryWithDirectory = directoryListing
+				? `${directoryListing}\n\n[Conversation compacted — summary of prior context]\n\n${summary.trim()}`
+				: `[Conversation compacted — summary of prior context]\n\n${summary.trim()}`
+
 			const updatedThread: ThreadType = {
 				...thread,
 				lastModified: new Date().toISOString(),
-				compactionSummary: summary.trim(),
+				compactionSummary: summaryWithDirectory,
 				compactionBoundaryIdx: boundaryIdx,
 				compactionPercent: compactPercent,
 				compactionSavedTokens: savedTokens,
