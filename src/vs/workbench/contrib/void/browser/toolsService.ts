@@ -701,6 +701,15 @@ export class ToolsService implements IToolsService {
 			},
 
 			delete_file_or_folder: async ({ uri, isRecursive }) => {
+				// Clean up any pending diffs for the file (or files under the folder)
+				// before deletion, so the diff UI doesn't reference stale URIs.
+				const uriPath = uri.fsPath
+				for (const trackedPath of Object.keys(editCodeService.diffAreasOfURI)) {
+					if (trackedPath === uriPath || (isRecursive && trackedPath.startsWith(uriPath + '/'))) {
+						const trackedUri = URI.file(trackedPath)
+						editCodeService.acceptOrRejectAllDiffAreas({ uri: trackedUri, removeCtrlKs: true, behavior: 'accept', _addToHistory: false })
+					}
+				}
 				await fileService.del(uri, { recursive: isRecursive })
 				return { result: {} }
 			},
