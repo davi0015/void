@@ -838,6 +838,12 @@ Deferred fixes (still not shipped; re-open only if symptoms return):
 - Fix: removed `initialFillDoneRef` guards from the spacer-height sync `useLayoutEffect` and the `ResizeObserver` callback. Spacer height is now always synced to content height, even before the initial fill completes.
 - Files: `SidebarChat.tsx`
 
+**Bidirectional LazyBlockCode + model disposal** ✅ DONE
+- Problem: `LazyBlockCode` was monotonic — once a Monaco editor was mounted, it stayed mounted forever, even when scrolled out of view. Combined with leaked text models (models were created in `modelOfEditorId` but never disposed on unmount), this caused unbounded memory and worker thread growth during long sessions.
+- Fix (bidirectional unmount): `LazyBlockCode` now unmounts Monaco when the block scrolls away (downgrades to `<pre><code>` placeholder) and re-mounts on re-entry. Height is locked during transitions to prevent scroll jumps. A `requestAnimationFrame` check handles the case where the element is already out of viewport when the observer starts (e.g., streaming just ended). This caps live Monacos to the viewport count (~5-10) instead of growing unboundedly.
+- Fix (model disposal): `BlockCode`'s dispose callback now disposes the text model and removes it from `modelOfEditorId`, releasing language workers and associated resources.
+- Files: `inputs.tsx`
+
 ### Next — Workspace-scoped chats (in progress, 5 commits)
 
 Goal: chat history lives "in the workspace", not as one global pile. Default thread list shows current workspace's chats + legacy unscoped; other workspaces' chats are visible as **read-only** in an "Other workspaces" group, with explicit Copy/Move actions to bring them into the current workspace.

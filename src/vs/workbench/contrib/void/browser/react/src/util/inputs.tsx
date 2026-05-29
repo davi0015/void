@@ -1776,7 +1776,12 @@ const BlockCode = ({ initValue, language, maxHeight, showScrollbars, onReady }: 
 			}, [modelService])}
 
 			dispose={useCallback((editor: CodeEditorWidget) => {
-				editor.dispose();
+				const model = editor.getModel()
+				editor.dispose()
+				if (model) {
+					model.dispose()
+					delete modelOfEditorId[id]
+				}
 			}, [modelService])}
 
 			propsFn={useCallback(() => { return [] }, [])}
@@ -1815,23 +1820,29 @@ const scheduleLazyMount = (cb: () => void) => {
 
 
 // Lazy wrapper around BlockCode that defers mounting the heavy Monaco CodeEditorWidget
-// until the block is close to the viewport. Rendering dozens of Monaco editors per chat
-// thread is the dominant cost on tab switches / long chats (disposable churn, TextMate
-// worker attach/detach, scrollbar+sash+hover provider allocation). We render a plain
-// <pre><code> placeholder with the same container styling while off-screen, then upgrade
-// in-place to the real BlockCode when the IntersectionObserver fires. Upgrade is
-// monotonic: once mounted, Monaco stays mounted — the expensive work is the mount itself,
-// not the continued existence. Mounts are also funneled through a per-frame queue
-// (`scheduleLazyMount`) so a burst of IO fires during fast scrolling staggers instead
-// of piling onto a single frame.
+// until the block is near the viewport, and unmounts it when it scrolls away.
+// Rendering dozens of Monaco editors per chat thread is the dominant cost on
+// tab switches / long chats (disposable churn, TextMate worker attach/detach,
+// scrollbar+sash+hover provider allocation). We render a plain <pre><code>
+// placeholder with the same container styling while off-screen, then upgrade
+// in-place to the real BlockCode when the IntersectionObserver fires. When the
+// block scrolls away, we downgrade back to the placeholder — this caps live
+// Monacos to the viewport count (~5-10) instead of growing unboundedly.
+// Mounts are funneled through a per-frame queue (`scheduleLazyMount`) so a
+// burst of IO fires during fast scrolling staggers instead of piling onto a
+// single frame. Unmounts are immediate to release memory/workers ASAP.
 export const LazyBlockCode = ({ initValue, language, maxHeight, showScrollbars, isStreaming }: BlockCodeProps) => {
 	const wrapperRef = useRef<HTMLDivElement | null>(null)
 	const lockedHeightRef = useRef<number | null>(null)
 	const [isVisible, setIsVisible] = useState(false)
+	const isVisibleRef = useRef(isVisible)
+	isVisibleRef.current = isVisible
 
 	useEffect(() => {
-		if (isStreaming) return
-		if (isVisible) return
+		if (isStreaming) {
+			setIsVisible(true)
+			return
+		}
 		const el = wrapperRef.current
 		if (!el) return
 		if (typeof IntersectionObserver === 'undefined') {
@@ -1842,22 +1853,48 @@ export const LazyBlockCode = ({ initValue, language, maxHeight, showScrollbars, 
 		const io = new IntersectionObserver((entries) => {
 			if (cancelled) return
 			if (entries.some(e => e.isIntersecting)) {
-				io.disconnect()
 				scheduleLazyMount(() => {
 					if (cancelled) return
-					// Capture placeholder height so the wrapper stays the same
-					// size while Monaco replaces the <pre> content inside it.
+					lockedHeightRef.current = el.offsetHeight
+					setIsVisible(true)
+				})
+			} else if (entries.every(e => !e.isIntersecting)) {
+				// Scrolled away — freeze the current height so the wrapper
+				// doesn't collapse when Monaco unmounts, then downgrade to
+				// the lightweight <pre><code> placeholder.
+				const currentHeight = el.offsetHeight
+				if (currentHeight > 0) {
+					lockedHeightRef.current = currentHeight
+				}
+				setIsVisible(false)
+			}
+		}, { rootMargin: '500px 0px' })
+		io.observe(el)
+		// If the element is already out of viewport when the observer
+		// starts (e.g., streaming just ended and the block scrolled away),
+		// the IO won't fire because there's no transition. Check immediately.
+		// Use requestAnimationFrame to let the browser compute layout first.
+		requestAnimationFrame(() => {
+			if (cancelled) return
+			const rect = el.getBoundingClientRect()
+			// Expand check by rootMargin (500px) to match the IO threshold
+			const isInViewport = rect.bottom > -500 && rect.top < window.innerHeight + 500
+			if (!isInViewport && isVisibleRef.current) {
+				lockedHeightRef.current = el.offsetHeight
+				setIsVisible(false)
+			} else if (isInViewport && !isVisibleRef.current) {
+				scheduleLazyMount(() => {
+					if (cancelled) return
 					lockedHeightRef.current = el.offsetHeight
 					setIsVisible(true)
 				})
 			}
-		}, { rootMargin: '500px 0px' })
-		io.observe(el)
+		})
 		return () => {
 			cancelled = true
 			io.disconnect()
 		}
-	}, [isVisible, isStreaming])
+	}, [isStreaming])
 
 	// Once Monaco's onDidContentSizeChange fires and sets the real height,
 	// clear the locked height so the wrapper follows the editor naturally.
