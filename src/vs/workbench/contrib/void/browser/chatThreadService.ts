@@ -4172,7 +4172,6 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const { overridesOfModel } = this._settingsService.state
 		const modelSelectionOptions = this._settingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
-		let systemMessageChars = 0
 		const { chatMode } = this._settingsService.state.globalSettings
 		const sendCompactionFromChatMessages = async (chatMsgs: ChatMessage[], label: string) => {
 			const { messages: msgs, separateSystemMessage: sysMsg } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
@@ -4182,7 +4181,6 @@ We only need to do it for files that were edited since `from`, ie files between 
 				frozenAiInstructions,
 				manualCompaction,
 			})
-			if (sysMsg) systemMessageChars = sysMsg.length
 			return new Promise<string>((resolve, reject) => {
 				this._llmMessageService.sendLLMMessage({
 					messagesType: 'chatMessages',
@@ -4210,6 +4208,12 @@ We only need to do it for files that were edited since `from`, ie files between 
 		// Block message input during compaction (same as running agent)
 		this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '', reasoningSoFar: '', toolCallsSoFar: [] }, interrupt: Promise.resolve(() => { }) })
 
+		// Save the pre-compaction usage so we can restore it after. The
+		// compaction request's usage overwrites latestUsage, but the user's
+		// "last request" stats should reflect their last normal chat turn,
+		// not the internal compaction operation.
+		const preCompactionLatestUsage = thread.latestUsage ? { ...thread.latestUsage } : undefined
+
 		try {
 			const summary = await sendCompactionFromChatMessages(compactionMessages, 'Manual Compaction')
 
@@ -4231,26 +4235,45 @@ We only need to do it for files that were edited since `from`, ie files between 
 				targetChars,
 			})
 
-			// saved = lastInputTokens - systemTokens - recentTokens - summaryTokens
+			// Per-turn savings = what the full conversation costs minus what
+			// the compacted conversation costs. We use the provider's actual
+			// inputTokens from the compaction request (which sent the full
+			// conversation + summarization prompt) and subtract the estimated
+			// cost of system + recent messages + summary + summarization prompt.
+			// This captures structural overhead (tool schemas, message framing)
+			// that char-count-based estimates miss — which is significant for
+			// tool-heavy conversations.
 			const summaryTokens = Math.round(summary.trim().length / charsPerToken)
+			const summarizationPromptTokens = Math.round(summarizationPrompt.length / charsPerToken)
 			const lastInputTokens = this.latestUsageOfThreadId[threadId]?.inputTokens
 			let savedTokens: number
-			if (lastInputTokens && systemMessageChars > 0) {
-				let recentChars = 0
-				for (let i = boundaryIdx; i < chatMessages.length; i++) {
-					const m = chatMessages[i]
-					if (m.role === 'user') recentChars += (m.content?.length ?? 0)
-					else if (m.role === 'assistant') recentChars += (m.displayContent?.length ?? 0) + (m.reasoning?.length ?? 0)
-					else if (m.role === 'tool') {
-						recentChars += (m.rawParamsStr?.length ?? 0)
-						const r = m.result
-						if (typeof r === 'string') recentChars += r.length
-						else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') recentChars += ((r as { content: string }).content.length)
+			if (lastInputTokens) {
+				// Estimate recent (post-boundary) tokens using the provider's
+				// real ratio rather than charsPerToken, so structural overhead
+				// is proportionally included.
+				const recentChars = (() => {
+					let n = 0
+					for (let i = boundaryIdx; i < chatMessages.length; i++) {
+						const m = chatMessages[i]
+						if (m.role === 'user') n += (m.content?.length ?? 0)
+						else if (m.role === 'assistant') n += (m.displayContent?.length ?? 0) + (m.reasoning?.length ?? 0)
+						else if (m.role === 'tool') {
+							n += (m.rawParamsStr?.length ?? 0)
+							const r = m.result
+							if (typeof r === 'string') n += r.length
+							else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') n += ((r as { content: string }).content.length)
+						}
 					}
-				}
-				const recentTokens = Math.round(recentChars / charsPerToken)
-				const systemTokens = Math.round(systemMessageChars / charsPerToken)
-				savedTokens = Math.max(0, lastInputTokens - systemTokens - recentTokens - summaryTokens)
+					return n
+				})()
+				// Derive the real chars→tokens ratio from the compaction request
+				// (sentChars ≈ compactableChars + recentChars + summarizationPrompt
+				// body chars). This ratio captures structural overhead that plain
+				// body-char counting misses.
+				const fullBodyChars = compactableChars + recentChars + summarizationPrompt.length
+				const realCharsPerToken = fullBodyChars / lastInputTokens
+				const recentTokens = Math.round(recentChars / realCharsPerToken)
+				savedTokens = Math.max(0, lastInputTokens - recentTokens - summarizationPromptTokens - summaryTokens)
 			} else {
 				savedTokens = Math.max(0, Math.round((compactableChars - summary.trim().length) / charsPerToken))
 			}
@@ -4274,6 +4297,12 @@ We only need to do it for files that were edited since `from`, ie files between 
 				compactionPercent: compactPercent,
 				compactionSavedTokens: savedTokens,
 			}
+			// Restore the pre-compaction latestUsage so the tooltip shows
+			// the user's last normal chat turn, not the compaction request.
+			if (preCompactionLatestUsage) {
+				updatedThread.latestUsage = preCompactionLatestUsage
+				this.latestUsageOfThreadId[threadId] = preCompactionLatestUsage
+			}
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 			this._storeThread(threadId, updatedThread)
 			this._setState({ allThreads: newThreads })
@@ -4281,6 +4310,15 @@ We only need to do it for files that were edited since `from`, ie files between 
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e)
 			console.error('[Compaction] Failed:', e)
+			// Restore pre-compaction usage on error too, so a failed
+			// compaction doesn't leave stale stats.
+			if (preCompactionLatestUsage) {
+				const currentThread = this.state.allThreads[threadId]
+				if (currentThread) {
+					currentThread.latestUsage = preCompactionLatestUsage
+					this.latestUsageOfThreadId[threadId] = preCompactionLatestUsage
+				}
+			}
 			return msg
 		} finally {
 			this._setStreamState(threadId, undefined)
