@@ -2591,10 +2591,6 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		const scrollEl = scrollContainerRef.current
 		const spacerEl = spacerRef.current
 		if (!scrollEl || !spacerEl) return
-		// Always sync spacer height to content, even before initial fill
-		// completes. Without this, messages can be invisible if the initial
-		// fill phase hasn't run yet (e.g., scrollEl.clientHeight === 0 on
-		// first render in a hidden tab).
 
 		const contentH = getContentHeight()
 		const oldH = spacerHeightRef.current
@@ -2605,22 +2601,24 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		if (Math.abs(delta) < 1) return
 
 		spacerHeightRef.current = contentH
+		spacerEl.style.height = contentH + 'px'
+
+		// Scroll compensation only after initial fill — before that the
+		// baseline is unreliable and compensation would misalign the
+		// viewport. During initial fill, just set the spacer height so
+		// content is visible; scrolling to bottom happens in the initial
+		// fill effect itself.
+		if (!initialFillDoneRef.current) return
 
 		if (mountStartChanged) {
 			if (delta > 0) {
-				spacerEl.style.height = contentH + 'px'
 				scrollEl.scrollTop += delta
 			} else {
 				scrollEl.scrollTop += delta
-				spacerEl.style.height = contentH + 'px'
 			}
 			lastScrollTopRef.current = scrollEl.scrollTop
 		} else {
-			// Check wasAtBottom BEFORE updating spacer height — reading
-			// scrollHeight after the spacer grows would make us appear
-			// far from bottom, breaking auto-scroll on message commit.
 			const wasAtBottom = Math.abs(scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop) < 40
-			spacerEl.style.height = contentH + 'px'
 			if (wasAtBottom) {
 				scrollEl.scrollTop = 1e10
 			}
@@ -2642,6 +2640,14 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		let prevWidth = scrollEl.clientWidth
 
 		const contentRo = new ResizeObserver(() => {
+			if (!initialFillDoneRef.current) {
+				// Still in initial fill — just sync height, no scroll compensation
+				const contentH = contentEl.offsetHeight
+				spacerHeightRef.current = contentH
+				spacerEl.style.height = contentH + 'px'
+				return
+			}
+
 			const currWidth = scrollEl.clientWidth
 			const widthChanged = currWidth !== prevWidth
 			prevWidth = currWidth
