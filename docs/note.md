@@ -820,6 +820,19 @@ Deferred fixes (still not shipped; re-open only if symptoms return):
 - Fix: save `thread.latestUsage` before compaction starts, restore it after compaction completes (success or failure). The cumulative counters still include compaction tokens (the user was billed for them), but the "last request" line reflects the user's last normal turn.
 - Files: `chatThreadService.ts`
 
+**Request timing in usage stats** ✅ DONE
+- Added timing fields to `LLMUsage`: `ttftMs`, `totalMs`, `requestCount`, `wallMs`, `ttftMsSum`.
+- Captured in the normal chat loop: `requestStartMs` recorded before `sendLLMMessage`, `firstTokenMs` on first non-empty `onText` callback, `totalMs` on `onFinalMessage`.
+- `_addUsage` sums `requestCount`, `wallMs`, `ttftMsSum` cumulatively; carries latest for `ttftMs` and `totalMs`.
+- TokenUsageRing tooltip:
+  - **Last request**: `TTFT: Xms, Total: Xs`
+  - **Cumulative (turn/thread)**: `3 requests, avg TTFT: 1.2s, 8.5s`
+  - Output token rate shows both generation and effective: `Output: 5.2k (42 tok/s gen, 28 tok/s eff)`
+    - **gen** = `outputTokens / (wallMs - ttftMsSum)` — pure model throughput, excludes TTFT
+    - **eff** = `outputTokens / wallMs` — end-to-end rate the user experiences, includes TTFT
+- Known limitation: for existing threads, `wallMs` only accumulates from requests made after this change while `outputTokens` has full history — the rate will be inaccurate until enough new requests land. New threads are accurate from the start.
+- Files: `sendLLMMessageTypes.ts`, `chatThreadService.ts`, `SidebarChat.tsx`
+
 ### Next — Workspace-scoped chats (in progress, 5 commits)
 
 Goal: chat history lives "in the workspace", not as one global pile. Default thread list shows current workspace's chats + legacy unscoped; other workspaces' chats are visible as **read-only** in an "Other workspaces" group, with explicit Copy/Move actions to bring them into the current workspace.

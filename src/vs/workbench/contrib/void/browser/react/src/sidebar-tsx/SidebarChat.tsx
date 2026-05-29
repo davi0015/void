@@ -331,18 +331,56 @@ interface TokenUsageRingProps {
 
 // Format a single LLMUsage block for the tooltip. Returns an array of plain
 // text lines (no HTML — react-tooltip's html mode is blocked by Trusted Types).
-const formatUsageBlock = (label: string, u: LLMUsage | undefined): (string | null)[] => {
+const formatDuration = (ms: number | undefined): string => {
+	if (ms === undefined) return ''
+	if (ms < 1000) return `${Math.round(ms)}ms`
+	return `${(ms / 1000).toFixed(1)}s`
+}
+
+const formatTokenRate = (tokens: number | undefined, ms: number | undefined): string => {
+	if (tokens === undefined || !ms || ms === 0) return ''
+	const rate = tokens / (ms / 1000)
+	return `${rate.toFixed(0)} tok/s`
+}
+
+const formatUsageBlock = (label: string, u: LLMUsage | undefined, mode: 'single' | 'cumulative' = 'single'): (string | null)[] => {
 	if (!u) return [`${label}: -`]
 	const total = u.totalTokens ?? ((u.inputTokens ?? 0) + (u.outputTokens ?? 0) + (u.reasoningTokens ?? 0))
 	const inputLine = u.cachedInputTokens !== undefined
 		? `  Input: ${formatTokenCount(u.inputTokens)} (${formatTokenCount(u.cachedInputTokens)} cached)`
 		: `  Input: ${formatTokenCount(u.inputTokens)}`
+	// Generation rate (excludes TTFT) vs effective rate (includes TTFT).
+	// Generation rate is the model's actual throughput; effective rate is what
+	// the user experiences end-to-end.
+	const rateMs = u.wallMs ?? u.totalMs
+	const genMs = (u.wallMs ?? u.totalMs) !== undefined && u.ttftMsSum !== undefined && u.requestCount
+		? (u.wallMs ?? u.totalMs)! - u.ttftMsSum : u.totalMs !== undefined && u.ttftMs !== undefined
+		? u.totalMs - u.ttftMs : undefined
+	const genRate = formatTokenRate(u.outputTokens, genMs)
+	const effRate = formatTokenRate(u.outputTokens, rateMs)
+	const outputLine = genRate && effRate
+		? `  Output: ${formatTokenCount(u.outputTokens)} (${genRate} gen, ${effRate} eff)`
+		: effRate
+		? `  Output: ${formatTokenCount(u.outputTokens)} (${effRate})`
+		: `  Output: ${formatTokenCount(u.outputTokens)}`
+	const timingLine: (string | null)[] = []
+	if (mode === 'single') {
+		// Per-request: TTFT and total duration only
+		if (u.ttftMs !== undefined || u.totalMs !== undefined) {
+			timingLine.push(`  TTFT: ${formatDuration(u.ttftMs)}, Total: ${formatDuration(u.totalMs)}`)
+		}
+	} else if (mode === 'cumulative' && u.requestCount !== undefined && u.requestCount > 0) {
+		// Cumulative: request count, average TTFT, wall time
+		const avgTtft = u.ttftMsSum !== undefined ? Math.round(u.ttftMsSum / u.requestCount) : undefined
+		timingLine.push(`  ${u.requestCount} request${u.requestCount !== 1 ? 's' : ''}${avgTtft !== undefined ? `, avg TTFT: ${formatDuration(avgTtft)}` : ''}, ${formatDuration(u.wallMs)}`)
+	}
 	return [
 		`${label}:`,
 		inputLine,
-		`  Output: ${formatTokenCount(u.outputTokens)}`,
+		outputLine,
 		u.reasoningTokens !== undefined ? `  Reasoning: ${formatTokenCount(u.reasoningTokens)}` : null,
 		`  Total: ${formatTokenCount(total)}`,
+		...timingLine,
 	]
 }
 
@@ -471,11 +509,11 @@ const TokenUsageRing: React.FC<TokenUsageRingProps> = ({ usage, contextWindow, c
 			`Context window usage`,
 			`${formatTokenCount(total)} / ${formatTokenCount(contextWindow)} (${displayPct})`,
 			``,
-			...formatUsageBlock('Last request', usage),
+			...formatUsageBlock('Last request', usage, 'single'),
 			``,
-			...formatUsageBlock('Cumulative this turn', effectiveThisTurn),
+			...formatUsageBlock('Cumulative this turn', effectiveThisTurn, 'cumulative'),
 			``,
-			...formatUsageBlock('Cumulative this thread', cumulativeThisThread),
+			...formatUsageBlock('Cumulative this thread', cumulativeThisThread, 'cumulative'),
 			...manualCompactionLines,
 			...compactionLines,
 		].filter(s => s !== null).join('\n')

@@ -1255,6 +1255,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			totalTokens: add(a.totalTokens, b.totalTokens),
 			reasoningTokens: add(a.reasoningTokens, b.reasoningTokens),
 			cachedInputTokens: add(a.cachedInputTokens, b.cachedInputTokens),
+			// Per-request timing: carry latest (summing is nonsensical)
+			ttftMs: b.ttftMs ?? a.ttftMs,
+			totalMs: b.totalMs ?? a.totalMs,
+			// Aggregatable counters: sum across requests
+			requestCount: add(a.requestCount, b.requestCount),
+			wallMs: add(a.wallMs, b.wallMs),
+			ttftMsSum: add(a.ttftMsSum, b.ttftMsSum),
 		}
 	}
 
@@ -2145,6 +2152,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				shouldRetryLLM = false
 				nAttempts += 1
 
+				// Per-request timing: TTFT = time from send to first non-empty
+				// token; total = time from send to onFinalMessage.
+				const requestStartMs = Date.now()
+				let firstTokenMs: number | undefined
+
 				type ResTypes =
 					| { type: 'llmDone', toolCalls: RawToolCallObj[], info: { fullText: string, fullReasoning: string, anthropicReasoning: AnthropicReasoning[] | null, finishReason?: string } }
 					| { type: 'llmError', error?: { message: string; fullError: Error | null; } }
@@ -2163,18 +2175,24 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
 					separateSystemMessage: separateSystemMessage,
 					onText: ({ fullText, fullReasoning, toolCalls, usage }) => {
-						if (usage) this._setLatestUsage(threadId, usage)
+						// Capture TTFT on the first non-empty token
+						if (firstTokenMs === undefined && (fullText || fullReasoning)) {
+							firstTokenMs = Date.now() - requestStartMs
+						}
+						if (usage) this._setLatestUsage(threadId, { ...usage, ttftMs: firstTokenMs })
 						// Coalesced fire (see _scheduleStreamTextUpdate). Final/transition
 						// state changes go through _setStreamState which cancels any
 						// pending update, so we cannot drop a meaningful end-state.
 						this._scheduleStreamTextUpdate(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallsSoFar: toolCalls ?? [] }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
 					},
 					onFinalMessage: async ({ fullText, fullReasoning, toolCalls, anthropicReasoning, usage, finishReason }) => {
+						const totalMs = Date.now() - requestStartMs
 						console.log(`[PrefixCache:final] thread=${threadId.slice(0, 8)} finishReason=${finishReason} fullReasoning.len=${fullReasoning?.length ?? 0} fullText.len=${fullText?.length ?? 0} toolCalls=${toolCalls?.length ?? 0} anthropicReasoning=${anthropicReasoning?.length ?? 0}`)
 						if (fullReasoning) console.log(`[PrefixCache:reasoning] "${fullReasoning}"`)
 						if (usage) {
-							console.log(`[PrefixCache:usage] thread=${threadId.slice(0, 8)} input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens} reasoning=${usage.reasoningTokens} total=${usage.totalTokens}`)
-							this._setLatestUsage(threadId, usage)
+							const usageWithTiming: LLMUsage = { ...usage, ttftMs: firstTokenMs, totalMs, requestCount: 1, wallMs: totalMs, ttftMsSum: firstTokenMs }
+							console.log(`[PrefixCache:usage] thread=${threadId.slice(0, 8)} input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens} reasoning=${usage.reasoningTokens} total=${usage.totalTokens} ttft=${firstTokenMs}ms total=${totalMs}ms`)
+							this._setLatestUsage(threadId, usageWithTiming)
 						}
 						// Lock in this request's usage so the next loop iteration's
 						// running total is added to (not replacing) what we already counted.

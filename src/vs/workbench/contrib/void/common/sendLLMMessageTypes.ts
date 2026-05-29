@@ -121,6 +121,13 @@ export type LLMUsage = {
 	// (OpenAI's implicit prompt cache; DeepSeek and a few others mirror the schema).
 	// Undefined on servers that don't return the field.
 	cachedInputTokens?: number;
+	// Timing — populated by the chat orchestration layer (chatThreadService),
+	// not by the send layer. Meaningful on both per-request and cumulative usage.
+	ttftMs?: number;       // time-to-first-token: wall time from request start to first non-empty text chunk (per-request only; cumulative carries the latest)
+	totalMs?: number;      // total wall time for this request (per-request only; cumulative carries the latest)
+	requestCount?: number; // number of LLM requests (1 per request; sums cumulatively)
+	wallMs?: number;       // sum of totalMs across requests (sums cumulatively; used for average token rate)
+	ttftMsSum?: number;    // sum of ttftMs across requests (sums cumulatively; used for average TTFT)
 }
 
 // `toolCalls` is an ordered list. Providers that support parallel/batched tool calling
