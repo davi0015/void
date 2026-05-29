@@ -845,6 +845,12 @@ Deferred fixes (still not shipped; re-open only if symptoms return):
 - Fix (model disposal): `BlockCode`'s dispose callback now disposes the text model and removes it from `modelOfEditorId`, releasing language workers and associated resources.
 - Files: `inputs.tsx`
 
+**VoidModelService model lifecycle — release after read-only tools** ✅ DONE
+- Problem: `VoidModelService._modelRefOfURI` kept every model reference forever. Each `initializeModel` call creates a model that registers with language services, spawning workers. In a typical agent session, `go_to_definition`/`go_to_usages` pre-initialized models for ALL target files (30+ per call for popular symbols), `read_file`/`search_in_file`/`read_lint_errors` each created a model, and none were ever released. This was the primary cause of OS thread growth (106+ threads).
+- Fix: added `releaseModel(uri)` to `VoidModelService` that disposes the model ref and removes it from `_modelRefOfURI`. Read-only tool stringifiers now call `releaseModel` after using the model (the stringifier is the last consumer). Write tools (`edit_file`, `rewrite_file`) keep their models since `editCodeService` needs them for diff tracking.
+- Fix: removed `go_to_definition`/`go_to_usages` target model pre-initialization. These tools only need target URI + line number for results; the stringifier falls back to `<preview unavailable>` when the model isn't loaded.
+- Files: `voidModelService.ts`, `toolsService.ts`
+
 ### Next — Workspace-scoped chats (in progress, 5 commits)
 
 Goal: chat history lives "in the workspace", not as one global pile. Default thread list shows current workspace's chats + legacy unscoped; other workspaces' chats are visible as **read-only** in an "Other workspaces" group, with explicit Copy/Move actions to bring them into the current workspace.

@@ -14,6 +14,7 @@ type VoidModelType = {
 export interface IVoidModelService {
 	readonly _serviceBrand: undefined;
 	initializeModel(uri: URI): Promise<void>;
+	releaseModel(uri: URI): void;
 	getModel(uri: URI): VoidModelType;
 	getModelFromFsPath(fsPath: string): VoidModelType;
 	getModelSafe(uri: URI): Promise<VoidModelType>;
@@ -55,6 +56,17 @@ class VoidModelService extends Disposable implements IVoidModelService {
 		catch (e) {
 			console.log('InitializeModel error:', e)
 		}
+	};
+
+	// Release a model reference that was created by a read-only operation.
+	// Models for files open in editor tabs are kept alive by the editor's
+	// own model service — we only release our extra reference here. Safe to
+	// call even if the model was never initialized or already released.
+	releaseModel = (uri: URI) => {
+		const ref = this._modelRefOfURI[uri.fsPath]
+		if (!ref) return
+		ref.dispose()
+		delete this._modelRefOfURI[uri.fsPath]
 	};
 
 	getModelFromFsPath = (fsPath: string): VoidModelType => {
