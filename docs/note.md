@@ -833,9 +833,10 @@ Deferred fixes (still not shipped; re-open only if symptoms return):
 - Known limitation: for existing threads, `wallMs` only accumulates from requests made after this change while `outputTokens` has full history — the rate will be inaccurate until enough new requests land. New threads are accurate from the start.
 - Files: `sendLLMMessageTypes.ts`, `chatThreadService.ts`, `SidebarChat.tsx`
 
-**Virtualization scroll fix — remove `initialFillDoneRef` gates** ✅ DONE
-- Problem: chat could become stuck/unscrollable, especially with many short messages. The spacer div (`spacerRef`) that controls virtualized content height was only set after `initialFillDoneRef` became `true`. If the initial fill phase didn't complete (e.g., `scrollEl.clientHeight === 0` when the tab was hidden), the spacer was never given a height, making all messages invisible inside `overflow: hidden`.
-- Fix: removed `initialFillDoneRef` guards from the spacer-height sync `useLayoutEffect` and the `ResizeObserver` callback. Spacer height is now always synced to content height, even before the initial fill completes.
+**Virtualization scroll fix — spacer height + initial fill reliability** ✅ DONE
+- Problem: chat could become stuck/unscrollable when the initial fill phase never completed (`scrollEl.clientHeight === 0` on first render, e.g., hidden tab, slow layout on large displays). The spacer div was never given a height, `overflow: hidden` clipped everything to 0px, and `mountStart` stayed at `totalCount - 1` (only the last message rendered).
+- Fix (spacer always synced): the sync `useLayoutEffect` and `ResizeObserver` now always set `spacerEl.style.height = contentH + 'px'` regardless of `initialFillDoneRef`. Scroll compensation is still gated on `initialFillDoneRef` (it needs a correct baseline).
+- Fix (initial fill retry): when `scrollEl.clientHeight === 0`, instead of returning early forever, schedules a `requestAnimationFrame` to re-trigger the effect after the browser paints. This ensures the initial fill always eventually runs.
 - Files: `SidebarChat.tsx`
 
 **Bidirectional LazyBlockCode + model disposal** ✅ DONE

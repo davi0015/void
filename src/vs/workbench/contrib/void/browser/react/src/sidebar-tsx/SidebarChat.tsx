@@ -2549,7 +2549,16 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		if (initialFillDoneRef.current) return
 		const scrollEl = scrollContainerRef.current
 		if (!scrollEl || !isActive) return
-		if (scrollEl.clientHeight === 0) return
+		if (scrollEl.clientHeight === 0) {
+			// Layout hasn't completed yet — retry after the browser
+			// paints. Without this, the initial fill never runs and
+			// only the last message is rendered (spacer stays wrong,
+			// chat appears stuck).
+			requestAnimationFrame(() => {
+				if (!initialFillDoneRef.current) setMountStart(prev => prev)
+			})
+			return
+		}
 
 		if (!estimationDoneRef.current) {
 			estimationDoneRef.current = true
