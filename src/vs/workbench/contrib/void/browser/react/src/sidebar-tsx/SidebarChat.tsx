@@ -2579,10 +2579,13 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	// Expand (delta > 0): grow wrapper first, then adjust scrollTop.
 	const prevMountStartRef = useRef(mountStart)
 	useLayoutEffect(() => {
-		if (!initialFillDoneRef.current) return
 		const scrollEl = scrollContainerRef.current
 		const spacerEl = spacerRef.current
 		if (!scrollEl || !spacerEl) return
+		// Always sync spacer height to content, even before initial fill
+		// completes. Without this, messages can be invisible if the initial
+		// fill phase hasn't run yet (e.g., scrollEl.clientHeight === 0 on
+		// first render in a hidden tab).
 
 		const contentH = getContentHeight()
 		const oldH = spacerHeightRef.current
@@ -2630,8 +2633,6 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		let prevWidth = scrollEl.clientWidth
 
 		const contentRo = new ResizeObserver(() => {
-			if (!initialFillDoneRef.current) return
-
 			const currWidth = scrollEl.clientWidth
 			const widthChanged = currWidth !== prevWidth
 			prevWidth = currWidth

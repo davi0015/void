@@ -833,6 +833,11 @@ Deferred fixes (still not shipped; re-open only if symptoms return):
 - Known limitation: for existing threads, `wallMs` only accumulates from requests made after this change while `outputTokens` has full history — the rate will be inaccurate until enough new requests land. New threads are accurate from the start.
 - Files: `sendLLMMessageTypes.ts`, `chatThreadService.ts`, `SidebarChat.tsx`
 
+**Virtualization scroll fix — remove `initialFillDoneRef` gates** ✅ DONE
+- Problem: chat could become stuck/unscrollable, especially with many short messages. The spacer div (`spacerRef`) that controls virtualized content height was only set after `initialFillDoneRef` became `true`. If the initial fill phase didn't complete (e.g., `scrollEl.clientHeight === 0` when the tab was hidden), the spacer was never given a height, making all messages invisible inside `overflow: hidden`.
+- Fix: removed `initialFillDoneRef` guards from the spacer-height sync `useLayoutEffect` and the `ResizeObserver` callback. Spacer height is now always synced to content height, even before the initial fill completes.
+- Files: `SidebarChat.tsx`
+
 ### Next — Workspace-scoped chats (in progress, 5 commits)
 
 Goal: chat history lives "in the workspace", not as one global pile. Default thread list shows current workspace's chats + legacy unscoped; other workspaces' chats are visible as **read-only** in an "Other workspaces" group, with explicit Copy/Move actions to bring them into the current workspace.
