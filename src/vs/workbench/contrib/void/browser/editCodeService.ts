@@ -793,15 +793,15 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		}
 
 		if (Object.keys(pendingSnapshotsOfURI).length === 0) {
-			this._storageService.remove(PENDING_DIFFS_STORAGE_KEY, StorageScope.APPLICATION)
+			this._storageService.remove(PENDING_DIFFS_STORAGE_KEY, StorageScope.WORKSPACE)
 			return
 		}
 
-		this._storageService.store(PENDING_DIFFS_STORAGE_KEY, JSON.stringify(pendingSnapshotsOfURI), StorageScope.APPLICATION, StorageTarget.USER)
+		this._storageService.store(PENDING_DIFFS_STORAGE_KEY, JSON.stringify(pendingSnapshotsOfURI), StorageScope.WORKSPACE, StorageTarget.USER)
 	}
 
 	private async _rehydratePendingDiffs(): Promise<void> {
-		const raw = this._storageService.get(PENDING_DIFFS_STORAGE_KEY, StorageScope.APPLICATION)
+		const raw = this._storageService.get(PENDING_DIFFS_STORAGE_KEY, StorageScope.WORKSPACE)
 		if (!raw) return
 
 		let parsed: unknown
