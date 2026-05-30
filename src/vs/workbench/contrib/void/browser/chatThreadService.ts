@@ -32,7 +32,7 @@ import { IEditCodeService } from './editCodeServiceInterface.js';
 import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
-import { LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY } from '../common/storageKeys.js';
+import { LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, MESSAGE_KEY_PREFIX, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { RunOnceScheduler, timeout } from '../../../../base/common/async.js';
@@ -896,9 +896,23 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	private readonly _pendingThreadWrites = new Map<string, ThreadType>()
 	private _storeThreadFlushScheduler: RunOnceScheduler | null = null
 
+	// Pending individual message writes (key = `${threadId}.${msgIdx`).
+	// Flushed alongside thread metadata writes so append is O(1) — no
+	// re-serialization of the entire message array.
+	private _pendingMessageWrites = new Map<string, ChatMessage>()
+
 	private _storeThread(threadId: string, thread: ThreadType | undefined, updateIndex = false) {
 		if (thread === undefined) {
 			this._pendingThreadWrites.delete(threadId)
+			// Remove all message keys for this thread
+			const msgCount = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.count', StorageScope.APPLICATION)
+			if (msgCount) {
+				const n = parseInt(msgCount, 10)
+				for (let i = 0; i < n; i++) {
+					this._storageService.remove(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
+				}
+				this._storageService.remove(MESSAGE_KEY_PREFIX + threadId + '.count', StorageScope.APPLICATION)
+			}
 			this._storageService.remove(THREAD_KEY_PREFIX + threadId, StorageScope.APPLICATION)
 			this._writeThreadIndex({ removed: threadId })
 			return
@@ -916,12 +930,39 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 	}
 
+	// Write a single message to append-only storage. Called by
+	// _addMessageToThread so only the new message is serialized,
+	// not the entire thread.
+	private _storeMessage(threadId: string, msgIdx: number, message: ChatMessage) {
+		this._pendingMessageWrites.set(threadId + '.' + msgIdx, message)
+		// Ensure the flush scheduler is running (same throttle as metadata)
+		if (!this._storeThreadFlushScheduler) {
+			this._storeThreadFlushScheduler = new RunOnceScheduler(() => this._flushPendingThreadWrites(), 500)
+			this._register(this._storeThreadFlushScheduler)
+		}
+		if (!this._storeThreadFlushScheduler.isScheduled()) {
+			this._storeThreadFlushScheduler.schedule()
+		}
+	}
+
 	private _flushPendingThreadWrites() {
-		if (this._pendingThreadWrites.size === 0) return
+		if (this._pendingThreadWrites.size === 0 && this._pendingMessageWrites.size === 0) return
+		// Flush thread metadata (without messages array)
 		for (const [id, thread] of this._pendingThreadWrites) {
-			this._storageService.store(THREAD_KEY_PREFIX + id, JSON.stringify(thread), StorageScope.APPLICATION, StorageTarget.USER)
+			const { messages: _messages, ...metadata } = thread
+			this._storageService.store(THREAD_KEY_PREFIX + id, JSON.stringify({ ...metadata, _msgCount: thread.messages.length }), StorageScope.APPLICATION, StorageTarget.USER)
+		}
+		// Flush individual messages
+		for (const [key, message] of this._pendingMessageWrites) {
+			const dotIdx = key.indexOf('.')
+			const threadId = key.slice(0, dotIdx)
+			const msgIdx = key.slice(dotIdx + 1)
+			this._storageService.store(MESSAGE_KEY_PREFIX + key, JSON.stringify(message), StorageScope.APPLICATION, StorageTarget.USER)
+			// Update message count
+			this._storageService.store(MESSAGE_KEY_PREFIX + threadId + '.count', msgIdx + 1 + '', StorageScope.APPLICATION, StorageTarget.USER)
 		}
 		this._pendingThreadWrites.clear()
+		this._pendingMessageWrites.clear()
 	}
 
 	private _writeThreadIndex(delta?: { added?: string, removed?: string }) {
@@ -935,7 +976,55 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	private _readThread(threadId: string): ThreadType | undefined {
 		const raw = this._storageService.get(THREAD_KEY_PREFIX + threadId, StorageScope.APPLICATION)
 		if (!raw) return undefined
-		return JSON.parse(raw, ChatThreadService._storageReviver) as ThreadType
+		const parsed = JSON.parse(raw, ChatThreadService._storageReviver) as any
+
+		// Migration: old format has messages array inline
+		if (parsed.messages && Array.isArray(parsed.messages)) {
+			// Old format — migrate to split storage
+			const thread = parsed as ThreadType
+			this._migrateThreadToSplitMessages(threadId, thread)
+			return thread
+		}
+
+		// New format — load messages from separate keys
+		const msgCount = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.count', StorageScope.APPLICATION)
+		const n = msgCount ? parseInt(msgCount, 10) : (parsed._msgCount ?? 0)
+		const messages: ChatMessage[] = []
+		for (let i = 0; i < n; i++) {
+			const msgRaw = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
+			if (msgRaw) {
+				messages.push(JSON.parse(msgRaw, ChatThreadService._storageReviver) as ChatMessage)
+			}
+		}
+		delete parsed._msgCount
+		return { ...parsed, messages } as ThreadType
+	}
+
+	/** Migrate a thread from inline messages to per-message keys. */
+	private _migrateThreadToSplitMessages(threadId: string, thread: ThreadType) {
+		for (let i = 0; i < thread.messages.length; i++) {
+			this._storageService.store(MESSAGE_KEY_PREFIX + threadId + '.' + i, JSON.stringify(thread.messages[i]), StorageScope.APPLICATION, StorageTarget.USER)
+		}
+		this._storageService.store(MESSAGE_KEY_PREFIX + threadId + '.count', thread.messages.length + '', StorageScope.APPLICATION, StorageTarget.USER)
+		// Rewrite metadata without messages
+		const { messages: _messages, ...metadata } = thread
+		this._storageService.store(THREAD_KEY_PREFIX + threadId, JSON.stringify({ ...metadata, _msgCount: thread.messages.length }), StorageScope.APPLICATION, StorageTarget.USER)
+	}
+
+	/** Rewrite all message keys for a thread (after truncation or mutation).
+	 *  Removes any stale keys beyond the new message count. */
+	private _rewriteAllMessages(threadId: string, messages: ChatMessage[]) {
+		// Remove stale keys beyond new length
+		const oldCountStr = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.count', StorageScope.APPLICATION)
+		const oldCount = oldCountStr ? parseInt(oldCountStr, 10) : 0
+		for (let i = messages.length; i < oldCount; i++) {
+			this._storageService.remove(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
+		}
+		// Write current messages
+		for (let i = 0; i < messages.length; i++) {
+			this._storageService.store(MESSAGE_KEY_PREFIX + threadId + '.' + i, JSON.stringify(messages[i]), StorageScope.APPLICATION, StorageTarget.USER)
+		}
+		this._storageService.store(MESSAGE_KEY_PREFIX + threadId + '.count', messages.length + '', StorageScope.APPLICATION, StorageTarget.USER)
 	}
 
 	private _readAllThreadsSplit(): ChatThreads | null {
@@ -2384,6 +2473,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				...oldThread.messages.slice(messageIdx + 1, Infinity),
 			],
 		}
+		// Write just the changed message key
+		this._storeMessage(threadId, messageIdx, newMessage)
 		const newThreads = { ...allThreads, [threadId]: updatedThread }
 		this._storeThread(threadId, updatedThread)
 		this._setState({ allThreads: newThreads })
@@ -2928,6 +3019,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 				messages: newMessages,
 			};
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread };
+			this._rewriteAllMessages(threadId, newMessages);
 			this._storeThread(threadId, updatedThread);
 			this._setState({ allThreads: newThreads });
 
@@ -2961,6 +3053,8 @@ We only need to do it for files that were edited since `from`, ie files between 
 		// clear messages up to the index
 		const slicedMessages = thread.messages.slice(0, messageIdx)
 		const removedMessages = thread.messages.slice(messageIdx)
+		this._rewriteAllMessages(thread.id, slicedMessages)
+		this._storeThread(thread.id, { ...thread, messages: slicedMessages })
 		this._setState({
 			allThreads: {
 				...this.state.allThreads,
@@ -3667,6 +3761,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 			cumulativeCompactionThisThread: undefined,
 		}
 		const newThreads = { ...this.state.allThreads, [newId]: cloned }
+		this._rewriteAllMessages(newId, cloned.messages)
 		this._storeThread(newId, cloned, true)
 		// Drop in-memory telemetry mirrors for the new id (defensive — should
 		// be empty since the id is fresh, but keeps the maps strictly
@@ -3843,12 +3938,17 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const { allThreads } = this.state
 		const oldThread = allThreads[threadId]
 		if (!oldThread) return // should never happen
+		const msgIdx = oldThread.messages.length
 		const updatedThread = {
 			...oldThread,
 			lastModified: new Date().toISOString(),
 			messages: [...oldThread.messages, message],
 		}
 		const newThreads = { ...allThreads, [threadId]: updatedThread }
+		// Append-only storage: write just the new message instead of
+		// re-serializing the entire thread. Metadata is still throttled
+		// via _storeThread but now excludes the messages array.
+		this._storeMessage(threadId, msgIdx, message)
 		this._storeThread(threadId, updatedThread)
 		this._setState({ allThreads: newThreads })
 	}
@@ -3948,20 +4048,23 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
 
+		const newMessages = thread.messages.map((m, i) =>
+			i === messageIdx && m.role === 'user' ? {
+				...m,
+				state: {
+					...m.state,
+					...state
+				},
+			} : m
+		)
+		this._rewriteAllMessages(threadId, newMessages)
+		this._storeThread(threadId, { ...thread, messages: newMessages })
 		this._setState({
 			allThreads: {
 				...this.state.allThreads,
 				[threadId]: {
 					...thread,
-					messages: thread.messages.map((m, i) =>
-						i === messageIdx && m.role === 'user' ? {
-							...m,
-							state: {
-								...m.state,
-								...state
-							},
-						} : m
-					)
+					messages: newMessages
 				}
 			}
 		})

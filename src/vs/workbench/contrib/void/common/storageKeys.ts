@@ -24,6 +24,11 @@ export const THREAD_STORAGE_KEY = 'void.chatThreadStorageII'
 export const THREAD_KEY_PREFIX = 'void.chatThread.'
 export const THREAD_INDEX_KEY = 'void.chatThreadIndex'
 
+// Per-message append-only storage. Each message is stored under
+// `void.chatMsg.{threadId}.{messageIndex}` so appending a message
+// is O(1) instead of re-serializing the entire thread.
+export const MESSAGE_KEY_PREFIX = 'void.chatMsg.'
+
 
 // Ordered list of thread ids pinned as tabs in the chat sidebar. Persisted
 // separately from THREAD_STORAGE_KEY so evolving tab UX doesn't force a
