@@ -1042,48 +1042,6 @@ const scrollToBottom = (divRef: { current: HTMLElement | null }) => {
 
 
 
-const ScrollToBottomContainer = ({ children, className, style, scrollContainerRef }: { children: React.ReactNode, className?: string, style?: React.CSSProperties, scrollContainerRef: React.MutableRefObject<HTMLDivElement | null> }) => {
-	const isAtBottomRef = useRef(true);
-
-	const divRef = scrollContainerRef
-
-	const onScroll = useCallback(() => {
-		const div = divRef.current;
-		if (!div) return;
-
-		isAtBottomRef.current =
-			div.scrollHeight - div.clientHeight - div.scrollTop < 100;
-	}, [divRef]);
-
-	useLayoutEffect(() => {
-		const div = divRef.current;
-		if (!div) return;
-		// Check both the ref (set by onScroll) and the live position.
-		// During streaming, content grows without scrollTop changing, so
-		// the ref might be stale. The live check catches "still near
-		// bottom but drifted slightly past the 40px threshold".
-		const distFromBottom = div.scrollHeight - div.clientHeight - div.scrollTop;
-		if (isAtBottomRef.current || distFromBottom < 100) {
-			scrollToBottom(divRef);
-		}
-	}, [children]);
-
-	useEffect(() => {
-		scrollToBottom(divRef);
-	}, []);
-
-	return (
-		<div
-			ref={divRef}
-			onScroll={onScroll}
-			className={className}
-			style={style}
-		>
-			{children}
-		</div>
-	);
-};
-
 export { getRelative, getFolderName, getBasename } from './sidebarChatHelpers.js';
 
 
@@ -2489,6 +2447,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	const contentRef = useRef<HTMLDivElement | null>(null)
 	const spacerHeightRef = useRef(0)
 	const lastScrollTopRef = useRef(0)
+	const isAtBottomRef = useRef(true)
 
 	const getContentHeight = useCallback(() => {
 		return contentRef.current?.offsetHeight ?? 0
@@ -2562,8 +2521,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			lastScrollTopRef.current = scrollEl.scrollTop
 		} else {
 			// New message appended at the end — stay at bottom if we were there
-			const wasAtBottom = Math.abs(scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop) < 40
-			if (wasAtBottom) {
+			if (isAtBottomRef.current) {
 				scrollToBottom(scrollContainerRef)
 			}
 			lastScrollTopRef.current = scrollEl.scrollTop
@@ -2608,8 +2566,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			spacerHeightRef.current = contentH
 
 			if (!widthChanged) {
-				const distFromBottom = scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop
-				if (distFromBottom < 100) {
+				if (isAtBottomRef.current) {
 					scrollToBottom(scrollContainerRef)
 				} else {
 					scrollEl.scrollTop += delta
@@ -2631,9 +2588,8 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				flushSync(() => setMountStart(Math.max(0, mountStartRef.current - 1)))
 				return
 			}
-			// If near bottom, snap back to bottom
-			const distFromBottom = scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop
-			if (distFromBottom < 100) {
+			// If was at bottom, snap back to bottom
+			if (isAtBottomRef.current) {
 				scrollToBottom(scrollContainerRef)
 			}
 		})
@@ -2734,6 +2690,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				const currScrollTop = el.scrollTop
 				const prevScrollTop = lastScrollTopRef.current
 				lastScrollTopRef.current = currScrollTop
+				isAtBottomRef.current = el.scrollHeight - el.clientHeight - currScrollTop < 100
 				const scrollingUp = currScrollTop < prevScrollTop
 				const scrollingDown = currScrollTop > prevScrollTop
 
@@ -2744,11 +2701,10 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					return
 				}
 				if (scrollingDown && currScrollTop > el.clientHeight * 3) {
-					// Skip trim when near the bottom — auto-scroll from streaming
-					// triggers scroll-down events and trimming here would desync
-					// ScrollToBottomContainer's isAtBottomRef, breaking auto-scroll.
-					const distFromBottom = el.scrollHeight - el.clientHeight - currScrollTop
-					if (distFromBottom < 100) return
+					// Skip trim when we were at the bottom — auto-scroll
+					// triggers scroll-down events, trimming here would
+					// desync scroll position and break auto-scroll.
+					if (isAtBottomRef.current) return
 
 					const mounted = totalCountRef.current - mountStartRef.current
 					const avgH = mounted > 0 ? (contentRef.current?.offsetHeight ?? el.scrollHeight) / mounted : 200
@@ -2919,8 +2875,8 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				</div>
 				<div className='h-px w-full' style={{ background: 'linear-gradient(to right, transparent, var(--void-border-1), transparent)' }} />
 			</div>
-			<ScrollToBottomContainer
-				scrollContainerRef={scrollContainerRef}
+			<div
+				ref={scrollContainerRef}
 				className={`
 					flex flex-col
 					px-4 pt-4 pb-0
@@ -2941,8 +2897,10 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					streamingChatIdx={streamingChatIdx}
 					threadIsReadOnly={threadIsReadOnly}
 					isRunning={isRunning}
+					scrollContainerRef={scrollContainerRef}
+					isAtBottomRef={isAtBottomRef}
 				/>
-		</ScrollToBottomContainer>
+		</div>
 	</div>
 	)
 })
@@ -2952,16 +2910,29 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 // independently. This prevents ThreadMessagesView from re-rendering on
 // every stream tick (~10Hz). Only this component re-renders when the LLM
 // emits a new token; the message list above stays stable.
-const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOnly, isRunning }: {
+const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOnly, isRunning, scrollContainerRef, isAtBottomRef }: {
 	threadId: string
 	streamingChatIdx: number
 	threadIsReadOnly: boolean
 	isRunning: ReturnType<typeof useStreamRunningState>
+	scrollContainerRef: React.MutableRefObject<HTMLDivElement | null>
+	isAtBottomRef: React.MutableRefObject<boolean>
 }) => {
 	const streamState = useChatThreadsStreamState(threadId)
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
 	const commandService = accessor.get('ICommandService')
+
+	// Auto-scroll to bottom on every stream tick if the user was at the
+	// bottom. Uses isAtBottomRef (set by the scroll handler) instead of
+	// checking live distance — content may have grown by more than 100px
+	// since the last scroll event, making the live check unreliable.
+	useLayoutEffect(() => {
+		if (isAtBottomRef.current) {
+			scrollToBottom(scrollContainerRef)
+			isAtBottomRef.current = true
+		}
+	})
 
 	const latestError = streamState?.error
 	const { displayContentSoFar, toolCallsSoFar, reasoningSoFar } = streamState?.llmInfo ?? {}
