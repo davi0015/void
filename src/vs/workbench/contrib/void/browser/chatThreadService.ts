@@ -1178,8 +1178,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// which forced a full React re-render of the assistant bubble (full marked
 	// re-lex of the entire message + Monaco editor work for code blocks). That
 	// saturated the renderer's main thread, causing input lag (queued Enter
-	// keypresses) and visible UI freezes. We coalesce to ~20Hz here, which is
-	// indistinguishable from real-time visually but bounds per-chunk render cost.
+	// keypresses) and visible UI freezes. We coalesce to ~5Hz here (200ms),
+	// which is indistinguishable from real-time visually but bounds per-chunk
+	// render cost — especially important for threads with 1000+ messages where
+	// each render cycle is more expensive.
 	private readonly _streamTextThrottle = new Map<string, { scheduler: RunOnceScheduler; pending: ThreadStreamState[string] | null }>()
 
 	private _scheduleStreamTextUpdate(threadId: string, state: ThreadStreamState[string]) {
@@ -1192,7 +1194,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				e.pending = null
 				this.streamState[threadId] = pending
 				this._onDidChangeStreamState.fire({ threadId })
-			}, 100)
+			}, 200)
 			entry = { scheduler, pending: state }
 			this._streamTextThrottle.set(threadId, entry)
 		} else {
@@ -2105,47 +2107,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				return
 			}
 
-			// Prefix-cache investigation log: dump each message's role, char length,
-			// content hash, and cumulative hash so we can spot where the prefix diverges
-			// between turns. The cumulative hash represents the byte-identical prefix
-			// up to (and including) that message — if it matches the previous turn's
-			// cumulative hash at the same index, the provider can reuse its KV cache.
-			{
-				const djb2 = (s: string): string => {
-					let h = 5381
-					for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
-					return (h >>> 0).toString(16).padStart(8, '0')
-				}
-				const msgContent = (m: typeof messages[number]): string => {
-					if ('content' in m) {
-						const c = m.content
-						if (typeof c === 'string') return c
-						if (Array.isArray(c)) return c.map(p => {
-							if ('text' in p && typeof p.text === 'string') return p.text
-							if ('content' in p && typeof p.content === 'string') return p.content
-							if ('type' in p) return `[${p.type}]`
-							return ''
-						}).join('|')
-					}
-					if ('parts' in m) return m.parts.map(p => 'text' in p && typeof p.text === 'string' ? p.text : '[part]').join('|')
-					return ''
-				}
-				let cumStr = ''
-				const sysMsg = separateSystemMessage || ''
-				if (sysMsg) cumStr += sysMsg
-				const lines: string[] = []
-				if (sysMsg) lines.push(`  [sys] len=${sysMsg.length} hash=${djb2(sysMsg)} cumHash=${djb2(cumStr)}`)
-				for (let i = 0; i < messages.length; i++) {
-					const m = messages[i]
-					const role = ('role' in m) ? (m as { role: string }).role : '?'
-					const content = msgContent(m)
-					cumStr += content
-					const preview = content.slice(0, 60).replace(/\n/g, '\\n')
-					lines.push(`  [${i}] ${role} len=${content.length} hash=${djb2(content)} cumHash=${djb2(cumStr)} "${preview}..."`)
-				}
-				console.log(`[PrefixCache] thread=${threadId.slice(0, 8)} turn=${nMessagesSent} msgs=${messages.length} totalChars=${sentChars}\n${lines.join('\n')}`)
-			}
-
 			let shouldRetryLLM = true
 			let nAttempts = 0
 			while (shouldRetryLLM) {
@@ -2187,11 +2148,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					},
 					onFinalMessage: async ({ fullText, fullReasoning, toolCalls, anthropicReasoning, usage, finishReason }) => {
 						const totalMs = Date.now() - requestStartMs
-						console.log(`[PrefixCache:final] thread=${threadId.slice(0, 8)} finishReason=${finishReason} fullReasoning.len=${fullReasoning?.length ?? 0} fullText.len=${fullText?.length ?? 0} toolCalls=${toolCalls?.length ?? 0} anthropicReasoning=${anthropicReasoning?.length ?? 0}`)
-						if (fullReasoning) console.log(`[PrefixCache:reasoning] "${fullReasoning}"`)
 						if (usage) {
 							const usageWithTiming: LLMUsage = { ...usage, ttftMs: firstTokenMs, totalMs, requestCount: 1, wallMs: totalMs, ttftMsSum: firstTokenMs }
-							console.log(`[PrefixCache:usage] thread=${threadId.slice(0, 8)} input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens} reasoning=${usage.reasoningTokens} total=${usage.totalTokens} ttft=${firstTokenMs}ms total=${totalMs}ms`)
 							this._setLatestUsage(threadId, usageWithTiming)
 						}
 						// Lock in this request's usage so the next loop iteration's
