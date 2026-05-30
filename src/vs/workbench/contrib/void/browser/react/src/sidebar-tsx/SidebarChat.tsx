@@ -1050,13 +1050,19 @@ const ScrollToBottomContainer = ({ children, className, style, scrollContainerRe
 		const div = divRef.current;
 		if (!div) return;
 
-		isAtBottomRef.current = Math.abs(
-			div.scrollHeight - div.clientHeight - div.scrollTop
-		) < 40;
+		isAtBottomRef.current =
+			div.scrollHeight - div.clientHeight - div.scrollTop < 100;
 	}, [divRef]);
 
-	useEffect(() => {
-		if (isAtBottomRef.current) {
+	useLayoutEffect(() => {
+		const div = divRef.current;
+		if (!div) return;
+		// Check both the ref (set by onScroll) and the live position.
+		// During streaming, content grows without scrollTop changing, so
+		// the ref might be stale. The live check catches "still near
+		// bottom but drifted slightly past the 40px threshold".
+		const distFromBottom = div.scrollHeight - div.clientHeight - div.scrollTop;
+		if (isAtBottomRef.current || distFromBottom < 100) {
 			scrollToBottom(divRef);
 		}
 	}, [children]);
@@ -2578,6 +2584,12 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		const contentH = getContentHeight()
 		spacerHeightRef.current = contentH
 		if (spacerRef.current) spacerRef.current.style.height = contentH + 'px'
+
+		// After the spacer is set to the correct height, scroll to bottom.
+		// On initial mount/fill the scroll position is always 0 (top), so
+		// we can't use wasAtBottom — we always want to land at the bottom
+		// on first render.
+		scrollToBottom(scrollContainerRef)
 	}, [mountStart, totalCount, isActive, scrollContainerRef, getContentHeight, estimateMsgHeight])
 
 	// Sync wrapper height + scrollTop after expand or new messages.
