@@ -238,6 +238,13 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
   each model → 589ms long tasks → Chromium creates thread pool workers that are never destroyed.
   The lightweight version costs zero overhead on scroll. Removed `LazyBlockCode`'s
   IntersectionObserver, height locking, and mount rate-limiting queue (unnecessary without Monaco).
+- **Syntax highlighting for code blocks** (`inputs.tsx`): Added token-level syntax highlighting
+  using VS Code's built-in `tokenizeToString` (same TextMate grammars as the editor). Renders
+  `<span class="mtkN">` tokens via React elements (not `dangerouslySetInnerHTML`, which is blocked
+  by VS Code's Trusted Types CSP). Module-level LRU cache (500 entries) avoids re-tokenizing
+  identical code. Grammar activation is handled with up to 3 retries at 1s intervals — renders
+  plain text first, then highlights once the grammar loads. Skipped during streaming (content
+  changes every ~200ms, tokenization is expensive).
 - **Lightweight diff display** (`inputs.tsx`): Replaced Monaco `DiffEditorWidget` + 2 models per
   diff block with a unified diff view using line-level LCS highlighting. Removed lines show
   red background with strikethrough and `user-select: none`; added lines show green background

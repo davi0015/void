@@ -1646,16 +1646,125 @@ const normalizeIndentation = (code: string): string => {
 
 
 export type BlockCodeProps = { initValue: string, language?: string, maxHeight?: number, showScrollbars?: boolean, isStreaming?: boolean }
-// Lightweight code block — uses <pre><code> instead of Monaco to avoid
-// creating/destroying heavy editors on every virtualization scroll cycle.
-const BlockCode = ({ initValue, maxHeight }: BlockCodeProps) => {
+
+type TokenSpan = { className: string; text: string }
+
+// Module-level cache for tokenized spans: key = language + code
+const tokenizedCache = new Map<string, TokenSpan[][]>()
+const tokenizedCacheMaxSize = 500
+
+// Parse the HTML from _tokenizeToString into a structured token array.
+// Output format: array of lines, each line is an array of { className, text } spans.
+const parseTokenizedHtml = (html: string): TokenSpan[][] => {
+	const lines: TokenSpan[][] = []
+	let currentLine: TokenSpan[] = []
+	// Match <span class="mtkN ...">text</span> and <br/>
+	const spanRe = /<span class="([^"]*)">([^<]*)<\/span>/g
+	let match: RegExpExecArray | null
+	let lastIndex = 0
+
+	// Strip outer div wrapper
+	const inner = html.replace(/^<div class="monaco-tokenized-source">/, '').replace(/<\/div>$/, '')
+
+	while ((match = spanRe.exec(inner)) !== null) {
+		// Check for <br/> between last match and this one
+		const between = inner.slice(lastIndex, match.index)
+		if (between.includes('<br/>')) {
+			const parts = between.split('<br/>')
+			// Each <br/> ends a line (the first part is after the previous span, ignore it)
+			for (let i = 1; i < parts.length; i++) {
+				lines.push(currentLine)
+				currentLine = []
+			}
+		}
+		currentLine.push({ className: match[1], text: match[2] })
+		lastIndex = match.index + match[0].length
+	}
+	// Check for trailing <br/>
+	const trailing = inner.slice(lastIndex)
+	if (trailing.includes('<br/>')) {
+		const parts = trailing.split('<br/>')
+		for (let i = 1; i < parts.length; i++) {
+			lines.push(currentLine)
+			currentLine = []
+		}
+	}
+	if (currentLine.length > 0) {
+		lines.push(currentLine)
+	}
+	return lines
+}
+
+// Lightweight code block — uses VS Code's built-in tokenizer for syntax
+// highlighting instead of Monaco editors. Avoids creating/destroying
+// heavy editors on every virtualization scroll cycle.
+const BlockCode = ({ initValue, language, maxHeight, isStreaming }: BlockCodeProps) => {
+	const accessor = useAccessor()
+	const languageService = accessor.get('ILanguageService')
 	const normalized = normalizeIndentation(initValue)
 	const MAX_HEIGHT = maxHeight ?? Infinity
 	const maxHeightStyle = MAX_HEIGHT !== Infinity ? { maxHeight: `${MAX_HEIGHT}px` } as React.CSSProperties : undefined
+	const selectableStyle: React.CSSProperties = { userSelect: 'text', WebkitUserSelect: 'text' }
+
+	// During streaming, skip tokenization — it's expensive and the content
+	// changes every ~200ms anyway. Render plain text until streaming stops.
+	const [tokenLines, setTokenLines] = useState<TokenSpan[][] | null>(() => {
+		if (isStreaming || !language) return null
+		const cacheKey = `${language}\0${normalized}`
+		return tokenizedCache.get(cacheKey) ?? null
+	})
+
+	useEffect(() => {
+		if (isStreaming || !language) {
+			setTokenLines(null)
+			return
+		}
+		const cacheKey = `${language}\0${normalized}`
+		const cached = tokenizedCache.get(cacheKey)
+		if (cached) {
+			setTokenLines(cached)
+			return
+		}
+		let disposed = false
+		const tokenize = async (attempt: number) => {
+			if (disposed) return
+			const { tokenizeToString } = await import('../../../../../../../editor/common/languages/textToHtmlTokenizer.js')
+			if (disposed) return
+			const html = await tokenizeToString(languageService, normalized, language)
+			if (disposed || !html) return
+			const parsed = parseTokenizedHtml(html)
+			// If tokenization produced only flat mtk1 tokens, the grammar
+			// wasn't loaded yet. Retry after a delay (extension activation).
+			const allSame = parsed.every(line => line.every(span => span.className === 'mtk1'))
+			if (allSame && attempt < 3) {
+				setTimeout(() => tokenize(attempt + 1), 1000)
+				return
+			}
+			if (tokenizedCache.size > tokenizedCacheMaxSize) {
+				const keys = [...tokenizedCache.keys()]
+				for (let i = 0; i < 100; i++) tokenizedCache.delete(keys[i])
+			}
+			tokenizedCache.set(cacheKey, parsed)
+			setTokenLines(parsed)
+		}
+		tokenize(0)
+		return () => { disposed = true }
+	}, [normalized, language, isStreaming, languageService])
+
 	return (
-		<div className='relative z-0 px-2 py-1 bg-void-bg-3' style={{ ...maxHeightStyle, userSelect: 'text', WebkitUserSelect: 'text' }}>
-			<pre className='m-0 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto overflow-y-auto text-void-fg-2' style={{ ...maxHeightStyle, userSelect: 'text', WebkitUserSelect: 'text' }}>
-				<code>{normalized}</code>
+		<div className='relative z-0 px-2 py-1 bg-void-bg-3' style={{ ...maxHeightStyle, ...selectableStyle }}>
+			<pre className='m-0 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto overflow-y-auto text-void-fg-2' style={{ ...maxHeightStyle, ...selectableStyle }}>
+				{tokenLines
+					? <code className="monaco-tokenized-source">{tokenLines.map((line, i) =>
+						<React.Fragment key={i}>
+							{i > 0 && '\n'}
+							{line.map((span, j) =>
+								<span key={j} className={span.className}>{span.text}</span>
+							)}
+						</React.Fragment>
+					)}</code>
+					: <code>{normalized}</code>
+				}
 			</pre>
 		</div>
 	)
@@ -1692,8 +1801,8 @@ const scheduleLazyMount = (cb: () => void) => {
 
 // BlockCode is now lightweight (<pre><code>), so no need for IntersectionObserver
 // or lazy mounting. We keep the export name so call-sites don't change.
-export const LazyBlockCode = ({ initValue, maxHeight }: BlockCodeProps) => {
-	return <BlockCode initValue={initValue} maxHeight={maxHeight} />
+export const LazyBlockCode = ({ initValue, language, maxHeight, isStreaming }: BlockCodeProps) => {
+	return <BlockCode initValue={initValue} language={language} maxHeight={maxHeight} isStreaming={isStreaming} />
 }
 
 
