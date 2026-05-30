@@ -227,10 +227,11 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
   has stale file content" without parsing error message strings.
 
 - **Chat virtualization** (`SidebarChat.tsx`): `ThreadMessagesView` implements window-based
-  virtualization — only messages within ~5x viewport height are mounted. Scrolling down trims
-  messages from the top (`setMountStart`), scrolling up expands. The initial fill mounts
-  `VIEWPORT_FILL_FACTOR=5` viewport heights of messages so the chat is scrollable on load.
-  The trim buffer is also 5x viewport, so trimming happens less frequently during normal scrolling.
+  virtualization with measurement-based fill. Only messages within `VIEWPORT_FILL_FACTOR=3`
+  viewport heights of content are mounted. The layout effect measures actual DOM content height
+  and expands `mountStart` one message at a time until the 3-viewport invariant is met — no
+  height estimation needed. Scrolling down trims messages from the top, scrolling up expands.
+  The trim buffer is 5x viewport, so trimming happens less frequently during normal scrolling.
 - **Lightweight code blocks** (`inputs.tsx`): Replaced Monaco `CodeEditorWidget` + `ITextModel`
   with `<pre><code>` for chat code blocks. Monaco editors were being created/destroyed on every
   virtualization scroll cycle — each creation fires `onModelAdded` → VS Code services process
@@ -273,6 +274,17 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
   `useRunningThreadIds` — they now only re-render when `isRunning` transitions, not every token.
 - **Stream throttle increase** (`chatThreadService.ts`): Bumped from 100ms (10Hz) to 200ms (5Hz).
   Visually indistinguishable but halves render cost during streaming.
+- **Tab switch scroll-to-bottom** (`SidebarChat.tsx`): `wasHiddenRef` tracks whether
+  `ThreadMessagesView` was hidden (inactive tab or `clientHeight === 0`). On activation,
+  `initialFillDoneRef` is reset so the fill loop runs and scrolls to bottom when complete.
+  No `setTimeout` — event-driven via `useLayoutEffect`.
+- **ResizeObserver bottom-snapping** (`SidebarChat.tsx`): Two ResizeObservers keep the
+  chat at the bottom when content or viewport changes. `contentRo` watches the content div
+  — when content grows (StreamingBubble renders, LaTeX, etc.) and we're near the bottom,
+  snaps to bottom. `scrollRo` watches the scroll container — when the viewport resizes
+  (e.g. CommandBarInChat file-details panel opens/closes), enforces the 3-viewport
+  invariant and snaps to bottom if near bottom. Both fire during CSS transitions for
+  smooth scrolling.
 - **Three-way thread storage split** (`chatThreadService.ts`): Each thread uses three storage
   categories: `void.chatThread.<id>` (static metadata — compaction summary, title, workspace,
   state; written on user actions/compaction, never during streaming), `void.chatUsage.<id>`
