@@ -1828,15 +1828,75 @@ export const VoidButtonBgDarken = ({ children, disabled, onClick, className }: {
 
 
 
-// Lightweight diff display — plain text instead of Monaco DiffEditorWidget.
+// Simple line-level diff using LCS. Returns a unified view where each
+// line is tagged as 'same', 'removed', or 'added'.
+type DiffLine = { type: 'same' | 'removed' | 'added'; text: string }
+const computeLineDiff = (orig: string, final: string): DiffLine[] => {
+	const origLines = orig.split('\n')
+	const finalLines = final.split('\n')
+
+	// Build LCS table
+	const m = origLines.length
+	const n = finalLines.length
+	const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0))
+	for (let i = 1; i <= m; i++) {
+		for (let j = 1; j <= n; j++) {
+			dp[i][j] = origLines[i - 1] === finalLines[j - 1]
+				? dp[i - 1][j - 1] + 1
+				: Math.max(dp[i - 1][j], dp[i][j - 1])
+		}
+	}
+
+	// Backtrack to produce unified diff
+	const result: DiffLine[] = []
+	let i = m, j = n
+	while (i > 0 || j > 0) {
+		if (i > 0 && j > 0 && origLines[i - 1] === finalLines[j - 1]) {
+			result.push({ type: 'same', text: origLines[i - 1] })
+			i--; j--
+		} else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+			result.push({ type: 'added', text: finalLines[j - 1] })
+			j--
+		} else {
+			result.push({ type: 'removed', text: origLines[i - 1] })
+			i--
+		}
+	}
+	result.reverse()
+	return result
+}
+
+// Lightweight diff display with line-level highlighting.
 const SingleDiffEditor = ({ block }: { block: ExtractedSearchReplaceBlock, lang?: string }) => {
 	const selectableStyle: React.CSSProperties = { userSelect: 'text', WebkitUserSelect: 'text' }
+	const notSelectableStyle: React.CSSProperties = { userSelect: 'none', WebkitUserSelect: 'none' }
+	const diffLines = useMemo(() => computeLineDiff(block.orig, block.final), [block.orig, block.final])
+
 	return (
-		<div className="w-full bg-void-bg-3 text-xs font-mono" style={selectableStyle}>
-			<div className="text-void-fg-4 px-2 py-1 border-b border-void-border-1">--- Original ---</div>
-			<pre className="m-0 px-2 py-1 text-void-fg-2 whitespace-pre overflow-x-auto max-h-[150px]" style={selectableStyle}>{block.orig}</pre>
-			<div className="text-void-fg-4 px-2 py-1 border-t border-b border-void-border-1">+++ Modified +++</div>
-			<pre className="m-0 px-2 py-1 text-void-fg-2 whitespace-pre overflow-x-auto max-h-[150px]" style={selectableStyle}>{block.final}</pre>
+		<div className="w-full bg-void-bg-3 text-xs font-mono overflow-x-auto max-h-[300px] overflow-y-auto" style={selectableStyle}>
+			<div className="min-w-full inline-block">
+				{diffLines.map((line, i) => {
+					if (line.type === 'removed') {
+						return (
+							<div key={i} className="px-2 whitespace-pre leading-[19px] bg-[rgba(255,0,0,0.12)] text-void-fg-4 line-through opacity-60 min-w-full" style={notSelectableStyle}>
+								<span className="opacity-50">-</span>{line.text}
+							</div>
+						)
+					}
+					if (line.type === 'added') {
+						return (
+							<div key={i} className="px-2 whitespace-pre leading-[19px] bg-[rgba(0,128,0,0.18)] text-void-fg-2 min-w-full" style={selectableStyle}>
+								<span className="opacity-50 select-none">+</span>{line.text}
+							</div>
+						)
+					}
+					return (
+						<div key={i} className="px-2 whitespace-pre leading-[19px] text-void-fg-2 min-w-full" style={selectableStyle}>
+							<span className="opacity-50 select-none"> </span>{line.text}
+						</div>
+					)
+				})}
+			</div>
 		</div>
 	)
 }

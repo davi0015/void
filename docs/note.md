@@ -239,8 +239,13 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
   The lightweight version costs zero overhead on scroll. Removed `LazyBlockCode`'s
   IntersectionObserver, height locking, and mount rate-limiting queue (unnecessary without Monaco).
 - **Lightweight diff display** (`inputs.tsx`): Replaced Monaco `DiffEditorWidget` + 2 models per
-  diff block with plain text original/modified display. Same rationale as code blocks — creating
-  DiffEditorWidgets on scroll was a major source of thread and memory growth.
+  diff block with a unified diff view using line-level LCS highlighting. Removed lines show
+  red background with strikethrough and `user-select: none`; added lines show green background
+  and are selectable. Same rationale as code blocks — creating DiffEditorWidgets on scroll was
+  a major source of thread and memory growth.
+- **Text selection in sidebar** (`inputs.tsx`): VS Code sets `body { user-select: none }` globally,
+  which prevents text selection in sidebar content. Added inline `userSelect: 'text'` and
+  `WebkitUserSelect: 'text'` styles to code blocks and diff displays to override this.
 - **Lightweight terminal output** (`ToolResultComponents.tsx`): Replaced xterm.js terminal
   attachment for `run_command` results with plain text `<pre>`. Running commands show a
   placeholder instead of attaching a terminal instance.
