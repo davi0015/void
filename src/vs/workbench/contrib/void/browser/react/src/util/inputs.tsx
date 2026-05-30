@@ -1653,8 +1653,8 @@ const BlockCode = ({ initValue, maxHeight }: BlockCodeProps) => {
 	const MAX_HEIGHT = maxHeight ?? Infinity
 	const maxHeightStyle = MAX_HEIGHT !== Infinity ? { maxHeight: `${MAX_HEIGHT}px` } as React.CSSProperties : undefined
 	return (
-		<div className='relative z-0 px-2 py-1 bg-void-bg-3' style={maxHeightStyle}>
-			<pre className='m-0 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto overflow-y-auto text-void-fg-2' style={maxHeightStyle}>
+		<div className='relative z-0 px-2 py-1 bg-void-bg-3' style={{ ...maxHeightStyle, userSelect: 'text', WebkitUserSelect: 'text' }}>
+			<pre className='m-0 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto overflow-y-auto text-void-fg-2' style={{ ...maxHeightStyle, userSelect: 'text', WebkitUserSelect: 'text' }}>
 				<code>{normalized}</code>
 			</pre>
 		</div>
@@ -1830,12 +1830,13 @@ export const VoidButtonBgDarken = ({ children, disabled, onClick, className }: {
 
 // Lightweight diff display — plain text instead of Monaco DiffEditorWidget.
 const SingleDiffEditor = ({ block }: { block: ExtractedSearchReplaceBlock, lang?: string }) => {
+	const selectableStyle: React.CSSProperties = { userSelect: 'text', WebkitUserSelect: 'text' }
 	return (
-		<div className="w-full bg-void-bg-3 text-xs font-mono">
+		<div className="w-full bg-void-bg-3 text-xs font-mono" style={selectableStyle}>
 			<div className="text-void-fg-4 px-2 py-1 border-b border-void-border-1">--- Original ---</div>
-			<pre className="m-0 px-2 py-1 text-void-fg-2 whitespace-pre overflow-x-auto max-h-[150px]">{block.orig}</pre>
+			<pre className="m-0 px-2 py-1 text-void-fg-2 whitespace-pre overflow-x-auto max-h-[150px]" style={selectableStyle}>{block.orig}</pre>
 			<div className="text-void-fg-4 px-2 py-1 border-t border-b border-void-border-1">+++ Modified +++</div>
-			<pre className="m-0 px-2 py-1 text-void-fg-2 whitespace-pre overflow-x-auto max-h-[150px]">{block.final}</pre>
+			<pre className="m-0 px-2 py-1 text-void-fg-2 whitespace-pre overflow-x-auto max-h-[150px]" style={selectableStyle}>{block.final}</pre>
 		</div>
 	)
 }
