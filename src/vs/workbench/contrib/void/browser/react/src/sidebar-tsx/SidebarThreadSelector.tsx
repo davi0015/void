@@ -5,7 +5,7 @@
 
 import React, { startTransition, useEffect, useLayoutEffect, useMemo, useRef, useState, KeyboardEvent } from 'react';
 import { CopyButton, IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
-import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useFullChatThreadsStreamState, useSettingsState } from '../util/services.js';
+import { useAccessor, useChatThreadsState, useRunningThreadIds, useSettingsState } from '../util/services.js';
 import { IconX } from './SidebarChat.js';
 import { Check, ChevronDown, ChevronRight, Copy, Globe, Icon, LoaderCircle, Lock, MessageCircleQuestion, Plus, Trash2, UserCheck, X } from 'lucide-react';
 import { isThreadReadOnly, IsRunningType, ThreadType } from '../../../chatThreadService.js';
@@ -76,13 +76,7 @@ export const PastThreadsList = React.memo(({ className = '' }: { className?: str
 	const threadsState = useChatThreadsState()
 	const { allThreads, currentWorkspaceUri } = threadsState
 
-	const streamState = useFullChatThreadsStreamState()
-
-	const runningThreadIds: { [threadId: string]: IsRunningType | undefined } = {}
-	for (const threadId in streamState) {
-		const isRunning = streamState[threadId]?.isRunning
-		if (isRunning) { runningThreadIds[threadId] = isRunning }
-	}
+	const runningThreadIds = useRunningThreadIds()
 
 	if (!allThreads) {
 		return <div key="error" className="p-1">{`Error accessing chat history.`}</div>;
@@ -457,7 +451,7 @@ export const SidebarThreadTabs = React.memo(() => {
 	const contextMenuService = accessor.get('IContextMenuService')
 
 	const threadsState = useChatThreadsState()
-	const streamState = useFullChatThreadsStreamState()
+	const runningThreadIds = useRunningThreadIds()
 
 	const { allThreads, currentThreadId, pinnedThreadIds, currentWorkspaceUri } = threadsState
 
@@ -835,7 +829,7 @@ export const SidebarThreadTabs = React.memo(() => {
 				{showNothing ? null : renderedTabs.map(id => {
 					const t = allThreads[id]!
 					const isActive = id === currentThreadId
-					const isRunning = streamState[id]?.isRunning
+					const isRunning = runningThreadIds[id]
 
 					// Phase E commit 5 — workspace provenance indicator. The icon
 					// slot is shared with the running-state spinner above; running

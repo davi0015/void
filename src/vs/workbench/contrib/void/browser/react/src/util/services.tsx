@@ -467,6 +467,58 @@ export const useFullChatThreadsStreamState = () => {
 	return s
 }
 
+// Returns true when any thread is streaming. Only fires on isRunning
+// transitions (start/stop), not on every streaming token, so consumers
+// don't re-render at ~10Hz during LLM output.
+export const useAnyThreadRunning = (): boolean => {
+	const compute = () => Object.values(chatThreadsStreamState).some(s => !!s?.isRunning)
+	const [running, setRunning] = useState(compute)
+	useEffect(() => {
+		setRunning(compute())
+		const listener = () => {
+			const next = compute()
+			setRunning(prev => prev === next ? prev : next)
+		}
+		chatThreadsStreamStateListeners.add(listener)
+		return () => { chatThreadsStreamStateListeners.delete(listener) }
+	}, [])
+	return running
+}
+
+// Returns a map of threadId → isRunning for threads that are currently
+// running. Only fires on isRunning transitions, not on every streaming
+// token. Used by thread selectors that need to show running indicators
+// per thread without re-rendering at ~10Hz.
+export const useRunningThreadIds = (): Record<string, IsRunningType | undefined> => {
+	const compute = () => {
+		const result: Record<string, IsRunningType | undefined> = {}
+		for (const threadId in chatThreadsStreamState) {
+			const isRunning = chatThreadsStreamState[threadId]?.isRunning
+			if (isRunning) { result[threadId] = isRunning }
+		}
+		return result
+	}
+	const [ids, setIds] = useState(compute)
+	useEffect(() => {
+		setIds(compute())
+		const listener = () => {
+			const next = compute()
+			setIds(prev => {
+				const prevKeys = Object.keys(prev)
+				const nextKeys = Object.keys(next)
+				if (prevKeys.length !== nextKeys.length) return next
+				for (const k of prevKeys) {
+					if (prev[k] !== next[k]) return next
+				}
+				return prev
+			})
+		}
+		chatThreadsStreamStateListeners.add(listener)
+		return () => { chatThreadsStreamStateListeners.delete(listener) }
+	}, [])
+	return ids
+}
+
 
 
 export const useRefreshModelState = () => {
