@@ -18,6 +18,7 @@ export interface IVoidModelService {
 	getModel(uri: URI): VoidModelType;
 	getModelFromFsPath(fsPath: string): VoidModelType;
 	getModelSafe(uri: URI): Promise<VoidModelType>;
+	withModel<T>(uri: URI, fn: (model: VoidModelType) => T): T;
 	saveModel(uri: URI): Promise<void>;
 
 }
@@ -58,7 +59,8 @@ class VoidModelService extends Disposable implements IVoidModelService {
 		}
 	};
 
-	// Release a model reference that was created by a read-only operation.
+
+	// Release a model reference. Called internally by acquireModel and withModel.
 	// Models for files open in editor tabs are kept alive by the editor's
 	// own model service — we only release our extra reference here. Safe to
 	// call even if the model was never initialized or already released.
@@ -92,8 +94,19 @@ class VoidModelService extends Disposable implements IVoidModelService {
 	getModelSafe = async (uri: URI): Promise<VoidModelType> => {
 		if (!(uri.fsPath in this._modelRefOfURI)) await this.initializeModel(uri);
 		return this.getModel(uri);
-
 	};
+
+	// Use a model for a read-only operation. The ref is automatically released
+	// when the callback returns — callers never need to remember releaseModel.
+	// The model must already be initialized (e.g. via getModelSafe during tool execution).
+	withModel = <T>(uri: URI, fn: (model: VoidModelType) => T): T => {
+		const result = this.getModel(uri)
+		try {
+			return fn(result)
+		} finally {
+			this.releaseModel(uri)
+		}
+	}
 
 	override dispose() {
 		super.dispose();

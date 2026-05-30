@@ -10,9 +10,9 @@ import { SelectBox } from '../../../../../../../base/browser/ui/selectBox/select
 import { IDisposable } from '../../../../../../../base/common/lifecycle.js';
 import { Checkbox } from '../../../../../../../base/browser/ui/toggle/toggle.js';
 
-import { CodeEditorWidget } from '../../../../../../../editor/browser/widget/codeEditor/codeEditorWidget.js'
+
 import { useAccessor } from './services.js';
-import { ITextModel } from '../../../../../../../editor/common/model.js';
+
 import { asCssVariable } from '../../../../../../../platform/theme/common/colorUtils.js';
 import { inputBackground, inputForeground } from '../../../../../../../platform/theme/common/colorRegistry.js';
 import { useFloating, autoUpdate, offset, flip, shift, size, autoPlacement } from '@floating-ui/react';
@@ -20,7 +20,7 @@ import { URI } from '../../../../../../../base/common/uri.js';
 import { getBasename, getFolderName } from '../sidebar-tsx/SidebarChat.js';
 import { ChevronRight, File, Folder, FolderClosed, LucideProps } from 'lucide-react';
 import { StagingSelectionItem } from '../../../../common/chatThreadServiceTypes.js';
-import { DiffEditorWidget } from '../../../../../../../editor/browser/widget/diffEditor/diffEditorWidget.js';
+
 import { extractSearchReplaceBlocks, ExtractedSearchReplaceBlock } from '../../../../common/helpers/extractCodeFromResult.js';
 import { IAccessibilitySignalService } from '../../../../../../../platform/accessibilitySignal/browser/accessibilitySignalService.js';
 import { IEditorProgressService } from '../../../../../../../platform/progress/common/progress.js';
@@ -1645,149 +1645,20 @@ const normalizeIndentation = (code: string): string => {
 }
 
 
-const modelOfEditorId: { [id: string]: ITextModel | undefined } = {}
 export type BlockCodeProps = { initValue: string, language?: string, maxHeight?: number, showScrollbars?: boolean, isStreaming?: boolean }
-// Not exported: the only call-site is LazyBlockCode below. Using this directly re-introduces
-// the tab-switch/long-chat perf regression we fixed in Perf 1 Fix C — always go through LazyBlockCode.
-const BlockCode = ({ initValue, language, maxHeight, showScrollbars, onReady }: BlockCodeProps & { onReady?: () => void }) => {
-
-	initValue = normalizeIndentation(initValue)
-
-	// default settings
-	const MAX_HEIGHT = maxHeight ?? Infinity;
-	const SHOW_SCROLLBARS = showScrollbars ?? false;
-
-	const divRef = useRef<HTMLDivElement | null>(null)
-
-	const accessor = useAccessor()
-	const instantiationService = accessor.get('IInstantiationService')
-	// const languageDetectionService = accessor.get('ILanguageDetectionService')
-	const modelService = accessor.get('IModelService')
-
-	const id = useId()
-
-	// these are used to pass to the model creation of modelRef
-	const initValueRef = useRef(initValue)
-	const languageRef = useRef(language)
-	const onReadyRef = useRef(onReady)
-	onReadyRef.current = onReady
-
-	const modelRef = useRef<ITextModel | null>(null)
-
-	// if we change the initial value, don't re-render the whole thing, just set it here. same for language
-	useEffect(() => {
-		initValueRef.current = initValue
-		modelRef.current?.setValue(initValue)
-	}, [initValue])
-	useEffect(() => {
-		languageRef.current = language
-		if (language) modelRef.current?.setLanguage(language)
-	}, [language])
-
-	return <div ref={divRef} className='relative z-0 px-2 py-1 bg-void-bg-3'>
-		<WidgetComponent
-			className='@@bg-editor-style-override' // text-sm
-			ctor={useCallback((container) => {
-				return instantiationService.createInstance(
-					CodeEditorWidget,
-					container,
-					{
-						automaticLayout: true,
-						wordWrap: 'off',
-
-						scrollbar: {
-							alwaysConsumeMouseWheel: false,
-							...SHOW_SCROLLBARS ? {
-								vertical: 'auto',
-								verticalScrollbarSize: 8,
-								horizontal: 'auto',
-								horizontalScrollbarSize: 8,
-							} : {
-								vertical: 'hidden',
-								verticalScrollbarSize: 0,
-								horizontal: 'auto',
-								horizontalScrollbarSize: 8,
-								ignoreHorizontalScrollbarInContentHeight: true,
-
-							},
-						},
-						scrollBeyondLastLine: false,
-
-						lineNumbers: 'off',
-
-						readOnly: true,
-						domReadOnly: true,
-						readOnlyMessage: { value: '' },
-
-						minimap: {
-							enabled: false,
-							// maxColumn: 0,
-						},
-
-						hover: { enabled: false },
-
-						selectionHighlight: false, // highlights whole words
-						renderLineHighlight: 'none',
-
-						folding: false,
-						lineDecorationsWidth: 0,
-						overviewRulerLanes: 0,
-						hideCursorInOverviewRuler: true,
-						overviewRulerBorder: false,
-						glyphMargin: false,
-
-						stickyScroll: {
-							enabled: false,
-						},
-					},
-					{
-						isSimpleWidget: true,
-					})
-			}, [instantiationService])}
-
-			onCreateInstance={useCallback((editor: CodeEditorWidget) => {
-				const languageId = languageRef.current ? languageRef.current : 'plaintext'
-
-				const model = modelOfEditorId[id] ?? modelService.createModel(
-					initValueRef.current, {
-					languageId: languageId,
-					onDidChange: (e) => { return { dispose: () => { } } } // no idea why they'd require this
-				})
-				modelRef.current = model
-				editor.setModel(model);
-
-				const container = editor.getDomNode()
-				const parentNode = container?.parentElement
-				const resize = () => {
-					const height = editor.getScrollHeight() + 1
-					if (parentNode) {
-						// const height = Math.min(, MAX_HEIGHT);
-						parentNode.style.height = `${height}px`;
-						parentNode.style.maxHeight = `${MAX_HEIGHT}px`;
-						editor.layout();
-					}
-				}
-
-				resize()
-				onReadyRef.current?.()
-				const disposable = editor.onDidContentSizeChange(() => { resize() });
-
-				return [disposable, model]
-			}, [modelService])}
-
-			dispose={useCallback((editor: CodeEditorWidget) => {
-				const model = editor.getModel()
-				editor.dispose()
-				if (model) {
-					model.dispose()
-					delete modelOfEditorId[id]
-				}
-			}, [modelService])}
-
-			propsFn={useCallback(() => { return [] }, [])}
-		/>
-	</div>
-
+// Lightweight code block — uses <pre><code> instead of Monaco to avoid
+// creating/destroying heavy editors on every virtualization scroll cycle.
+const BlockCode = ({ initValue, maxHeight }: BlockCodeProps) => {
+	const normalized = normalizeIndentation(initValue)
+	const MAX_HEIGHT = maxHeight ?? Infinity
+	const maxHeightStyle = MAX_HEIGHT !== Infinity ? { maxHeight: `${MAX_HEIGHT}px` } as React.CSSProperties : undefined
+	return (
+		<div className='relative z-0 px-2 py-1 bg-void-bg-3' style={maxHeightStyle}>
+			<pre className='m-0 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto overflow-y-auto text-void-fg-2' style={maxHeightStyle}>
+				<code>{normalized}</code>
+			</pre>
+		</div>
+	)
 }
 
 
@@ -1819,111 +1690,10 @@ const scheduleLazyMount = (cb: () => void) => {
 }
 
 
-// Lazy wrapper around BlockCode that defers mounting the heavy Monaco CodeEditorWidget
-// until the block is near the viewport, and unmounts it when it scrolls away.
-// Rendering dozens of Monaco editors per chat thread is the dominant cost on
-// tab switches / long chats (disposable churn, TextMate worker attach/detach,
-// scrollbar+sash+hover provider allocation). We render a plain <pre><code>
-// placeholder with the same container styling while off-screen, then upgrade
-// in-place to the real BlockCode when the IntersectionObserver fires. When the
-// block scrolls away, we downgrade back to the placeholder — this caps live
-// Monacos to the viewport count (~5-10) instead of growing unboundedly.
-// Mounts are funneled through a per-frame queue (`scheduleLazyMount`) so a
-// burst of IO fires during fast scrolling staggers instead of piling onto a
-// single frame. Unmounts are immediate to release memory/workers ASAP.
-export const LazyBlockCode = ({ initValue, language, maxHeight, showScrollbars, isStreaming }: BlockCodeProps) => {
-	const wrapperRef = useRef<HTMLDivElement | null>(null)
-	const lockedHeightRef = useRef<number | null>(null)
-	const [isVisible, setIsVisible] = useState(false)
-	const isVisibleRef = useRef(isVisible)
-	isVisibleRef.current = isVisible
-
-	useEffect(() => {
-		if (isStreaming) {
-			setIsVisible(true)
-			return
-		}
-		const el = wrapperRef.current
-		if (!el) return
-		if (typeof IntersectionObserver === 'undefined') {
-			setIsVisible(true)
-			return
-		}
-		let cancelled = false
-		const io = new IntersectionObserver((entries) => {
-			if (cancelled) return
-			if (entries.some(e => e.isIntersecting)) {
-				scheduleLazyMount(() => {
-					if (cancelled) return
-					lockedHeightRef.current = el.offsetHeight
-					setIsVisible(true)
-				})
-			} else if (entries.every(e => !e.isIntersecting)) {
-				// Scrolled away — freeze the current height so the wrapper
-				// doesn't collapse when Monaco unmounts, then downgrade to
-				// the lightweight <pre><code> placeholder.
-				const currentHeight = el.offsetHeight
-				if (currentHeight > 0) {
-					lockedHeightRef.current = currentHeight
-				}
-				setIsVisible(false)
-			}
-		}, { rootMargin: '500px 0px' })
-		io.observe(el)
-		// If the element is already out of viewport when the observer
-		// starts (e.g., streaming just ended and the block scrolled away),
-		// the IO won't fire because there's no transition. Check immediately.
-		// Use requestAnimationFrame to let the browser compute layout first.
-		requestAnimationFrame(() => {
-			if (cancelled) return
-			const rect = el.getBoundingClientRect()
-			// Expand check by rootMargin (500px) to match the IO threshold
-			const isInViewport = rect.bottom > -500 && rect.top < window.innerHeight + 500
-			if (!isInViewport && isVisibleRef.current) {
-				lockedHeightRef.current = el.offsetHeight
-				setIsVisible(false)
-			} else if (isInViewport && !isVisibleRef.current) {
-				scheduleLazyMount(() => {
-					if (cancelled) return
-					lockedHeightRef.current = el.offsetHeight
-					setIsVisible(true)
-				})
-			}
-		})
-		return () => {
-			cancelled = true
-			io.disconnect()
-		}
-	}, [isStreaming])
-
-	// Once Monaco's onDidContentSizeChange fires and sets the real height,
-	// clear the locked height so the wrapper follows the editor naturally.
-	const onEditorReady = useCallback(() => {
-		lockedHeightRef.current = null
-		if (wrapperRef.current) wrapperRef.current.style.height = ''
-	}, [])
-
-	const lockedStyle = lockedHeightRef.current != null
-		? { height: lockedHeightRef.current + 'px' } as React.CSSProperties
-		: undefined
-
-	return (
-		<div ref={wrapperRef} style={lockedStyle}>
-			{isVisible && !isStreaming
-				? <BlockCode initValue={initValue} language={language} maxHeight={maxHeight} showScrollbars={showScrollbars} onReady={onEditorReady} />
-				: (() => {
-					const normalized = normalizeIndentation(initValue)
-					return (
-						<div className='relative z-0 px-2 py-1 bg-void-bg-3'>
-							<pre className='m-0 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto text-void-fg-2'>
-								<code>{normalized}</code>
-							</pre>
-						</div>
-					)
-				})()
-			}
-		</div>
-	)
+// BlockCode is now lightweight (<pre><code>), so no need for IntersectionObserver
+// or lazy mounting. We keep the export name so call-sites don't change.
+export const LazyBlockCode = ({ initValue, maxHeight }: BlockCodeProps) => {
+	return <BlockCode initValue={initValue} maxHeight={maxHeight} />
 }
 
 
@@ -2058,100 +1828,17 @@ export const VoidButtonBgDarken = ({ children, disabled, onClick, className }: {
 
 
 
-const SingleDiffEditor = ({ block, lang }: { block: ExtractedSearchReplaceBlock, lang: string | undefined }) => {
-	const accessor = useAccessor();
-	const modelService = accessor.get('IModelService');
-	const instantiationService = accessor.get('IInstantiationService');
-	const languageService = accessor.get('ILanguageService');
-
-	const languageSelection = useMemo(() => languageService.createById(lang), [lang, languageService]);
-
-	// Create models for original and modified
-	const originalModel = useMemo(() =>
-		modelService.createModel(block.orig, languageSelection),
-		[block.orig, languageSelection, modelService]
-	);
-	const modifiedModel = useMemo(() =>
-		modelService.createModel(block.final, languageSelection),
-		[block.final, languageSelection, modelService]
-	);
-
-	// Imperatively mount the DiffEditorWidget
-	const divRef = useRef<HTMLDivElement | null>(null);
-	const editorRef = useRef<any>(null);
-
-	useEffect(() => {
-		if (!divRef.current) return;
-		const editor = instantiationService.createInstance(
-			DiffEditorWidget,
-			divRef.current,
-			{
-				automaticLayout: true,
-				readOnly: true,
-				renderSideBySide: true,
-				minimap: { enabled: false },
-				lineNumbers: 'off',
-				scrollbar: {
-					vertical: 'hidden',
-					horizontal: 'auto',
-					verticalScrollbarSize: 0,
-					horizontalScrollbarSize: 8,
-					alwaysConsumeMouseWheel: false,
-					ignoreHorizontalScrollbarInContentHeight: true,
-				},
-				hover: { enabled: false },
-				folding: false,
-				selectionHighlight: false,
-				renderLineHighlight: 'none',
-				overviewRulerLanes: 0,
-				hideCursorInOverviewRuler: true,
-				overviewRulerBorder: false,
-				glyphMargin: false,
-				stickyScroll: { enabled: false },
-				scrollBeyondLastLine: false,
-				renderGutterMenu: false,
-				renderIndicators: false,
-			},
-			{ originalEditor: { isSimpleWidget: true }, modifiedEditor: { isSimpleWidget: true } }
-		);
-		editor.setModel({ original: originalModel, modified: modifiedModel });
-
-		const updateHeight = () => {
-			const contentHeight = Math.max(
-				originalModel.getLineCount() * 19,
-				modifiedModel.getLineCount() * 19
-			) + 19 * 2 + 1;
-
-			// Set reasonable min/max heights
-			const height = Math.min(Math.max(contentHeight, 100), 300);
-			if (divRef.current) {
-				divRef.current.style.height = `${height}px`;
-				editor.layout();
-			}
-		};
-
-		updateHeight();
-		editorRef.current = editor;
-
-		// Update height when content changes
-		const disposable1 = originalModel.onDidChangeContent(() => updateHeight());
-		const disposable2 = modifiedModel.onDidChangeContent(() => updateHeight());
-
-		// dispose editor before models so DiffEditorWidget releases model references first
-		return () => {
-			disposable1.dispose();
-			disposable2.dispose();
-			editor.dispose();
-			editorRef.current = null;
-			originalModel.dispose();
-			modifiedModel.dispose();
-		};
-	}, [originalModel, modifiedModel, instantiationService]);
-
+// Lightweight diff display — plain text instead of Monaco DiffEditorWidget.
+const SingleDiffEditor = ({ block }: { block: ExtractedSearchReplaceBlock, lang?: string }) => {
 	return (
-		<div className="w-full bg-void-bg-3 @@bg-editor-style-override" ref={divRef} />
-	);
-};
+		<div className="w-full bg-void-bg-3 text-xs font-mono">
+			<div className="text-void-fg-4 px-2 py-1 border-b border-void-border-1">--- Original ---</div>
+			<pre className="m-0 px-2 py-1 text-void-fg-2 whitespace-pre overflow-x-auto max-h-[150px]">{block.orig}</pre>
+			<div className="text-void-fg-4 px-2 py-1 border-t border-b border-void-border-1">+++ Modified +++</div>
+			<pre className="m-0 px-2 py-1 text-void-fg-2 whitespace-pre overflow-x-auto max-h-[150px]">{block.final}</pre>
+		</div>
+	)
+}
 
 
 

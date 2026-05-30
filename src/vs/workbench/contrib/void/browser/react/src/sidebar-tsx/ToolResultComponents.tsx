@@ -9,7 +9,7 @@ import { useAccessor, useChatThreadsStreamState, useSettingsState } from '../uti
 
 import { ChatMarkdownRender, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
 import { URI } from '../../../../../../../base/common/uri.js';
-import { LazyBlockCode, VoidDiffEditor } from '../util/inputs.js';
+import { VoidDiffEditor } from '../util/inputs.js';
 import { AlertTriangle, Ban, ChevronRight, CircleEllipsis } from 'lucide-react';
 import { ChatMessage, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, LintErrorItem, ToolName } from '../../../../common/toolsServiceTypes.js';
@@ -735,42 +735,6 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 	const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected, }
 
 
-	const effect = async () => {
-		if (streamState?.isRunning !== 'tool') return
-		if (type !== 'run_command' || toolMessage.type !== 'running_now') return;
-
-		// wait for the interruptor so we know it's running
-
-		await streamState?.interrupt
-		const container = divRef.current;
-		if (!container) return;
-
-		const terminal = terminalToolsService.getTemporaryTerminal(toolMessage.params.terminalId);
-		if (!terminal) return;
-
-		try {
-			terminal.attachToElement(container);
-			terminal.setVisible(true)
-		} catch {
-		}
-
-		// Listen for size changes of the container and keep the terminal layout in sync.
-		const resizeObserver = new ResizeObserver((entries) => {
-			const height = entries[0].borderBoxSize[0].blockSize;
-			const width = entries[0].borderBoxSize[0].inlineSize;
-			if (typeof terminal.layout === 'function') {
-				terminal.layout({ width, height });
-			}
-		});
-
-		resizeObserver.observe(container);
-		return () => { terminal.detachFromElement(); resizeObserver?.disconnect(); }
-	}
-
-	useEffect(() => {
-		effect()
-	}, [terminalToolsService, toolMessage, toolMessage.type, type]);
-
 	if (toolMessage.type === 'success') {
 		const { result } = toolMessage
 
@@ -789,7 +753,7 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 
 		componentParams.children = <ToolChildrenWrapper className='whitespace-pre text-nowrap overflow-auto text-sm'>
 			<div className='!select-text cursor-auto'>
-				<LazyBlockCode initValue={`${msg.trim()}`} language='shellscript' />
+				<pre className='m-0 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto text-void-fg-2'>{msg.trim()}</pre>
 			</div>
 		</ToolChildrenWrapper>
 	}
@@ -803,7 +767,7 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 	}
 	else if (toolMessage.type === 'running_now') {
 		if (type === 'run_command')
-			componentParams.children = <div ref={divRef} className='relative h-[300px] text-sm' />
+			componentParams.children = <div className='relative h-[300px] text-sm bg-void-bg-3 p-2 overflow-auto'><pre className='m-0 font-mono text-[13px] whitespace-pre text-void-fg-2'>Running command...</pre></div>
 	}
 	else if (toolMessage.type === 'rejected' || toolMessage.type === 'tool_request') {
 	}

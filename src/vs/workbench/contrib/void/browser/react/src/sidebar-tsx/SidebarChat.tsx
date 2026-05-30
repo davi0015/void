@@ -2536,7 +2536,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		return lines * LINE_H + BUBBLE_PADDING
 	}, [])
 
-	const VIEWPORT_FILL_FACTOR = 3
+	const VIEWPORT_FILL_FACTOR = 5
 
 	// Two-phase initial mount:
 	// Phase 1: estimate heights from content, set mountStart in one shot
@@ -2792,7 +2792,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					const mounted = totalCountRef.current - mountStartRef.current
 					const avgH = mounted > 0 ? (contentRef.current?.offsetHeight ?? el.scrollHeight) / mounted : 200
 					const msgsAbove = Math.floor(currScrollTop / avgH)
-					const msgsToKeepAbove = Math.ceil((el.clientHeight * 2) / avgH)
+					const msgsToKeepAbove = Math.ceil((el.clientHeight * 5) / avgH)
 					const msgsToRemove = msgsAbove - msgsToKeepAbove
 					if (msgsToRemove > 0) {
 						flushSync(() => setMountStart(prev => Math.min(prev + msgsToRemove, Math.max(0, totalCountRef.current - 1))))
@@ -2847,6 +2847,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			return cache.html
 		}
 
+		// Incremental append: same mountStart, just more messages at the end
 		if (depsMatch && previousMessages.length > cache.len) {
 			const newElements: React.ReactNode[] = []
 			for (let i = cache.len; i < previousMessages.length; i++) {
@@ -2871,7 +2872,47 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			return merged
 		}
 
-		// Full rebuild: mountStart changed, thread deps changed, etc.
+		// mountStart changed but messages array is the same — trim/extend
+		// at the edges instead of rebuilding everything. Keys stay the same
+		// for existing elements so React skips reconciliation on them.
+		const c = cache
+		if (c && c.msgs === previousMessages && previousMessages.length === c.len) {
+			const oldStart = c.mountStart
+			const newStart = mountStart
+			if (oldStart === newStart) {
+				return c.html
+			}
+
+			let result: React.ReactNode[]
+			if (newStart > oldStart) {
+				// Scrolled down — remove elements from the front
+				result = c.html.slice(newStart - oldStart)
+			} else {
+				// Scrolled up — prepend new elements at the front
+				const prefix: React.ReactNode[] = []
+				for (let i = newStart; i < oldStart; i++) {
+					prefix.push(<ChatBubble
+						key={i}
+						currCheckpointIdx={currCheckpointIdx}
+						chatMessage={previousMessages[i]}
+						messageIdx={i}
+						isCommitted={true}
+						chatIsRunning={undefined}
+						threadId={threadId}
+						_scrollToBottom={scrollToBottomCb}
+						firstPendingToolRequestIdx={firstPendingToolRequestIdx}
+						threadIsReadOnly={threadIsReadOnly}
+						compactionBoundaryIdx={compactionBoundaryIdx}
+					/>)
+				}
+				result = [...prefix, ...c.html]
+			}
+			c.html = result
+			c.mountStart = mountStart
+			return result
+		}
+
+		// Full rebuild: msgs reference changed (e.g. compaction, checkpoint)
 		const result: React.ReactNode[] = []
 		for (let i = mountStart; i < previousMessages.length; i++) {
 			result.push(<ChatBubble

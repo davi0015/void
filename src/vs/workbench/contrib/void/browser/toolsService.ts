@@ -823,13 +823,13 @@ export class ToolsService implements IToolsService {
 		// given to the LLM after the call for successful tool calls
 		this.stringOfResult = {
 			read_file: (params, result) => {
-				if (result.outlined) {
-					voidModelService.releaseModel(params.uri)
-					return `SUCCESS: File outline retrieved for ${params.uri.fsPath} (${result.totalNumLines} lines, ${result.totalFileLen} characters).\nThis file is too large to read all at once. The outline below shows the file's structure with line numbers.\n\nIMPORTANT: Do NOT retry this call without line numbers — you will get the same outline.\nUse start_line and end_line to read specific sections.\n\n${result.outlineText}\n\nNEXT STEPS: To read a specific section, call read_file with the same path plus start_line and end_line from the outline above.`
-				}
-				const fence = safeFence(result.fileContents)
-				voidModelService.releaseModel(params.uri)
-				return `${params.uri.fsPath}\n${fence}\n${result.fileContents}\n${fence}${nextPageStr(result.hasNextPage)}${result.hasNextPage ? `\nMore info because truncated: this file has ${result.totalNumLines} lines, or ${result.totalFileLen} characters.` : ''}`
+				return voidModelService.withModel(params.uri, () => {
+					if (result.outlined) {
+						return `SUCCESS: File outline retrieved for ${params.uri.fsPath} (${result.totalNumLines} lines, ${result.totalFileLen} characters).\nThis file is too large to read all at once. The outline below shows the file's structure with line numbers.\n\nIMPORTANT: Do NOT retry this call without line numbers — you will get the same outline.\nUse start_line and end_line to read specific sections.\n\n${result.outlineText}\n\nNEXT STEPS: To read a specific section, call read_file with the same path plus start_line and end_line from the outline above.`
+					}
+					const fence = safeFence(result.fileContents)
+					return `${params.uri.fsPath}\n${fence}\n${result.fileContents}\n${fence}${nextPageStr(result.hasNextPage)}${result.hasNextPage ? `\nMore info because truncated: this file has ${result.totalNumLines} lines, or ${result.totalFileLen} characters.` : ''}`
+				})
 			},
 			ls_dir: (params, result) => {
 				const dirTreeStr = stringifyDirectoryTree1Deep(params, result)
@@ -845,51 +845,51 @@ export class ToolsService implements IToolsService {
 				return result.uris.map(uri => uri.fsPath).join('\n') + nextPageStr(result.hasNextPage)
 			},
 			search_in_file: (params, result) => {
-				const { model } = voidModelService.getModel(params.uri)
-				if (!model) return '<Error getting string of result>'
-				const lines = result.lines.map(n => {
-					const lineContent = model.getValueInRange({ startLineNumber: n, startColumn: 1, endLineNumber: n, endColumn: Number.MAX_SAFE_INTEGER }, EndOfLinePreference.LF)
-					return `Line ${n}:\n\`\`\`\n${lineContent}\n\`\`\``
-				}).join('\n\n');
-				voidModelService.releaseModel(params.uri)
-				return lines;
+				return voidModelService.withModel(params.uri, ({ model }) => {
+					if (!model) return '<Error getting string of result>'
+					return result.lines.map(n => {
+						const lineContent = model.getValueInRange({ startLineNumber: n, startColumn: 1, endLineNumber: n, endColumn: Number.MAX_SAFE_INTEGER }, EndOfLinePreference.LF)
+						return `Line ${n}:\n\`\`\`\n${lineContent}\n\`\`\``
+					}).join('\n\n');
+				})
 			},
 			go_to_definition: (params, result) => {
-				if (result.locations.length === 0) {
-					voidModelService.releaseModel(params.uri)
-					return `No definition found for \`${params.symbolName}\` on ${params.uri.fsPath}:${params.line}. This can happen for built-in or primitive types. If you believe this is wrong, try \`search_in_file\` or \`search_for_files\` with \`${params.symbolName}\` as the query.`
-				}
-				const header = result.locations.length === 1
-					? `Found 1 definition of \`${params.symbolName}\`:`
-					: `Found ${result.locations.length} definitions of \`${params.symbolName}\`:`
-				const lines = result.locations.map((loc, i) => {
-					const { model } = voidModelService.getModel(loc.uri)
-					const preview = model ? model.getLineContent(loc.line).trim() : '<preview unavailable>'
-					return `${i + 1}. ${loc.uri.fsPath}:${loc.line}:${loc.column}  ${preview}`
+				return voidModelService.withModel(params.uri, () => {
+					if (result.locations.length === 0) {
+						return `No definition found for \`${params.symbolName}\` on ${params.uri.fsPath}:${params.line}. This can happen for built-in or primitive types. If you believe this is wrong, try \`search_in_file\` or \`search_for_files\` with \`${params.symbolName}\` as the query.`
+					}
+					const header = result.locations.length === 1
+						? `Found 1 definition of \`${params.symbolName}\`:`
+						: `Found ${result.locations.length} definitions of \`${params.symbolName}\`:`
+					const lines = result.locations.map((loc, i) => {
+						const { model } = voidModelService.getModel(loc.uri)
+						const preview = model ? model.getLineContent(loc.line).trim() : '<preview unavailable>'
+						return `${i + 1}. ${loc.uri.fsPath}:${loc.line}:${loc.column}  ${preview}`
+					})
+					return [header, ...lines].join('\n')
 				})
-				voidModelService.releaseModel(params.uri)
-				return [header, ...lines].join('\n')
 			},
 			go_to_usages: (params, result) => {
-				if (result.locations.length === 0) {
-					voidModelService.releaseModel(params.uri)
-					return `No usages found for \`${params.symbolName}\` on ${params.uri.fsPath}:${params.line}. If you believe this is wrong, try \`search_for_files\` with \`${params.symbolName}\` as the query.`
-				}
-				const header = `Found ${result.locations.length} ${result.locations.length === 1 ? 'usage' : 'usages'} of \`${params.symbolName}\`${result.hasNextPage ? ' (more on next page)' : ''}:`
-				const lines = result.locations.map((loc, i) => {
-					const { model } = voidModelService.getModel(loc.uri)
-					const preview = model ? model.getLineContent(loc.line).trim() : '<preview unavailable>'
-					return `${i + 1}. ${loc.uri.fsPath}:${loc.line}:${loc.column}  ${preview}`
+				return voidModelService.withModel(params.uri, () => {
+					if (result.locations.length === 0) {
+						return `No usages found for \`${params.symbolName}\` on ${params.uri.fsPath}:${params.line}. If you believe this is wrong, try \`search_for_files\` with \`${params.symbolName}\` as the query.`
+					}
+					const header = `Found ${result.locations.length} ${result.locations.length === 1 ? 'usage' : 'usages'} of \`${params.symbolName}\`${result.hasNextPage ? ' (more on next page)' : ''}:`
+					const lines = result.locations.map((loc, i) => {
+						const { model } = voidModelService.getModel(loc.uri)
+						const preview = model ? model.getLineContent(loc.line).trim() : '<preview unavailable>'
+						return `${i + 1}. ${loc.uri.fsPath}:${loc.line}:${loc.column}  ${preview}`
+					})
+					const footer = result.hasNextPage ? '\n\n(More usages available. Call again with `page_number` incremented by 1 to see them.)' : ''
+					return [header, ...lines].join('\n') + footer
 				})
-				voidModelService.releaseModel(params.uri)
-				const footer = result.hasNextPage ? '\n\n(More usages available. Call again with `page_number` incremented by 1 to see them.)' : ''
-				return [header, ...lines].join('\n') + footer
 			},
 			read_lint_errors: (params, result) => {
-				voidModelService.releaseModel(params.uri)
-				return result.lintErrors ?
-					stringifyLintErrors(result.lintErrors)
-					: 'No lint errors found.'
+				return voidModelService.withModel(params.uri, () => {
+					return result.lintErrors ?
+						stringifyLintErrors(result.lintErrors)
+						: 'No lint errors found.'
+				})
 			},
 			// ---
 			create_file_or_folder: (params, result) => {

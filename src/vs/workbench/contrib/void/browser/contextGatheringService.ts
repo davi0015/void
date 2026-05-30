@@ -50,6 +50,7 @@ class ContextGatheringService extends Disposable implements IContextGatheringSer
 	}
 
 	private _subscribeToModel(model: ITextModel): void {
+		if (model.isForSimpleWidget) return
 		console.log('Subscribing to model:', model.uri.toString());
 		this._register(model.onDidChangeContent(() => {
 			const editor = this._codeEditorService.getFocusedCodeEditor();

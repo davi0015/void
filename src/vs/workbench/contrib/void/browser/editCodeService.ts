@@ -21,6 +21,7 @@ import { RenderOptions } from '../../../../editor/browser/widget/diffEditor/comp
 
 import * as dom from '../../../../base/browser/dom.js';
 import { Widget } from '../../../../base/browser/ui/widget.js';
+import { Schemas } from '../../../../base/common/network.js';
 import { URI } from '../../../../base/common/uri.js';
 import { IConsistentEditorItemService, IConsistentItemService } from './helperServices/consistentItemService.js';
 import { voidPrefixAndSuffix, ctrlKStream_userMessage, ctrlKStream_systemMessage, defaultQuickEditFimTags, rewriteCode_systemMessage, rewriteCode_userMessage, searchReplaceGivenDescription_systemMessage, searchReplaceGivenDescription_userMessage, tripleTick, } from '../common/prompt/prompts.js';
@@ -172,6 +173,18 @@ class EditCodeService extends Disposable implements IEditCodeService {
 	diffAreasOfURI: Record<string, Set<string> | undefined> = {}; // uri -> diffareaId
 
 	diffAreaOfId: Record<string, DiffArea> = {}; // diffareaId -> diffArea
+
+	private _removeDiffAreaFromId(diffareaid: string | number) {
+		const diffArea = this.diffAreaOfId[diffareaid]
+		delete this.diffAreaOfId[diffareaid]
+		// Auto-release model when last diff area for this URI is removed
+		if (diffArea) {
+			const remaining = this.diffAreasOfURI[diffArea._URI.fsPath]
+			if (remaining && remaining.size === 0) {
+				this._voidModelService.releaseModel(diffArea._URI)
+			}
+		}
+	}
 	diffOfId: Record<string, Diff> = {}; // diffid -> diff (redundant with diffArea._diffOfId)
 
 	// events
@@ -215,7 +228,10 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		const registeredModelURIs = new Set<string>()
 		const initializeModel = async (model: ITextModel) => {
 
-			await this._voidModelService.initializeModel(model.uri)
+			// Skip non-workspace models (chat code blocks are inmemory:// + isForSimpleWidget).
+			// They never have diffs, and initializing them would leak permanent
+			// model refs in VoidModelService._modelRefOfURI and listeners here.
+			if (model.uri.scheme === Schemas.inMemory || model.isForSimpleWidget) return
 
 			// do not add listeners to the same model twice - important, or will see duplicates
 			if (registeredModelURIs.has(model.uri.fsPath)) return
@@ -241,6 +257,8 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		// initialize all existing models + initialize when a new model mounts
 		for (let model of this._modelService.getModels()) { initializeModel(model) }
 		this._register(this._modelService.onModelAdded(model => { initializeModel(model) }));
+		// clean up when a model is removed so it can be re-initialized later
+		this._register(this._modelService.onModelRemoved(model => { registeredModelURIs.delete(model.uri.fsPath) }));
 
 
 		// this function adds listeners to refresh styles when editor changes tab
@@ -337,7 +355,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 
 	private _addDiffAreaStylesToURI = (uri: URI) => {
-		const { model } = this._voidModelService.getModel(uri)
+		const model = this._modelService.getModel(uri)
 
 		for (const diffareaid of this.diffAreasOfURI[uri.fsPath] || []) {
 			const diffArea = this.diffAreaOfId[diffareaid]
@@ -366,7 +384,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 
 	private _computeDiffsAndAddStylesToURI = (uri: URI) => {
-		const { model } = this._voidModelService.getModel(uri)
+		const model = this._modelService.getModel(uri)
 		if (model === null) return
 		const fullFileText = model.getValue(EndOfLinePreference.LF)
 
@@ -499,7 +517,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 		const disposeInThisEditorFns: (() => void)[] = []
 
-		const { model } = this._voidModelService.getModel(uri)
+		const model = this._modelService.getModel(uri)
 
 		// green decoration and minimap decoration
 		if (type !== 'deletion') {
@@ -647,7 +665,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 	weAreWriting = false
 	private _writeURIText(uri: URI, text: string, range_: IRange | 'wholeFileRange', { shouldRealignDiffAreas, skipRefresh, }: { shouldRealignDiffAreas: boolean, skipRefresh?: boolean, }) {
-		const { model } = this._voidModelService.getModel(uri)
+		const model = this._modelService.getModel(uri)
 		if (!model) {
 			if (!skipRefresh)
 				this._refreshStylesAndDiffsInURI(uri)
@@ -689,7 +707,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 
 	private _getCurrentVoidFileSnapshot = (uri: URI): VoidFileSnapshot => {
-		const { model } = this._voidModelService.getModel(uri)
+		const model = this._modelService.getModel(uri)
 		const snapshottedDiffAreaOfId: Record<string, DiffAreaSnapshotEntry> = {}
 
 		for (const diffareaid in this.diffAreaOfId) {
@@ -906,20 +924,20 @@ class EditCodeService extends Disposable implements IEditCodeService {
 	// delete all diffs, update diffAreaOfId, update diffAreasOfModelId
 	private _deleteDiffZone(diffZone: DiffZone) {
 		this._clearAllDiffAreaEffects(diffZone)
-		delete this.diffAreaOfId[diffZone.diffareaid]
+		this._removeDiffAreaFromId(diffZone.diffareaid)
 		this.diffAreasOfURI[diffZone._URI.fsPath]?.delete(diffZone.diffareaid.toString())
 		this._onDidAddOrDeleteDiffZones.fire({ uri: diffZone._URI })
 	}
 
 	private _deleteTrackingZone(trackingZone: TrackingZone<unknown>) {
-		delete this.diffAreaOfId[trackingZone.diffareaid]
+		this._removeDiffAreaFromId(trackingZone.diffareaid)
 		this.diffAreasOfURI[trackingZone._URI.fsPath]?.delete(trackingZone.diffareaid.toString())
 	}
 
 	private _deleteCtrlKZone(ctrlKZone: CtrlKZone) {
 		this._clearAllEffects(ctrlKZone._URI)
 		ctrlKZone._mountInfo?.dispose()
-		delete this.diffAreaOfId[ctrlKZone.diffareaid]
+		this._removeDiffAreaFromId(ctrlKZone.diffareaid)
 		this.diffAreasOfURI[ctrlKZone._URI.fsPath]?.delete(ctrlKZone.diffareaid.toString())
 	}
 
@@ -1403,7 +1421,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		linkedCtrlKZone: CtrlKZone | null,
 		onWillUndo: () => void,
 	}) {
-		const { model } = this._voidModelService.getModel(uri)
+		const model = this._modelService.getModel(uri)
 		if (!model) return
 
 		// treat like full file, unless linkedCtrlKZone was provided in which case use its diff's range
@@ -1513,7 +1531,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			throw new Error(`Void: diff.type not recognized on: ${from}`)
 		}
 
-		const { model } = this._voidModelService.getModel(uri)
+		const model = this._modelService.getModel(uri)
 		if (!model) return
 
 		let streamRequestIdRef: { current: string | null } = { current: null } // can use this as a proxy to set the diffArea's stream state requestId
@@ -1712,7 +1730,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 	_fileLengthOfGivenURI(givenURI: URI | 'current') {
 		const uri = this._uriOfGivenURI(givenURI)
 		if (!uri) return null
-		const { model } = this._voidModelService.getModel(uri)
+		const model = this._modelService.getModel(uri)
 		if (!model) return null
 		const numCharsInFile = model.getValueLength(EndOfLinePreference.LF)
 		return numCharsInFile
@@ -1766,7 +1784,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		const blocks = extractSearchReplaceBlocks(blocksStr)
 		if (blocks.length === 0) throw new Error(`No Search/Replace blocks were received!`)
 
-		const { model } = this._voidModelService.getModel(uri)
+		const model = this._modelService.getModel(uri)
 		if (!model) throw new Error(`Error applying Search/Replace blocks: File does not exist.`)
 		const modelStr = model.getValue(EndOfLinePreference.LF)
 		// .split('\n').map(l => '\t' + l).join('\n') // for testing purposes only, remember to remove this
@@ -1836,7 +1854,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		const uri = this._getURIBeforeStartApplying(opts)
 		if (!uri) return
 
-		const { model } = this._voidModelService.getModel(uri)
+		const model = this._modelService.getModel(uri)
 		if (!model) return
 
 		let streamRequestIdRef: { current: string | null } = { current: null } // can use this as a proxy to set the diffArea's stream state requestId

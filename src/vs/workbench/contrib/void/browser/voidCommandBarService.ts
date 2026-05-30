@@ -5,6 +5,7 @@
 
 import { Disposable, IDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import { createDecorator, IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
+import { Schemas } from '../../../../base/common/network.js';
 import { URI } from '../../../../base/common/uri.js';
 import * as dom from '../../../../base/browser/dom.js';
 import { Widget } from '../../../../base/browser/ui/widget.js';
@@ -107,6 +108,8 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 
 		const registeredModelURIs = new Set<string>()
 		const initializeModel = async (model: ITextModel) => {
+			// Skip non-workspace models (chat code blocks are inmemory:// + isForSimpleWidget)
+			if (model.uri.scheme === Schemas.inMemory || model.isForSimpleWidget) return
 			// do not add listeners to the same model twice - important, or will see duplicates
 			if (registeredModelURIs.has(model.uri.fsPath)) return
 			registeredModelURIs.add(model.uri.fsPath)
@@ -115,6 +118,10 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 		// initialize all existing models + initialize when a new model mounts
 		this._modelService.getModels().forEach(model => { initializeModel(model) })
 		this._register(this._modelService.onModelAdded(model => { initializeModel(model) }));
+		this._register(this._modelService.onModelRemoved(model => {
+			registeredModelURIs.delete(model.uri.fsPath)
+			this._listenToTheseURIs.delete(model.uri)
+		}));
 
 
 
