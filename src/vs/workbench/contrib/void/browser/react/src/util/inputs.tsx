@@ -1845,11 +1845,9 @@ const SingleDiffEditor = ({ block }: { block: ExtractedSearchReplaceBlock, lang?
 
 
 /**
- * ToolDiffEditor mounts a native VSCode DiffEditorWidget to show a diff between original and modified code blocks.
- * Props:
- *   - uri: URI of the file (for language detection, etc)
- *   - searchReplaceBlocks: string in search/replace format (from LLM)
- *   - language?: string (optional, fallback to 'plaintext')
+ * VoidDiffEditor renders search/replace diff blocks as plain text
+ * (original + modified sections). Lightweight alternative to Monaco
+ * DiffEditorWidget — zero model creation, zero language service activation.
  */
 export const VoidDiffEditor = ({ uri, searchReplaceBlocks, language }: { uri?: any, searchReplaceBlocks: string, language?: string }) => {
 	const accessor = useAccessor();

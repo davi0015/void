@@ -154,11 +154,11 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
   defeating `React.memo` on every stream update.
 - **Tool call preview streaming** (`EditToolChildren`): Passes `isStreaming` so the incremental lexer
   is used for the chat-side code preview during `edit_file` / `rewrite_file` tool calls.
-- **Stream throttle**: Bumped from 50ms → 100ms to give the editor more main-thread budget.
-- **Per-thread storage** (`chatThreadService.ts`): Each thread is stored under its own SQLite key
-  (`void.chatThread.{id}`) instead of a single blob for all threads. Saving one thread no longer
-  re-serializes the entire map. A lightweight index key (`void.chatThreadIndex`) stores the list
-  of thread IDs. Automatic one-time migration splits the old blob on first load.
+- **Stream throttle**: Bumped from 50ms → 200ms (via 100ms intermediate) to give the editor more main-thread budget.
+- **Per-thread storage** (`chatThreadService.ts`): Each thread is stored under its own key
+  instead of a single blob for all threads. A lightweight index key (`void.chatThreadIndex`)
+  stores the list of thread IDs. Automatic one-time migration splits the old blob on first load.
+  (See three-way split below for the current format.)
 - **Granular stream subscriptions** (`services.tsx`): Added `useStreamRunningState` hook that only
   re-renders when the `isRunning` status transitions (e.g. idle→LLM→idle), not on every content
   tick. `SidebarChat` and `CommandBarInChat` switched from `useChatThreadsStreamState` (fires every
@@ -257,12 +257,31 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
   access in a callback — `withModel(uri, ({ model }) => { ... })`. The model ref is automatically
   released when the callback returns. Replaces manual `getModel` + `releaseModel` pairs in
   `toolsService.ts` stringifiers. Impossible to forget the release.
-- **`isForSimpleWidget: true` on chat models** (`inputs.tsx`): Added to `BlockCode` (now removed)
-  and `SingleDiffEditor` model creation. Prevents VS Code's extension host from syncing these
-  throwaway models and activating language services for them.
+- **`isForSimpleWidget` filters** (`editCodeService.ts`, `voidCommandBarService.ts`,
+  `contextGatheringService.ts`): All Void `onModelAdded` listeners skip models with
+  `isForSimpleWidget` or `inmemory://` URIs, preventing chat code block models from
+  triggering full VS Code service activation. (Chat code blocks no longer create models
+  at all — see lightweight code blocks above — but the filters remain as a safety net.)
 - **Incremental virtualization rebuild** (`SidebarChat.tsx`): When `mountStart` changes during
   scroll, existing chat bubbles are sliced/prepended instead of rebuilding all from scratch.
   Messages with the same `key` are reused by React without unmounting, reducing DOM churn.
+- **StreamingBubble isolation** (`SidebarChat.tsx`): Extracted streaming content into a
+  `StreamingBubble` component that independently subscribes to `useChatThreadsStreamState`.
+  `ThreadMessagesView` only subscribes to `useStreamRunningState` (fires on start/stop, not
+  every token). Prevents ~5Hz re-renders of the entire message list during streaming.
+  `Checkpoint` and `SidebarThreadSelector` similarly switched to `useAnyThreadRunning` /
+  `useRunningThreadIds` — they now only re-render when `isRunning` transitions, not every token.
+- **Stream throttle increase** (`chatThreadService.ts`): Bumped from 100ms (10Hz) to 200ms (5Hz).
+  Visually indistinguishable but halves render cost during streaming.
+- **Three-way thread storage split** (`chatThreadService.ts`): Each thread uses three storage
+  categories: `void.chatThread.<id>` (static metadata — compaction summary, title, workspace,
+  state; written on user actions/compaction, never during streaming), `void.chatUsage.<id>`
+  (frequently-changing stats — latestUsage, cumulativeUsage, lastModified; ~200 bytes, written
+  at ~5Hz during streaming), `void.chatMsg.<id>.<n>` (individual message at index n; O(1)
+  append, O(1) edit, delete-removed-keys truncate). Key wins: usage updates only serialize
+  ~200 bytes instead of the full thread; `_addMessageToThread` writes one key instead of
+  re-serializing the entire messages array; compaction only writes the metadata key. Auto-migrates
+  from old inline format on first read.
 
 ### Known performance issues
 
