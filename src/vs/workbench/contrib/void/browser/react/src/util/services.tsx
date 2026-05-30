@@ -519,8 +519,6 @@ export const useRunningThreadIds = (): Record<string, IsRunningType | undefined>
 	return ids
 }
 
-
-
 export const useRefreshModelState = () => {
 	const [s, ss] = useState(refreshModelState)
 	useEffect(() => {

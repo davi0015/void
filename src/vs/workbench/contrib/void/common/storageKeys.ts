@@ -29,6 +29,9 @@ export const THREAD_INDEX_KEY = 'void.chatThreadIndex'
 // is O(1) instead of re-serializing the entire thread.
 export const MESSAGE_KEY_PREFIX = 'void.chatMsg.'
 
+// Frequently-changing usage stats (latestUsage, cumulativeUsage, etc.)
+// Written at ~5Hz during streaming. Always small (~200 bytes).
+export const USAGE_KEY_PREFIX = 'void.chatUsage.'
 
 // Ordered list of thread ids pinned as tabs in the chat sidebar. Persisted
 // separately from THREAD_STORAGE_KEY so evolving tab UX doesn't force a
