@@ -1586,17 +1586,12 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	// --- FIM ---
 
 	prepareFIMMessage: IConvertToLLMMessageService['prepareFIMMessage'] = ({ messages }) => {
-		// Get combined AI instructions with the provided aiInstructions as the base
-		const combinedInstructions = this._getCombinedAIInstructions();
-
-		let prefix = `\
-${!combinedInstructions ? '' : `\
-// Instructions:
-// Do not output an explanation. Try to avoid outputting comments. Only output the middle code.
-${combinedInstructions.split('\n').map(line => `//${line}`).join('\n')}`}
-
-${messages.prefix}`
-
+		// For FIM, do NOT prepend AI instructions (.voidrules content).
+		// Small models (7B) get confused by instruction comments in the
+		// prefix and produce garbage or empty output instead of code.
+		// The FIM endpoint is designed to complete code — it only needs
+		// the code prefix and suffix, not instructions about behavior.
+		const prefix = messages.prefix
 		const suffix = messages.suffix
 		const stopTokens = messages.stopTokens
 		return { prefix, suffix, stopTokens }

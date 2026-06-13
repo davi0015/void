@@ -75,18 +75,8 @@ const parseHeadersJSON = (s: string | undefined): Record<string, string | null |
 }
 
 const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includeInPayload }: { settingsOfProvider: SettingsOfProvider, providerName: ProviderName, includeInPayload?: { [s: string]: any } }) => {
-	const headerLoggingFetch = (async (url: any, init: any) => {
-		const resp = await fetch(url, init)
-		try {
-			const h: Record<string, string> = {}
-			resp.headers.forEach((v, k) => { h[k] = v })
-			console.log(`[PrefixCache:headers] ${providerName} ${JSON.stringify(h)}`)
-		} catch { /* ignore */ }
-		return resp
-	}) as unknown as ClientOptions['fetch']
 	const commonPayloadOpts: ClientOptions = {
 		dangerouslyAllowBrowser: true,
-		fetch: headerLoggingFetch,
 		...includeInPayload,
 	}
 	if (providerName === 'openAI') {
@@ -192,7 +182,7 @@ const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includ
 }
 
 
-const _sendOpenAICompatibleFIM = async ({ messages: { prefix, suffix, stopTokens }, onFinalMessage, onError, settingsOfProvider, modelName: modelName_, _setAborter, providerName, overridesOfModel }: SendFIMParams_Internal) => {
+const _sendOpenAICompatibleFIM = async ({ messages: { prefix, suffix, stopTokens }, onText, onFinalMessage, onError, settingsOfProvider, modelName: modelName_, _setAborter, providerName, overridesOfModel }: SendFIMParams_Internal) => {
 
 	const {
 		modelName,
@@ -201,30 +191,36 @@ const _sendOpenAICompatibleFIM = async ({ messages: { prefix, suffix, stopTokens
 	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
 
 	if (!supportsFIM) {
-		if (modelName === modelName_)
-			onError({ message: `Model ${modelName} does not support FIM.`, fullError: null })
-		else
-			onError({ message: `Model ${modelName_} (${modelName}) does not support FIM.`, fullError: null })
+		onError({ message: `Model ${modelName_} (${modelName}) does not support FIM.`, fullError: null })
 		return
 	}
 
 	const openai = await newOpenAICompatibleSDK({ providerName, settingsOfProvider, includeInPayload: additionalOpenAIPayload })
-	openai.completions
-		.create({
+
+	// Use non-streaming for the completions endpoint. LiteLLM and other
+	// proxies cache non-streaming responses correctly, but may return
+	// empty or malformed chunks when streaming cached completions.
+	// FIM requests are not aborted (they complete in the background),
+	// so the 2-4 second latency is acceptable.
+	const abortController = new AbortController()
+	_setAborter(() => abortController.abort())
+
+	try {
+		const response = await openai.completions.create({
 			model: modelName,
 			prompt: prefix,
-			suffix: suffix,
+			suffix: suffix || undefined,
 			stop: stopTokens,
 			max_tokens: 300,
-		})
-		.then(async response => {
-			const fullText = response.choices[0]?.text
-			onFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null });
-		})
-		.catch(error => {
-			if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: authErrorMessage(providerName, error), fullError: error }); }
-			else { onError({ message: error + '', fullError: error }); }
-		})
+		}, { signal: abortController.signal })
+
+		const fullText = response.choices[0]?.text ?? ''
+		onText({ fullText, fullReasoning: '' })
+		onFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null });
+	} catch (error) {
+		if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: authErrorMessage(providerName, error), fullError: error }); }
+		else { onError({ message: error + '', fullError: error }); }
+	}
 }
 
 
@@ -327,6 +323,9 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		// Required to select the model
 		(openai as AzureOpenAI).deploymentName = modelName;
 	}
+	// Log messages to verify reasoning_content round-trip for DeepSeek
+	const lastMsg = messages[messages.length - 1] as any
+	console.log('[void/sendLLM] provider:', providerName, 'model:', modelName, 'msgCount:', messages.length, 'lastMsg:', JSON.stringify({ role: lastMsg?.role, content_preview: lastMsg?.content?.slice(0, 200), has_reasoning_content: lastMsg?.reasoning_content !== undefined, reasoning_preview: lastMsg?.reasoning_content?.slice(0, 200) }, null, 2), 'reasoning_summary:', messages.map((m: any) => ({ role: m.role, has_rc: m.reasoning_content !== undefined, rc_len: m.reasoning_content?.length })))
 	const options: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
 		model: modelName,
 		messages: messages as any,
@@ -399,12 +398,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 			_setAborter(() => response.controller.abort())
 
 			// when receive text
-			let chunkIdx = 0
 			for await (const chunk of response) {
-				if (chunkIdx < 3 || chunk.usage) {
-					console.log(`[PrefixCache:chunk#${chunkIdx}] ${JSON.stringify(chunk)}`)
-				}
-				chunkIdx++
 				// message
 				const newText = chunk.choices[0]?.delta?.content ?? ''
 				fullTextSoFar += newText
@@ -1067,7 +1061,7 @@ export const sendLLMMessageToProviderImplementation = {
 	},
 	openAI: {
 		sendChat: (params) => _sendOpenAICompatibleChat(params),
-		sendFIM: null,
+		sendFIM: (params) => _sendOpenAICompatibleFIM(params),
 		list: null,
 	},
 	xAI: {

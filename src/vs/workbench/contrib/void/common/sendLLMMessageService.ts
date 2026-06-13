@@ -159,7 +159,6 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 	abort(requestId: string) {
 		this.llmMessageHooks.onAbort[requestId]?.() // calling the abort hook here is instant (doesn't go over a channel)
 		this.channel.call('abort', { requestId } satisfies MainLLMMessageAbortParams);
-		this._clearChannelHooks(requestId)
 	}
 
 

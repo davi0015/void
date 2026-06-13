@@ -8,7 +8,6 @@ import { IMetricsService } from '../../common/metricsService.js';
 import { BackendProviderSettings, BuiltInProviderName, isBackendId, displayInfoOfProviderName, registerBackendDisplayNames } from '../../common/voidSettingsTypes.js';
 import { sendLLMMessageToProviderImplementation } from './sendLLMMessage.impl.js';
 
-
 export const sendLLMMessage = async ({
 	messagesType,
 	messages: messages_,
@@ -77,13 +76,14 @@ export const sendLLMMessage = async ({
 
 	const onFinalMessage: OnFinalMessage = (params) => {
 		const { fullText, fullReasoning, toolCalls } = params
-		if (_didAbort) return
+		// For FIM, always deliver the result — the autocomplete service
+		// stores it for the next re-query even if the original call was
+		// aborted or superseded.
+		if (_didAbort && messagesType !== 'FIMMessage') return
 		captureLLMEvent(`${loggingName} - Received Full Message`, {
 			messageLength: fullText.length,
 			reasoningLength: fullReasoning?.length,
 			duration: new Date().getMilliseconds() - submit_time.getMilliseconds(),
-			// Parallel tool calling: capture the number of tools and a comma-joined summary
-			// so metrics can see how often models emit batches (vs. 0 or 1 tool per turn).
 			toolCallCount: toolCalls?.length ?? 0,
 			toolCallNames: toolCalls?.map(t => t.name).join(','),
 		})
@@ -91,7 +91,7 @@ export const sendLLMMessage = async ({
 	}
 
 	const onError: OnError = ({ message: errorMessage, fullError }) => {
-		if (_didAbort) return
+		if (_didAbort && messagesType !== 'FIMMessage') return
 		console.error('sendLLMMessage onError:', errorMessage)
 
 		// handle failed to fetch errors, which give 0 information by design
@@ -104,6 +104,13 @@ export const sendLLMMessage = async ({
 
 	// we should NEVER call onAbort internally, only from the outside
 	const onAbort = () => {
+		if (messagesType === 'FIMMessage') {
+			// Soft abort for FIM — don't kill the stream. The result may
+			// arrive before the next request completes, so store it for
+			// the next re-query. Only suppress intermediate callbacks.
+			_didAbort = true
+			return
+		}
 		captureLLMEvent(`${loggingName} - Abort`, { messageLengthSoFar: _fullTextSoFar.length })
 		try { _aborter?.() } // aborter sometimes automatically throws an error
 		catch (e) { }
@@ -139,9 +146,9 @@ export const sendLLMMessage = async ({
 		if (messagesType === 'FIMMessage') {
 			if (sendFIM) {
 				await sendFIM({ messages: messages_, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName, _setAborter, providerName, separateSystemMessage })
-				return
+			} else {
+				onError({ message: `Error: Model ${modelName} does not support FIM.`, fullError: null })
 			}
-			onError({ message: `Error running Autocomplete with ${providerName} - ${modelName}.`, fullError: null })
 			return
 		}
 		onError({ message: `Error: Message type "${messagesType}" not recognized.`, fullError: null })

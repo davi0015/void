@@ -105,7 +105,6 @@ export class LLMMessageChannel implements IServerChannel {
 				this.llmMessageEmitters.onFinalMessage.fire({ requestId, ...p });
 			},
 			onError: (p) => {
-				console.log('sendLLM: firing err');
 				this.llmMessageEmitters.onError.fire({ requestId, ...p });
 			},
 			abortRef: this._infoOfRunningRequest[requestId].abortRef,
@@ -114,13 +113,11 @@ export class LLMMessageChannel implements IServerChannel {
 		this._infoOfRunningRequest[requestId].waitForSend = p
 	}
 
-	private async _callAbort(params: MainLLMMessageAbortParams) {
+	private _callAbort(params: MainLLMMessageAbortParams) {
 		const { requestId } = params;
 		if (!(requestId in this._infoOfRunningRequest)) return
-		const { waitForSend, abortRef } = this._infoOfRunningRequest[requestId]
-		await waitForSend // wait for the send to finish so we know abortRef was set
+		const { abortRef } = this._infoOfRunningRequest[requestId]
 		abortRef?.current?.()
-		delete this._infoOfRunningRequest[requestId]
 	}
 
 
