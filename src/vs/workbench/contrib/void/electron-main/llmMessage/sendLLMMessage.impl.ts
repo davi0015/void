@@ -323,9 +323,6 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		// Required to select the model
 		(openai as AzureOpenAI).deploymentName = modelName;
 	}
-	// Log messages to verify reasoning_content round-trip for DeepSeek
-	const lastMsg = messages[messages.length - 1] as any
-	console.log('[void/sendLLM] provider:', providerName, 'model:', modelName, 'msgCount:', messages.length, 'lastMsg:', JSON.stringify({ role: lastMsg?.role, content_preview: lastMsg?.content?.slice(0, 200), has_reasoning_content: lastMsg?.reasoning_content !== undefined, reasoning_preview: lastMsg?.reasoning_content?.slice(0, 200) }, null, 2), 'reasoning_summary:', messages.map((m: any) => ({ role: m.role, has_rc: m.reasoning_content !== undefined, rc_len: m.reasoning_content?.length })))
 	const options: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
 		model: modelName,
 		messages: messages as any,
