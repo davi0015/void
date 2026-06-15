@@ -380,6 +380,18 @@ export const builtinTools: {
 		},
 	},
 
+	// --- history ---
+	search_history: {
+		name: 'search_history',
+		description: `Searches the current conversation history for messages matching a text query and/or structured filters. Returns matching messages with surrounding context. Use this when the user asks about something that happened earlier in the conversation, when you need to recall a previous tool call, or when you want to find past errors or results.`,
+		params: {
+			query: { description: `Text to search for across all message content (user messages, assistant messages, tool params, and tool results). Case-insensitive. Pass null to skip text filtering.` },
+			tool_name: { description: `Filter to only return tool calls with this name (e.g. "run_command", "edit_file"). Pass null to include all message types.` },
+			result_status: { description: `Filter tool calls by result status: "error" for failed tool calls, "success" for successful ones. Pass null to include all.` },
+			context_radius: { description: `Number of messages before and after each match to include for context. Default is 3.` },
+		},
+	},
+
 } satisfies { [T in keyof BuiltinToolResultType]: InternalToolInfo }
 
 

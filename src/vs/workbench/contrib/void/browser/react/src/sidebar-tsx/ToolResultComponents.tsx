@@ -318,6 +318,7 @@ export const titleOfBuiltinToolName = {
 	'go_to_definition': { done: 'Found definition', proposed: 'Go to definition', running: loadingTitleWrapper('Finding definition') },
 	'go_to_usages': { done: 'Found usages', proposed: 'Go to usages', running: loadingTitleWrapper('Finding usages') },
 	'fetch_url': { done: 'Fetched URL', proposed: 'Fetch URL', running: loadingTitleWrapper('Fetching URL') },
+	'search_history': { done: 'Searched history', proposed: 'Search history', running: loadingTitleWrapper('Searching history') },
 } as const satisfies Record<BuiltinToolName, { done: any, proposed: any, running: any }>
 
 
@@ -504,6 +505,12 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 				display = toolParams.url
 			}
 			return { desc1: display }
+		},
+		'search_history': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['search_history']
+			return {
+				desc1: toolParams.query ? `"${toolParams.query}"` : toolParams.toolName ? `tool: ${toolParams.toolName}` : '(search)',
+			}
 		},
 		'go_to_usages': () => {
 			const toolParams = _toolParams as BuiltinToolCallParams['go_to_usages']
@@ -1506,6 +1513,47 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 				componentParams.bottomChildren = <BottomChildren title='Content preview'>
 					<SmallProseWrapper>
 						<ChatMarkdownRender string={preview} chatMessageLocation={undefined} isApplyEnabled={false} />
+					</SmallProseWrapper>
+				</BottomChildren>
+			}
+			else if (toolMessage.type === 'tool_error') {
+				const { result } = toolMessage
+				componentParams.bottomChildren = <BottomChildren title='Error'>
+					<CodeChildren>
+						{result}
+					</CodeChildren>
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		},
+	},
+	'search_history': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const title = getTitle(toolMessage)
+			const icon = null
+
+			if (toolMessage.type === 'tool_request') return null
+			if (toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
+
+			const isError = toolMessage.type === 'tool_error'
+			const isRejected = toolMessage.type === 'rejected'
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (toolMessage.type === 'success') {
+				const { result } = toolMessage
+				componentParams.desc1 = `${result.totalMatches} match${result.totalMatches !== 1 ? 'es' : ''}`
+				const previewLen = 2000
+				const preview = result.matches.length > previewLen
+					? result.matches.substring(0, previewLen) + '...'
+					: result.matches
+				componentParams.bottomChildren = <BottomChildren title='Results'>
+					<SmallProseWrapper>
+						<ChatMarkdownRender string={'```\n' + preview + '\n```'} chatMessageLocation={undefined} isApplyEnabled={false} />
 					</SmallProseWrapper>
 				</BottomChildren>
 			}

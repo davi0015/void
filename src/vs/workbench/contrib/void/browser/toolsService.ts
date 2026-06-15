@@ -24,6 +24,7 @@ import { DocumentSymbol, SymbolKind } from '../../../../editor/common/languages.
 import { IVoidSettingsService } from '../common/voidSettingsService.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
 import { IFetchUrlService } from '../common/fetchUrlService.js'
+import type { ChatMessage } from '../common/chatThreadServiceTypes.js'
 
 
 // tool use for AI
@@ -306,7 +307,7 @@ export class ToolsService implements IToolsService {
 		@IFileService fileService: IFileService,
 		@IWorkspaceContextService workspaceContextService: IWorkspaceContextService,
 		@ISearchService searchService: ISearchService,
-		@IInstantiationService instantiationService: IInstantiationService,
+		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@IVoidModelService voidModelService: IVoidModelService,
 		@IEditCodeService editCodeService: IEditCodeService,
 		@ITerminalToolService private readonly terminalToolService: ITerminalToolService,
@@ -317,7 +318,7 @@ export class ToolsService implements IToolsService {
 		@ILanguageFeaturesService languageFeaturesService: ILanguageFeaturesService,
 		@IFetchUrlService private readonly fetchUrlService: IFetchUrlService,
 	) {
-		const queryBuilder = instantiationService.createInstance(QueryBuilder);
+		const queryBuilder = this.instantiationService.createInstance(QueryBuilder);
 
 		// Resolve the current workspace root lazily so that multi-root / workspace-switch
 		// scenarios pick up the correct folder at call time rather than at construction time.
@@ -497,6 +498,16 @@ export class ToolsService implements IToolsService {
 					throw new Error(`Invalid URL: "${url}". URL must start with http:// or https://.`);
 				}
 				return { url };
+			},
+
+			search_history: (params: RawToolParamsObj) => {
+				const { query: queryUnknown, tool_name: toolNameUnknown, result_status: resultStatusUnknown, context_radius: contextRadiusUnknown } = params
+				const query = isFalsy(queryUnknown) ? null : validateStr('query', queryUnknown)
+				const toolName = isFalsy(toolNameUnknown) ? null : validateStr('toolName', toolNameUnknown)
+				const resultStatus = isFalsy(resultStatusUnknown) ? null : (resultStatusUnknown === 'error' || resultStatusUnknown === 'success' ? resultStatusUnknown : null) as 'error' | 'success' | null
+				const contextRadiusRaw = validateNumber(contextRadiusUnknown, { default: 3 })
+				const contextRadius = Math.max(1, Math.min(contextRadiusRaw ?? 3, 10))
+				return { query, toolName, resultStatus, contextRadius }
 			},
 
 		}
@@ -808,6 +819,98 @@ export class ToolsService implements IToolsService {
 				const result = await this.fetchUrlService.fetchUrl(url);
 				return { result };
 			},
+
+			search_history: async ({ query, toolName, resultStatus, contextRadius }) => {
+				const { IChatThreadService } = await import('./chatThreadService.js')
+				const chatThreadService = this.instantiationService.invokeFunction(accessor => accessor.get(IChatThreadService))
+				const thread = chatThreadService.getCurrentThread()
+				if (!thread) {
+					return { result: { matches: 'No active conversation thread.', totalMatches: 0 } }
+				}
+				const messages = thread.messages
+				const queryLower = query?.toLowerCase() ?? null
+
+				// Find matching message indices
+				const matchIndices: number[] = []
+
+				for (let i = 0; i < messages.length; i++) {
+					const msg = messages[i]
+
+					// Filter by tool_name
+					if (toolName && msg.role !== 'tool') continue
+					if (toolName && msg.role === 'tool' && msg.name !== toolName) continue
+
+					// Filter by result_status
+					if (resultStatus && msg.role !== 'tool') continue
+					if (resultStatus && msg.role === 'tool') {
+						if (resultStatus === 'error' && msg.type !== 'tool_error') continue
+						if (resultStatus === 'success' && msg.type !== 'success') continue
+					}
+
+					// Text search
+					if (queryLower) {
+						let textToSearch = ''
+						if (msg.role === 'user') textToSearch = (msg.content ?? '') + ' ' + (msg.displayContent ?? '')
+						else if (msg.role === 'assistant') textToSearch = (msg.displayContent ?? '') + ' ' + (msg.reasoning ?? '')
+						else if (msg.role === 'tool') {
+							textToSearch = (msg.content ?? '')
+								+ ' ' + JSON.stringify(msg.rawParams ?? {})
+								+ ' ' + (typeof msg.result === 'string' ? msg.result : JSON.stringify(msg.result ?? {}))
+						}
+
+						if (!textToSearch.toLowerCase().includes(queryLower)) continue
+					}
+
+					// If no filters at all, skip (don't return everything)
+					if (!queryLower && !toolName && !resultStatus) continue
+
+					matchIndices.push(i)
+				}
+
+				if (matchIndices.length === 0) {
+					return { result: { matches: 'No matching messages found.', totalMatches: 0 } }
+				}
+
+				// Build context windows around matches, merging overlapping ranges
+				const maxMatches = 20
+				const limitedIndices = matchIndices.slice(0, maxMatches)
+
+				// Collect unique message indices to include
+				const includeIndices = new Set<number>()
+				for (const idx of limitedIndices) {
+					for (let j = Math.max(0, idx - contextRadius); j <= Math.min(messages.length - 1, idx + contextRadius); j++) {
+						includeIndices.add(j)
+					}
+				}
+
+				// Format messages
+				const formatMessage = (msg: ChatMessage, idx: number): string => {
+					const prefix = `[${idx}]`
+					if (msg.role === 'user') {
+						return `${prefix} [USER]: ${(msg.displayContent || msg.content || '(empty)').slice(0, 500)}`
+					} else if (msg.role === 'assistant') {
+						const content = (msg.displayContent || '(empty)').slice(0, 500)
+						const reasoning = msg.reasoning ? `\n  Reasoning: ${msg.reasoning.slice(0, 300)}` : ''
+						return `${prefix} [ASSISTANT]: ${content}${reasoning}`
+					} else if (msg.role === 'tool') {
+						const paramsStr = JSON.stringify(msg.rawParams ?? {}).slice(0, 300)
+						const resultStr = ('result' in msg ? (typeof msg.result === 'string' ? msg.result : JSON.stringify(msg.result ?? {})) : '(no result yet)').slice(0, 500)
+						return `${prefix} [TOOL:${msg.name} type=${msg.type}]: params=${paramsStr}\n  result=${resultStr}`
+					} else if (msg.role === 'checkpoint') {
+						return `${prefix} [CHECKPOINT]`
+					} else if (msg.role === 'interrupted_streaming_tool') {
+						return `${prefix} [INTERRUPTED:${msg.name}]`
+					} else {
+						return `${prefix} [UNKNOWN]`
+					}
+				}
+
+				const sortedIndices = Array.from(includeIndices).sort((a, b) => a - b)
+				const formattedLines = sortedIndices.map(idx => formatMessage(messages[idx], idx))
+				const matches = formattedLines.join('\n\n')
+
+				return { result: { matches, totalMatches: matchIndices.length } }
+			},
 		}
 
 
@@ -956,6 +1059,11 @@ export class ToolsService implements IToolsService {
 
 			fetch_url: (_params, result) => {
 				return `# ${result.title}\n\nSource: ${result.url}\n\n${result.content}`;
+			},
+
+			search_history: (_params, result) => {
+				const totalStr = result.totalMatches > 20 ? ` (showing first 20 of ${result.totalMatches})` : ''
+				return `Found ${result.totalMatches} matching message(s)${totalStr}:\n\n${result.matches}`
 			},
 		}
 

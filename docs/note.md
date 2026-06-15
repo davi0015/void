@@ -1753,3 +1753,24 @@ User-triggered conversation compaction that sends old messages to the current mo
 - **`supportsTools: boolean` per model** — separates "does this model support tool calling" from "what format" so the rare model that genuinely can't call tools can be encoded explicitly instead of relying on `specialToolFormat: undefined` (which is now ambiguous).
 - **Audit `importantDetails` for unenforceable rules** — empirically observed during Phase A1+A2 baseline that capable models (e.g. MiniMax 2.5) ignore `Do NOT write tables` for tabular data. Likely cause: late position in a long numbered list. Two fixes worth considering: (a) reposition genuinely-important rules early in the list and demote optional style preferences to a separate "style preferences" block the model can break, (b) drop rules we don't actually enforce — every ignored rule teaches the model the system message isn't authoritative, weakening compliance on rules we *do* care about. Cheap pass, ~30 min, do as part of Option 2 prompt rewrite.
 - ~~**Surface `finish_reason` on OpenAI-compatible streams**~~ — promoted to Next → Quality 1 above.
+- **Write-to-temp-file for inline code execution** — When the LLM generates `python3 -c "..."` (or `node -e "..."`, `ruby -e "..."`, etc.), intercept in `runCommand`, write the code to `/tmp/void_exec_xxx.py`, and send `python3 /tmp/void_exec_xxx.py` instead. This eliminates shell quoting issues, large write chunking through the 50-byte `chunkInput` pipeline, and `\n`→`\r` conversion problems. Blocked on finding root cause of the persistent terminal crash that kills all terminals (PTY host is shared across all windows). Once we can reproduce the crash, implement this as the fix.
+- **RAG context for autocomplete** — The `relevantContext` parameter in `getCompletionOptions` is currently `''`. Including context from open tabs and recently modified files in the FIM prefix would significantly improve autocomplete quality. Needs design decisions: how much context, which files, how to format it, token budget. The Google AI Mode autocomplete approach recommends this.
+
+### search_history tool ✅ Implemented
+
+Added a `search_history` tool that lets the LLM agent search its own conversation history. This is useful when the user asks about something that happened earlier in the conversation (e.g. "what command broke the terminal?") — the agent can search by text query, tool name, or result status, and get matching messages with surrounding context.
+
+**Parameters:**
+- `query` — case-insensitive text search across all message content (user, assistant, tool params/results). Pass null to skip text filtering.
+- `tool_name` — filter by specific tool name (e.g. `run_command`, `edit_file`). Pass null to include all message types.
+- `result_status` — filter by `error` or `success` for tool calls. Pass null to include all.
+- `context_radius` — number of messages before/after each match to include (default 3, max 10).
+
+**Implementation details:**
+- Searches `thread.messages` in browser-process memory (no IPC needed)
+- Uses `rawParams` instead of `params` for text search (params doesn't exist on all `ToolMessage` variants)
+- Resolves `IChatThreadService` lazily via dynamic import to avoid circular dependency with `chatThreadService.ts` (which imports `IToolsService`)
+- No approval required (read-only tool)
+- One-time prefix cache miss per existing thread due to new tool definition in system message; new threads unaffected
+- UI rendering in `ToolResultComponents.tsx` shows match count and collapsible results in a code block
+- Removed stale `console.log` debug line from `sendLLMMessage.impl.ts` (was logging `reasoning_content` round-trip on every request)

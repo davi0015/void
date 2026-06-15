@@ -101,6 +101,8 @@ export type BuiltinToolCallParams = {
 	'kill_persistent_terminal': { persistentTerminalId: string },
 	// --- web ---
 	'fetch_url': { url: string },
+	// --- history ---
+	'search_history': { query: string | null, toolName: string | null, resultStatus: 'error' | 'success' | null, contextRadius: number },
 }
 
 // RESULT OF TOOL CALL
@@ -128,6 +130,8 @@ export type BuiltinToolResultType = {
 	'kill_persistent_terminal': {},
 	// --- web ---
 	'fetch_url': { title: string, content: string, url: string },
+	// --- history ---
+	'search_history': { matches: string, totalMatches: number },
 }
 
 
