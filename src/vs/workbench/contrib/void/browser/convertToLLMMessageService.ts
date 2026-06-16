@@ -23,8 +23,6 @@ import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { stringHash } from '../../../../base/common/hash.js';
 
-export const EMPTY_MESSAGE = '(empty message)'
-
 
 
 export type ImageAttachment = {
@@ -704,30 +702,17 @@ const prepareOpenAIOrAnthropicMessages = ({
 	}
 
 
-	// ================ no empty message ================
+	// ================ clean up empty content ================
 	for (let i = 0; i < llmMessages.length; i += 1) {
 		const currMsg: AnthropicOrOpenAILLMMessage = llmMessages[i]
-		const nextMsg: AnthropicOrOpenAILLMMessage | undefined = llmMessages[i + 1]
-
 		if (currMsg.role === 'tool') continue
+		// Skip assistant messages that carry reasoning — the reasoning
+		// is the meaningful payload, empty text content is fine.
+		if (currMsg.role === 'assistant' && 'reasoning_content' in currMsg && currMsg.reasoning_content) continue
 
-		// if content is a string, replace string with empty msg
-		if (typeof currMsg.content === 'string') {
-			currMsg.content = currMsg.content || EMPTY_MESSAGE
-		}
-		else {
-			// allowed to be empty if has a tool in it or following it
-			if (currMsg.content.find(c => c.type === 'tool_result' || c.type === 'tool_use')) {
-				currMsg.content = currMsg.content.filter(c => !(c.type === 'text' && !c.text)) as any
-				continue
-			}
-			if (nextMsg?.role === 'tool') continue
-
-			// replace any empty text entries with empty msg, and make sure there's at least 1 entry
-			for (const c of currMsg.content) {
-				if (c.type === 'text') c.text = c.text || EMPTY_MESSAGE
-			}
-			if (currMsg.content.length === 0) currMsg.content = [{ type: 'text', text: EMPTY_MESSAGE }]
+		if (typeof currMsg.content !== 'string') {
+			// Remove empty text entries from content arrays
+			currMsg.content = currMsg.content.filter(c => !(c.type === 'text' && !c.text)) as any
 		}
 	}
 

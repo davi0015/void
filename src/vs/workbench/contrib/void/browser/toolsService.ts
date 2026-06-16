@@ -891,9 +891,9 @@ export class ToolsService implements IToolsService {
 					if (msg.role === 'user') {
 						return `${prefix} [USER]: ${(msg.displayContent || msg.content || '(empty)').slice(0, 500)}`
 					} else if (msg.role === 'assistant') {
-						const content = (msg.displayContent || '(empty)').slice(0, 500)
-						const reasoning = msg.reasoning ? `\n  Reasoning: ${msg.reasoning.slice(0, 300)}` : ''
-						return `${prefix} [ASSISTANT]: ${content}${reasoning}`
+						const content = msg.displayContent || msg.reasoning || '(empty)'
+						const reasoning = (!msg.displayContent && msg.reasoning) ? '' : msg.reasoning ? `\n  Reasoning: ${msg.reasoning.slice(0, 300)}` : ''
+						return `${prefix} [ASSISTANT]: ${content.slice(0, 500)}${reasoning}`
 					} else if (msg.role === 'tool') {
 						const paramsStr = JSON.stringify(msg.rawParams ?? {}).slice(0, 300)
 						const resultStr = ('result' in msg ? (typeof msg.result === 'string' ? msg.result : JSON.stringify(msg.result ?? {})) : '(no result yet)').slice(0, 500)
