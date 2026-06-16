@@ -340,7 +340,7 @@ const formatDuration = (ms: number | undefined): string => {
 const formatTokenRate = (tokens: number | undefined, ms: number | undefined): string => {
 	if (tokens === undefined || !ms || ms === 0) return ''
 	const rate = tokens / (ms / 1000)
-	return `${rate.toFixed(0)} tok/s`
+	return `${rate.toFixed(1)} tok/s`
 }
 
 const formatUsageBlock = (label: string, u: LLMUsage | undefined, mode: 'single' | 'cumulative' = 'single'): (string | null)[] => {
