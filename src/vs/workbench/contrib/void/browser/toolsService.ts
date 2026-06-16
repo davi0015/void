@@ -1062,8 +1062,10 @@ export class ToolsService implements IToolsService {
 			},
 
 			search_history: (_params, result) => {
-				const totalStr = result.totalMatches > 20 ? ` (showing first 20 of ${result.totalMatches})` : ''
-				return `Found ${result.totalMatches} matching message(s)${totalStr}:\n\n${result.matches}`
+				const totalMatches = result?.totalMatches ?? 0
+				const matches = result?.matches ?? ''
+				const totalStr = totalMatches > 20 ? ` (showing first 20 of ${totalMatches})` : ''
+				return `Found ${totalMatches} matching message(s)${totalStr}:\n\n${matches}`
 			},
 		}
 
