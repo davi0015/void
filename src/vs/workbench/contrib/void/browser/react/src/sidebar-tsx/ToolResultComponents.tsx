@@ -186,15 +186,16 @@ const EditTool = ({ toolMessage, threadId, messageIdx, content }: Parameters<Res
 	const icon = null
 
 	const { rawParams, params, name } = toolMessage
-	const desc1OnClick = () => voidOpenFileFn(params.uri, accessor)
+	const desc1OnClick = params ? () => voidOpenFileFn(params.uri, accessor) : undefined
 	const componentParams: ToolHeaderParams = { title, desc1, desc1OnClick, desc1Info, isError, icon, isRejected, }
 
 
+	const uri = params?.uri
 	const editToolType = toolMessage.name === 'edit_file' ? 'diff' : 'rewrite'
 	if (toolMessage.type === 'running_now' || toolMessage.type === 'tool_request') {
 		componentParams.children = <ToolChildrenWrapper className='bg-void-bg-3'>
 			<EditToolChildren
-				uri={params.uri}
+				uri={uri}
 				code={content}
 				type={editToolType}
 			/>
@@ -210,7 +211,7 @@ const EditTool = ({ toolMessage, threadId, messageIdx, content }: Parameters<Res
 		})
 		componentParams.desc2 = <EditToolHeaderButtons
 			applyBoxId={applyBoxId}
-			uri={params.uri}
+			uri={uri}
 			codeStr={content}
 			toolName={name}
 			threadId={threadId}
@@ -219,7 +220,7 @@ const EditTool = ({ toolMessage, threadId, messageIdx, content }: Parameters<Res
 		// add children
 		componentParams.children = <ToolChildrenWrapper className='bg-void-bg-3'>
 			<EditToolChildren
-				uri={params.uri}
+				uri={uri}
 				code={content}
 				type={editToolType}
 			/>
@@ -1392,7 +1393,8 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 	},
 	'edit_file': {
 		resultWrapper: (params) => {
-			return <EditTool {...params} content={params.toolMessage.params.searchReplaceBlocks} />
+			const content = params.toolMessage.params?.searchReplaceBlocks ?? params.toolMessage.rawParams?.search_replace_blocks ?? ''
+			return <EditTool {...params} content={content} />
 		}
 	},
 

@@ -1697,7 +1697,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (outcome === 'success') {
 			this._updateLatestTool(threadId, {
 				role: 'tool', type: 'success',
-				params: tool.rawParams as ToolCallParams<ToolName>,
+				params: { uri: URI.parse(tool.rawParams?.uri ?? ''), searchReplaceBlocks: tool.rawParams?.search_replace_blocks ?? '' } as ToolCallParams<'edit_file'>,
 				result: { lintErrors: null } as any,
 				name: tool.name,
 				content: `Changes merged into a prior edit_file call for the same file and applied together.`,
@@ -1706,7 +1706,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		} else {
 			this._updateLatestTool(threadId, {
 				role: 'tool', type: 'tool_error',
-				params: tool.rawParams as ToolCallParams<ToolName>,
+				params: { uri: URI.parse(tool.rawParams?.uri ?? ''), searchReplaceBlocks: tool.rawParams?.search_replace_blocks ?? '' } as ToolCallParams<'edit_file'>,
 				result: outcome,
 				name: tool.name,
 				content: `Changes were merged into a prior edit_file call for the same file, but it failed: ${outcome}`,
@@ -2497,18 +2497,22 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					for (let i = 0; i < batchSize; i++) {
 						const tc = toolCalls[i]
 						const mcpServerName = mcpTools?.find(t => t.name === tc.name)?.mcpServerName
+						// Validate params immediately so the UI can safely read
+						// `params` (camelCase keys, URI objects, etc.) on the
+						// tool_request row. If validation fails, params stays
+						// undefined — `_runToolCall` will produce the
+						// `invalid_params` row when it processes this tool.
+						let validatedParams: ToolCallParams<ToolName> | undefined
+						if (isABuiltinToolName(tc.name)) {
+							try { validatedParams = this._toolsService.validateParams[tc.name](tc.rawParams) } catch { /* _runToolCall handles invalid_params */ }
+						}
 						this._addMessageToThread(threadId, {
 							role: 'tool',
 							type: 'tool_request',
 							content: '(Pending...)',
 							result: null,
 							name: tc.name,
-							// Placeholder unvalidated params — `_runToolCall` will validate and
-							// replace via `_updateLatestTool` before the tool runs. The cast is
-							// safe because the UI only reads validated `params` on tool_requests
-							// once they've transitioned past the placeholder phase (which happens
-							// synchronously when `_tryDrainPendingBatch` hits this tool).
-							params: tc.rawParams as unknown as ToolCallParams<ToolName>,
+							params: validatedParams ?? tc.rawParams as unknown as ToolCallParams<ToolName>,
 							id: tc.id,
 							rawParams: tc.rawParams,
 							rawParamsStr: tc.rawParamsStr,

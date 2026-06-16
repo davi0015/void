@@ -113,7 +113,7 @@ export type BuiltinToolResultType = {
 	'get_dir_tree': { str: string, },
 	'search_pathnames_only': { uris: URI[], hasNextPage: boolean },
 	'search_for_files': { uris: URI[], hasNextPage: boolean },
-	'search_in_file': { lines: number[]; },
+	'search_in_file': { lines: number[], lineContentOfLineNumber: Record<number, string> },
 	'go_to_definition': { locations: { uri: URI, line: number, column: number }[] },
 	'go_to_usages': { locations: { uri: URI, line: number, column: number }[], hasNextPage: boolean },
 	'read_lint_errors': { lintErrors: LintErrorItem[] | null },
