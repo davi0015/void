@@ -2060,14 +2060,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					}
 				}
 
-				// Transition (or create) the tool_request row. _updateLatestTool finds the
-				// row by id: for solo tool calls there's no pre-added row and it appends one
-				// (same as the old behavior). For batched tool calls, the batch processor
-				// pre-added a tool_request with batchIndex/batchSize, and this call now
-				// replaces its placeholder unvalidated params with the validated ones while
-				// preserving the batch metadata.
-				this._updateLatestTool(threadId, { role: 'tool', type: 'tool_request', content: '(Awaiting user permission...)', result: null, name: toolName, params: toolParams, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
 				if (!autoApprove) {
+					// Transition (or create) the tool_request row. _updateLatestTool finds the
+					// row by id: for solo tool calls there's no pre-added row and it appends one
+					// (same as the old behavior). For batched tool calls, the batch processor
+					// pre-added a tool_request with batchIndex/batchSize, and this call now
+					// replaces its placeholder unvalidated params with the validated ones while
+					// preserving the batch metadata.
+					this._updateLatestTool(threadId, { role: 'tool', type: 'tool_request', content: '(Awaiting user permission...)', result: null, name: toolName, params: toolParams, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
 					return { awaitingUserApproval: true }
 				}
 			}
