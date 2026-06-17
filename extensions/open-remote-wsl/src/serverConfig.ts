@@ -31,10 +31,10 @@ export async function getVSCodeServerConfig(): Promise<IServerConfig> {
 	const productJson = await getVSCodeProductJson();
 
 	return {
-		version: vscode.version.replace('-insider', ''),
-		commit: productJson.commit,
-		quality: productJson.quality,
-		release: productJson.release,
+		version: productJson.voidVersion ?? vscode.version.replace('-insider', ''),
+		commit: productJson.voidVersion ?? 'dev',
+		quality: productJson.quality ?? 'stable',
+		release: productJson.voidRelease ?? productJson.release,
 		serverApplicationName: productJson.serverApplicationName,
 		serverDataFolderName: productJson.serverDataFolderName,
 		serverDownloadUrlTemplate: productJson.serverDownloadUrlTemplate,
