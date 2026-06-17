@@ -425,12 +425,16 @@ export class Mangler {
 		const visit = (node: ts.Node): void => {
 			if (this.config.manglePrivateFields) {
 				if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+					const fileName = node.getSourceFile().fileName;
+					if (fileName.includes('node_modules')) {
+						return;
+					}
 					const anchor = node.name ?? node;
-					const key = `${node.getSourceFile().fileName}|${anchor.getStart()}`;
+					const key = `${fileName}|${anchor.getStart()}`;
 					if (this.allClassDataByKey.has(key)) {
 						throw new Error('DUPE?');
 					}
-					this.allClassDataByKey.set(key, new ClassData(node.getSourceFile().fileName, node));
+					this.allClassDataByKey.set(key, new ClassData(fileName, node));
 				}
 			}
 
@@ -565,6 +569,9 @@ export class Mangler {
 			}
 		};
 		const appendRename = (newText: string, loc: ts.RenameLocation) => {
+			if (loc.fileName.includes('node_modules')) {
+				return;
+			}
 			appendEdit(loc.fileName, {
 				newText: (loc.prefixText || '') + newText + (loc.suffixText || ''),
 				offset: loc.textSpan.start,
