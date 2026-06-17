@@ -120,16 +120,18 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 	}
 
 	listAllTerminals(): { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[] {
-		return [...this.terminalService.instances].map(terminal => {
-			const voidId = idOfPersistentTerminalName(terminal.title)
-			const isVoidTerminal = voidId !== null
-			return {
-				name: isVoidTerminal ? `Void Agent ${voidId === '1' ? '' : `(${voidId})`}`.trim() : terminal.title,
-				status: this._getTerminalStatus(terminal),
-				lastCommand: this._getLastCommand(terminal),
-				isVoidTerminal,
-			}
-		})
+		return [...this.terminalService.instances]
+			.filter(terminal => !terminal.shellLaunchConfig.hideFromUser)
+			.map(terminal => {
+				const voidId = idOfPersistentTerminalName(terminal.title)
+				const isVoidTerminal = voidId !== null
+				return {
+					name: isVoidTerminal ? `Void Agent ${voidId === '1' ? '' : `(${voidId})`}`.trim() : terminal.title,
+					status: this._getTerminalStatus(terminal),
+					lastCommand: this._getLastCommand(terminal),
+					isVoidTerminal,
+				}
+			})
 	}
 
 	getValidNewTerminalId(): string {
@@ -312,92 +314,94 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		}
 
 		const waitForResult = async () => {
-			if (isPersistent) {
-				// focus the terminal about to run
-				this.terminalService.setActiveInstance(terminal)
-				await this.terminalService.focusActiveInstance()
-			}
-			let result: string = ''
-			let resolveReason: TerminalResolveReason | undefined
+			try {
+				if (isPersistent) {
+					// focus the terminal about to run
+					this.terminalService.setActiveInstance(terminal)
+					await this.terminalService.focusActiveInstance()
+				}
+				let result: string = ''
+				let resolveReason: TerminalResolveReason | undefined
 
 
-			const cmdCap = await this._waitForCommandDetectionCapability(terminal)
-			// if (!cmdCap) throw new Error(`There was an error using the terminal: CommandDetection capability did not mount yet. Please try again in a few seconds or report this to the Void team.`)
+				const cmdCap = await this._waitForCommandDetectionCapability(terminal)
+				// if (!cmdCap) throw new Error(`There was an error using the terminal: CommandDetection capability did not mount yet. Please try again in a few seconds or report this to the Void team.`)
 
-			// Prefer the structured command-detection capability when available
+				// Prefer the structured command-detection capability when available
 
-			const waitUntilDone = new Promise<void>(resolve => {
-				if (!cmdCap) return
-				const l = cmdCap.onCommandFinished(cmd => {
-					if (resolveReason) return // already resolved
-					resolveReason = { type: 'done', exitCode: cmd.exitCode ?? 0 };
-					result = cmd.getOutput() ?? ''
-					l.dispose()
-					resolve()
+				const waitUntilDone = new Promise<void>(resolve => {
+					if (!cmdCap) return
+					const l = cmdCap.onCommandFinished(cmd => {
+						if (resolveReason) return // already resolved
+						resolveReason = { type: 'done', exitCode: cmd.exitCode ?? 0 };
+						result = cmd.getOutput() ?? ''
+						l.dispose()
+						resolve()
+					})
+					disposables.push(l)
 				})
-				disposables.push(l)
-			})
 
 
-			// send the command now that listeners are attached
-			await terminal.sendText(command, true)
+				// send the command now that listeners are attached
+				await terminal.sendText(command, true)
 
-			const waitUntilInterrupt = isPersistent ?
-				// timeout after X seconds
-				new Promise<void>((res) => {
-					setTimeout(() => {
-						resolveReason = { type: 'timeout' };
-						res()
-					}, MAX_TERMINAL_BG_COMMAND_TIME * 1000)
-				})
-				// inactivity-based timeout
-				: new Promise<void>(res => {
-					let globalTimeoutId: ReturnType<typeof setTimeout>;
-					const resetTimer = () => {
-						clearTimeout(globalTimeoutId);
-						globalTimeoutId = setTimeout(() => {
-							if (resolveReason) return
-
+				const waitUntilInterrupt = isPersistent ?
+					// timeout after X seconds
+					new Promise<void>((res) => {
+						setTimeout(() => {
 							resolveReason = { type: 'timeout' };
-							res();
-						}, MAX_TERMINAL_INACTIVE_TIME * 1000);
-					};
+							res()
+						}, MAX_TERMINAL_BG_COMMAND_TIME * 1000)
+					})
+					// inactivity-based timeout
+					: new Promise<void>(res => {
+						let globalTimeoutId: ReturnType<typeof setTimeout>;
+						const resetTimer = () => {
+							clearTimeout(globalTimeoutId);
+							globalTimeoutId = setTimeout(() => {
+								if (resolveReason) return
 
-					const dTimeout = terminal.onData(() => { resetTimer(); });
-					disposables.push(dTimeout, toDisposable(() => clearTimeout(globalTimeoutId)));
-					resetTimer();
-				})
+								resolveReason = { type: 'timeout' };
+								res();
+							}, MAX_TERMINAL_INACTIVE_TIME * 1000);
+						};
 
-			// wait for result
-			await Promise.any([waitUntilDone, waitUntilInterrupt])
-				.finally(() => disposables.forEach(d => d.dispose()))
+						const dTimeout = terminal.onData(() => { resetTimer(); });
+						disposables.push(dTimeout, toDisposable(() => clearTimeout(globalTimeoutId)));
+						resetTimer();
+					})
+
+				// wait for result
+				await Promise.any([waitUntilDone, waitUntilInterrupt])
+					.finally(() => disposables.forEach(d => d.dispose()))
 
 
 
-			// read result if timed out, since we didn't get it (could clean this code up but it's ok)
-			if (resolveReason?.type === 'timeout') {
-				const terminalId = isPersistent ? params.persistentTerminalId : params.terminalId
-				result = await this.readTerminal(terminalId)
+				// read result if timed out, since we didn't get it (could clean this code up but it's ok)
+				if (resolveReason?.type === 'timeout') {
+					const terminalId = isPersistent ? params.persistentTerminalId : params.terminalId
+					result = await this.readTerminal(terminalId)
+				}
+
+				if (!resolveReason) throw new Error('Unexpected internal error: Promise.any should have resolved with a reason.')
+
+				if (!isPersistent) result = `$ ${command}\n${result}`
+				result = removeAnsiEscapeCodes(result)
+				// trim
+				if (result.length > MAX_TERMINAL_CHARS) {
+					const half = MAX_TERMINAL_CHARS / 2
+					result = result.slice(0, half)
+						+ '\n...\n'
+						+ result.slice(result.length - half, Infinity)
+				}
+
+				return { result, resolveReason }
+			} finally {
+				// Always dispose temporary terminals, even if an error was thrown
+				if (!isPersistent) {
+					interrupt()
+				}
 			}
-
-			if (!isPersistent) {
-				interrupt()
-			}
-
-			if (!resolveReason) throw new Error('Unexpected internal error: Promise.any should have resolved with a reason.')
-
-			if (!isPersistent) result = `$ ${command}\n${result}`
-			result = removeAnsiEscapeCodes(result)
-			// trim
-			if (result.length > MAX_TERMINAL_CHARS) {
-				const half = MAX_TERMINAL_CHARS / 2
-				result = result.slice(0, half)
-					+ '\n...\n'
-					+ result.slice(result.length - half, Infinity)
-			}
-
-			return { result, resolveReason }
-
 		}
 		const resPromise = waitForResult()
 

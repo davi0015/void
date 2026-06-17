@@ -186,7 +186,21 @@ const EditTool = ({ toolMessage, threadId, messageIdx, content }: Parameters<Res
 	const icon = null
 
 	const { rawParams, params, name } = toolMessage
-	const desc1OnClick = params ? () => voidOpenFileFn(params.uri, accessor) : undefined
+	const desc1OnClick = params ? () => {
+		const editCodeService = accessor.get('IEditCodeService')
+		// Find the first DiffZone for this URI and scroll to it
+		const diffAreaIds = editCodeService.diffAreasOfURI[params.uri.fsPath]
+		if (diffAreaIds) {
+			for (const id of diffAreaIds) {
+				const diffArea = editCodeService.diffAreaOfId[id]
+				if (diffArea?.type === 'DiffZone') {
+					voidOpenFileFn(params.uri, accessor, [diffArea.startLine, diffArea.endLine])
+					return
+				}
+			}
+		}
+		voidOpenFileFn(params.uri, accessor)
+	} : undefined
 	const componentParams: ToolHeaderParams = { title, desc1, desc1OnClick, desc1Info, isError, icon, isRejected, }
 
 
