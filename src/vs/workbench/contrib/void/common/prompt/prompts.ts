@@ -482,7 +482,7 @@ export type ChatPromptContext = {
 	directoryStr: string
 	openedURIs: string[]
 	activeURI: string | undefined
-	persistentTerminalIDs: string[]
+	allTerminals: { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[]
 	chatMode: ChatMode
 	mcpTools: InternalToolInfo[] | undefined
 	includeXMLToolDefinitions: boolean
@@ -493,7 +493,13 @@ export type ChatPromptContext = {
 // should prepend this to the latest user message (Phase B caching layout) rather
 // than embed it in the system message — keeping it out of the system message lets
 // the stable prefix and the full conversation history be prefix-cached across turns.
-export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode: mode, includeDirectoryListing = true, directoryDiff }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'persistentTerminalIDs' | 'chatMode'> & { includeDirectoryListing?: boolean, directoryDiff?: string | null }) => {
+export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode: mode, includeDirectoryListing = true, directoryDiff }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'allTerminals' | 'chatMode'> & { includeDirectoryListing?: boolean, directoryDiff?: string | null }) => {
+	const terminalBlock = mode === 'agent' && allTerminals.length > 0
+		? allTerminals.map(t => {
+			const cmd = t.lastCommand ? ` — ${t.lastCommand}` : ''
+			return `  - ${t.name}: ${t.status}${cmd}`
+		}).join('\n')
+		: null
 	const sysInfo = (`Here is the user's system information:
 <system_info>
 - ${os}
@@ -505,9 +511,10 @@ ${workspaceFolders.join('\n') || 'NO FOLDERS OPEN'}
 ${activeURI}
 
 - Open files:
-${openedURIs.join('\n') || 'NO OPENED FILES'}${''/* separator */}${mode === 'agent' && persistentTerminalIDs.length !== 0 ? `
+${openedURIs.join('\n') || 'NO OPENED FILES'}${terminalBlock ? `
 
-- Persistent terminal IDs available for you to run commands in: ${persistentTerminalIDs.join(', ')}` : ''}
+- Terminals:
+${terminalBlock}` : ''}
 </system_info>`)
 
 

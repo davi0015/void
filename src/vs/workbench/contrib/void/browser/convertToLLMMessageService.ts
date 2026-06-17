@@ -1212,7 +1212,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		const workspaceFolders = this.workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath)
 		const openedURIs = this.modelService.getModels().filter(m => m.isAttachedToEditor()).map(m => m.uri.fsPath) || [];
 		const activeURI = this.editorService.activeEditor?.resource?.fsPath;
-		const persistentTerminalIDs = this.terminalToolService.listPersistentTerminalIds()
+		const allTerminals = this.terminalToolService.listAllTerminals()
 
 		let directoryStr = ''
 		let directoryDiff: string | null = null
@@ -1231,7 +1231,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			directorySnapshot = currPaths
 		}
 
-		const volatile = chat_volatileContext({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode, includeDirectoryListing, directoryDiff })
+		const volatile = chat_volatileContext({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode, includeDirectoryListing, directoryDiff })
 		return { volatile, directorySnapshot }
 	}
 

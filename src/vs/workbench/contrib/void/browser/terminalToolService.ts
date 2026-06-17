@@ -21,7 +21,7 @@ import { timeout } from '../../../../base/common/async.js';
 export interface ITerminalToolService {
 	readonly _serviceBrand: undefined;
 
-	listPersistentTerminalIds(): string[];
+	listAllTerminals(): { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[];
 	runCommand(command: string, opts:
 		| { type: 'persistent', persistentTerminalId: string }
 		| { type: 'temporary', cwd: string | null, terminalId: string }
@@ -103,8 +103,33 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 	}
 
 
-	listPersistentTerminalIds() {
-		return Object.keys(this.persistentTerminalInstanceOfId)
+	private _getLastCommand(terminal: ITerminalInstance): string {
+		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection)
+		if (!cmdCap) return ''
+		const lastCmd = cmdCap.commands.at(-1)
+		if (!lastCmd?.command) return ''
+		const cmd = lastCmd.command
+		return cmd.length > 80 ? cmd.slice(0, 77) + '...' : cmd
+	}
+
+	private _getTerminalStatus(terminal: ITerminalInstance): string {
+		const exitCode = terminal.exitCode
+		return exitCode !== undefined
+			? `exited (code ${exitCode})`
+			: 'running'
+	}
+
+	listAllTerminals(): { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[] {
+		return [...this.terminalService.instances].map(terminal => {
+			const voidId = idOfPersistentTerminalName(terminal.title)
+			const isVoidTerminal = voidId !== null
+			return {
+				name: isVoidTerminal ? `Void Agent ${voidId === '1' ? '' : `(${voidId})`}`.trim() : terminal.title,
+				status: this._getTerminalStatus(terminal),
+				lastCommand: this._getLastCommand(terminal),
+				isVoidTerminal,
+			}
+		})
 	}
 
 	getValidNewTerminalId(): string {
