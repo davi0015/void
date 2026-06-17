@@ -773,6 +773,30 @@ Resp Nemotron: 3 tool calls, search + read convertToLLMMessageService.ts + read 
   - **`sendLLMMessageChannel.ts`** — removed `await waitForSend` in `_callAbort` (race condition with soft abort), removed `delete this._infoOfRunningRequest` on abort (FIM emitters must stay alive), removed debug `console.log`.
   - **`sendLLMMessageService.ts`** — removed `this._clearChannelHooks(requestId)` from `abort()` so FIM result hooks survive until `onFinalMessage`/`onError` fires.
   - Files: `autocompleteService.ts` (major rewrite, ~810 lines → ~350), `convertToLLMMessageService.ts` (`prepareFIMMessage` simplified), `sendLLMMessage.impl.ts` (`_sendOpenAICompatibleFIM` rewrite + `openAI.sendFIM` + debug log cleanup), `sendLLMMessage.ts` (soft abort + FIM result delivery + removed chat fallback), `sendLLMMessageChannel.ts` (abort fixes), `sendLLMMessageService.ts` (hook lifetime fix).
+- **Terminal status in volatile context** ✅ DONE
+  - Problem: the LLM agent had no visibility into which terminals exist, whether they're running or exited, or what their last command was. The volatile context only listed persistent terminal IDs (`1, 3, 5`).
+  - Fix: replaced `persistentTerminalIDs: string[]` with `allTerminals: { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[]` in `ChatPromptContext`. The volatile context now renders all terminals (both Void Agent and user-managed) with name, status, and trimmed last command:
+    ```
+    - Terminals:
+      - Void Agent: running — python3 /tmp/test_fim.py
+      - zsh: running — git status
+      - Void Agent (2): exited (code 0) — echo "hello"
+    ```
+  - Added `_getTerminalStatus()` and `_getLastCommand()` helpers to `terminalToolService.ts`. Status uses `terminal.exitCode` (`undefined` = running, number = exited with code). Last command reads from `CommandDetection` capability, trimmed to 80 chars.
+  - Files: `terminalToolService.ts`, `prompts.ts`, `convertToLLMMessageService.ts`
+- **Edit tool file link scroll to diff zone** ✅ DONE
+  - Problem: clicking the file path in an `edit_file`/`rewrite_file` result opened the file but didn't scroll to the changed lines. User had to manually find the diff.
+  - Fix: `desc1OnClick` in `ToolResultComponents.tsx` now looks up the first `DiffZone` for the URI from `editCodeService.diffAreasOfURI` and passes its `startLine`/`endLine` range to `voidOpenFileFn`. Falls back to opening without range if no DiffZone found.
+  - Files: `ToolResultComponents.tsx`
+- **Temporary terminal disposal with `try/finally`** ✅ DONE
+  - Problem: temporary (inline) terminals created by `run_command` leaked forever when exceptions occurred during command execution. If `readTerminal()` threw (e.g. when xterm isn't rendered on hidden terminals), `interrupt()` was skipped and the terminal stayed in `terminalService.instances` permanently.
+  - Fix: wrapped the entire `waitForResult()` body in `try/finally`, calling `interrupt()` in the `finally` block for temporary terminals. Guarantees disposal even on error paths.
+  - Files: `terminalToolService.ts`
+- **Fix backgrounded terminal instances leaking on dispose** ✅ DONE
+  - Problem: VS Code's `_backgroundedTerminalInstances` array (which holds `hideFromUser` terminals) was never cleaned up on dispose. The `onDisposed` listener only forwarded the event without removing the instance from the array. This caused `terminalService.instances` to return disposed temporary terminals forever, making them appear in the LLM's terminal list until restart.
+  - Fix: the `onDisposed` listener for backgrounded terminals now splices the instance out of `_backgroundedTerminalInstances` and cleans up `_backgroundedTerminalDisposables`, in addition to forwarding the event. This is a fix to VS Code's `terminalService.ts` (outside `src/vs/workbench/contrib/void`).
+  - With this fix, `listAllTerminals()` no longer needs a `hideFromUser` filter — disposed terminals are properly removed from the instances array.
+  - Files: `terminalService.ts`, `terminalToolService.ts`
 
 ### Next — Performance & billing-honesty (promoted from backlog)
 
@@ -1753,7 +1777,7 @@ User-triggered conversation compaction that sends old messages to the current mo
 - **`supportsTools: boolean` per model** — separates "does this model support tool calling" from "what format" so the rare model that genuinely can't call tools can be encoded explicitly instead of relying on `specialToolFormat: undefined` (which is now ambiguous).
 - **Audit `importantDetails` for unenforceable rules** — empirically observed during Phase A1+A2 baseline that capable models (e.g. MiniMax 2.5) ignore `Do NOT write tables` for tabular data. Likely cause: late position in a long numbered list. Two fixes worth considering: (a) reposition genuinely-important rules early in the list and demote optional style preferences to a separate "style preferences" block the model can break, (b) drop rules we don't actually enforce — every ignored rule teaches the model the system message isn't authoritative, weakening compliance on rules we *do* care about. Cheap pass, ~30 min, do as part of Option 2 prompt rewrite.
 - ~~**Surface `finish_reason` on OpenAI-compatible streams**~~ — promoted to Next → Quality 1 above.
-- **Write-to-temp-file for inline code execution** — When the LLM generates `python3 -c "..."` (or `node -e "..."`, `ruby -e "..."`, etc.), intercept in `runCommand`, write the code to `/tmp/void_exec_xxx.py`, and send `python3 /tmp/void_exec_xxx.py` instead. This eliminates shell quoting issues, large write chunking through the 50-byte `chunkInput` pipeline, and `\n`→`\r` conversion problems. Blocked on finding root cause of the persistent terminal crash that kills all terminals (PTY host is shared across all windows). Once we can reproduce the crash, implement this as the fix.
+- **Write-to-temp-file for inline code execution** — When the LLM generates `python3 -c "..."` (or `node -e "..."`, `ruby -e "..."`, etc.), intercept in `runCommand`, write the code to `/tmp/void_exec_xxx.py`, and send `python3 /tmp/void_exec_xxx.py` instead. This eliminates shell quoting issues, large write chunking through the 50-byte `chunkInput` pipeline, and `\n`→`\r` conversion problems. The backgrounded-terminal leak fix (dispose cleanup) resolved one class of terminal state corruption; this remains a defensive measure for shell-quoting edge cases.
 - **RAG context for autocomplete** — The `relevantContext` parameter in `getCompletionOptions` is currently `''`. Including context from open tabs and recently modified files in the FIM prefix would significantly improve autocomplete quality. Needs design decisions: how much context, which files, how to format it, token budget. The Google AI Mode autocomplete approach recommends this.
 
 ### search_history tool ✅ Implemented
