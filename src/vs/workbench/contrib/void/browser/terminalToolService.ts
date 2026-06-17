@@ -120,9 +120,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 	}
 
 	listAllTerminals(): { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[] {
-		return [...this.terminalService.instances]
-			.filter(terminal => !terminal.shellLaunchConfig.hideFromUser)
-			.map(terminal => {
+		return [...this.terminalService.instances].map(terminal => {
 				const voidId = idOfPersistentTerminalName(terminal.title)
 				const isVoidTerminal = voidId !== null
 				return {
