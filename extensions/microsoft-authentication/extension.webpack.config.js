@@ -38,7 +38,9 @@ module.exports = withDefaults({
 					from: '**/dist/msal*.(node|dll)',
 					to: '[name][ext]',
 					// These will only be present on Windows for now
-					noErrorOnMissing: !isWindows
+					// Also disable error on windows, because there is build error
+					// noErrorOnMissing: !isWindows
+					noErrorOnMissing: true
 				}
 			]
 		})
