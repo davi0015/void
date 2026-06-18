@@ -416,6 +416,39 @@ Implications:
 - **API keys can't be migrated by file-copying** — they're encrypted with `IEncryptionService` (Electron `safeStorage` → macOS Keychain), and Keychain entries are scoped per bundle ID. `code-oss-dev` and `com.voideditor.code` are different identities, so even copying `state.vscdb` over wouldn't decrypt.
 - **Non-secret settings can be migrated** by copying `~/Library/Application Support/code-oss-dev/User/settings.json` to `~/Library/Application Support/Void/User/settings.json` before first launch. Usually not worth the bother.
 
+### Windows Build (PowerShell)
+
+Build the Windows app:
+
+```powershell
+npm run gulp vscode-win32-x64
+```
+
+Output lands in `..\VSCode-win32-x64\Void.exe`.
+
+#### WSL Remote Support
+
+To connect to WSL from Void, a Linux REH (Remote Extension Host) server must run inside WSL. Build it once:
+
+```powershell
+npm run gulp vscode-reh-linux-x64
+```
+
+Output lands in `..\vscode-reh-linux-x64\`. Then copy it into WSL at the expected path:
+
+```powershell
+# From inside WSL
+mkdir -p ~/.void-server/bin/1.4.9
+cp -r /mnt/c/Users/<you>/dev/vscode-reh-linux-x64/* ~/.void-server/bin/1.4.9/
+chmod +x ~/.void-server/bin/1.4.9/bin/void-server
+```
+
+The `1.4.9` path matches `voidVersion` from `product.json`. When Void connects to WSL, it checks if the server already exists at this path — if found, it skips the download entirely.
+
+**Rebuild frequency:** Only when server-side code changes (extension host, terminal process, file watchers, etc.). UI/browser-side changes don't require a rebuild. One build is enough for day-to-day use.
+
+**Mangle build error:** If you hit `OVERLAPPING edit` in `google-auth-library` during the REH build, ensure `build/lib/mangle/index.js` has the `node_modules` skip filter (committed as of `cb63c7ba`).
+
 ### Why not `void-builder`?
 
 The official Void release pipeline lives in [voideditor/void-builder](https://github.com/voideditor/void-builder) (a VSCodium fork). It handles code signing, notarization, auto-updates, and Linux/Windows builds via GitHub Actions. Use it when you actually want to publish releases. For "share with a few teammates", the local-build + create-dmg + xattr instructions above are the right tradeoff.
