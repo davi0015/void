@@ -170,6 +170,8 @@ export type VoidStaticModelInfo = { // not stateful
 	specialToolFormat?: 'openai-style' | 'anthropic-style' | 'gemini-style', // typically you should use 'openai-style'. null means "can't call tools by default", and asks the LLM to output XML in agent mode
 	supportsFIM: boolean; // whether the model was specifically designed for autocomplete or "FIM" ("fill-in-middle" format)
 	supportsVision?: boolean; // whether the model accepts image inputs (e.g. Gemini, GPT-4o, Claude)
+	supportsEmbedding?: boolean; // whether this model can produce embeddings via /v1/embeddings
+	supportsChat?: boolean; // whether this model can do chat completion; defaults to true. Embedding-only models set this to false.
 
 	additionalOpenAIPayload?: { [key: string]: unknown } // additional payload in the message body for requests that are openai-compatible (ollama, vllm, openai, openrouter, etc)
 
@@ -218,6 +220,8 @@ export const modelOverrideKeys = [
 	'specialToolFormat',
 	'supportsFIM',
 	'supportsVision',
+	'supportsEmbedding',
+	'supportsChat',
 	'reasoningCapabilities',
 	'additionalOpenAIPayload'
 ] as const
@@ -1469,7 +1473,7 @@ const openRouterModelOptions_assumingOpenAICompat = {
 		reservedOutputTokenSpace: null,
 		cost: { input: 0.07, output: 0.16 },
 		downloadable: false,
-	}
+	},
 } as const satisfies { [s: string]: VoidStaticModelInfo }
 
 const openRouterSettings: VoidStaticProviderInfo = {

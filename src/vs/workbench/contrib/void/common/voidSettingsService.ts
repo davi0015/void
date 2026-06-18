@@ -119,11 +119,12 @@ export const modelFilterOfFeatureName: {
 		emptyMessage: null | { message: string, priority: 'always' | 'fallback' }
 	} } = {
 	'Autocomplete': { filter: (o, opts) => getModelCapabilities(o.providerName, o.modelName, opts.overridesOfModel).supportsFIM, emptyMessage: { message: 'No models support FIM', priority: 'always' } },
-	'Chat': { filter: o => true, emptyMessage: null, },
-	'Ctrl+K': { filter: o => true, emptyMessage: null, },
-	'Apply': { filter: o => true, emptyMessage: null, },
-	'SCM': { filter: o => true, emptyMessage: null, },
+	'Chat': { filter: (o, opts) => getModelCapabilities(o.providerName, o.modelName, opts.overridesOfModel).supportsChat !== false, emptyMessage: null, },
+	'Ctrl+K': { filter: (o, opts) => getModelCapabilities(o.providerName, o.modelName, opts.overridesOfModel).supportsChat !== false, emptyMessage: null, },
+	'Apply': { filter: (o, opts) => getModelCapabilities(o.providerName, o.modelName, opts.overridesOfModel).supportsChat !== false, emptyMessage: null, },
+	'SCM': { filter: (o, opts) => getModelCapabilities(o.providerName, o.modelName, opts.overridesOfModel).supportsChat !== false, emptyMessage: null, },
 	'VisionHelper': { filter: (o, opts) => getModelCapabilities(o.providerName, o.modelName, opts.overridesOfModel).supportsVision === true, emptyMessage: { message: 'No models support vision', priority: 'fallback' } },
+	'SemanticSearch': { filter: (o, opts) => getModelCapabilities(o.providerName, o.modelName, opts.overridesOfModel).supportsEmbedding === true, emptyMessage: { message: 'No models support embeddings', priority: 'fallback' } },
 }
 
 
@@ -233,9 +234,9 @@ const defaultState = () => {
 	const d: VoidSettingsState = {
 		settingsOfProvider: deepClone(defaultSettingsOfProvider),
 		backends: {},
-		modelSelectionOfFeature: { 'Chat': null, 'Ctrl+K': null, 'Autocomplete': null, 'Apply': null, 'SCM': null, 'VisionHelper': null },
+		modelSelectionOfFeature: { 'Chat': null, 'Ctrl+K': null, 'Autocomplete': null, 'Apply': null, 'SCM': null, 'VisionHelper': null, 'SemanticSearch': null },
 		globalSettings: deepClone(defaultGlobalSettings),
-		optionsOfModelSelection: { 'Chat': {}, 'Ctrl+K': {}, 'Autocomplete': {}, 'Apply': {}, 'SCM': {}, 'VisionHelper': {} },
+		optionsOfModelSelection: { 'Chat': {}, 'Ctrl+K': {}, 'Autocomplete': {}, 'Apply': {}, 'SCM': {}, 'VisionHelper': {}, 'SemanticSearch': {} },
 		overridesOfModel: deepClone(defaultOverridesOfModel),
 		_modelOptions: [], // computed later
 		mcpUserStateOfName: {},
@@ -315,6 +316,13 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			if (readS.globalSettings.autoOutlineReadFile === undefined) readS.globalSettings.autoOutlineReadFile = true;
 
 			if (readS.globalSettings.rulesPaths === undefined) readS.globalSettings.rulesPaths = '';
+
+			// add SemanticSearch feature
+			if (readS.modelSelectionOfFeature && !readS.modelSelectionOfFeature['SemanticSearch']) {
+				readS.modelSelectionOfFeature['SemanticSearch'] = null
+				readS.optionsOfModelSelection['SemanticSearch'] = {}
+			}
+			if (readS.globalSettings.semanticSearchEnabled === undefined) readS.globalSettings.semanticSearchEnabled = true;
 		}
 		catch (e) {
 			readS = defaultState()
