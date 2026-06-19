@@ -17,7 +17,7 @@ import { IEmbeddingService } from '../common/embeddingService.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { getModelCapabilities } from '../common/modelCapabilities.js';
 import { ProviderName } from '../common/voidSettingsTypes.js';
-import { Emitter } from '../../../../base/common/event.js';
+import { Emitter, Event } from '../../../../base/common/event.js';
 import { getAllUrisInDirectory } from '../common/directoryStrService.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { joinPath } from '../../../../base/common/resources.js';
@@ -58,6 +58,7 @@ export interface ISemanticIndexService {
 	search(query: string, nResults: number, includePattern?: string): Promise<SemanticSearchResult[]>
 	readonly indexStatus: IndexStatus
 	readonly indexProgress: { indexed: number, total: number }
+	readonly onDidChangeStatus: Event<void>
 }
 
 export const ISemanticIndexService = createDecorator<ISemanticIndexService>('semanticIndexService');
@@ -178,6 +179,11 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 		this._onDidChangeStatus.fire()
 	}
 
+	private setProgress(progress: { indexed: number, total: number }) {
+		this._progress = progress
+		this._onDidChangeStatus.fire()
+	}
+
 	constructor(
 		@IFileService private readonly fileService: IFileService,
 		@IWorkspaceContextService private readonly workspaceContextService: IWorkspaceContextService,
@@ -266,7 +272,7 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 				allUris.push(...uris)
 			}
 
-			this._progress = { indexed: 0, total: allUris.length }
+			this.setProgress({ indexed: 0, total: allUris.length })
 
 			// Chunk and embed each file
 			const fileHashOfUri: Record<string, string> = {}
@@ -294,7 +300,7 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 					// skip unreadable files
 				}
 
-				this._progress = { indexed: i + 1, total: allUris.length }
+				this.setProgress({ indexed: i + 1, total: allUris.length })
 			}
 
 			// Embed chunks in batches

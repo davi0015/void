@@ -56,6 +56,7 @@ import { IExtensionManagementService } from '../../../../../../../platform/exten
 import { IMCPService } from '../../../../common/mcpService.js';
 import { IStorageService, StorageScope } from '../../../../../../../platform/storage/common/storage.js'
 import { OPT_OUT_KEY } from '../../../../common/storageKeys.js'
+import { ISemanticIndexService, IndexStatus } from '../../../semanticIndexService.js'
 import { registerChatDevTools } from '../../../chatThreadDevTools.js'
 
 
@@ -92,6 +93,10 @@ const commandBarURIStateListeners: Set<(uri: URI) => void> = new Set();
 const activeURIListeners: Set<(uri: URI | null) => void> = new Set();
 
 const mcpListeners: Set<() => void> = new Set()
+
+let semanticIndexStatus: IndexStatus = 'idle'
+let semanticIndexProgress = { indexed: 0, total: 0 }
+const semanticIndexStateListeners: Set<() => void> = new Set()
 
 
 // must call this before you can use any of the hooks below
@@ -200,6 +205,17 @@ export const _registerServices = (accessor: ServicesAccessor) => {
 		})
 	)
 
+	// Semantic index state
+	const semanticIndexService = accessor.get(ISemanticIndexService)
+	semanticIndexStatus = semanticIndexService.indexStatus
+	semanticIndexProgress = semanticIndexService.indexProgress
+	disposables.push(
+		semanticIndexService.onDidChangeStatus(() => {
+			semanticIndexStatus = semanticIndexService.indexStatus
+			semanticIndexProgress = semanticIndexService.indexProgress
+			semanticIndexStateListeners.forEach(l => l())
+		})
+	)
 
 	return disposables
 }
@@ -253,6 +269,7 @@ const getReactAccessor = (accessor: ServicesAccessor) => {
 		IMCPService: accessor.get(IMCPService),
 
 		IStorageService: accessor.get(IStorageService),
+		ISemanticIndexService: accessor.get(ISemanticIndexService),
 
 	} as const
 	return reactAccessor
@@ -626,5 +643,19 @@ export const useIsOptedOut = () => {
 		return () => disposables.clear()
 	}, [storageService, getVal])
 
+	return s
+}
+
+
+export const useSemanticIndexState = () => {
+	const [s, ss] = useState({ status: semanticIndexStatus, progress: semanticIndexProgress })
+	useEffect(() => {
+		ss({ status: semanticIndexStatus, progress: semanticIndexProgress })
+		const listener = () => {
+			ss({ status: semanticIndexStatus, progress: semanticIndexProgress })
+		}
+		semanticIndexStateListeners.add(listener)
+		return () => { semanticIndexStateListeners.delete(listener) }
+	}, [])
 	return s
 }

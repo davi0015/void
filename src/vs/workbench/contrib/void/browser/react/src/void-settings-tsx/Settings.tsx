@@ -7,7 +7,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useState, useR
 import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName, BackendId, BackendProtocol, BackendProviderSettings } from '../../../../common/voidSettingsTypes.js'
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js'
 import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSegmentedControl, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js'
-import { useAccessor, useIsDark, useIsOptedOut, useRefreshModelListener, useRefreshModelState, useSettingsState } from '../util/services.js'
+import { useAccessor, useIsDark, useIsOptedOut, useRefreshModelListener, useRefreshModelState, useSettingsState, useSemanticIndexState } from '../util/services.js'
 import { X, RefreshCw, Loader2, Check, Asterisk, Plus, GripVertical } from 'lucide-react'
 import { URI } from '../../../../../../../base/common/uri.js'
 import { ModelDropdown } from './ModelDropdown.js'
@@ -1434,6 +1434,49 @@ const MCPServersList = () => {
 	return <div className="my-2">{content}</div>
 };
 
+const SemanticSearchSettings = () => {
+	const accessor = useAccessor()
+	const voidSettingsService = accessor.get('IVoidSettingsService')
+	const settingsState = useSettingsState()
+	const indexState = useSemanticIndexState()
+
+	return <div className='w-full'>
+		<h4 className={`text-base`}>{displayInfoOfFeatureName('SemanticSearch')}</h4>
+		<div className='text-sm text-void-fg-3 mt-1'>Search code by meaning or intent, not exact string match. Requires an embedding model (e.g. text-embedding-3-small on OpenAI, nomic-embed-text on Ollama).</div>
+
+		<div className='my-2'>
+			{/* Enable Switch */}
+			<ErrorBoundary>
+				<div className='flex items-center gap-x-2 my-2'>
+					<VoidSwitch
+						size='xs'
+						value={settingsState.globalSettings.semanticSearchEnabled}
+						onChange={(newVal) => voidSettingsService.setGlobalSetting('semanticSearchEnabled', newVal)}
+					/>
+					<span className='text-void-fg-3 text-xs pointer-events-none'>{settingsState.globalSettings.semanticSearchEnabled ? 'Enabled' : 'Disabled'}</span>
+				</div>
+			</ErrorBoundary>
+
+			{/* Model Dropdown */}
+			<ErrorBoundary>
+				<div className={`my-2 ${!settingsState.globalSettings.semanticSearchEnabled ? 'hidden' : ''}`}>
+					<ModelDropdown featureName={'SemanticSearch'} className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-1 rounded p-0.5 px-1' />
+				</div>
+			</ErrorBoundary>
+
+			{/* Index Status */}
+			<ErrorBoundary>
+				{settingsState.globalSettings.semanticSearchEnabled && indexState.status !== 'idle' && (
+					<div className='text-xs text-void-fg-3 mt-1'>
+						{indexState.status === 'indexing' && `Indexing... ${indexState.progress.indexed}/${indexState.progress.total} files`}
+						{indexState.status === 'ready' && `Index ready (${indexState.progress.total} files indexed)`}
+					</div>
+				)}
+			</ErrorBoundary>
+		</div>
+	</div>
+}
+
 export const Settings = () => {
 	const isDark = useIsDark()
 	// ─── sidebar nav ──────────────────────────
@@ -1825,6 +1868,11 @@ export const Settings = () => {
 												</div>
 
 											</div>
+										</ErrorBoundary>
+
+										{/* Semantic Search */}
+										<ErrorBoundary>
+											<SemanticSearchSettings />
 										</ErrorBoundary>
 									</div>
 								</ErrorBoundary>

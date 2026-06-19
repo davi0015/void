@@ -8,7 +8,7 @@ import { flushSync } from 'react-dom';
 
 
 
-import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction, useAnyThreadRunning } from '../util/services.js';
+import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction, useAnyThreadRunning, useSemanticIndexState } from '../util/services.js';
 
 import { ChatMarkdownRender, ChatMessageLocation } from '../markdown/ChatMarkdownRender.js';
 import { URI } from '../../../../../../../base/common/uri.js';
@@ -3028,6 +3028,22 @@ const useRulesOutdated = (threadId: string, lastAppliedRules: string | undefined
 	return outdatedInfo
 }
 
+const SemanticIndexProgressIndicator = () => {
+	const { status, progress } = useSemanticIndexState()
+	const accessor = useAccessor()
+	const settingsState = useSettingsState()
+
+	if (!settingsState.globalSettings.semanticSearchEnabled) return null
+	if (status !== 'indexing') return null
+
+	return (
+		<div className='flex items-center gap-1.5 text-xs text-void-fg-3 px-3 py-1 mx-2 mb-1 rounded select-none'>
+			<IconLoading className='w-3 h-3' />
+			<span>Indexing... {progress.indexed}/{progress.total} files</span>
+		</div>
+	)
+}
+
 const RulesOutdatedBanner = ({ detectedAt }: { detectedAt: Date | null }) => {
 	const timeStr = detectedAt ? detectedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : null
 	return (
@@ -3416,12 +3432,14 @@ export const SidebarChat = () => {
 				)}
 				{!canCompact && !showCompactDialog && <div />}
 			</div>
+			<SemanticIndexProgressIndicator />
 			{inputChatArea}
 		</div>
 	</div>
 
 	const landingPageInput = <div>
 		<div className='pt-8'>
+			<SemanticIndexProgressIndicator />
 			{inputChatArea}
 		</div>
 	</div>
