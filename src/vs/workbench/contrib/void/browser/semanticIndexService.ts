@@ -23,6 +23,7 @@ import { IEnvironmentService } from '../../../../platform/environment/common/env
 import { joinPath } from '../../../../base/common/resources.js';
 import { hash } from '../../../../base/common/hash.js';
 import { VSBuffer } from '../../../../base/common/buffer.js';
+import { RunOnceScheduler } from '../../../../base/common/async.js';
 
 // ---- Types ----
 
@@ -68,6 +69,7 @@ const CHUNK_OVERLAP_CHARS = 200
 const INDEX_VERSION = 1
 const MAX_FILE_SIZE_BYTES = 1_000_000 // 1MB
 const EMBEDDING_BATCH_SIZE = 64 // texts per embed() call
+const FILE_WATCHER_DEBOUNCE_MS = 5000
 
 // Binary extensions to skip
 const BINARY_EXTENSIONS = new Set([
@@ -158,8 +160,15 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 	private _status: IndexStatus = 'idle'
 	private _progress = { indexed: 0, total: 0 }
 	private _chunks: Chunk[] = []
+	private _fileHashOfUri: Record<string, string> = {}
+	private _currentEmbeddingModel: string = ''
+
 	private readonly _onDidChangeStatus = new Emitter<void>()
 	readonly onDidChangeStatus = this._onDidChangeStatus.event
+
+	// Debounced file watcher
+	private readonly _fileChangeScheduler: RunOnceScheduler
+	private _pendingChangedUris = new Set<string>()
 
 	get indexStatus(): IndexStatus { return this._status }
 	get indexProgress(): { indexed: number, total: number } { return this._progress }
@@ -177,6 +186,32 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 		@IEnvironmentService private readonly environmentService: IEnvironmentService,
 	) {
 		super()
+
+		// Debounced handler for file changes
+		this._fileChangeScheduler = this._register(new RunOnceScheduler(() => {
+			this._handleFileChanges()
+		}, FILE_WATCHER_DEBOUNCE_MS))
+
+		// Watch for file changes across all workspace folders
+		const folders = this.workspaceContextService.getWorkspace().folders
+		for (const folder of folders) {
+			this._register(this.fileService.watch(folder.uri))
+		}
+		this._register(this.fileService.onDidFilesChange(e => {
+			for (const resource of e.rawUpdated) {
+				this._pendingChangedUris.add(resource.fsPath)
+			}
+			for (const resource of e.rawDeleted) {
+				this._pendingChangedUris.add(resource.fsPath)
+			}
+			for (const resource of e.rawAdded) {
+				this._pendingChangedUris.add(resource.fsPath)
+			}
+			if (this._pendingChangedUris.size > 0 && this._status === 'ready') {
+				this._fileChangeScheduler.schedule()
+			}
+		}))
+
 		// Start indexing when the workspace is ready
 		this._indexWorkspace()
 	}
@@ -216,8 +251,9 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 
 		try {
 			// Try to load existing index from disk
-			const loaded = await this._loadIndex(modelKey)
+			const loaded = await this._loadIndex(modelKey, model)
 			if (loaded) {
+				this._currentEmbeddingModel = modelKey
 				this.setStatus('ready')
 				return
 			}
@@ -262,36 +298,125 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 			}
 
 			// Embed chunks in batches
-			for (let i = 0; i < allChunks.length; i += EMBEDDING_BATCH_SIZE) {
-				const batch = allChunks.slice(i, i + EMBEDDING_BATCH_SIZE)
-				const texts = batch.map(c => c.content)
-				const embeddings = await this.embeddingService.embed(
-					model.providerName,
-					model.modelName,
-					texts,
-					this.voidSettingsService.state.settingsOfProvider,
-				)
-				for (let j = 0; j < batch.length; j++) {
-					batch[j].embedding = embeddings[j] ?? []
-				}
-			}
+			await this._embedChunks(allChunks, model)
 
 			this._chunks = allChunks
+			this._fileHashOfUri = fileHashOfUri
+			this._currentEmbeddingModel = modelKey
 
 			// Persist index
-			const index: SemanticIndex = {
-				version: INDEX_VERSION,
-				embeddingModel: modelKey,
-				fileHashOfUri,
-				chunks: allChunks,
-			}
-			await this._saveIndex(index)
+			await this._saveCurrentIndex()
 
 			this.setStatus('ready')
 		} catch (e) {
 			console.error('[semanticIndex] Indexing failed:', e)
 			this.setStatus('idle')
 		}
+	}
+
+	// Embed an array of chunks in batches
+	private async _embedChunks(chunks: Chunk[], model: { providerName: ProviderName, modelName: string }): Promise<void> {
+		for (let i = 0; i < chunks.length; i += EMBEDDING_BATCH_SIZE) {
+			const batch = chunks.slice(i, i + EMBEDDING_BATCH_SIZE)
+			const texts = batch.map(c => c.content)
+			const embeddings = await this.embeddingService.embed(
+				model.providerName,
+				model.modelName,
+				texts,
+				this.voidSettingsService.state.settingsOfProvider,
+			)
+			for (let j = 0; j < batch.length; j++) {
+				batch[j].embedding = embeddings[j] ?? []
+			}
+		}
+	}
+
+	// Handle file changes detected by the watcher
+	private async _handleFileChanges(): Promise<void> {
+		if (this._status !== 'ready') return
+
+		const changedPaths = [...this._pendingChangedUris]
+		this._pendingChangedUris.clear()
+
+		const model = this._resolveEmbeddingModel()
+		if (!model) return
+
+		const chunksToRemove = new Set<number>()
+		const newChunks: Chunk[] = []
+		const newFileHashes: Record<string, string> = {}
+
+		for (const fsPath of changedPaths) {
+			const uri = URI.file(fsPath)
+
+			// Remove existing chunks for this file
+			for (let i = 0; i < this._chunks.length; i++) {
+				if (this._chunks[i].uri === fsPath) {
+					chunksToRemove.add(i)
+				}
+			}
+
+			// If file was deleted, skip re-indexing
+			const exists = await this.fileService.exists(uri)
+			if (!exists) {
+				delete this._fileHashOfUri[fsPath]
+				continue
+			}
+
+			if (isBinaryFile(uri)) continue
+
+			try {
+				const stat = await this.fileService.stat(uri)
+				if (stat.size > MAX_FILE_SIZE_BYTES) continue
+
+				const content = await this.fileService.readFile(uri)
+				const text = content.value.toString()
+				const fileHashValue = contentHash(text)
+
+				// Skip if file content hasn't actually changed
+				if (this._fileHashOfUri[fsPath] === fileHashValue) {
+					// Remove the removal markers — content didn't change
+					for (let i = 0; i < this._chunks.length; i++) {
+						if (this._chunks[i].uri === fsPath) {
+							chunksToRemove.delete(i)
+						}
+					}
+					continue
+				}
+
+				newFileHashes[fsPath] = fileHashValue
+				const lines = text.split('\n')
+				const chunks = chunkContent(text, lines)
+				for (const chunk of chunks) {
+					chunk.uri = fsPath
+				}
+				newChunks.push(...chunks)
+			} catch {
+				// skip unreadable files
+			}
+		}
+
+		if (chunksToRemove.size === 0 && newChunks.length === 0) return
+
+		// Embed new chunks
+		await this._embedChunks(newChunks, model)
+
+		// Rebuild chunks array: remove old, add new
+		const updatedChunks: Chunk[] = []
+		for (let i = 0; i < this._chunks.length; i++) {
+			if (!chunksToRemove.has(i)) {
+				updatedChunks.push(this._chunks[i])
+			}
+		}
+		updatedChunks.push(...newChunks)
+		this._chunks = updatedChunks
+
+		// Update file hashes
+		for (const [path, hashValue] of Object.entries(newFileHashes)) {
+			this._fileHashOfUri[path] = hashValue
+		}
+
+		// Persist updated index
+		await this._saveCurrentIndex()
 	}
 
 	// Search by cosine similarity
@@ -345,7 +470,7 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 		return joinPath(this.environmentService.userRoamingDataHome, 'voidSemanticIndex', `${workspaceHash}.json`)
 	}
 
-	private async _loadIndex(expectedModel: string): Promise<boolean> {
+	private async _loadIndex(expectedModel: string, model: { providerName: ProviderName, modelName: string }): Promise<boolean> {
 		try {
 			const path = this._indexPath()
 			const exists = await this.fileService.exists(path)
@@ -355,12 +480,10 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 			const index: SemanticIndex = JSON.parse(content.value.toString())
 
 			if (index.version !== INDEX_VERSION) return false
+			// Full re-index if embedding model changed (different vector space)
 			if (index.embeddingModel !== expectedModel) return false
 
-			// Verify files haven't changed — only keep chunks for unchanged files
-			const validChunks: Chunk[] = []
-			const fileHashOfUri: Record<string, string> = {}
-
+			// Hash all current workspace files
 			const folders = this.workspaceContextService.getWorkspace().folders
 			const allUris: URI[] = []
 			for (const folder of folders) {
@@ -368,46 +491,104 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 				allUris.push(...uris)
 			}
 
-			const currentFileHashOfUri: Record<string, string | null> = {}
-
-			for (const chunk of index.chunks) {
-				// Check if we've hashed this file yet
-				if (!(chunk.uri in currentFileHashOfUri)) {
-					const uri = URI.file(chunk.uri)
-					try {
-						const fileContent = await this.fileService.readFile(uri)
-						currentFileHashOfUri[chunk.uri] = contentHash(fileContent.value.toString())
-					} catch {
-						currentFileHashOfUri[chunk.uri] = null // file deleted
-					}
+			const currentHashOfFsPath: Record<string, string | null> = {}
+			for (const uri of allUris) {
+				if (isBinaryFile(uri)) continue
+				try {
+					const stat = await this.fileService.stat(uri)
+					if (stat.size > MAX_FILE_SIZE_BYTES) continue
+					const fileContent = await this.fileService.readFile(uri)
+					currentHashOfFsPath[uri.fsPath] = contentHash(fileContent.value.toString())
+				} catch {
+					currentHashOfFsPath[uri.fsPath] = null
 				}
-
-				const currentHash = currentFileHashOfUri[chunk.uri]
-				if (currentHash === null) continue // file deleted
-				if (currentHash === index.fileHashOfUri[chunk.uri]) {
-					validChunks.push(chunk)
-					fileHashOfUri[chunk.uri] = currentHash
-				}
-				// If hash differs, skip this chunk (needs re-indexing — for now we drop it)
 			}
 
-			this._chunks = validChunks
+			// Separate chunks into unchanged, changed, and deleted
+			const unchangedChunks: Chunk[] = []
+			const changedFsPaths = new Set<string>()
+			const indexedFsPaths = new Set<string>()
 
-			// TODO: re-embed changed files (commit 3 will handle this)
+			for (const chunk of index.chunks) {
+				indexedFsPaths.add(chunk.uri)
+				const currentHash = currentHashOfFsPath[chunk.uri]
+				if (currentHash === null) continue // file deleted — drop chunks
+				if (currentHash === index.fileHashOfUri[chunk.uri]) {
+					unchangedChunks.push(chunk) // file unchanged — keep chunks
+				} else {
+					changedFsPaths.add(chunk.uri) // file changed — need re-indexing
+				}
+			}
 
-			return validChunks.length > 0
+			// Find new files not in the index
+			const newFsPaths: string[] = []
+			for (const [fsPath, hashVal] of Object.entries(currentHashOfFsPath)) {
+				if (hashVal !== null && !indexedFsPaths.has(fsPath)) {
+					newFsPaths.push(fsPath)
+				}
+			}
+
+			// Re-chunk and re-embed changed + new files
+			const changedAndNewPaths = [...changedFsPaths, ...newFsPaths]
+			const newChunks: Chunk[] = []
+			const newFileHashOfUri: Record<string, string> = {}
+
+			for (const fsPath of changedAndNewPaths) {
+				const uri = URI.file(fsPath)
+				try {
+					const fileContent = await this.fileService.readFile(uri)
+					const text = fileContent.value.toString()
+					newFileHashOfUri[fsPath] = currentHashOfFsPath[fsPath]!
+					const lines = text.split('\n')
+					const chunks = chunkContent(text, lines)
+					for (const chunk of chunks) {
+						chunk.uri = fsPath
+					}
+					newChunks.push(...chunks)
+				} catch {
+					// skip unreadable
+				}
+			}
+
+			// Embed only the changed/new chunks
+			if (newChunks.length > 0) {
+				await this._embedChunks(newChunks, model)
+			}
+
+			// Merge file hashes
+			const mergedFileHashOfUri: Record<string, string> = {}
+			for (const [path, hashVal] of Object.entries(index.fileHashOfUri)) {
+				if (currentHashOfFsPath[path] !== null) {
+					mergedFileHashOfUri[path] = hashVal
+				}
+			}
+			Object.assign(mergedFileHashOfUri, newFileHashOfUri)
+
+			this._chunks = [...unchangedChunks, ...newChunks]
+			this._fileHashOfUri = mergedFileHashOfUri
+
+			// Persist updated index
+			await this._saveCurrentIndex()
+
+			return this._chunks.length > 0
 		} catch {
 			return false
 		}
 	}
 
-	private async _saveIndex(index: SemanticIndex): Promise<void> {
+	private async _saveCurrentIndex(): Promise<void> {
 		try {
 			const path = this._indexPath()
 			const dir = joinPath(this.environmentService.userRoamingDataHome, 'voidSemanticIndex')
 			const dirExists = await this.fileService.exists(dir)
 			if (!dirExists) {
 				await this.fileService.createFolder(dir)
+			}
+			const index: SemanticIndex = {
+				version: INDEX_VERSION,
+				embeddingModel: this._currentEmbeddingModel,
+				fileHashOfUri: this._fileHashOfUri,
+				chunks: this._chunks,
 			}
 			await this.fileService.writeFile(path, VSBuffer.fromString(JSON.stringify(index)))
 		} catch (e) {

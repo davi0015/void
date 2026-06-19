@@ -240,7 +240,7 @@ export const builtinTools: {
 
 	search_for_files: {
 		name: 'search_for_files',
-		description: `Use this to find which files contain a given string or regex pattern across the workspace. Returns a list of matching file names (not line numbers). For line-number positions within a specific file, use \`search_in_file\`. For locating where a NAMED function / class / variable / type is defined or used, use \`go_to_definition\` / \`go_to_usages\` instead — LSP is precise where text search is noisy. Never use \`run_command\` with \`grep\` — this tool is the correct choice.`,
+		description: `Use this to find which files contain a given string or regex pattern across the workspace. Returns a list of matching file names (not line numbers). For line-number positions within a specific file, use \`search_in_file\`. For locating where a NAMED function / class / variable / type is defined or used, use \`go_to_definition\` / \`go_to_usages\` instead — LSP is precise where text search is noisy. For conceptual or intent-based queries where there's no exact string to match, use \`semantic_search\` instead. Never use \`run_command\` with \`grep\` — this tool is the correct choice.`,
 		params: {
 			query: { description: `Your query for the search.` },
 			search_in_folder: { description: 'Optional. Leave as blank by default. ONLY fill this in if your previous search with the same query was truncated. Searches descendants of this folder only.' },
@@ -252,7 +252,7 @@ export const builtinTools: {
 	// add new search_in_file tool
 	search_in_file: {
 		name: 'search_in_file',
-		description: `Use this to find where a pattern appears inside a specific file. Returns the start line numbers of matches. For cross-file content search, use \`search_for_files\`. For locating where a NAMED function / class / variable / type is defined or used, use \`go_to_definition\` / \`go_to_usages\` instead — LSP is precise where text search is noisy. Never use \`run_command\` with \`grep\` — this tool is the correct choice.`,
+		description: `Use this to find where a pattern appears inside a specific file. Returns the start line numbers of matches. For cross-file content search, use \`search_for_files\`. For locating where a NAMED function / class / variable / type is defined or used, use \`go_to_definition\` / \`go_to_usages\` instead — LSP is precise where text search is noisy. For conceptual or intent-based queries where there's no exact string to match, use \`semantic_search\` instead. Never use \`run_command\` with \`grep\` — this tool is the correct choice.`,
 		params: {
 			...uriParam('file'),
 			query: { description: 'The string or regex to search for in the file.' },
@@ -279,6 +279,16 @@ export const builtinTools: {
 			line: { description: `Optional — strongly recommended when you know it. The 1-indexed line number in the file where \`symbol_name\` appears. If you have just read the file or run \`search_in_file\`, pass the line you saw — this is the most reliable mode and is REQUIRED to disambiguate when the same name has multiple meanings in the same file (shadowing, re-assignment, overloaded declarations). If omitted, the tool scans the file for the first whole-word occurrence of \`symbol_name\` — safe for distinctive names, risky for common names.` },
 			...paginationParam,
 		},
+	},
+
+	semantic_search: {
+		name: 'semantic_search',
+		description: `Use this to find code by meaning or intent, not exact string match. Best for conceptual queries like 'error handling', 'authentication flow', 'retry logic', or 'how does the agent loop work'. For exact symbol names use \`go_to_definition\`/\`go_to_usages\`; for exact strings use \`search_in_file\`/\`search_for_files\`. Never use \`run_command\` with \`grep\` for conceptual searches — this tool is the correct choice.`,
+		params: {
+			query: { description: 'A natural-language description of what you\'re looking for (e.g. "error handling logic", "authentication middleware", "retry with backoff").' },
+			n_results: { description: 'Optional. Number of results to return. Default is 10.' },
+			include_pattern: { description: `Optional. Glob pattern to restrict results (e.g. \`src/**\` to only search under src/, \`*.ts\` for TypeScript files). Only fill this in if you need to narrow results.` },
+		}
 	},
 
 	read_lint_errors: {
@@ -610,7 +620,7 @@ You will be given instructions from the user, and may also receive a list of fil
 		// eval; Gemma's persistent `find`-fallback after C1-only change). Rules
 		// that appear in tool descriptions AND importantDetails get followed
 		// more reliably than rules that appear in one surface only.
-		details.push(`For file and directory operations, always use the dedicated tool — never shell out via \`run_command\`: use \`read_file\` (not \`cat\`), \`ls_dir\` or \`get_dir_tree\` (not \`ls\` / \`tree\`), \`search_pathnames_only\` (not \`find\`), \`search_in_file\` or \`search_for_files\` (not \`grep\`), and \`edit_file\` or \`rewrite_file\` (not \`sed\` / \`echo >\`). To locate a NAMED function / class / variable / type — whether to inspect its definition or find all its usages — always use \`go_to_definition\` / \`go_to_usages\`; use \`search_in_file\` / \`search_for_files\` only for free-text or conceptual queries (e.g., 'where is error handling done', 'find TODOs', 'any references to auth cookies') where there is no specific identifier to resolve. \`run_command\` is for things the dedicated tools don't do — installing packages, running tests, git operations, build commands.`)
+		details.push(`For file and directory operations, always use the dedicated tool — never shell out via \`run_command\`: use \`read_file\` (not \`cat\`), \`ls_dir\` or \`get_dir_tree\` (not \`ls\` / \`tree\`), \`search_pathnames_only\` (not \`find\`), \`search_in_file\` or \`search_for_files\` (not \`grep\`), and \`edit_file\` or \`rewrite_file\` (not \`sed\` / \`echo >\`). When searching code: use \`go_to_definition\`/\`go_to_usages\` for named symbols, \`search_in_file\`/\`search_for_files\` for exact strings, and \`semantic_search\` for conceptual/intent queries where there's no exact string to match. Pick the right tool upfront — don't cascade through multiple search tools for the same query. \`run_command\` is for things the dedicated tools don't do — installing packages, running tests, git operations, build commands.`)
 
 		// A4 — Rebalance over-iteration. Replaces three compounding rules
 		// ("maximal certainty BEFORE" + "OFTEN need to gather context" +

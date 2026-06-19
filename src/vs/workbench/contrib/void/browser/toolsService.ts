@@ -500,6 +500,14 @@ export class ToolsService implements IToolsService {
 				return { url };
 			},
 
+			semantic_search: (params: RawToolParamsObj) => {
+				const { query: queryUnknown, n_results: nResultsUnknown, include_pattern: includePatternUnknown } = params
+				const query = validateStr('query', queryUnknown)
+				const nResults = validateNumber(nResultsUnknown, { default: 10 }) ?? 10
+				const includePattern = isFalsy(includePatternUnknown) ? null : validateStr('include_pattern', includePatternUnknown)
+				return { query, nResults, includePattern }
+			},
+
 			search_history: (params: RawToolParamsObj) => {
 				const { query: queryUnknown, tool_name: toolNameUnknown, result_status: resultStatusUnknown, context_radius: contextRadiusUnknown } = params
 				const query = isFalsy(queryUnknown) ? null : validateStr('query', queryUnknown)
@@ -822,6 +830,13 @@ export class ToolsService implements IToolsService {
 				return { result };
 			},
 
+			semantic_search: async ({ query, nResults, includePattern }) => {
+				const { ISemanticIndexService } = await import('./semanticIndexService.js')
+				const semanticIndexService = this.instantiationService.invokeFunction(accessor => accessor.get(ISemanticIndexService))
+				const results = await semanticIndexService.search(query, nResults, includePattern ?? undefined)
+				return { result: { results } }
+			},
+
 			search_history: async ({ query, toolName, resultStatus, contextRadius }) => {
 				const { IChatThreadService } = await import('./chatThreadService.js')
 				const chatThreadService = this.instantiationService.invokeFunction(accessor => accessor.get(IChatThreadService))
@@ -1059,6 +1074,15 @@ export class ToolsService implements IToolsService {
 
 			fetch_url: (_params, result) => {
 				return `# ${result.title}\n\nSource: ${result.url}\n\n${result.content}`;
+			},
+
+			semantic_search: (_params, result) => {
+				if (result.results.length === 0) return 'No semantic search results found.'
+				const lines = result.results.map((r, i) => {
+					const scoreStr = r.score.toFixed(2)
+					return `${i + 1}. ${r.uri.fsPath}:${r.startLine}-${r.endLine} (score: ${scoreStr})\n\`\`\`\n${r.snippet}\n\`\`\``
+				})
+				return `Found ${result.results.length} result(s):\n\n${lines.join('\n\n')}`
 			},
 
 			search_history: (_params, result) => {

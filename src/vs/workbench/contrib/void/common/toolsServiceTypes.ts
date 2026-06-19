@@ -101,6 +101,8 @@ export type BuiltinToolCallParams = {
 	'kill_persistent_terminal': { persistentTerminalId: string },
 	// --- web ---
 	'fetch_url': { url: string },
+	// --- semantic search ---
+	'semantic_search': { query: string, nResults: number, includePattern: string | null },
 	// --- history ---
 	'search_history': { query: string | null, toolName: string | null, resultStatus: 'error' | 'success' | null, contextRadius: number },
 }
@@ -128,6 +130,8 @@ export type BuiltinToolResultType = {
 	'run_persistent_command': { result: string; resolveReason: TerminalResolveReason; },
 	'open_persistent_terminal': { persistentTerminalId: string },
 	'kill_persistent_terminal': {},
+	// --- semantic search ---
+	'semantic_search': { results: { uri: URI, startLine: number, endLine: number, snippet: string, score: number }[] },
 	// --- web ---
 	'fetch_url': { title: string, content: string, url: string },
 	// --- history ---

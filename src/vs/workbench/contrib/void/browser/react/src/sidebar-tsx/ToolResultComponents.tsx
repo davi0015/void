@@ -333,6 +333,7 @@ export const titleOfBuiltinToolName = {
 	'go_to_definition': { done: 'Found definition', proposed: 'Go to definition', running: loadingTitleWrapper('Finding definition') },
 	'go_to_usages': { done: 'Found usages', proposed: 'Go to usages', running: loadingTitleWrapper('Finding usages') },
 	'fetch_url': { done: 'Fetched URL', proposed: 'Fetch URL', running: loadingTitleWrapper('Fetching URL') },
+	'semantic_search': { done: 'Searched semantically', proposed: 'Search semantically', running: loadingTitleWrapper('Searching semantically') },
 	'search_history': { done: 'Searched history', proposed: 'Search history', running: loadingTitleWrapper('Searching history') },
 } as const satisfies Record<BuiltinToolName, { done: any, proposed: any, running: any }>
 
@@ -520,6 +521,12 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 				display = toolParams.url
 			}
 			return { desc1: display }
+		},
+		'semantic_search': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['semantic_search']
+			return {
+				desc1: `"${toolParams.query}"`,
+			}
 		},
 		'search_history': () => {
 			const toolParams = _toolParams as BuiltinToolCallParams['search_history']
@@ -1531,6 +1538,53 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 						<ChatMarkdownRender string={preview} chatMessageLocation={undefined} isApplyEnabled={false} />
 					</SmallProseWrapper>
 				</BottomChildren>
+			}
+			else if (toolMessage.type === 'tool_error') {
+				const { result } = toolMessage
+				componentParams.bottomChildren = <BottomChildren title='Error'>
+					<CodeChildren>
+						{result}
+					</CodeChildren>
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		},
+	},
+	'semantic_search': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const title = getTitle(toolMessage)
+			const icon = null
+
+			if (toolMessage.type === 'tool_request') return null
+			if (toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
+
+			const isError = toolMessage.type === 'tool_error'
+			const isRejected = toolMessage.type === 'rejected'
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (toolMessage.type === 'success') {
+				const { result } = toolMessage
+				componentParams.numResults = result.results.length
+				if (result.results.length === 0) {
+					componentParams.bottomChildren = <BottomChildren title='No results'><span /></BottomChildren>
+				} else {
+					componentParams.bottomChildren = <BottomChildren title='Results'>
+						<ToolChildrenWrapper>
+							{result.results.map((r: { uri: URI, startLine: number, endLine: number, snippet: string, score: number }, i: number) => (
+								<ListableToolItem key={i}
+									name={`${getBasename(r.uri.fsPath)}:${r.startLine}-${r.endLine} (score: ${r.score.toFixed(2)})`}
+									className='w-full overflow-auto'
+									onClick={() => { voidOpenFileFn(r.uri, accessor) }}
+								/>
+							))}
+						</ToolChildrenWrapper>
+					</BottomChildren>
+				}
 			}
 			else if (toolMessage.type === 'tool_error') {
 				const { result } = toolMessage
