@@ -134,6 +134,7 @@ import { VoidSCMService } from '../../workbench/contrib/void/electron-main/voidS
 import { IVoidSCMService } from '../../workbench/contrib/void/common/voidSCMTypes.js';
 import { MCPChannel } from '../../workbench/contrib/void/electron-main/mcpChannel.js';
 import { FetchUrlChannel } from '../../workbench/contrib/void/electron-main/fetchUrlChannel.js';
+import { EmbeddingChannel } from '../../workbench/contrib/void/electron-main/embeddingChannel.js';
 /**
  * The main VS Code application. There will only ever be one instance,
  * even if the user starts many instances (e.g. from the command line).
@@ -1258,6 +1259,10 @@ export class CodeApplication extends Disposable {
 		// Void added this
 		const fetchUrlChannel = new FetchUrlChannel();
 		mainProcessElectronServer.registerChannel('void-channel-fetchUrl', fetchUrlChannel);
+
+		// Void added this
+		const embeddingChannel = new EmbeddingChannel();
+		mainProcessElectronServer.registerChannel('void-channel-embedding', embeddingChannel);
 
 		// Extension Host Debug Broadcasting
 		const electronExtensionHostDebugBroadcastChannel = new ElectronExtensionHostDebugBroadcastChannel(accessor.get(IWindowsMainService));
