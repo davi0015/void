@@ -1470,6 +1470,7 @@ const SemanticSearchSettings = () => {
 					<div className='text-xs text-void-fg-3 mt-1'>
 						{indexState.status === 'indexing' && (indexState.progress.indexed < 0 ? 'Scanning files...' : `Indexing ${indexState.progress.indexed}/${indexState.progress.total}`)}
 						{indexState.status === 'ready' && 'Index ready'}
+						{indexState.status === 'noModel' && 'No embedding model configured'}
 					</div>
 				)}
 			</ErrorBoundary>

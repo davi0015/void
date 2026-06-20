@@ -131,7 +131,7 @@ export type BuiltinToolResultType = {
 	'open_persistent_terminal': { persistentTerminalId: string },
 	'kill_persistent_terminal': {},
 	// --- semantic search ---
-	'semantic_search': { results: { uri: URI, startLine: number, endLine: number, snippet: string, score: number, indexStatus: string, indexProgress: { indexed: number, total: number } }[] },
+	'semantic_search': { results: { uri: URI, startLine: number, endLine: number, snippet: string, score: number, indexStatus: string, indexProgress: { indexed: number, total: number } }[], noResultReason?: string },
 	// --- web ---
 	'fetch_url': { title: string, content: string, url: string },
 	// --- history ---

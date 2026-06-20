@@ -833,8 +833,8 @@ export class ToolsService implements IToolsService {
 			semantic_search: async ({ query, nResults, includePattern }) => {
 				const { ISemanticIndexService } = await import('./semanticIndexService.js')
 				const semanticIndexService = this.instantiationService.invokeFunction(accessor => accessor.get(ISemanticIndexService))
-				const results = await semanticIndexService.search(query, nResults, includePattern ?? undefined)
-				return { result: { results } }
+				const { results, noResultReason } = await semanticIndexService.search(query, nResults, includePattern ?? undefined)
+				return { result: { results, noResultReason } }
 			},
 
 			search_history: async ({ query, toolName, resultStatus, contextRadius }) => {
@@ -1080,7 +1080,13 @@ export class ToolsService implements IToolsService {
 				const statusNote = result.results.length > 0 && result.results[0].indexStatus === 'indexing'
 					? `\nNote: Index is still being built (${result.results[0].indexProgress.indexed}/${result.results[0].indexProgress.total} files indexed). Results may be incomplete.`
 					: ''
-				if (result.results.length === 0) return `No semantic search results found.${statusNote}`
+				const reasonMap: Record<string, string> = {
+					'disabled': ' Semantic search is disabled in settings.',
+					'noModel': ' No embedding model configured. Add a model with supportsEmbedding: true in Void settings.',
+					'notReady': ' Index is not built yet. Wait for indexing to complete.',
+				}
+				const reasonNote = result.results.length === 0 && result.noResultReason ? reasonMap[result.noResultReason] ?? '' : ''
+				if (result.results.length === 0) return `No semantic search results found.${reasonNote}${statusNote}`
 				const lines = result.results.map((r, i) => {
 					const scoreStr = r.score.toFixed(2)
 					return `${i + 1}. ${r.uri.fsPath}:${r.startLine}-${r.endLine} (score: ${scoreStr})\n\`\`\`\n${r.snippet}\n\`\`\``

@@ -832,6 +832,14 @@ Resp Nemotron: 3 tool calls, search + read convertToLLMMessageService.ts + read 
   - Files: `terminalService.ts`, `terminalToolService.ts`
 - **PTY host hang fix — `fs.write()` in libuv thread pool** ✅ DONE — see `docs/20260621-terminal-crash-analysis.md` for full root cause analysis, diagnostic approach, architecture reference, and rejected theories.
 - **Terminal leaked disposable fixes** ✅ DONE — see `docs/20260621-terminal-crash-analysis.md` for details on the four leak sources and fixes.
+- **Semantic search** ✅ DONE — embedding-based code search tool (`semantic_search`) for finding code by meaning/intent rather than exact string match. Design doc at `docs/designs/semantic-search.md`. Key components:
+  - **Model system integration** — `supportsEmbedding` and `supportsChat` capability flags on `VoidStaticModelInfo`, `SemanticSearch` feature with model dropdown filtered by `supportsEmbedding: true`, chat features gated against `supportsChat === false`
+  - **IPC channel** — `embeddingChannel.ts` in electron-main process, uses `newOpenAICompatibleSDK` for all providers, `encoding_format: 'float'` to avoid base64 decoding bug with litellm/sglang/vLLM, retry with exponential backoff for 429/504
+  - **SemanticIndexService** — chunking (configurable size/overlap), embedding with Matryoshka truncation (configurable dimensions), base64-encoded Float32Array on disk, content not persisted (read on demand), mtime-based change detection, file watcher with debounce, incremental save every 4 batches, failed chunks re-queued and retried until success, partial search results during indexing, `noModel` status when no embedding model configured
+  - **semantic_search tool** — cosine similarity search, `include_pattern` glob filter, partial results with index status, actionable no-result reasons (disabled/no model/not ready), three-surface prompt pattern for tool selection
+  - **Settings UI** — enable/disable toggle, model dropdown, advanced settings (dimensions, batch size, concurrency, chunk size, chunk overlap, max file size), index status display
+  - **Skip lists** — binary files, lock files, minified JS/CSS, AppleScript, documents, etc.
+  - **Bug fixes during development** — zero-embedding bug (base64 vs float encoding), startLine always 1 (char offset → line number mapping), stuck progress (failed batch cleanup), surrogate character sanitization, empty text handling, O(N²) incremental saves
 
 ### Next — Performance & billing-honesty (promoted from backlog)
 

@@ -27,7 +27,7 @@ import { RunOnceScheduler } from '../../../../base/common/async.js';
 
 // ---- Types ----
 
-export type IndexStatus = 'idle' | 'indexing' | 'ready'
+export type IndexStatus = 'idle' | 'indexing' | 'ready' | 'noModel'
 
 export interface SemanticSearchResult {
 	uri: URI
@@ -38,6 +38,8 @@ export interface SemanticSearchResult {
 	indexStatus: IndexStatus
 	indexProgress: { indexed: number, total: number }
 }
+
+export type SemanticSearchNoResultReason = 'disabled' | 'noModel' | 'notReady'
 
 interface Chunk {
 	uri: string
@@ -68,7 +70,7 @@ interface SemanticIndex {
 
 export interface ISemanticIndexService {
 	readonly _serviceBrand: undefined
-	search(query: string, nResults: number, includePattern?: string): Promise<SemanticSearchResult[]>
+	search(query: string, nResults: number, includePattern?: string): Promise<{ results: SemanticSearchResult[], noResultReason?: SemanticSearchNoResultReason }>
 	readonly indexStatus: IndexStatus
 	readonly indexProgress: { indexed: number, total: number }
 	readonly onDidChangeStatus: Event<void>
@@ -338,17 +340,18 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 	}
 
 	private async _indexWorkspace(): Promise<void> {
-		const model = this._resolveEmbeddingModel()
-		if (!model) {
-			console.warn('[semanticIndex] No embedding model configured — skipping indexing')
-			return
-		}
-
-		const modelKey = `${model.providerName}/${model.modelName}/d${this._embeddingDimensions}/c${this._chunkSizeChars}/o${this._chunkOverlapChars}/m${this._maxFileSizeBytes}`
 		if (!this.voidSettingsService.state.globalSettings.semanticSearchEnabled) {
 			console.warn('[semanticIndex] Semantic search is disabled — skipping indexing')
 			return
 		}
+
+		const model = this._resolveEmbeddingModel()
+		if (!model) {
+			this.setStatus('noModel')
+			return
+		}
+
+		const modelKey = `${model.providerName}/${model.modelName}/d${this._embeddingDimensions}/c${this._chunkSizeChars}/o${this._chunkOverlapChars}/m${this._maxFileSizeBytes}`
 
 		this._status = 'indexing'
 		this._progress = { indexed: -1, total: 0 } // -1 = scanning phase
@@ -732,13 +735,17 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 	}
 
 	// Search by cosine similarity
-	async search(query: string, nResults: number, includePattern?: string): Promise<SemanticSearchResult[]> {
-		if (this._chunks.length === 0) {
-			return []
+	async search(query: string, nResults: number, includePattern?: string): Promise<{ results: SemanticSearchResult[], noResultReason?: SemanticSearchNoResultReason }> {
+		if (!this.voidSettingsService.state.globalSettings.semanticSearchEnabled) {
+			return { results: [], noResultReason: 'disabled' }
 		}
 
 		const model = this._resolveEmbeddingModel()
-		if (!model) return []
+		if (!model) return { results: [], noResultReason: 'noModel' }
+
+		if (this._chunks.length === 0) {
+			return { results: [], noResultReason: 'notReady' }
+		}
 
 		// Embed the query
 		const [queryEmbedding] = await this.embeddingService.embed(
@@ -747,7 +754,7 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 			[query],
 			this.voidSettingsService.state.settingsOfProvider,
 		)
-		if (!queryEmbedding || queryEmbedding.length === 0) return []
+		if (!queryEmbedding || queryEmbedding.length === 0) return { results: [] }
 
 		// Truncate query embedding to match stored chunk dimensions
 		const truncatedQuery = queryEmbedding.length > this._embeddingDimensions ? queryEmbedding.slice(0, this._embeddingDimensions) : queryEmbedding
@@ -792,7 +799,7 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 				indexProgress: this._progress,
 			})
 		}
-		return results
+		return { results }
 	}
 
 	// ---- Persistence ----
