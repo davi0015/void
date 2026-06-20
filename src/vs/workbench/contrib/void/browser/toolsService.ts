@@ -1077,12 +1077,15 @@ export class ToolsService implements IToolsService {
 			},
 
 			semantic_search: (_params, result) => {
-				if (result.results.length === 0) return 'No semantic search results found.'
+				const statusNote = result.results.length > 0 && result.results[0].indexStatus === 'indexing'
+					? `\nNote: Index is still being built (${result.results[0].indexProgress.indexed}/${result.results[0].indexProgress.total} files indexed). Results may be incomplete.`
+					: ''
+				if (result.results.length === 0) return `No semantic search results found.${statusNote}`
 				const lines = result.results.map((r, i) => {
 					const scoreStr = r.score.toFixed(2)
 					return `${i + 1}. ${r.uri.fsPath}:${r.startLine}-${r.endLine} (score: ${scoreStr})\n\`\`\`\n${r.snippet}\n\`\`\``
 				})
-				return `Found ${result.results.length} result(s):\n\n${lines.join('\n\n')}`
+				return `Found ${result.results.length} result(s):\n\n${lines.join('\n\n')}${statusNote}`
 			},
 
 			search_history: (_params, result) => {

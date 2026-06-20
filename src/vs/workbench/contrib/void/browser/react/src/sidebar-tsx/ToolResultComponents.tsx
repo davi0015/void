@@ -1570,12 +1570,14 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			if (toolMessage.type === 'success') {
 				const { result } = toolMessage
 				componentParams.numResults = result.results.length
+				const isPartial = result.results.length > 0 && result.results[0].indexStatus === 'indexing'
+				const partialNote = isPartial ? ` (indexing ${result.results[0].indexProgress.indexed}/${result.results[0].indexProgress.total})` : ''
 				if (result.results.length === 0) {
 					componentParams.bottomChildren = <BottomChildren title='No results'><span /></BottomChildren>
 				} else {
-					componentParams.bottomChildren = <BottomChildren title='Results'>
+					componentParams.bottomChildren = <BottomChildren title={`Results${partialNote}`}>
 						<ToolChildrenWrapper>
-							{result.results.map((r: { uri: URI, startLine: number, endLine: number, snippet: string, score: number }, i: number) => (
+							{result.results.map((r: { uri: URI, startLine: number, endLine: number, snippet: string, score: number, indexStatus: string, indexProgress: { indexed: number, total: number } }, i: number) => (
 								<ListableToolItem key={i}
 									name={`${getBasename(r.uri.fsPath)}:${r.startLine}-${r.endLine} (score: ${r.score.toFixed(2)})`}
 									className='w-full overflow-auto'

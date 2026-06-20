@@ -3028,18 +3028,21 @@ const useRulesOutdated = (threadId: string, lastAppliedRules: string | undefined
 	return outdatedInfo
 }
 
-const SemanticIndexProgressIndicator = () => {
+const SemanticIndexProgressLabel = () => {
 	const { status, progress } = useSemanticIndexState()
-	const accessor = useAccessor()
 	const settingsState = useSettingsState()
 
 	if (!settingsState.globalSettings.semanticSearchEnabled) return null
 	if (status !== 'indexing') return null
 
+	const label = progress.indexed < 0
+		? 'Scanning files...'
+		: `Indexing ${progress.indexed}/${progress.total}`
+
 	return (
-		<div className='flex items-center gap-1.5 text-xs text-void-fg-3 px-3 py-1 mx-2 mb-1 rounded select-none'>
+		<div className='flex items-center gap-1 text-xs text-void-fg-3 select-none'>
 			<IconLoading className='w-3 h-3' />
-			<span>Indexing... {progress.indexed}/{progress.total} files</span>
+			<span>{label}</span>
 		</div>
 	)
 }
@@ -3431,15 +3434,18 @@ export const SidebarChat = () => {
 					</button>
 				)}
 				{!canCompact && !showCompactDialog && <div />}
+				<SemanticIndexProgressLabel />
 			</div>
-			<SemanticIndexProgressIndicator />
 			{inputChatArea}
 		</div>
 	</div>
 
 	const landingPageInput = <div>
 		<div className='pt-8'>
-			<SemanticIndexProgressIndicator />
+			<div className='flex items-center justify-between mb-1 px-2'>
+				<div />
+				<SemanticIndexProgressLabel />
+			</div>
 			{inputChatArea}
 		</div>
 	</div>

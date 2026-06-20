@@ -1468,8 +1468,8 @@ const SemanticSearchSettings = () => {
 			<ErrorBoundary>
 				{settingsState.globalSettings.semanticSearchEnabled && indexState.status !== 'idle' && (
 					<div className='text-xs text-void-fg-3 mt-1'>
-						{indexState.status === 'indexing' && `Indexing... ${indexState.progress.indexed}/${indexState.progress.total} files`}
-						{indexState.status === 'ready' && `Index ready (${indexState.progress.total} files indexed)`}
+						{indexState.status === 'indexing' && (indexState.progress.indexed < 0 ? 'Scanning files...' : `Indexing ${indexState.progress.indexed}/${indexState.progress.total}`)}
+						{indexState.status === 'ready' && 'Index ready'}
 					</div>
 				)}
 			</ErrorBoundary>
