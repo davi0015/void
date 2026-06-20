@@ -528,12 +528,51 @@ export class TerminalProcess extends Disposable implements ITerminalChildProcess
 	private _doWrite(): void {
 		const object = this._writeQueue.shift()!;
 		this._logService.trace('node-pty.IPty#write', object.data);
-		if (object.isBinary) {
-			this._ptyProcess!.write(Buffer.from(object.data, 'binary') as any);
-		} else {
-			this._ptyProcess!.write(object.data);
+
+		// [VOID] On macOS, node-pty's net.Socket.write() can block the
+		// event loop when the kernel PTY input buffer is full (e.g. shell
+		// is busy writing output and not reading stdin). This permanently
+		// hangs the PTY host, killing all terminals.
+		//
+		// To prevent this, we bypass node-pty's socket and write directly
+		// to the PTY fd using fs.write() with a callback. This runs in the
+		// libuv thread pool, so even if the kernel write blocks, the event
+		// loop stays responsive.
+		//
+		// We must pause node-pty's internal read socket before writing to
+		// avoid N-API callback exceptions from concurrent fd access.
+		const ptyProcess = this._ptyProcess!;
+		const socket = (ptyProcess as any)._socket as (NodeJS.ReadWriteStream & { pause(): void; resume(): void; destroyed: boolean }) | undefined;
+		if (socket) {
+			socket.pause();
 		}
-		this._childProcessMonitor?.handleInput();
+
+		const fd = (ptyProcess as any).fd;
+		const buffer = object.isBinary
+			? Buffer.from(object.data, 'binary')
+			: Buffer.from(object.data);
+		fs.write(fd, buffer, 0, buffer.length, null, (err) => {
+			// Resume node-pty's read socket after the write completes
+			if (socket && !socket.destroyed) {
+				socket.resume();
+			}
+
+			if (err) {
+				// EAGAIN means the write would block — re-queue and retry later.
+				// Other errors (EBADF etc.) mean the PTY is gone — drop silently.
+				if (err.code === 'EAGAIN' || err.code === 'EWOULDBLOCK') {
+					this._writeQueue.unshift(object);
+					if (this._writeTimeout === undefined) {
+						this._writeTimeout = setTimeout(() => {
+							this._writeTimeout = undefined;
+							this._startWrite();
+						}, Constants.WriteInterval);
+					}
+				}
+				return;
+			}
+			this._childProcessMonitor?.handleInput();
+		});
 	}
 
 	resize(cols: number, rows: number): void {

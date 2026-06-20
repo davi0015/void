@@ -1012,6 +1012,10 @@ export class TerminalService extends Disposable implements ITerminalService {
 					if (index !== -1) {
 						this._backgroundedTerminalInstances.splice(index, 1);
 					}
+					const disposables = this._backgroundedTerminalDisposables.get(e.instanceId);
+					if (disposables) {
+						dispose(disposables);
+					}
 					this._backgroundedTerminalDisposables.delete(e.instanceId);
 					this._onDidDisposeInstance.fire(e);
 				})

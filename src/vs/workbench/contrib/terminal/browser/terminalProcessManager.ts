@@ -199,6 +199,10 @@ export class TerminalProcessManager extends Disposable implements ITerminalProce
 
 	override dispose(immediate: boolean = false): void {
 		this._isDisposed = true;
+		if (this._processListeners) {
+			dispose(this._processListeners);
+			this._processListeners = undefined;
+		}
 		if (this._process) {
 			// If the process was still connected this dispose came from
 			// within VS Code, not the process, so mark the process as
@@ -728,6 +732,17 @@ class SeamlessRelaunchDataFilter extends Disposable {
 		@ITerminalLogService private readonly _logService: ITerminalLogService
 	) {
 		super();
+	}
+
+	override dispose(): void {
+		this._dataListener?.dispose();
+		this._firstDisposable?.dispose();
+		this._secondDisposable?.dispose();
+		if (this._swapTimeout) {
+			mainWindow.clearTimeout(this._swapTimeout);
+			this._swapTimeout = undefined;
+		}
+		super.dispose();
 	}
 
 	newProcess(process: ITerminalChildProcess, reset: boolean) {

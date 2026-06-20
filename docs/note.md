@@ -830,6 +830,8 @@ Resp Nemotron: 3 tool calls, search + read convertToLLMMessageService.ts + read 
   - Fix: the `onDisposed` listener for backgrounded terminals now splices the instance out of `_backgroundedTerminalInstances` and cleans up `_backgroundedTerminalDisposables`, in addition to forwarding the event. This is a fix to VS Code's `terminalService.ts` (outside `src/vs/workbench/contrib/void`).
   - With this fix, `listAllTerminals()` no longer needs a `hideFromUser` filter — disposed terminals are properly removed from the instances array.
   - Files: `terminalService.ts`, `terminalToolService.ts`
+- **PTY host hang fix — `fs.write()` in libuv thread pool** ✅ DONE — see `docs/20260621-terminal-crash-analysis.md` for full root cause analysis, diagnostic approach, architecture reference, and rejected theories.
+- **Terminal leaked disposable fixes** ✅ DONE — see `docs/20260621-terminal-crash-analysis.md` for details on the four leak sources and fixes.
 
 ### Next — Performance & billing-honesty (promoted from backlog)
 
@@ -1810,7 +1812,7 @@ User-triggered conversation compaction that sends old messages to the current mo
 - **`supportsTools: boolean` per model** — separates "does this model support tool calling" from "what format" so the rare model that genuinely can't call tools can be encoded explicitly instead of relying on `specialToolFormat: undefined` (which is now ambiguous).
 - **Audit `importantDetails` for unenforceable rules** — empirically observed during Phase A1+A2 baseline that capable models (e.g. MiniMax 2.5) ignore `Do NOT write tables` for tabular data. Likely cause: late position in a long numbered list. Two fixes worth considering: (a) reposition genuinely-important rules early in the list and demote optional style preferences to a separate "style preferences" block the model can break, (b) drop rules we don't actually enforce — every ignored rule teaches the model the system message isn't authoritative, weakening compliance on rules we *do* care about. Cheap pass, ~30 min, do as part of Option 2 prompt rewrite.
 - ~~**Surface `finish_reason` on OpenAI-compatible streams**~~ — promoted to Next → Quality 1 above.
-- **Write-to-temp-file for inline code execution** — When the LLM generates `python3 -c "..."` (or `node -e "..."`, `ruby -e "..."`, etc.), intercept in `runCommand`, write the code to `/tmp/void_exec_xxx.py`, and send `python3 /tmp/void_exec_xxx.py` instead. This eliminates shell quoting issues, large write chunking through the 50-byte `chunkInput` pipeline, and `\n`→`\r` conversion problems. The backgrounded-terminal leak fix (dispose cleanup) resolved one class of terminal state corruption; this remains a defensive measure for shell-quoting edge cases.
+- ~~**PTY host hang fix**~~ — promoted to Done above. Full analysis in `docs/20260621-terminal-crash-analysis.md`.
 - **RAG context for autocomplete** — The `relevantContext` parameter in `getCompletionOptions` is currently `''`. Including context from open tabs and recently modified files in the FIM prefix would significantly improve autocomplete quality. Needs design decisions: how much context, which files, how to format it, token budget. The Google AI Mode autocomplete approach recommends this.
 
 ### search_history tool ✅ Implemented

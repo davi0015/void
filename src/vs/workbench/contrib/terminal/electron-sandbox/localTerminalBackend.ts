@@ -153,6 +153,7 @@ class LocalTerminalBackend extends BaseTerminalBackend implements ITerminalBacke
 				if (pty) {
 					pty.handleExit(e.event);
 					this._ptys.delete(e.id);
+					pty.dispose();
 				}
 			}));
 			store.add(directProxy.onProcessReady(e => this._ptys.get(e.id)?.handleReady(e.event)));
