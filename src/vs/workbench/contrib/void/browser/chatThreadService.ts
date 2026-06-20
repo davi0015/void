@@ -25,7 +25,7 @@ import { ILanguageFeaturesService } from '../../../../editor/common/services/lan
 import { ChatMessage, CheckpointEntry, CodespanLocationLink, CompactionInfo, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js';
 import { Position } from '../../../../editor/common/core/position.js';
 import { IMetricsService } from '../common/metricsService.js';
-import { shorten } from '../../../../base/common/labels.js';
+
 import { IVoidModelService } from '../common/voidModelService.js';
 import { findLast, findLastIdx } from '../../../../base/common/arraysFind.js';
 import { IEditCodeService } from './editCodeServiceInterface.js';
@@ -3283,20 +3283,9 @@ We only need to do it for files that were edited since `from`, ie files between 
 			const doesUriMatchTarget = (uri: URI) => uri.path.includes(target)
 
 			// check if any prevFiles are the `target`
-			for (const [idx, uri] of prevUris.entries()) {
+			for (const uri of prevUris) {
 				if (doesUriMatchTarget(uri)) {
-
-					// shorten it
-
-					// TODO make this logic more general
-					const prevUriStrs = prevUris.map(uri => uri.fsPath)
-					const shortenedUriStrs = shorten(prevUriStrs)
-					let displayText = shortenedUriStrs[idx]
-					const ellipsisIdx = displayText.lastIndexOf('…/');
-					if (ellipsisIdx >= 0) {
-						displayText = displayText.slice(ellipsisIdx + 2)
-					}
-
+					const displayText = this.getRelativeStr(uri) ?? uri.fsPath
 					return { uri, displayText }
 				}
 			}
@@ -3311,19 +3300,9 @@ We only need to do it for files that were edited since `from`, ie files between 
 				return null
 			}
 
-			for (const [idx, uri] of uris.entries()) {
+			for (const uri of uris) {
 				if (doesUriMatchTarget(uri)) {
-
-					// TODO make this logic more general
-					const prevUriStrs = prevUris.map(uri => uri.fsPath)
-					const shortenedUriStrs = shorten(prevUriStrs)
-					let displayText = shortenedUriStrs[idx]
-					const ellipsisIdx = displayText.lastIndexOf('…/');
-					if (ellipsisIdx >= 0) {
-						displayText = displayText.slice(ellipsisIdx + 2)
-					}
-
-
+					const displayText = this.getRelativeStr(uri) ?? uri.fsPath
 					return { uri, displayText }
 				}
 			}
