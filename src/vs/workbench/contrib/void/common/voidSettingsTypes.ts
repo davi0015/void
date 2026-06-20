@@ -486,6 +486,12 @@ export type GlobalSettings = {
 	autoOutlineReadFile: boolean;
 	rulesPaths: string;
 	semanticSearchEnabled: boolean;
+	semanticSearchDimensions: number;
+	semanticSearchBatchSize: number;
+	semanticSearchConcurrency: number;
+	semanticSearchChunkSize: number;
+	semanticSearchChunkOverlap: number;
+	semanticSearchMaxFileSize: number;
 }
 
 export const defaultGlobalSettings: GlobalSettings = {
@@ -505,6 +511,12 @@ export const defaultGlobalSettings: GlobalSettings = {
 	autoOutlineReadFile: true,
 	rulesPaths: '',
 	semanticSearchEnabled: true,
+	semanticSearchDimensions: 1024,
+	semanticSearchBatchSize: 64,
+	semanticSearchConcurrency: 16,
+	semanticSearchChunkSize: 2400,
+	semanticSearchChunkOverlap: 200,
+	semanticSearchMaxFileSize: 1_000_000,
 }
 
 export type GlobalSettingName = keyof GlobalSettings

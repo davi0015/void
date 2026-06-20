@@ -323,6 +323,12 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 				readS.optionsOfModelSelection['SemanticSearch'] = {}
 			}
 			if (readS.globalSettings.semanticSearchEnabled === undefined) readS.globalSettings.semanticSearchEnabled = true;
+			if (readS.globalSettings.semanticSearchDimensions === undefined) readS.globalSettings.semanticSearchDimensions = 1024;
+			if (readS.globalSettings.semanticSearchBatchSize === undefined) readS.globalSettings.semanticSearchBatchSize = 64;
+			if (readS.globalSettings.semanticSearchConcurrency === undefined) readS.globalSettings.semanticSearchConcurrency = 16;
+			if (readS.globalSettings.semanticSearchChunkSize === undefined) readS.globalSettings.semanticSearchChunkSize = 2400;
+			if (readS.globalSettings.semanticSearchChunkOverlap === undefined) readS.globalSettings.semanticSearchChunkOverlap = 200;
+			if (readS.globalSettings.semanticSearchMaxFileSize === undefined) readS.globalSettings.semanticSearchMaxFileSize = 1_000_000;
 		}
 		catch (e) {
 			readS = defaultState()

@@ -1473,6 +1473,65 @@ const SemanticSearchSettings = () => {
 					</div>
 				)}
 			</ErrorBoundary>
+
+			{/* Advanced Settings */}
+			<ErrorBoundary>
+				{settingsState.globalSettings.semanticSearchEnabled && (
+					<div className='mt-2 space-y-1'>
+						<div className='text-xs text-void-fg-3 font-medium'>Advanced</div>
+						<div className='grid grid-cols-[auto_1fr] gap-x-2 gap-y-1 items-center text-xs'>
+							<span className='text-void-fg-3'>Dimensions</span>
+							<VoidSimpleInputBox
+								value={String(settingsState.globalSettings.semanticSearchDimensions ?? 1024)}
+								onChangeValue={(val) => voidSettingsService.setGlobalSetting('semanticSearchDimensions', parseInt(val) || 1024)}
+								placeholder='1024'
+								compact
+								className='max-w-20'
+							/>
+							<span className='text-void-fg-3'>Batch size</span>
+							<VoidSimpleInputBox
+								value={String(settingsState.globalSettings.semanticSearchBatchSize ?? 64)}
+								onChangeValue={(val) => voidSettingsService.setGlobalSetting('semanticSearchBatchSize', parseInt(val) || 64)}
+								placeholder='64'
+								compact
+								className='max-w-20'
+							/>
+							<span className='text-void-fg-3'>Concurrency</span>
+							<VoidSimpleInputBox
+								value={String(settingsState.globalSettings.semanticSearchConcurrency ?? 16)}
+								onChangeValue={(val) => voidSettingsService.setGlobalSetting('semanticSearchConcurrency', parseInt(val) || 16)}
+								placeholder='16'
+								compact
+								className='max-w-20'
+							/>
+							<span className='text-void-fg-3'>Chunk size</span>
+							<VoidSimpleInputBox
+								value={String(settingsState.globalSettings.semanticSearchChunkSize ?? 2400)}
+								onChangeValue={(val) => voidSettingsService.setGlobalSetting('semanticSearchChunkSize', parseInt(val) || 2400)}
+								placeholder='2400'
+								compact
+								className='max-w-20'
+							/>
+							<span className='text-void-fg-3'>Chunk overlap</span>
+							<VoidSimpleInputBox
+								value={String(settingsState.globalSettings.semanticSearchChunkOverlap ?? 200)}
+								onChangeValue={(val) => voidSettingsService.setGlobalSetting('semanticSearchChunkOverlap', parseInt(val) || 200)}
+								placeholder='200'
+								compact
+								className='max-w-20'
+							/>
+							<span className='text-void-fg-3'>Max file size</span>
+							<VoidSimpleInputBox
+								value={String(settingsState.globalSettings.semanticSearchMaxFileSize ?? 1000000)}
+								onChangeValue={(val) => voidSettingsService.setGlobalSetting('semanticSearchMaxFileSize', parseInt(val) || 1000000)}
+								placeholder='1000000'
+								compact
+								className='max-w-20'
+							/>
+						</div>
+					</div>
+				)}
+			</ErrorBoundary>
 		</div>
 	</div>
 }

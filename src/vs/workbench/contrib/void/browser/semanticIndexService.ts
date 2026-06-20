@@ -78,12 +78,7 @@ export const ISemanticIndexService = createDecorator<ISemanticIndexService>('sem
 
 // ---- Constants ----
 
-const CHUNK_SIZE_CHARS = 2400
-const CHUNK_OVERLAP_CHARS = 200
-const INDEX_VERSION = 3 // v3: removed content from on-disk format (read from source file on demand)
-const MAX_FILE_SIZE_BYTES = 1_000_000 // 1MB
-const EMBEDDING_BATCH_SIZE = 64
-const EMBEDDING_DIMENSIONS = 1024 // truncate to this many dims (Matryoshka); reduces index size and search cost
+const INDEX_VERSION = 1 // only bump when on-disk format changes
 
 // Encode a float array to base64 (for disk storage — ~4x smaller than JSON float arrays)
 const encodeEmbedding = (embedding: number[]): string => {
@@ -127,6 +122,10 @@ const SKIP_EXTENSIONS = new Set([
 	'.plist', '.xcodeproj', '.xcworkspace',
 	'.dockerignore', '.gitignore', '.eslintignore',
 	'.egg-info',
+	'.scpt', '.applescript', // AppleScript
+	'.nib', '.xib', '.storyboard', // macOS/iOS UI
+	'.pbxproj', // Xcode project
+	'.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', // documents
 ])
 
 // Filenames that are not useful for semantic search
@@ -178,22 +177,24 @@ const cosineSimilarity = (a: number[], b: number[]): number => {
 }
 
 // Split file content into chunks with overlap, tracking line numbers
-const chunkContent = (content: string, lines: string[]): Chunk[] => {
+const chunkContent = (content: string, lines: string[], chunkSizeChars: number, chunkOverlapChars: number): Chunk[] => {
 	const chunks: Chunk[] = []
 	let offset = 0
 
 	while (offset < content.length) {
-		const end = Math.min(offset + CHUNK_SIZE_CHARS, content.length)
+		const end = Math.min(offset + chunkSizeChars, content.length)
 		const chunkText = content.slice(offset, end)
 
 		// Find the line range for this chunk
 		let charCount = 0
 		let startLine = 1
 		let endLine = lines.length
+		let foundStart = false
 
 		for (let i = 0; i < lines.length; i++) {
-			if (charCount === offset) {
+			if (!foundStart && charCount >= offset) {
 				startLine = i + 1
+				foundStart = true
 			}
 			charCount += lines[i].length + 1 // +1 for newline
 			if (charCount >= end) {
@@ -212,7 +213,7 @@ const chunkContent = (content: string, lines: string[]): Chunk[] => {
 		})
 
 		if (end >= content.length) break
-		offset += CHUNK_SIZE_CHARS - CHUNK_OVERLAP_CHARS
+		offset += chunkSizeChars - chunkOverlapChars
 	}
 
 	return chunks
@@ -249,6 +250,14 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 
 	get indexStatus(): IndexStatus { return this._status }
 	get indexProgress(): { indexed: number, total: number } { return this._progress }
+
+	// Settings accessors — read from voidSettingsService with defaults
+	private get _embeddingDimensions(): number { return this.voidSettingsService.state.globalSettings.semanticSearchDimensions || 1024 }
+	private get _embeddingBatchSize(): number { return this.voidSettingsService.state.globalSettings.semanticSearchBatchSize || 64 }
+	private get _embeddingConcurrency(): number { return this.voidSettingsService.state.globalSettings.semanticSearchConcurrency || 16 }
+	private get _chunkSizeChars(): number { return this.voidSettingsService.state.globalSettings.semanticSearchChunkSize || 2400 }
+	private get _chunkOverlapChars(): number { return this.voidSettingsService.state.globalSettings.semanticSearchChunkOverlap || 200 }
+	private get _maxFileSizeBytes(): number { return this.voidSettingsService.state.globalSettings.semanticSearchMaxFileSize || 1_000_000 }
 
 	private setStatus(status: IndexStatus) {
 		this._status = status
@@ -335,7 +344,7 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 			return
 		}
 
-		const modelKey = `${model.providerName}/${model.modelName}/d${EMBEDDING_DIMENSIONS}`
+		const modelKey = `${model.providerName}/${model.modelName}/d${this._embeddingDimensions}/c${this._chunkSizeChars}/o${this._chunkOverlapChars}/m${this._maxFileSizeBytes}`
 		if (!this.voidSettingsService.state.globalSettings.semanticSearchEnabled) {
 			console.warn('[semanticIndex] Semantic search is disabled — skipping indexing')
 			return
@@ -360,7 +369,7 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 				if (shouldSkipFile(uri)) continue
 				try {
 					const stat = await this.fileService.stat(uri)
-					if (stat.size > MAX_FILE_SIZE_BYTES) continue
+					if (stat.size > this._maxFileSizeBytes) continue
 					indexableUris.push(uri)
 				} catch {
 					// skip
@@ -399,7 +408,7 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 					const text = sanitizeText(content.value.toString())
 
 					const lines = text.split('\n')
-					const chunks = chunkContent(text, lines)
+					const chunks = chunkContent(text, lines, this._chunkSizeChars, this._chunkOverlapChars)
 					for (const chunk of chunks) {
 						chunk.uri = fsPath
 					}
@@ -452,51 +461,62 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 	}
 
 	// Embed an array of chunks in batches with sliding window concurrency.
-	// On success, each chunk's embedding is set and it's added to this._chunks.
-	// Failed batches are retried up to MAX_RETRIES times, then skipped.
-	// Progress is reported as files fully indexed / total files.
+	// Failed chunks are moved to the end of the queue and retried until all succeed.
 	private async _embedChunks(chunks: Chunk[], model: { providerName: ProviderName, modelName: string }): Promise<void> {
-		const CONCURRENCY = 16
+		const CONCURRENCY = this._embeddingConcurrency
 		const MAX_RETRIES = 5
 		let completedBatches = 0
 		let indexedFileCount = 0
 
-		// Create all batch slices
-		const batches: { batch: Chunk[]; batchNum: number }[] = []
-		for (let i = 0; i < chunks.length; i += EMBEDDING_BATCH_SIZE) {
-			const batch = chunks.slice(i, i + EMBEDDING_BATCH_SIZE)
-			const batchNum = Math.floor(i / EMBEDDING_BATCH_SIZE) + 1
-			batches.push({ batch, batchNum })
-		}
-
-		const processBatch = async ({ batch, batchNum }: { batch: Chunk[]; batchNum: number }) => {
+		const processBatch = async (batch: Chunk[], batchNum: number): Promise<Chunk[]> => {
 			// Replace empty/whitespace-only texts with a space to avoid server errors
 			const texts = batch.map(c => c.content.trim() ? c.content : ' ')
 			let succeededChunks: Chunk[] = []
+			let failedChunks: Chunk[] = []
 
 			// Retry with exponential backoff on failure
 			for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+				succeededChunks = []
+				failedChunks = []
 				try {
-					const embeddings = await this.embeddingService.embed(
+					// Timeout: if the server hangs, don't wait forever
+					const embedPromise = this.embeddingService.embed(
 						model.providerName,
 						model.modelName,
 						texts,
 						this.voidSettingsService.state.settingsOfProvider,
 					)
+					const timeoutPromise = new Promise<never>((_, reject) =>
+						setTimeout(() => reject(new Error('Embedding request timed out')), 120_000)
+					)
+					const embeddings = await Promise.race([embedPromise, timeoutPromise])
 					for (let j = 0; j < batch.length; j++) {
 						if (embeddings[j] && embeddings[j].length > 0) {
-							batch[j].embedding = embeddings[j].length > EMBEDDING_DIMENSIONS ? embeddings[j].slice(0, EMBEDDING_DIMENSIONS) : embeddings[j]
+							batch[j].embedding = embeddings[j].length > this._embeddingDimensions ? embeddings[j].slice(0, this._embeddingDimensions) : embeddings[j]
 							succeededChunks.push(batch[j])
+						} else {
+							failedChunks.push(batch[j])
 						}
 					}
-					break // success — exit retry loop
+					if (failedChunks.length === 0) break // all succeeded
+					if (attempt < MAX_RETRIES) {
+						// Retry only the failed chunks
+						const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 30_000)
+						console.warn(`[semanticIndex] Batch ${batchNum}: ${failedChunks.length}/${batch.length} chunks failed (attempt ${attempt}/${MAX_RETRIES}), retrying in ${delayMs}ms`)
+						await new Promise<void>(resolve => setTimeout(resolve, delayMs))
+						// Rebuild texts for only the failed chunks
+						batch = failedChunks
+						failedChunks = []
+						continue
+					}
 				} catch (e) {
+					// Entire request failed — retry all chunks in this batch
 					if (attempt < MAX_RETRIES) {
 						const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 30_000)
 						console.warn(`[semanticIndex] Batch ${batchNum} failed (attempt ${attempt}/${MAX_RETRIES}), retrying in ${delayMs}ms:`, e)
 						await new Promise<void>(resolve => setTimeout(resolve, delayMs))
 					} else {
-						console.warn(`[semanticIndex] Batch ${batchNum} failed after ${MAX_RETRIES} attempts, ${batch.length} chunks will be re-indexed on next load:`, e)
+						failedChunks = batch
 					}
 				}
 			}
@@ -535,37 +555,78 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 			if (completedBatches % 4 === 0) {
 				await this._saveCurrentIndex()
 			}
+
+			// Return any chunks that still failed (will be re-queued)
+			return failedChunks
 		}
 
-		// Sliding window: always keep CONCURRENCY requests in flight
-		let nextBatchIdx = 0
-		const inFlight = new Set<Promise<void>>()
+		// Run batches in sliding window. Collect failed chunks and re-queue them.
+		let remainingChunks = chunks
+		let passNum = 1
+		while (remainingChunks.length > 0) {
+			// Create batch slices
+			const batches: Chunk[][] = []
+			for (let i = 0; i < remainingChunks.length; i += this._embeddingBatchSize) {
+				batches.push(remainingChunks.slice(i, i + this._embeddingBatchSize))
+			}
 
-		const launchNext = (): Promise<void> => {
-			if (nextBatchIdx >= batches.length) return Promise.resolve()
-			const batchItem = batches[nextBatchIdx++]
-			const p = processBatch(batchItem).then(() => {
-				inFlight.delete(p)
-				// Launch more if available
-				while (inFlight.size < CONCURRENCY && nextBatchIdx < batches.length) {
-					inFlight.add(launchNext())
+			const failedChunks: Chunk[] = []
+
+			// Sliding window: always keep CONCURRENCY requests in flight
+			let nextBatchIdx = 0
+			const inFlight = new Set<Promise<void>>()
+
+			const launchNext = (): Promise<void> => {
+				if (nextBatchIdx >= batches.length) return Promise.resolve()
+				const batchIdx = nextBatchIdx++
+				const batch = batches[batchIdx]
+				const p = processBatch(batch, batchIdx + 1).then(failed => {
+					failedChunks.push(...failed)
+					inFlight.delete(p)
+					while (inFlight.size < CONCURRENCY && nextBatchIdx < batches.length) {
+						inFlight.add(launchNext())
+					}
+				}).catch(() => {
+					inFlight.delete(p)
+				})
+				inFlight.add(p)
+				return p
+			}
+
+			while (inFlight.size < CONCURRENCY && nextBatchIdx < batches.length) {
+				inFlight.add(launchNext())
+			}
+
+			while (inFlight.size > 0) {
+				await Promise.race(inFlight)
+			}
+
+			if (failedChunks.length === 0) break // all done
+			console.warn(`[semanticIndex] Pass ${passNum} complete: ${failedChunks.length} chunks failed, re-queuing`)
+			remainingChunks = failedChunks
+			passNum++
+		}
+
+		// Clean up any remaining partial files (shouldn't happen normally)
+		for (const fsPath of Object.keys(this._remainingChunkCountOfFsPath)) {
+			const remaining = this._remainingChunkCountOfFsPath[fsPath]
+			if (remaining > 0) {
+				const hasSucceededChunks = this._chunks.some(c => c.uri === fsPath)
+				if (hasSucceededChunks) {
+					if (this._pendingFileHashOfUri[fsPath] !== undefined) {
+						this._fileHashOfUri[fsPath] = this._pendingFileHashOfUri[fsPath]
+						delete this._pendingFileHashOfUri[fsPath]
+					}
+					if (this._pendingMtimeOfUri[fsPath] !== undefined) {
+						this._mtimeOfUri[fsPath] = this._pendingMtimeOfUri[fsPath]
+						delete this._pendingMtimeOfUri[fsPath]
+					}
+				} else {
+					delete this._pendingFileHashOfUri[fsPath]
+					delete this._pendingMtimeOfUri[fsPath]
 				}
-			}).catch(() => {
-				// processBatch never throws — errors are caught inside
-				inFlight.delete(p)
-			})
-			inFlight.add(p)
-			return p
-		}
-
-		// Initial launch
-		while (inFlight.size < CONCURRENCY && nextBatchIdx < batches.length) {
-			inFlight.add(launchNext())
-		}
-
-		// Wait for all to complete
-		while (inFlight.size > 0) {
-			await Promise.race(inFlight)
+			}
+			delete this._remainingChunkCountOfFsPath[fsPath]
 		}
 	}
 
@@ -612,7 +673,7 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 
 				try {
 					const stat = await this.fileService.stat(uri)
-					if (stat.size > MAX_FILE_SIZE_BYTES) continue
+					if (stat.size > this._maxFileSizeBytes) continue
 
 					const content = await this.fileService.readFile(uri)
 					const text = sanitizeText(content.value.toString())
@@ -634,7 +695,7 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 					this._pendingFileHashOfUri[fsPath] = fileHashValue
 					this._pendingMtimeOfUri[fsPath] = stat.mtime
 					const lines = text.split('\n')
-					const chunks = chunkContent(text, lines)
+					const chunks = chunkContent(text, lines, this._chunkSizeChars, this._chunkOverlapChars)
 					for (const chunk of chunks) {
 						chunk.uri = fsPath
 					}
@@ -689,7 +750,7 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 		if (!queryEmbedding || queryEmbedding.length === 0) return []
 
 		// Truncate query embedding to match stored chunk dimensions
-		const truncatedQuery = queryEmbedding.length > EMBEDDING_DIMENSIONS ? queryEmbedding.slice(0, EMBEDDING_DIMENSIONS) : queryEmbedding
+		const truncatedQuery = queryEmbedding.length > this._embeddingDimensions ? queryEmbedding.slice(0, this._embeddingDimensions) : queryEmbedding
 
 		// Compute similarity scores
 		let scored = this._chunks.map(chunk => ({
@@ -825,11 +886,11 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 				}
 			}
 
-			// Remove chunks and hashes for files that no longer exist
+			// Remove chunks and hashes for files that no longer exist or should now be skipped
 			const indexableFsPathSet = new Set(indexableUris.map(u => u.fsPath))
-			this._chunks = this._chunks.filter(c => indexableFsPathSet.has(c.uri))
+			this._chunks = this._chunks.filter(c => indexableFsPathSet.has(c.uri) && !shouldSkipFile(URI.file(c.uri)))
 			for (const fsPath of Object.keys(this._fileHashOfUri)) {
-				if (!indexableFsPathSet.has(fsPath)) {
+				if (!indexableFsPathSet.has(fsPath) || shouldSkipFile(URI.file(fsPath))) {
 					delete this._fileHashOfUri[fsPath]
 					delete this._mtimeOfUri[fsPath]
 				}
@@ -892,7 +953,7 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 			}
 			// Truncate + serialize chunks: encode embeddings as base64 Float32Array
 			const serializedChunks: SerializedChunk[] = this._chunks.map(c => {
-				const truncated = c.embedding.length > EMBEDDING_DIMENSIONS ? c.embedding.slice(0, EMBEDDING_DIMENSIONS) : c.embedding
+				const truncated = c.embedding.length > this._embeddingDimensions ? c.embedding.slice(0, this._embeddingDimensions) : c.embedding
 				return {
 					uri: c.uri,
 					startLine: c.startLine,
