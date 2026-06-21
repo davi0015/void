@@ -2361,7 +2361,7 @@ const EditToolSoFar = ({ toolCallSoFar, }: { toolCallSoFar: RawToolCallObj }) =>
 	>
 		<EditToolChildren
 			uri={uri}
-			code={toolCallSoFar.rawParams.search_replace_blocks ?? toolCallSoFar.rawParams.new_content ?? ''}
+			code={toolCallSoFar.rawParams.edits ?? toolCallSoFar.rawParams.search_replace_blocks ?? toolCallSoFar.rawParams.new_content ?? ''}
 			type={'rewrite'}
 			isStreaming={true}
 		/>

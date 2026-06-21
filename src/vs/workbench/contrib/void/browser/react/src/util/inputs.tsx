@@ -21,7 +21,8 @@ import { getBasename, getFolderName } from '../sidebar-tsx/SidebarChat.js';
 import { ChevronRight, File, Folder, FolderClosed, LucideProps } from 'lucide-react';
 import { StagingSelectionItem } from '../../../../common/chatThreadServiceTypes.js';
 
-import { extractSearchReplaceBlocks, ExtractedSearchReplaceBlock } from '../../../../common/helpers/extractCodeFromResult.js';
+import { ExtractedSearchReplaceBlock } from '../../../../common/helpers/extractCodeFromResult.js';
+import { Edit } from '../../../../common/editCodeServiceTypes.js';
 import { IAccessibilitySignalService } from '../../../../../../../platform/accessibilitySignal/browser/accessibilitySignalService.js';
 import { IEditorProgressService } from '../../../../../../../platform/progress/common/progress.js';
 import { detectLanguage } from '../../../../common/helpers/languageHelpers.js';
@@ -2019,12 +2020,16 @@ const SingleDiffEditor = ({ block }: { block: ExtractedSearchReplaceBlock, lang?
  * (original + modified sections). Lightweight alternative to Monaco
  * DiffEditorWidget — zero model creation, zero language service activation.
  */
-export const VoidDiffEditor = ({ uri, searchReplaceBlocks, language }: { uri?: any, searchReplaceBlocks: string, language?: string }) => {
+export const VoidDiffEditor = ({ uri, edits, language }: { uri?: any, edits: Edit[], language?: string }) => {
 	const accessor = useAccessor();
 	const languageService = accessor.get('ILanguageService');
 
-	// Extract all blocks
-	const blocks = extractSearchReplaceBlocks(searchReplaceBlocks);
+	// Convert Edit[] to the block shape SingleDiffEditor expects
+	const blocks: ExtractedSearchReplaceBlock[] = edits.map(e => ({
+		state: 'done',
+		orig: e.original,
+		final: e.delete ? '' : e.updated,
+	}));
 
 	// Use detectLanguage for language detection if not provided
 	let lang = language;

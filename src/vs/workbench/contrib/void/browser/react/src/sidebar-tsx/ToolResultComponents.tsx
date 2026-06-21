@@ -10,9 +10,11 @@ import { useAccessor, useChatThreadsStreamState, useSettingsState } from '../uti
 import { ChatMarkdownRender, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
 import { URI } from '../../../../../../../base/common/uri.js';
 import { VoidDiffEditor } from '../util/inputs.js';
+import { extractSearchReplaceBlocks } from '../../../../common/helpers/extractCodeFromResult.js';
 import { AlertTriangle, Ban, ChevronRight, CircleEllipsis } from 'lucide-react';
 import { ChatMessage, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, LintErrorItem, ToolName } from '../../../../common/toolsServiceTypes.js';
+import { Edit } from '../../../../common/editCodeServiceTypes.js';
 import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE } from '../../../../common/prompt/prompts.js';
 import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
@@ -206,11 +208,30 @@ const EditTool = ({ toolMessage, threadId, messageIdx, content }: Parameters<Res
 
 	const uri = params?.uri
 	const editToolType = toolMessage.name === 'edit_file' ? 'diff' : 'rewrite'
+	// Read edits from the new `edits` param, with a fallback to the legacy
+	// `searchReplaceBlocks` string for old messages persisted before the format change.
+	const edits: Edit[] | undefined = (() => {
+		if (editToolType !== 'diff') return undefined
+		const newEdits = (params as BuiltinToolCallParams['edit_file'] | undefined)?.edits
+		if (newEdits) return newEdits
+		// Legacy: params.searchReplaceBlocks or rawParams.search_replace_blocks
+		const legacyStr = (params as { searchReplaceBlocks?: string } | undefined)?.searchReplaceBlocks
+			?? (rawParams as { search_replace_blocks?: string } | undefined)?.search_replace_blocks
+		if (typeof legacyStr === 'string' && legacyStr.length > 0) {
+			return extractSearchReplaceBlocks(legacyStr).map(b => ({
+				original: b.orig,
+				updated: b.final,
+				delete: b.final === '' ? true : undefined,
+			}))
+		}
+		return undefined
+	})()
 	if (toolMessage.type === 'running_now' || toolMessage.type === 'tool_request') {
 		componentParams.children = <ToolChildrenWrapper className='bg-void-bg-3'>
 			<EditToolChildren
 				uri={uri}
 				code={content}
+				edits={edits}
 				type={editToolType}
 			/>
 		</ToolChildrenWrapper>
@@ -236,6 +257,7 @@ const EditTool = ({ toolMessage, threadId, messageIdx, content }: Parameters<Res
 			<EditToolChildren
 				uri={uri}
 				code={content}
+				edits={edits}
 				type={editToolType}
 			/>
 		</ToolChildrenWrapper>
@@ -650,10 +672,10 @@ export const ListableToolItem = ({ name, onClick, isSmall, className, showDot }:
 
 
 
-export const EditToolChildren = ({ uri, code, type, isStreaming }: { uri: URI | undefined, code: string, type: 'diff' | 'rewrite', isStreaming?: boolean }) => {
+export const EditToolChildren = ({ uri, code, edits, type, isStreaming }: { uri: URI | undefined, code: string, edits?: Edit[], type: 'diff' | 'rewrite', isStreaming?: boolean }) => {
 
 	const content = type === 'diff' ?
-		<VoidDiffEditor uri={uri} searchReplaceBlocks={code} />
+		<VoidDiffEditor uri={uri} edits={edits ?? []} />
 		: <ChatMarkdownRender string={`\`\`\`\n${code}\n\`\`\``} codeURI={uri} chatMessageLocation={undefined} isStreaming={isStreaming} />
 
 	return <div className='!select-text cursor-auto'>
@@ -1414,8 +1436,7 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 	},
 	'edit_file': {
 		resultWrapper: (params) => {
-			const content = params.toolMessage.params?.searchReplaceBlocks ?? params.toolMessage.rawParams?.search_replace_blocks ?? ''
-			return <EditTool {...params} content={content} />
+			return <EditTool {...params} content='' />
 		}
 	},
 

@@ -840,6 +840,7 @@ Resp Nemotron: 3 tool calls, search + read convertToLLMMessageService.ts + read 
   - **Settings UI** — enable/disable toggle, model dropdown, advanced settings (dimensions, batch size, concurrency, chunk size, chunk overlap, max file size), index status display
   - **Skip lists** — binary files, lock files, minified JS/CSS, AppleScript, documents, etc.
   - **Bug fixes during development** — zero-embedding bug (base64 vs float encoding), startLine always 1 (char offset → line number mapping), stuck progress (failed batch cleanup), surrogate character sanitization, empty text handling, O(N²) incremental saves
+- **`edit_file` SEARCH/REPLACE → structured `edits` array** ✅ DONE — replaced the single-string SEARCH/REPLACE block format (git-conflict markers `<<<<<<< ORIGINAL / ======= / 
 
 ### Next — Performance & billing-honesty (promoted from backlog)
 

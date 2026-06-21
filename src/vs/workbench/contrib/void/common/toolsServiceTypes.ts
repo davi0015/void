@@ -1,5 +1,6 @@
 import { URI } from '../../../../base/common/uri.js'
 import { RawMCPToolCall } from './mcpServiceTypes.js';
+import { Edit } from './editCodeServiceTypes.js';
 import { builtinTools } from './prompt/prompts.js';
 import { RawToolParamsObj } from './sendLLMMessageTypes.js';
 
@@ -90,7 +91,7 @@ export type BuiltinToolCallParams = {
 	'read_lint_errors': { uri: URI },
 	// ---
 	'rewrite_file': { uri: URI, newContent: string },
-	'edit_file': { uri: URI, searchReplaceBlocks: string },
+	'edit_file': { uri: URI, edits: Edit[] },
 	'create_file_or_folder': { uri: URI, isFolder: boolean },
 	'delete_file_or_folder': { uri: URI, isRecursive: boolean, isFolder: boolean },
 	'rename_file_or_folder': { sourceUri: URI, targetUri: URI, overwrite: boolean },

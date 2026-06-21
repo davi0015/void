@@ -45,7 +45,7 @@ import { FeatureName } from '../common/voidSettingsTypes.js';
 import { IVoidModelService } from '../common/voidModelService.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { acceptBg, acceptBorder, buttonFontSize, buttonTextColor, rejectBg, rejectBorder } from '../common/helpers/colors.js';
-import { DiffArea, Diff, CtrlKZone, VoidFileSnapshot, DiffAreaSnapshotEntry, diffAreaSnapshotKeys, DiffZone, TrackingZone, ComputedDiff } from '../common/editCodeServiceTypes.js';
+import { DiffArea, Diff, CtrlKZone, VoidFileSnapshot, DiffAreaSnapshotEntry, diffAreaSnapshotKeys, DiffZone, TrackingZone, ComputedDiff, Edit } from '../common/editCodeServiceTypes.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { PENDING_DIFFS_STORAGE_KEY } from '../common/storageKeys.js';
@@ -1291,7 +1291,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		return null
 	}
 
-	public instantlyApplySearchReplaceBlocks({ uri, searchReplaceBlocks }: { uri: URI, searchReplaceBlocks: string }) {
+	public instantlyApplyEdits({ uri, edits }: { uri: URI, edits: Edit[] }) {
 		const existingDiffZone = this._findExistingDiffZone(uri)
 
 		let diffZone: DiffZone
@@ -1337,7 +1337,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		}
 
 		try {
-			this._instantlyApplySRBlocks(uri, searchReplaceBlocks)
+			this._instantlyApplyEdits(uri, edits)
 		}
 		catch (e) {
 			onError({ message: e + '', fullError: null })
@@ -1743,7 +1743,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 	 * Generates a human-readable error message for an invalid ORIGINAL search block.
 	 */
 	private _errContentOfInvalidStr = (
-		str: 'Not found' | 'Not unique' | 'Has overlap',
+		str: 'Not found' | 'Not unique' | 'Has overlap' | 'Empty replacement',
 		blockOrig: string,
 		fileContent?: string,
 	): string => {
@@ -1775,6 +1775,9 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			case 'Has overlap':
 				descStr = `The edit was not applied. The text in the ORIGINAL blocks must not overlap, but the following ORIGINAL code had overlap with another ORIGINAL string:\n${problematicCode}. Ensure you have the latest version of the file, and ensure the ORIGINAL code blocks do not overlap.`
 				break
+			case 'Empty replacement':
+				descStr = `The edit was not applied. The "updated" field was empty but "delete" was not set to true. To REPLACE code, fill "updated" with the new code — do not leave it empty. To DELETE code, set "delete": true. An empty "updated" without "delete": true is not allowed, because it would silently delete the "original" code. The ORIGINAL code in question was:\n${problematicCode}`
+				break
 			default:
 				descStr = ''
 		}
@@ -1782,12 +1785,11 @@ class EditCodeService extends Disposable implements IEditCodeService {
 	}
 
 
-	private _instantlyApplySRBlocks(uri: URI, blocksStr: string) {
-		const blocks = extractSearchReplaceBlocks(blocksStr)
-		if (blocks.length === 0) throw new Error(`No Search/Replace blocks were received!`)
+	private _instantlyApplyEdits(uri: URI, edits: Edit[]) {
+		if (edits.length === 0) throw new Error(`No edits were received!`)
 
 		const model = this._modelService.getModel(uri)
-		if (!model) throw new Error(`Error applying Search/Replace blocks: File does not exist.`)
+		if (!model) throw new Error(`Error applying edits: File does not exist.`)
 		const modelStr = model.getValue(EndOfLinePreference.LF)
 		// .split('\n').map(l => '\t' + l).join('\n') // for testing purposes only, remember to remove this
 		const modelStrLines = modelStr.split('\n')
@@ -1795,25 +1797,35 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 
 
-		const replacements: { origStart: number; origEnd: number; block: ExtractedSearchReplaceBlock }[] = []
-		for (const b of blocks) {
-			if (typeof b.orig !== 'string' || typeof b.final !== 'string')
-				throw new Error(`Invalid Search/Replace block: ORIGINAL and UPDATED must both be strings.`)
-			if (b.orig.length === 0)
-				throw new Error(`Invalid Search/Replace block: ORIGINAL must not be empty.`)
-			const idx = modelStr.indexOf(b.orig)
+		const replacements: { origStart: number; origEnd: number; final: string; orig: string }[] = []
+		for (const e of edits) {
+			if (typeof e.original !== 'string')
+				throw new Error(`Invalid edit: "original" must be a string.`)
+			if (e.original.length === 0)
+				throw new Error(`Invalid edit: "original" must not be empty.`)
+
+			// "delete": true => remove the matched span (final === '').
+			// Otherwise "updated" must be non-empty — an empty replacement without
+			// "delete": true is rejected so the model can't silently delete code by
+			// forgetting to fill in "updated".
+			const isDeletion = e.delete === true
+			const final = isDeletion ? '' : e.updated
+			if (!isDeletion && final.length === 0)
+				throw new Error(this._errContentOfInvalidStr('Empty replacement', e.original))
+
+			const idx = modelStr.indexOf(e.original)
 			if (idx !== -1) {
-				const lastIdx = modelStr.lastIndexOf(b.orig)
+				const lastIdx = modelStr.lastIndexOf(e.original)
 				if (lastIdx !== idx)
-					throw new Error(this._errContentOfInvalidStr('Not unique', b.orig, modelStr))
-				replacements.push({ origStart: idx, origEnd: idx + b.orig.length - 1, block: b })
+					throw new Error(this._errContentOfInvalidStr('Not unique', e.original, modelStr))
+				replacements.push({ origStart: idx, origEnd: idx + e.original.length - 1, final, orig: e.original })
 				continue
 			}
 
 			// fallback: match via line-level search (handles whitespace differences)
-			const res = findTextInCode(b.orig, modelStr, true, { returnType: 'lines' })
+			const res = findTextInCode(e.original, modelStr, true, { returnType: 'lines' })
 			if (typeof res === 'string')
-				throw new Error(this._errContentOfInvalidStr(res, b.orig))
+				throw new Error(this._errContentOfInvalidStr(res, e.original))
 			let [startLine, endLine] = res
 			startLine -= 1 // 0-index
 			endLine -= 1
@@ -1821,7 +1833,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 				modelStrLines.slice(0, startLine).join('\n') + '\n'
 				: '').length
 			const origEnd = modelStrLines.slice(0, endLine + 1).join('\n').length - 1
-			replacements.push({ origStart, origEnd, block: b })
+			replacements.push({ origStart, origEnd, final, orig: e.original })
 		}
 		// sort in increasing order
 		replacements.sort((a, b) => a.origStart - b.origStart)
@@ -1829,21 +1841,36 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		// ensure no overlap
 		for (let i = 1; i < replacements.length; i++) {
 			if (replacements[i].origStart <= replacements[i - 1].origEnd) {
-				throw new Error(this._errContentOfInvalidStr('Has overlap', replacements[i]?.block?.orig))
+				throw new Error(this._errContentOfInvalidStr('Has overlap', replacements[i]?.orig))
 			}
 		}
 
 		// apply each replacement from right to left (so indexes don't shift)
 		let newCode: string = modelStr
 		for (let i = replacements.length - 1; i >= 0; i--) {
-			const { origStart, origEnd, block } = replacements[i]
-			newCode = newCode.slice(0, origStart) + block.final + newCode.slice(origEnd + 1, Infinity)
+			const { origStart, origEnd, final } = replacements[i]
+			newCode = newCode.slice(0, origStart) + final + newCode.slice(origEnd + 1, Infinity)
 		}
 
 		this._writeURIText(uri, newCode,
 			'wholeFileRange',
 			{ shouldRealignDiffAreas: true, skipRefresh: true }
 		)
+	}
+
+	// Adapter for the streaming ClickApply path, which still produces SEARCH/REPLACE
+	// block strings (via the diff -> search/replace sub-LLM). Converts them to Edit[]
+	// and delegates to _instantlyApplyEdits. An empty "final" in this path is an
+	// intentional deletion (the sub-LLM derived it from a diff), so it maps to
+	// delete: true rather than being rejected.
+	private _instantlyApplySRBlocks(uri: URI, blocksStr: string) {
+		const blocks = extractSearchReplaceBlocks(blocksStr)
+		const edits: Edit[] = blocks.map(b => ({
+			original: b.orig,
+			updated: b.final,
+			delete: b.final.length === 0 ? true : undefined,
+		}))
+		this._instantlyApplyEdits(uri, edits)
 	}
 
 	private _initializeSearchAndReplaceStream(opts: StartApplyingOpts & { from: 'ClickApply' }): [DiffZone, Promise<void>] | undefined {

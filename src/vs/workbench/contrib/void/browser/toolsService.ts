@@ -9,6 +9,7 @@ import { ISearchService } from '../../../services/search/common/search.js'
 import { IEditCodeService } from './editCodeServiceInterface.js'
 import { ITerminalToolService } from './terminalToolService.js'
 import { LintErrorItem, BuiltinToolCallParams, BuiltinToolResultType, BuiltinToolName } from '../common/toolsServiceTypes.js'
+import { Edit } from '../common/editCodeServiceTypes.js'
 import { IVoidModelService } from '../common/voidModelService.js'
 import { EndOfLinePreference, ITextModel } from '../../../../editor/common/model.js'
 import { Position } from '../../../../editor/common/core/position.js'
@@ -160,6 +161,32 @@ const checkIfIsFolder = (uriStr: string) => {
 	uriStr = uriStr.trim()
 	if (uriStr.endsWith('/') || uriStr.endsWith('\\')) return true
 	return false
+}
+
+const validateEdits = (editsUnknown: unknown): Edit[] => {
+	if (typeof editsUnknown !== 'string') throw new Error(`Invalid LLM output format: edits must be a JSON string, but its type is "${typeof editsUnknown}".`)
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(editsUnknown)
+	} catch (e) {
+		throw new Error(`Invalid LLM output format: edits must be valid JSON. Error: ${e}`)
+	}
+	if (!Array.isArray(parsed)) throw new Error(`Invalid LLM output format: edits must be a JSON array, but got ${typeof parsed}.`)
+	const edits: Edit[] = []
+	for (let i = 0; i < parsed.length; i++) {
+		const item = parsed[i]
+		if (item === null || typeof item !== 'object') throw new Error(`Invalid LLM output format: edits[${i}] must be an object, but got ${typeof item}.`)
+		const obj = item as Record<string, unknown>
+		const original = obj.original
+		const updated = obj.updated
+		const del = obj.delete
+		if (typeof original !== 'string') throw new Error(`Invalid LLM output format: edits[${i}].original must be a string.`)
+		if (updated !== undefined && typeof updated !== 'string') throw new Error(`Invalid LLM output format: edits[${i}].updated must be a string.`)
+		const deleteBool = del === true || del === 'true'
+		edits.push({ original, updated: typeof updated === 'string' ? updated : '', delete: deleteBool || undefined })
+	}
+	if (edits.length === 0) throw new Error(`Invalid LLM output format: edits must contain at least one edit object.`)
+	return edits
 }
 
 // Scan a model for the first whole-word occurrence of `symbolName`. Whole-word
@@ -458,10 +485,10 @@ export class ToolsService implements IToolsService {
 			},
 
 			edit_file: (params: RawToolParamsObj) => {
-				const { uri: uriStr, search_replace_blocks: searchReplaceBlocksUnknown } = params
+				const { uri: uriStr, edits: editsUnknown } = params
 				const uri = validateURI(uriStr)
-				const searchReplaceBlocks = validateStr('searchReplaceBlocks', searchReplaceBlocksUnknown)
-				return { uri, searchReplaceBlocks }
+				const edits = validateEdits(editsUnknown)
+				return { uri, edits }
 			},
 
 			// ---
@@ -776,7 +803,7 @@ export class ToolsService implements IToolsService {
 				return { result: lintErrorsPromise }
 			},
 
-			edit_file: async ({ uri, searchReplaceBlocks }) => {
+			edit_file: async ({ uri, edits }) => {
 				// Same silent-fallthrough issue as rewrite_file (see comment there),
 				// but the right behavior is different: edit_file uses search/replace
 				// blocks which require existing content to match against. Auto-creating
@@ -794,7 +821,7 @@ export class ToolsService implements IToolsService {
 				}
 				await editCodeService.callBeforeApplyOrEdit(uri)
 				
-				editCodeService.instantlyApplySearchReplaceBlocks({ uri, searchReplaceBlocks })
+				editCodeService.instantlyApplyEdits({ uri, edits })
 
 				// at end, get lint errors
 				const lintErrorsPromise = Promise.resolve().then(async () => {

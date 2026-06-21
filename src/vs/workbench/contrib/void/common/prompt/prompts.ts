@@ -107,22 +107,13 @@ ${FINAL}
 ${tripleTick[1]}`
 
 
-const replaceTool_description = `\
-A string of SEARCH/REPLACE block(s) which will be applied to the given file.
-Your SEARCH/REPLACE blocks string must be formatted as follows:
-${searchReplaceBlockTemplate}
+const editsTool_description = `\
+A JSON array of edit objects: { "original": string, "updated": string, "delete"?: boolean }.
+- "original": lines in the file to replace. Must EXACTLY match (including whitespace), be unique, and be DISJOINT from other "original" values. Bias towards minimal length.
+- "updated": the new code replacing "original". Must be non-empty unless "delete" is true — an empty "updated" without "delete": true will be rejected.
+- "delete": set to true to delete the "original" code.
 
-## Guidelines:
-
-1. You may output multiple search replace blocks if needed.
-
-2. The ORIGINAL code in each SEARCH/REPLACE block must EXACTLY match lines in the original file. Do not add or remove any whitespace or comments from the original code.
-
-3. Each ORIGINAL text must be large enough to uniquely identify the change. However, bias towards writing as little as possible.
-
-4. Each ORIGINAL text must be DISJOINT from all other ORIGINAL text.
-
-5. This field is a STRING (not an array).`
+Example: [{"original": "let x = 6", "updated": "let x = 6.5"}, {"original": "let y = 7", "delete": true}]`
 
 
 // ======================================================== tools ========================================================
@@ -330,10 +321,10 @@ export const builtinTools: {
 
 	edit_file: {
 		name: 'edit_file',
-		description: `Edit the contents of a file. You must provide the file's URI as well as a SINGLE string of SEARCH/REPLACE block(s) that will be used to apply the edit. IMPORTANT: When editing a file multiple times, combine ALL changes into a SINGLE edit_file call with multiple SEARCH/REPLACE blocks. Do NOT call edit_file multiple times for the same file in one turn — each call modifies the file, making subsequent SEARCH blocks stale.`,
+		description: `Edit the contents of a file. You must provide the file's URI as well as an "edits" array of edit objects (each with "original", "updated", and optional "delete"). IMPORTANT: When editing a file multiple times, combine ALL changes into a SINGLE edit_file call with multiple edit objects in the array. Do NOT call edit_file multiple times for the same file in one turn — each call modifies the file, making subsequent "original" matches stale.`,
 		params: {
 			...uriParam('file'),
-			search_replace_blocks: { description: replaceTool_description }
+			edits: { description: editsTool_description }
 		},
 	},
 

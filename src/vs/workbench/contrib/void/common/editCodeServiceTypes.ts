@@ -5,6 +5,12 @@
 
 import { URI } from '../../../../base/common/uri.js';
 
+export type Edit = {
+	original: string;
+	updated: string;
+	delete?: boolean;
+}
+
 export type ComputedDiff = {
 	type: 'edit';
 	originalCode: string;

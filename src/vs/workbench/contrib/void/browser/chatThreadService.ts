@@ -1697,7 +1697,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (outcome === 'success') {
 			this._updateLatestTool(threadId, {
 				role: 'tool', type: 'success',
-				params: { uri: URI.parse(tool.rawParams?.uri ?? ''), searchReplaceBlocks: tool.rawParams?.search_replace_blocks ?? '' } as ToolCallParams<'edit_file'>,
+				params: { uri: URI.parse(tool.rawParams?.uri ?? ''), edits: [] } as ToolCallParams<'edit_file'>,
 				result: { lintErrors: null } as any,
 				name: tool.name,
 				content: `Changes merged into a prior edit_file call for the same file and applied together.`,
@@ -1706,7 +1706,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		} else {
 			this._updateLatestTool(threadId, {
 				role: 'tool', type: 'tool_error',
-				params: { uri: URI.parse(tool.rawParams?.uri ?? ''), searchReplaceBlocks: tool.rawParams?.search_replace_blocks ?? '' } as ToolCallParams<'edit_file'>,
+				params: { uri: URI.parse(tool.rawParams?.uri ?? ''), edits: [] } as ToolCallParams<'edit_file'>,
 				result: outcome,
 				name: tool.name,
 				content: `Changes were merged into a prior edit_file call for the same file, but it failed: ${outcome}`,
@@ -1731,22 +1731,33 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// edit_file would see a modified file and its SEARCH blocks would fail.
 			let mergedParams = next.rawParams
 			const mergedSiblingIds: string[] = []
-			if (next.name === 'edit_file' && typeof next.rawParams?.search_replace_blocks === 'string') {
+			if (next.name === 'edit_file' && typeof next.rawParams?.edits === 'string') {
 				const targetUri = next.rawParams.uri
-				let mergedBlocks = next.rawParams.search_replace_blocks
-				for (let i = 1; i < pending.length; i++) {
-					const sib = pending[i]
-					if (sib.name !== 'edit_file' || sib.rawParams?.uri !== targetUri) continue
-					const sibBlocks = sib.rawParams?.search_replace_blocks
-					if (typeof sibBlocks !== 'string') continue
-					mergedBlocks += '\n' + sibBlocks
-					mergedSiblingIds.push(sib.id)
-				}
-				if (mergedSiblingIds.length > 0) {
-					mergedParams = { ...next.rawParams, search_replace_blocks: mergedBlocks }
-					// Persist merged params so the approval path (which re-reads
-					// rawParams from the thread message) also uses merged blocks.
-					next.rawParams = mergedParams
+				try {
+					const firstParsed = JSON.parse(next.rawParams.edits)
+					if (Array.isArray(firstParsed)) {
+						let mergedEdits: unknown[] = firstParsed
+						for (let i = 1; i < pending.length; i++) {
+							const sib = pending[i]
+							if (sib.name !== 'edit_file' || sib.rawParams?.uri !== targetUri) continue
+							const sibEdits = sib.rawParams?.edits
+							if (typeof sibEdits !== 'string') continue
+							const sibParsed = JSON.parse(sibEdits)
+							if (Array.isArray(sibParsed)) {
+								mergedEdits = mergedEdits.concat(sibParsed)
+								mergedSiblingIds.push(sib.id)
+							}
+						}
+						if (mergedSiblingIds.length > 0) {
+							mergedParams = { ...next.rawParams, edits: JSON.stringify(mergedEdits) }
+							// Persist merged params so the approval path (which re-reads
+							// rawParams from the thread message) also uses merged edits.
+							next.rawParams = mergedParams
+						}
+					}
+				} catch {
+					// If edits JSON is malformed, skip merging — each call runs (and
+					// fails validation) separately, same as before.
 				}
 			}
 
