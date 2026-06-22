@@ -74,6 +74,13 @@ export const ToolHeaderWrapper = ({
 
 	const [isOpen_, setIsOpen] = useState(false);
 	const isExpanded = isOpen !== undefined ? isOpen : isOpen_
+	// Track whether children have ever been expanded. Children are only
+	// mounted after first expansion — collapsed tool results (search/read
+	// blocks) skip the full render cost (marked.lexer, string formatting,
+	// etc.) during scroll. Once expanded, children stay mounted so
+	// collapse/re-expand is instant.
+	const [hasBeenExpanded, setHasBeenExpanded] = useState(false)
+	if (isExpanded && !hasBeenExpanded) setHasBeenExpanded(true)
 
 	const isDropdown = children !== undefined // null ALLOWS dropdown
 	const isClickable = !!(isDropdown || onClick)
@@ -168,7 +175,7 @@ export const ToolHeaderWrapper = ({
 				  `}
 			//    bg-black bg-opacity-10 border border-void-border-4 border-opacity-50
 			>
-				{children}
+				{hasBeenExpanded && children}
 			</div>}
 		</div>
 		{bottomChildren}

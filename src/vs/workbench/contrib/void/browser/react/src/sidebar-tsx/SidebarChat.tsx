@@ -2589,10 +2589,17 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			if (!widthChanged) {
 				if (isAtBottomRef.current) {
 					scrollToBottom(scrollContainerRef)
-				} else {
-					scrollEl.scrollTop += delta
+					lastScrollTopRef.current = scrollEl.scrollTop
 				}
-				lastScrollTopRef.current = scrollEl.scrollTop
+				// When not at bottom, do NOT compensate scrollTop. The
+				// useLayoutEffect already handles virtualization (trim/expand)
+				// compensation — it runs before the RO in the React commit
+				// phase, so by the time the RO fires, spacerHeightRef is
+				// already updated and delta ≈ 0. The only time the RO sees
+				// a non-zero delta is for content changes the layout effect
+				// doesn't handle (tool result expansion, tokenization) —
+				// and compensating those pushes the viewport, causing the
+				// expansion header to jump out of view.
 			}
 		})
 		contentRo.observe(contentEl)
