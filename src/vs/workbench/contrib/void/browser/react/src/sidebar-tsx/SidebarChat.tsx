@@ -2408,6 +2408,18 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	// LLM streaming.
 	const isRunning = useStreamRunningState(threadId)
 
+	// Reset auto-scroll suppression when a new turn starts (isRunning
+	// transitions from not-running to running). This lets auto-scroll
+	// resume for the new response without requiring the user to manually
+	// scroll to the bottom first.
+	const prevIsRunningRef = useRef(false)
+	useEffect(() => {
+		if (isRunning && !prevIsRunningRef.current) {
+			userScrolledUpRef.current = false
+		}
+		prevIsRunningRef.current = !!isRunning
+	}, [isRunning])
+
 	const currCheckpointIdx = thread?.state?.currCheckpointIdx ?? undefined
 
 
@@ -2448,6 +2460,15 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	const spacerHeightRef = useRef(0)
 	const lastScrollTopRef = useRef(0)
 	const isAtBottomRef = useRef(true)
+	// Hysteresis for streaming auto-scroll. Once the user scrolls up,
+	// suppress auto-scroll until they explicitly scroll back to the
+	// bottom or a new turn starts. Without this, the 100px threshold
+	// in isAtBottomRef creates a trap: stream ticks fire ~10Hz, so the
+	// user would need to scroll >100px in <100ms to escape auto-scroll.
+	const userScrolledUpRef = useRef(false)
+	// Distinguishes auto-scroll (scrollToBottom) from user scroll in
+	// onScroll, so auto-scroll doesn't reset userScrolledUpRef.
+	const isAutoScrollRef = useRef(false)
 
 	const getContentHeight = useCallback(() => {
 		return contentRef.current?.offsetHeight ?? 0
@@ -2691,14 +2712,34 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		lastScrollTopRef.current = el.scrollTop
 
 		const onScroll = () => {
+			const currScrollTopSync = el.scrollTop
+			const prevScrollTopSync = lastScrollTopRef.current
+			// Update isAtBottomRef synchronously — before the rAF — so
+			// that StreamingBubble's useLayoutEffect (which fires on every
+			// stream tick with no deps array) sees the correct value.
+			isAtBottomRef.current = el.scrollHeight - el.clientHeight - currScrollTopSync < 100
+			// Set userScrolledUpRef synchronously on user scroll-up.
+			// Auto-scroll (scrollToBottom) always scrolls DOWN, so
+			// currScrollTop < prevScrollTop is only true for user scroll-up.
+			// This is the hysteresis that breaks the auto-scroll trap.
+			if (currScrollTopSync < prevScrollTopSync - 1) {
+				userScrolledUpRef.current = true
+			}
 			cancelAnimationFrame(rafId)
 			rafId = requestAnimationFrame(() => {
 				const currScrollTop = el.scrollTop
 				const prevScrollTop = lastScrollTopRef.current
 				lastScrollTopRef.current = currScrollTop
-				isAtBottomRef.current = el.scrollHeight - el.clientHeight - currScrollTop < 100
 				const scrollingUp = currScrollTop < prevScrollTop
 				const scrollingDown = currScrollTop > prevScrollTop
+
+				// Reset userScrolledUpRef when the user manually scrolls
+				// back to the bottom. isAutoScrollRef prevents auto-scroll
+				// (which also lands at the bottom) from resetting the flag.
+				if (el.scrollHeight - el.clientHeight - currScrollTop < 50 && !isAutoScrollRef.current) {
+					userScrolledUpRef.current = false
+				}
+				isAutoScrollRef.current = false
 
 				updateStickyQuestion(el)
 
@@ -2905,9 +2946,11 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					isRunning={isRunning}
 					scrollContainerRef={scrollContainerRef}
 					isAtBottomRef={isAtBottomRef}
+					userScrolledUpRef={userScrolledUpRef}
+					isAutoScrollRef={isAutoScrollRef}
 				/>
+			</div>
 		</div>
-	</div>
 	)
 })
 
@@ -2916,25 +2959,30 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 // independently. This prevents ThreadMessagesView from re-rendering on
 // every stream tick (~10Hz). Only this component re-renders when the LLM
 // emits a new token; the message list above stays stable.
-const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOnly, isRunning, scrollContainerRef, isAtBottomRef }: {
+const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOnly, isRunning, scrollContainerRef, isAtBottomRef, userScrolledUpRef, isAutoScrollRef }: {
 	threadId: string
 	streamingChatIdx: number
 	threadIsReadOnly: boolean
 	isRunning: ReturnType<typeof useStreamRunningState>
 	scrollContainerRef: React.MutableRefObject<HTMLDivElement | null>
 	isAtBottomRef: React.MutableRefObject<boolean>
+	userScrolledUpRef: React.MutableRefObject<boolean>
+	isAutoScrollRef: React.MutableRefObject<boolean>
 }) => {
 	const streamState = useChatThreadsStreamState(threadId)
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
 	const commandService = accessor.get('ICommandService')
 
-	// Auto-scroll to bottom on every stream tick if the user was at the
-	// bottom. Uses isAtBottomRef (set by the scroll handler) instead of
-	// checking live distance — content may have grown by more than 100px
-	// since the last scroll event, making the live check unreliable.
+	// Auto-scroll to bottom on every stream tick, but ONLY if the user
+	// hasn't scrolled up. userScrolledUpRef provides hysteresis: once
+	// the user scrolls up, auto-scroll is suppressed until they manually
+	// scroll back to the bottom (detected via isAutoScrollRef) or a new
+	// turn starts. This breaks the trap where the 100px threshold + 10Hz
+	// stream ticks made it nearly impossible to scroll away from streaming.
 	useLayoutEffect(() => {
-		if (isAtBottomRef.current) {
+		if (!userScrolledUpRef.current && isAtBottomRef.current) {
+			isAutoScrollRef.current = true
 			scrollToBottom(scrollContainerRef)
 			isAtBottomRef.current = true
 		}
