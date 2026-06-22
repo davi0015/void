@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 
 
@@ -2602,7 +2602,13 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		const scrollEl = scrollContainerRef.current
 		if (!scrollEl) return
 		const batch = msgsForPx(scrollEl.clientHeight * 2)
-		setMountStart(prev => Math.max(0, prev - batch))
+		// startTransition makes the render phase interruptible — React can
+		// yield between rendering individual messages so the scroll
+		// compositor can paint frames during the expand. The commit +
+		// layout effect (scrollTop compensation) still run synchronously
+		// after commit. Safe because expand triggers 1 viewport from the
+		// top, so the user won't reach the unmounted area before commit.
+		startTransition(() => setMountStart(prev => Math.max(0, prev - batch)))
 	}, [scrollContainerRef, msgsForPx])
 
 	const hasMore = mountStart > 0
