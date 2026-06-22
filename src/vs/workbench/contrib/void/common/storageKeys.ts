@@ -29,6 +29,13 @@ export const THREAD_INDEX_KEY = 'void.chatThreadIndex'
 // is O(1) instead of re-serializing the entire thread.
 export const MESSAGE_KEY_PREFIX = 'void.chatMsg.'
 
+// Checkpoint storage. Checkpoint snapshots (full file content) are stored
+// separately from conversation messages so they don't bloat the message
+// keys that get loaded at startup. Key format: `void.chatCheckpoint.{threadId}.{messageIndex}`
+// — uses the same index as the position in the messages array, so reads
+// can check both message and checkpoint keys at each index.
+export const CHECKPOINT_KEY_PREFIX = 'void.chatCheckpoint.'
+
 // Frequently-changing usage stats (latestUsage, cumulativeUsage, etc.)
 // Written at ~5Hz during streaming. Always small (~200 bytes).
 export const USAGE_KEY_PREFIX = 'void.chatUsage.'

@@ -32,7 +32,7 @@ import { IEditCodeService } from './editCodeServiceInterface.js';
 import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
-import { LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, MESSAGE_KEY_PREFIX, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY, USAGE_KEY_PREFIX } from '../common/storageKeys.js';
+import { CHECKPOINT_KEY_PREFIX, LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, MESSAGE_KEY_PREFIX, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY, USAGE_KEY_PREFIX } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { RunOnceScheduler, timeout } from '../../../../base/common/async.js';
@@ -140,6 +140,12 @@ export type ThreadType = {
 
 	messages: ChatMessage[];
 	filesWithUserChanges: Set<string>;
+
+	// Total number of message slots used. Stored in metadata so the read loop
+	// can iterate 0..messageCount-1 and skip gaps instead of breaking on the
+	// first missing key. After migration, always equals messages.length (no gaps).
+	// Undefined for old threads — triggers migration on first read.
+	messageCount?: number;
 
 	// Last-seen token usage from the LLM for this thread. Persisted so the
 	// context-usage ring shows a value immediately on reload (instead of only
@@ -428,6 +434,7 @@ const newThreadObject = (workspace?: { uri?: string, label?: string }) => {
 		createdAt: now,
 		lastModified: now,
 		messages: [],
+		messageCount: 0,
 		workspaceUri: workspace?.uri,
 		workspaceLabel: workspace?.label,
 		state: {
@@ -921,6 +928,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	private _pendingUsageWrites = new Map<string, object>()       // usage stats
 	private _pendingMessageKeyWrites = new Map<string, ChatMessage>() // individual msg keys
+	private _pendingCheckpointKeyWrites = new Map<string, CheckpointEntry>() // checkpoint keys (separate from messages)
 
 	// Which fields go in which key. Static metadata is written rarely
 	// (user actions, compaction). Usage is written at ~5Hz during
@@ -966,13 +974,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// Remove all storage keys for this thread
 			this._storageService.remove(THREAD_KEY_PREFIX + threadId, StorageScope.APPLICATION)
 			this._storageService.remove(USAGE_KEY_PREFIX + threadId, StorageScope.APPLICATION)
-			// Remove individual message keys. We don't know the count, so
-			// iterate until missing key. Since storage is in-memory, this
-			// is just Map lookups — fast even for thousands of messages.
+			// Remove individual message and checkpoint keys. We don't know
+			// the count, so iterate until both are missing.
 			for (let i = 0; ; i++) {
-				const key = MESSAGE_KEY_PREFIX + threadId + '.' + i
-				if (this._storageService.get(key, StorageScope.APPLICATION) === undefined) break
-				this._storageService.remove(key, StorageScope.APPLICATION)
+				const msgKey = MESSAGE_KEY_PREFIX + threadId + '.' + i
+				const checkpointKey = CHECKPOINT_KEY_PREFIX + threadId + '.' + i
+				const hasMsg = this._storageService.get(msgKey, StorageScope.APPLICATION) !== undefined
+				const hasCheckpoint = this._storageService.get(checkpointKey, StorageScope.APPLICATION) !== undefined
+				if (!hasMsg && !hasCheckpoint) break
+				if (hasMsg) this._storageService.remove(msgKey, StorageScope.APPLICATION)
+				if (hasCheckpoint) this._storageService.remove(checkpointKey, StorageScope.APPLICATION)
 			}
 			this._writeThreadIndex({ removed: threadId })
 			return
@@ -994,6 +1005,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// _editMessageInThread, etc.
 	private _storeMessageKey(threadId: string, msgIdx: number, message: ChatMessage) {
 		this._pendingMessageKeyWrites.set(threadId + '.' + msgIdx, message)
+		this._scheduleThreadFlush()
+	}
+
+	// Write an individual checkpoint key. Called by _addCheckpoint,
+	// _addUserModificationsToCurrCheckpoint, etc. Checkpoints are stored
+	// under a separate key prefix so their snapshot data is isolated from
+	// conversation messages.
+	private _storeCheckpointKey(threadId: string, msgIdx: number, checkpoint: CheckpointEntry) {
+		this._pendingCheckpointKeyWrites.set(threadId + '.' + msgIdx, checkpoint)
+		this._scheduleThreadFlush()
+	}
+
+	private _scheduleThreadFlush() {
 		if (!this._storeThreadFlushScheduler) {
 			this._storeThreadFlushScheduler = new RunOnceScheduler(() => this._flushPendingThreadWrites(), 500)
 			this._register(this._storeThreadFlushScheduler)
@@ -1003,12 +1027,21 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 	}
 
-	// Delete message keys from fromIdx onward (for truncate/rollback).
+	// Delete message and checkpoint keys from fromIdx onward (for truncate/rollback).
 	private _deleteMessageKeysFrom(threadId: string, fromIdx: number) {
-		for (let i = fromIdx; ; i++) {
-			const key = MESSAGE_KEY_PREFIX + threadId + '.' + i
-			if (this._storageService.get(key, StorageScope.APPLICATION) === undefined) break
-			this._storageService.remove(key, StorageScope.APPLICATION)
+		const thread = this.state.allThreads[threadId]
+		const maxIdx = thread?.messageCount ?? -1
+		for (let i = fromIdx; maxIdx >= 0 ? i < maxIdx : true; i++) {
+			const msgKey = MESSAGE_KEY_PREFIX + threadId + '.' + i
+			const checkpointKey = CHECKPOINT_KEY_PREFIX + threadId + '.' + i
+			const hasMsg = this._storageService.get(msgKey, StorageScope.APPLICATION) !== undefined
+			const hasCheckpoint = this._storageService.get(checkpointKey, StorageScope.APPLICATION) !== undefined
+			if (!hasMsg && !hasCheckpoint) {
+				if (maxIdx < 0) break
+				else continue
+			}
+			if (hasMsg) this._storageService.remove(msgKey, StorageScope.APPLICATION)
+			if (hasCheckpoint) this._storageService.remove(checkpointKey, StorageScope.APPLICATION)
 		}
 		// Also remove any pending writes for deleted keys
 		for (const k of this._pendingMessageKeyWrites.keys()) {
@@ -1017,26 +1050,32 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				if (idx >= fromIdx) this._pendingMessageKeyWrites.delete(k)
 			}
 		}
+		for (const k of this._pendingCheckpointKeyWrites.keys()) {
+			if (k.startsWith(threadId + '.')) {
+				const idx = parseInt(k.slice(threadId.length + 1), 10)
+				if (idx >= fromIdx) this._pendingCheckpointKeyWrites.delete(k)
+			}
+		}
 	}
 
 	// Write all messages for a thread (used after truncation/mutation
 	// where multiple keys change). Deletes stale keys beyond new length.
+	// Routes messages and checkpoints to their respective key prefixes.
 	private _storeAllMessageKeys(threadId: string, messages: ChatMessage[]) {
 		this._deleteMessageKeysFrom(threadId, messages.length)
 		for (let i = 0; i < messages.length; i++) {
-			this._pendingMessageKeyWrites.set(threadId + '.' + i, messages[i])
+			const msg = messages[i]
+			if (msg.role === 'checkpoint') {
+				this._pendingCheckpointKeyWrites.set(threadId + '.' + i, msg)
+			} else {
+				this._pendingMessageKeyWrites.set(threadId + '.' + i, msg)
+			}
 		}
-		if (!this._storeThreadFlushScheduler) {
-			this._storeThreadFlushScheduler = new RunOnceScheduler(() => this._flushPendingThreadWrites(), 500)
-			this._register(this._storeThreadFlushScheduler)
-		}
-		if (!this._storeThreadFlushScheduler.isScheduled()) {
-			this._storeThreadFlushScheduler.schedule()
-		}
+		this._scheduleThreadFlush()
 	}
 
 	private _flushPendingThreadWrites() {
-		if (this._pendingThreadWrites.size === 0 && this._pendingUsageWrites.size === 0 && this._pendingMessageKeyWrites.size === 0) return
+		if (this._pendingThreadWrites.size === 0 && this._pendingUsageWrites.size === 0 && this._pendingMessageKeyWrites.size === 0 && this._pendingCheckpointKeyWrites.size === 0) return
 
 		// Split each thread into metadata + usage and write separately.
 		// Usage-only writes from _storeUsage take precedence (they're
@@ -1063,9 +1102,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._storageService.store(MESSAGE_KEY_PREFIX + key, JSON.stringify(message), StorageScope.APPLICATION, StorageTarget.USER)
 		}
 
+		// Write individual checkpoint keys
+		for (const [key, checkpoint] of this._pendingCheckpointKeyWrites) {
+			this._storageService.store(CHECKPOINT_KEY_PREFIX + key, JSON.stringify(checkpoint), StorageScope.APPLICATION, StorageTarget.USER)
+		}
+
 		this._pendingThreadWrites.clear()
 		this._pendingUsageWrites.clear()
 		this._pendingMessageKeyWrites.clear()
+		this._pendingCheckpointKeyWrites.clear()
 	}
 
 	private _writeThreadIndex(delta?: { added?: string, removed?: string }) {
@@ -1080,18 +1125,32 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const metadataRaw = this._storageService.get(THREAD_KEY_PREFIX + threadId, StorageScope.APPLICATION)
 		if (!metadataRaw) return undefined
 
-		// Migration: old format has messages array inline in metadata
 		const metadataParsed = JSON.parse(metadataRaw, ChatThreadService._storageReviver) as any
+
+		// Migration 1: very old format has messages array inline in metadata.
+		// Split into per-message keys, discarding old checkpoint data.
 		if (metadataParsed.messages && Array.isArray(metadataParsed.messages)) {
-			const thread = metadataParsed as ThreadType
-			// Write individual message keys
-			for (let i = 0; i < thread.messages.length; i++) {
-				this._storageService.store(MESSAGE_KEY_PREFIX + threadId + '.' + i, JSON.stringify(thread.messages[i]), StorageScope.APPLICATION, StorageTarget.USER)
+			const allMessages = metadataParsed.messages as ChatMessage[]
+			const messages: ChatMessage[] = []
+			let msgIdx = 0
+			for (const msg of allMessages) {
+				if (msg.role === 'checkpoint') continue // discard old checkpoint data
+				this._storageService.store(MESSAGE_KEY_PREFIX + threadId + '.' + msgIdx, JSON.stringify(msg), StorageScope.APPLICATION, StorageTarget.USER)
+				messages.push(msg)
+				msgIdx++
 			}
-			// Split and rewrite metadata + usage without messages
+			// messageCount = max index + 1 so the read loop knows the range.
+			// Since we write contiguously here (no gaps), messageCount = messages.length.
+			metadataParsed.messageCount = msgIdx
+			delete metadataParsed.messages
+			const thread = { ...metadataParsed, messages } as ThreadType
+			thread.messageCount = msgIdx
 			const { metadata, usage } = this._splitThreadForStorage(thread)
 			this._storageService.store(THREAD_KEY_PREFIX + threadId, JSON.stringify(metadata), StorageScope.APPLICATION, StorageTarget.USER)
 			this._storageService.store(USAGE_KEY_PREFIX + threadId, JSON.stringify(usage), StorageScope.APPLICATION, StorageTarget.USER)
+			if (!thread.state) {
+				thread.state = { currCheckpointIdx: null, stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {} }
+			}
 			return thread
 		}
 
@@ -1099,13 +1158,56 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const usageRaw = this._storageService.get(USAGE_KEY_PREFIX + threadId, StorageScope.APPLICATION)
 		const usageParsed = usageRaw ? JSON.parse(usageRaw, ChatThreadService._storageReviver) as any : {}
 
-		// Read messages by iterating from 0 until missing key.
-		// Storage is backed by an in-memory Map, so each get() is ~0.0001ms.
 		const messages: ChatMessage[] = []
-		for (let i = 0; ; i++) {
-			const msgRaw = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
-			if (msgRaw === undefined) break
-			messages.push(JSON.parse(msgRaw, ChatThreadService._storageReviver) as ChatMessage)
+
+		if (metadataParsed.messageCount !== undefined) {
+			// New format with messageCount — iterate to count, check both
+			// message and checkpoint keys at each index, skip gaps.
+			for (let i = 0; i < metadataParsed.messageCount; i++) {
+				const msgRaw = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
+				if (msgRaw !== undefined) {
+					messages.push(JSON.parse(msgRaw, ChatThreadService._storageReviver) as ChatMessage)
+					continue
+				}
+				const checkpointRaw = this._storageService.get(CHECKPOINT_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
+				if (checkpointRaw !== undefined) {
+					messages.push(JSON.parse(checkpointRaw, ChatThreadService._storageReviver) as ChatMessage)
+					continue
+				}
+				// Gap — skip (deleted checkpoint, etc.)
+			}
+		} else {
+			// Migration 2: old per-message format without messageCount.
+			// Checkpoints were stored inline in void.chatMsg.* keys.
+			// Read sequentially, discard old checkpoint data, compact indices
+			// so array indices match storage indices (required by _editMessageInThread
+			// and _storeMessageKey which use array indices as storage keys).
+			let writeIdx = 0
+			for (let i = 0; ; i++) {
+				const msgRaw = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
+				if (msgRaw === undefined) break
+				const msg = JSON.parse(msgRaw, ChatThreadService._storageReviver) as ChatMessage
+				if (msg.role === 'checkpoint') {
+					// Discard old checkpoint data — it was bloated and dedup was broken
+					this._storageService.remove(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
+					continue
+				}
+				// Compact: re-store at contiguous index if needed
+				if (writeIdx !== i) {
+					this._storageService.store(MESSAGE_KEY_PREFIX + threadId + '.' + writeIdx, JSON.stringify(msg), StorageScope.APPLICATION, StorageTarget.USER)
+					this._storageService.remove(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
+				}
+				messages.push(msg)
+				writeIdx++
+			}
+			// Delete any remaining keys after compaction
+			for (let i = writeIdx; ; i++) {
+				const key = MESSAGE_KEY_PREFIX + threadId + '.' + i
+				if (this._storageService.get(key, StorageScope.APPLICATION) === undefined) break
+				this._storageService.remove(key, StorageScope.APPLICATION)
+			}
+			metadataParsed.messageCount = writeIdx
+			this._storageService.store(THREAD_KEY_PREFIX + threadId, JSON.stringify(metadataParsed), StorageScope.APPLICATION, StorageTarget.USER)
 		}
 
 		// Ensure state exists (may be missing if metadata was written by
@@ -2561,12 +2663,20 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 
 	private _addCheckpoint(threadId: string, checkpoint: CheckpointEntry) {
-		this._addMessageToThread(threadId, checkpoint)
-		// // update latest checkpoint idx to the one we just added
-		// const newThread = this.state.allThreads[threadId]
-		// if (!newThread) return // should never happen
-		// const currCheckpointIdx = newThread.messages.length - 1
-		// this._setThreadState(threadId, { currCheckpointIdx: currCheckpointIdx })
+		const { allThreads } = this.state
+		const oldThread = allThreads[threadId]
+		if (!oldThread) return // should never happen
+		const msgIdx = oldThread.messageCount ?? oldThread.messages.length
+		const updatedThread = {
+			...oldThread,
+			lastModified: new Date().toISOString(),
+			messages: [...oldThread.messages, checkpoint],
+			messageCount: msgIdx + 1,
+		}
+		this._storeCheckpointKey(threadId, msgIdx, checkpoint)
+		const newThreads = { ...allThreads, [threadId]: updatedThread }
+		this._storeThread(threadId, updatedThread)
+		this._setState({ allThreads: newThreads })
 	}
 
 
@@ -2585,8 +2695,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				...oldThread.messages.slice(messageIdx + 1, Infinity),
 			],
 		}
-		// Write the changed message key
-		this._storeMessageKey(threadId, messageIdx, newMessage)
+		// Write the changed key — route to checkpoint key if editing a checkpoint
+		if (newMessage.role === 'checkpoint') {
+			this._storeCheckpointKey(threadId, messageIdx, newMessage)
+		} else {
+			this._storeMessageKey(threadId, messageIdx, newMessage)
+		}
 		const newThreads = { ...allThreads, [threadId]: updatedThread }
 		this._storeThread(threadId, updatedThread)
 		this._setState({ allThreads: newThreads })
@@ -3129,6 +3243,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 				...thread,
 				lastModified: new Date().toISOString(),
 				messages: newMessages,
+				messageCount: newMessages.length,
 			};
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread };
 			this._storeAllMessageKeys(threadId, newMessages);
@@ -3166,14 +3281,12 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const slicedMessages = thread.messages.slice(0, messageIdx)
 		const removedMessages = thread.messages.slice(messageIdx)
 		this._deleteMessageKeysFrom(thread.id, messageIdx)
-		this._storeThread(thread.id, { ...thread, messages: slicedMessages })
+		const updatedThread = { ...thread, messages: slicedMessages, messageCount: slicedMessages.length }
+		this._storeThread(thread.id, updatedThread)
 		this._setState({
 			allThreads: {
 				...this.state.allThreads,
-				[thread.id]: {
-					...thread,
-					messages: slicedMessages
-				}
+				[thread.id]: updatedThread
 			}
 		})
 
@@ -4029,11 +4142,14 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const { allThreads } = this.state
 		const oldThread = allThreads[threadId]
 		if (!oldThread) return // should never happen
-		const msgIdx = oldThread.messages.length
+		// Use messageCount for the storage index (accounts for gaps from
+		// deleted checkpoints). Falls back to messages.length for old threads.
+		const msgIdx = oldThread.messageCount ?? oldThread.messages.length
 		const updatedThread = {
 			...oldThread,
 			lastModified: new Date().toISOString(),
 			messages: [...oldThread.messages, message],
+			messageCount: msgIdx + 1,
 		}
 		const newThreads = { ...allThreads, [threadId]: updatedThread }
 		// Write individual key for the new message + mark blob for
