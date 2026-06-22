@@ -2568,16 +2568,10 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			if (!widthChanged) {
 				if (isAtBottomRef.current) {
 					scrollToBottom(scrollContainerRef)
-					lastScrollTopRef.current = scrollEl.scrollTop
+				} else {
+					scrollEl.scrollTop += delta
 				}
-				// When not at bottom, do NOT adjust scrollTop. The delta could
-				// be from content below the viewport (e.g. streaming messages
-				// growing, diff blocks rendering), and compensating would push
-				// the viewport down — causing the scroll jump. Changes above
-				// the viewport are rare (code blocks render at final height on
-				// mount with <pre><code>), and the small shift they cause is
-				// far less disruptive than the jumps from below-viewport
-				// compensation.
+				lastScrollTopRef.current = scrollEl.scrollTop
 			}
 		})
 		contentRo.observe(contentEl)
