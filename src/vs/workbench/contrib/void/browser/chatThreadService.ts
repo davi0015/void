@@ -2624,7 +2624,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 			// if there was any change to the str or diffAreaSnapshot, update. rough approximation of equality, oldDiffAreasSnapshot === diffAreasSnapshot is not perfect
 			const voidFileSnapshot = this._editCodeService.getVoidFileSnapshot(URI.file(fsPath))
-			if (oldVoidFileSnapshot === voidFileSnapshot) continue
+			if (oldVoidFileSnapshot && oldVoidFileSnapshot.entireFileCode === voidFileSnapshot.entireFileCode) continue
 			voidFileSnapshotOfURI[fsPath] = voidFileSnapshot
 		}
 
