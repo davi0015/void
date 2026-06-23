@@ -1245,7 +1245,6 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		const attachImages = opts?.supportsVision === true
 
 		for (const m of chatMessages) {
-			if (m.role === 'checkpoint') continue
 			if (m.role === 'interrupted_streaming_tool') continue
 			if (m.role === 'assistant') {
 				simpleLLMMessages.push({
@@ -1399,7 +1398,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			let llmBoundary = 0
 			for (let ci = 0; ci < Math.min(manualCompaction.boundaryIdx, chatMessages.length); ci++) {
 				const role = chatMessages[ci].role
-				if (role !== 'checkpoint' && role !== 'interrupted_streaming_tool') {
+				if (role !== 'interrupted_streaming_tool') {
 					llmBoundary++
 				}
 			}

@@ -86,10 +86,13 @@ export type DecorativeCanceledTool = {
 }
 
 
-// checkpoints
+// checkpoints — separate from chat messages. Each checkpoint records
+// `messageIdx` = the number of messages that existed when it was created,
+// meaning "after message[messageIdx-1], before message[messageIdx]".
 export type CheckpointEntry = {
 	role: 'checkpoint';
 	type: 'user_edit' | 'tool_edit';
+	messageIdx: number;
 	voidFileSnapshotOfURI: { [fsPath: string]: VoidFileSnapshot | undefined };
 
 	userModifications: {
@@ -138,7 +141,6 @@ export type ChatMessage =
 	}
 	| ToolMessage<ToolName>
 	| DecorativeCanceledTool
-	| CheckpointEntry
 
 
 // one of the square items that indicates a selection in a chat bubble

@@ -1366,7 +1366,7 @@ export const SelectedFiles = (
 
 
 
-const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, currCheckpointIdx, _scrollToBottom, isReadOnly }: { chatMessage: ChatMessage & { role: 'user' }, messageIdx: number, currCheckpointIdx: number | undefined, isCheckpointGhost: boolean, _scrollToBottom: (() => void) | null, isReadOnly: boolean }) => {
+const UserMessageComponent = ({ chatMessage, messageIdx, /* isCheckpointGhost, */ _scrollToBottom, isReadOnly }: { chatMessage: ChatMessage & { role: 'user' }, messageIdx: number, /* isCheckpointGhost: boolean, */ _scrollToBottom: (() => void) | null, isReadOnly: boolean }) => {
 
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
@@ -1555,14 +1555,14 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 		</VoidChatArea>
 	}
 
-	const isMsgAfterCheckpoint = currCheckpointIdx !== undefined && currCheckpointIdx === messageIdx - 1
+	// checkpoint disabled — see checkpoint-storage-refactor.md
+	// const isMsgAfterCheckpoint = currCheckpointIdx !== undefined && currCheckpointIdx === messageIdx
 
 	// Rule-change chip. Rendered above the user bubble when `.voidrules` was
 	// edited between this send and the previous one on the same thread. Set by
 	// `chatThreadService._addUserMessageAndStreamResponse` at message creation
 	// time; see `getCurrentVoidRulesContent` and `thread.lastAppliedRules` for
-	// the detection logic. Dimmed along with the bubble when the message is on
-	// the far side of the current checkpoint so the visual grouping matches.
+	// the detection logic.
 	const rulesChangedBefore = !!chatMessage.rulesChangedBefore
 
 	return <>
@@ -1570,7 +1570,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
 			<div
 				className={`
 					self-end flex items-center gap-1 text-xs text-void-fg-3 opacity-80 mb-1 mr-1
-					${isCheckpointGhost && !isMsgAfterCheckpoint ? 'opacity-50' : ''}
+					${/* isCheckpointGhost && !isMsgAfterCheckpoint ? 'opacity-50' : '' */ ''}
 				`}
 				data-tooltip-id='void-tooltip'
 				data-tooltip-content='Your .voidrules changed before this message. The new rules apply from here onwards.'
@@ -1587,8 +1587,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, isCheckpointGhost, curr
         ${mode === 'edit' ? 'w-full max-w-full'
 					: mode === 'display' ? `self-end w-fit max-w-full whitespace-pre-wrap` : '' // user words should be pre
 				}
-
-        ${isCheckpointGhost && !isMsgAfterCheckpoint ? 'opacity-50 pointer-events-none' : ''}
+        ${/* isCheckpointGhost && !isMsgAfterCheckpoint ? 'opacity-50 pointer-events-none' : '' */ ''}
     `}
 			onMouseEnter={() => setIsHovered(true)}
 			onMouseLeave={() => setIsHovered(false)}
@@ -1719,7 +1718,7 @@ marker:text-inherit
 		{children}
 	</div>
 }
-const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted, messageIdx }: { chatMessage: ChatMessage & { role: 'assistant' }, isCheckpointGhost: boolean, messageIdx: number, isCommitted: boolean }) => {
+const AssistantMessageComponent = ({ chatMessage, /* isCheckpointGhost, */ isCommitted, messageIdx }: { chatMessage: ChatMessage & { role: 'assistant' }, /* isCheckpointGhost: boolean, */ messageIdx: number, isCommitted: boolean }) => {
 
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
@@ -1758,7 +1757,7 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 	return <>
 		{/* reasoning token — always mounted during streaming to avoid reflow on transition */}
 		{hasReasoning &&
-			<div className={`${isCheckpointGhost ? 'opacity-50' : ''}`}>
+			<div className={`${/* isCheckpointGhost ? 'opacity-50' : '' */ ''}`}>
 				<ReasoningWrapper isDoneReasoning={isDoneReasoning} isStreaming={!isCommitted}>
 					<SmallProseWrapper>
 						<ChatMarkdownRender
@@ -1774,7 +1773,7 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 		}
 
 		{(chatMessage.displayContent || !isCommitted) &&
-			<div className={`${isCheckpointGhost ? 'opacity-50' : ''}`} style={!chatMessage.displayContent ? { display: 'none' } : undefined}>
+			<div className={`${/* isCheckpointGhost ? 'opacity-50' : '' */ ''}`} style={!chatMessage.displayContent ? { display: 'none' } : undefined}>
 				<ProseWrapper>
 					<ChatMarkdownRender
 						string={chatMessage.displayContent || ''}
@@ -1788,7 +1787,7 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 		}
 
 		{showTruncationWarning &&
-			<div className={`${isCheckpointGhost ? 'opacity-50' : ''} mt-1`}>
+			<div className={`${/* isCheckpointGhost ? 'opacity-50' : '' */ ''} mt-1`}>
 				<WarningBox text={truncationWarningText} />
 			</div>
 		}
@@ -1900,48 +1899,28 @@ const ReadOnlyForeignThreadBanner = ({ ownerLabel, isUnscoped, threadId }: { own
 	)
 }
 
-const Checkpoint = ({ message, threadId, messageIdx, isCheckpointGhost, threadIsRunning }: { message: CheckpointEntry, threadId: string; messageIdx: number, isCheckpointGhost: boolean, threadIsRunning: boolean }) => {
-	const accessor = useAccessor()
-	const chatThreadService = accessor.get('IChatThreadService')
-
-	const isRunning = useStreamRunningState(threadId)
-	const anyThreadRunning = useAnyThreadRunning()
-	const isDisabled = useMemo(() => {
-		if (isRunning) return true
-		return anyThreadRunning
-	}, [isRunning, anyThreadRunning])
-
-	return <div
-		className={`flex items-center justify-center px-2 `}
-	>
-		<div
-			className={`
-                    text-xs
-                    text-void-fg-3
-                    select-none
-                    ${isCheckpointGhost ? 'opacity-50' : 'opacity-100'}
-					${isDisabled ? 'cursor-default' : 'cursor-pointer'}
-                `}
-			style={{ position: 'relative', display: 'inline-block' }} // allow absolute icon
-			onClick={() => {
-				if (threadIsRunning) return
-				if (isDisabled) return
-				chatThreadService.jumpToCheckpointBeforeMessageIdx({
-					threadId,
-					messageIdx,
-					jumpToUserModified: messageIdx === (chatThreadService.state.allThreads[threadId]?.messages.length ?? 0) - 1
-				})
-			}}
-			{...isDisabled ? {
-				'data-tooltip-id': 'void-tooltip',
-				'data-tooltip-content': `Disabled ${isRunning ? 'when running' : 'because another thread is running'}`,
-				'data-tooltip-place': 'top',
-			} : {}}
-		>
-			Checkpoint
-		</div>
-	</div>
-}
+// checkpoint disabled — see checkpoint-storage-refactor.md
+// const Checkpoint = ({ message, threadId, messageIdx, isCheckpointGhost, threadIsRunning }: { message: CheckpointEntry, threadId: string; messageIdx: number, isCheckpointGhost: boolean, threadIsRunning: boolean }) => {
+// 	const accessor = useAccessor()
+// 	const chatThreadService = accessor.get('IChatThreadService')
+// 	const isRunning = useStreamRunningState(threadId)
+// 	const anyThreadRunning = useAnyThreadRunning()
+// 	const isDisabled = useMemo(() => {
+// 		if (isRunning) return true
+// 		return anyThreadRunning
+// 	}, [isRunning, anyThreadRunning])
+// 	return <div className={`flex items-center justify-center px-2 `}>
+// 		<div className={`text-xs text-void-fg-3 select-none ${isCheckpointGhost ? 'opacity-50' : 'opacity-100'} ${isDisabled ? 'cursor-default' : 'cursor-pointer'}`}
+// 			style={{ position: 'relative', display: 'inline-block' }}
+// 			onClick={() => {
+// 				if (threadIsRunning) return
+// 				if (isDisabled) return
+// 				chatThreadService.jumpToCheckpointBeforeMessageIdx({ threadId, messageIdx, jumpToUserModified: messageIdx === (chatThreadService.state.allThreads[threadId]?.messages.length ?? 0) - 1 })
+// 			}}
+// 			{...isDisabled ? { 'data-tooltip-id': 'void-tooltip', 'data-tooltip-content': `Disabled ${isRunning ? 'when running' : 'because another thread is running'}`, 'data-tooltip-place': 'top' } : {}}
+// 		>Checkpoint</div>
+// 	</div>
+// }
 
 
 type ChatBubbleMode = 'display' | 'edit'
@@ -1951,7 +1930,7 @@ type ChatBubbleProps = {
 	isCommitted: boolean,
 	chatIsRunning: IsRunningType,
 	threadId: string,
-	currCheckpointIdx: number | undefined,
+	// currCheckpointIdx: number | undefined, // checkpoint disabled — see checkpoint-storage-refactor.md
 	_scrollToBottom: (() => void) | null,
 	// Phase E commit 4 — true when this thread is foreign to the current
 	// workspace and `editUserMessageAndStreamResponse` would be blocked at
@@ -1976,11 +1955,12 @@ const ChatBubble = React.memo((props: ChatBubbleProps) => {
 	</ErrorBoundary>
 })
 
-const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, messageIdx, chatIsRunning, _scrollToBottom, firstPendingToolRequestIdx, threadIsReadOnly, compactionBoundaryIdx }: ChatBubbleProps) => {
+const _ChatBubble = ({ threadId, chatMessage, /* currCheckpointIdx, */ isCommitted, messageIdx, chatIsRunning, _scrollToBottom, firstPendingToolRequestIdx, threadIsReadOnly, compactionBoundaryIdx }: ChatBubbleProps) => {
 
 	const role = chatMessage.role
 
-	const isCheckpointGhost = messageIdx > (currCheckpointIdx ?? Infinity) && !chatIsRunning // whether to show as gray (if chat is running, for good measure just dont show any ghosts)
+	// checkpoint disabled — see checkpoint-storage-refactor.md
+	// const isCheckpointGhost = messageIdx > (currCheckpointIdx ?? Infinity) && !chatIsRunning
 	const isCompactedMessage = compactionBoundaryIdx !== undefined && messageIdx < compactionBoundaryIdx
 	const showCompactionDivider = compactionBoundaryIdx !== undefined && messageIdx === compactionBoundaryIdx
 
@@ -1998,8 +1978,8 @@ const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, me
 	if (role === 'user') {
 		return <>{compactionDivider}<UserMessageComponent
 			chatMessage={chatMessage}
-			isCheckpointGhost={isCheckpointGhost}
-			currCheckpointIdx={currCheckpointIdx}
+			/* isCheckpointGhost={isCheckpointGhost} */
+			/* currCheckpointIdx={currCheckpointIdx} */
 			messageIdx={messageIdx}
 			_scrollToBottom={_scrollToBottom}
 			isReadOnly={threadIsReadOnly || isCompactedMessage}
@@ -2008,7 +1988,7 @@ const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, me
 	else if (role === 'assistant') {
 		return <>{compactionDivider}<AssistantMessageComponent
 			chatMessage={chatMessage}
-			isCheckpointGhost={isCheckpointGhost}
+			/* isCheckpointGhost={isCheckpointGhost} */
 			messageIdx={messageIdx}
 			isCommitted={isCommitted}
 		/></>
@@ -2016,7 +1996,7 @@ const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, me
 	else if (role === 'tool') {
 
 		if (chatMessage.type === 'invalid_params') {
-			return <div className={`${isCheckpointGhost ? 'opacity-50' : ''}`}>
+			return <div className={`${/* isCheckpointGhost ? 'opacity-50' : '' */ ''}`}>
 				<InvalidTool toolName={chatMessage.name} message={chatMessage.content} mcpServerName={chatMessage.mcpServerName} />
 			</div>
 		}
@@ -2028,7 +2008,7 @@ const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, me
 
 		if (ToolResultWrapper)
 			return <>
-				<div className={`${isCheckpointGhost ? 'opacity-50' : ''}`}>
+				<div className={`${/* isCheckpointGhost ? 'opacity-50' : '' */ ''}`}>
 					<ErrorBoundary fallback={
 						<div className='w-full border border-void-border-3 rounded px-2 py-1 bg-void-bg-3'>
 							<div className='flex items-center gap-x-2 min-h-[24px]'>
@@ -2046,7 +2026,7 @@ const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, me
 					</ErrorBoundary>
 				</div>
 				{chatMessage.type === 'tool_request' && messageIdx === firstPendingToolRequestIdx ?
-					<div className={`${isCheckpointGhost ? 'opacity-50 pointer-events-none' : ''}`}>
+					<div className={`${/* isCheckpointGhost ? 'opacity-50 pointer-events-none' : '' */ ''}`}>
 						<ToolRequestAcceptRejectButtons toolName={chatMessage.name} />
 					</div> : null}
 			</>
@@ -2054,19 +2034,9 @@ const _ChatBubble = ({ threadId, chatMessage, currCheckpointIdx, isCommitted, me
 	}
 
 	else if (role === 'interrupted_streaming_tool') {
-		return <div className={`${isCheckpointGhost ? 'opacity-50' : ''}`}>
+		return <div className={`${/* isCheckpointGhost ? 'opacity-50' : '' */ ''}`}>
 			<CanceledTool toolName={chatMessage.name} mcpServerName={chatMessage.mcpServerName} />
 		</div>
-	}
-
-	else if (role === 'checkpoint') {
-		return <Checkpoint
-			threadId={threadId}
-			message={chatMessage}
-			messageIdx={messageIdx}
-			isCheckpointGhost={isCheckpointGhost}
-			threadIsRunning={!!chatIsRunning}
-		/>
 	}
 
 }
@@ -2393,6 +2363,8 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	const chatThreadsService = accessor.get('IChatThreadService')
 	const currentWorkspaceUri = useCurrentWorkspaceUri()
 	const previousMessages = thread?.messages ?? []
+	// checkpoint disabled — see checkpoint-storage-refactor.md
+	// const checkpointsOfMessageIdx: { [messageIdx: number]: CheckpointEntry[] } = {}
 	// Phase E commit 4 — propagated to each user-message bubble so the in-
 	// bubble pencil and click-to-edit path agree with the input-area gating
 	// in `SidebarChat`. Computed here (rather than in `_ChatBubble`) to
@@ -2420,7 +2392,8 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		prevIsRunningRef.current = !!isRunning
 	}, [isRunning])
 
-	const currCheckpointIdx = thread?.state?.currCheckpointIdx ?? undefined
+	// checkpoint disabled — see checkpoint-storage-refactor.md
+	// const currCheckpointIdx = undefined as number | undefined
 
 
 	// Index of the "currently awaiting approval" tool request — the earliest of the
@@ -2800,7 +2773,8 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	// Incremental JSX cache for the mounted slice. When only messages are
 	// appended (streaming commit) and mountStart hasn't changed, reuse
 	// existing elements and only createElement for the new ones.
-	const prevMsgCacheRef = useRef<{ html: React.ReactNode[], len: number, mountStart: number, msgs: typeof previousMessages, threadId: string, checkpointIdx: typeof currCheckpointIdx, scrollCb: typeof scrollToBottomCb, pendingIdx: typeof firstPendingToolRequestIdx, readOnly: boolean, compactBoundary: typeof compactionBoundaryIdx } | null>(null)
+	// checkpoint disabled — see checkpoint-storage-refactor.md
+	const prevMsgCacheRef = useRef<{ html: React.ReactNode[], len: number, mountStart: number, msgs: typeof previousMessages, threadId: string, /* checkpointIdx: typeof currCheckpointIdx, */ scrollCb: typeof scrollToBottomCb, pendingIdx: typeof firstPendingToolRequestIdx, readOnly: boolean, compactBoundary: typeof compactionBoundaryIdx } | null>(null)
 
 	const previousMessagesHTML = (() => {
 		const cache = prevMsgCacheRef.current
@@ -2808,7 +2782,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			&& cache.threadId === threadId
 			&& cache.msgs === previousMessages
 			&& cache.mountStart === mountStart
-			&& cache.checkpointIdx === currCheckpointIdx
+			/* && cache.checkpointIdx === currCheckpointIdx */
 			&& cache.scrollCb === scrollToBottomCb
 			&& cache.pendingIdx === firstPendingToolRequestIdx
 			&& cache.readOnly === threadIsReadOnly
@@ -2822,9 +2796,11 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		if (depsMatch && previousMessages.length > cache.len) {
 			const newElements: React.ReactNode[] = []
 			for (let i = cache.len; i < previousMessages.length; i++) {
+				// const cps = checkpointsOfMessageIdx[i] // checkpoint disabled
+				// if (cps) for (const cp of cps) newElements.push(<Checkpoint key={`cp-${i}-${cps.indexOf(cp)}`} threadId={threadId} message={cp} messageIdx={i} isCheckpointGhost={i > (currCheckpointIdx ?? Infinity)} threadIsRunning={!!isRunning} />)
 				newElements.push(<ChatBubble
 					key={i}
-					currCheckpointIdx={currCheckpointIdx}
+					/* currCheckpointIdx={currCheckpointIdx} */
 					chatMessage={previousMessages[i]}
 					messageIdx={i}
 					isCommitted={true}
@@ -2836,6 +2812,13 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					compactionBoundaryIdx={compactionBoundaryIdx}
 				/>)
 			}
+			// checkpoint disabled — trailing checkpoints
+			// if (cache.len === previousMessages.length) {
+			// 	const trailingCps = checkpointsOfMessageIdx[previousMessages.length]
+			// 	if (trailingCps) for (let j = 0; j < trailingCps.length; j++) {
+			// 		newElements.push(<Checkpoint key={`cp-${previousMessages.length}-${j}`} threadId={threadId} message={trailingCps[j]} messageIdx={previousMessages.length} isCheckpointGhost={(previousMessages.length) > (currCheckpointIdx ?? Infinity)} threadIsRunning={!!isRunning} />)
+			// 	}
+			// }
 			const merged = [...cache.html, ...newElements]
 			cache.html = merged
 			cache.len = previousMessages.length
@@ -2847,7 +2830,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		// at the edges instead of rebuilding everything. Keys stay the same
 		// for existing elements so React skips reconciliation on them.
 		const c = cache
-		if (c && c.msgs === previousMessages && previousMessages.length === c.len) {
+		if (c && c.msgs === previousMessages && previousMessages.length === c.len /* && c.checkpointIdx === currCheckpointIdx */) {
 			const oldStart = c.mountStart
 			const newStart = mountStart
 			if (oldStart === newStart) {
@@ -2862,9 +2845,11 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				// Scrolled up — prepend new elements at the front
 				const prefix: React.ReactNode[] = []
 				for (let i = newStart; i < oldStart; i++) {
+					// const cps = checkpointsOfMessageIdx[i] // checkpoint disabled
+					// if (cps) for (let j = 0; j < cps.length; j++) prefix.push(<Checkpoint key={`cp-${i}-${j}`} threadId={threadId} message={cps[j]} messageIdx={i} isCheckpointGhost={i > (currCheckpointIdx ?? Infinity)} threadIsRunning={!!isRunning} />)
 					prefix.push(<ChatBubble
 						key={i}
-						currCheckpointIdx={currCheckpointIdx}
+						/* currCheckpointIdx={currCheckpointIdx} */
 						chatMessage={previousMessages[i]}
 						messageIdx={i}
 						isCommitted={true}
@@ -2886,10 +2871,12 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		// Full rebuild: msgs reference changed (e.g. compaction, checkpoint)
 		const result: React.ReactNode[] = []
 		for (let i = mountStart; i < previousMessages.length; i++) {
-			result.push(<ChatBubble
-				key={i}
-				currCheckpointIdx={currCheckpointIdx}
-				chatMessage={previousMessages[i]}
+			// const cps = checkpointsOfMessageIdx[i] // checkpoint disabled
+			// if (cps) for (let j = 0; j < cps.length; j++) result.push(<Checkpoint key={`cp-${i}-${j}`} threadId={threadId} message={cps[j]} messageIdx={i} isCheckpointGhost={i > (currCheckpointIdx ?? Infinity)} threadIsRunning={!!isRunning} />)
+		result.push(<ChatBubble
+			key={i}
+			/* currCheckpointIdx={currCheckpointIdx} */
+			chatMessage={previousMessages[i]}
 				messageIdx={i}
 				isCommitted={true}
 				chatIsRunning={undefined}
@@ -2900,8 +2887,13 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				compactionBoundaryIdx={compactionBoundaryIdx}
 			/>)
 		}
+		// checkpoint disabled — trailing checkpoints
+		// const trailingCps = checkpointsOfMessageIdx[previousMessages.length]
+		// if (trailingCps) for (let j = 0; j < trailingCps.length; j++) {
+		// 	result.push(<Checkpoint key={`cp-${previousMessages.length}-${j}`} threadId={threadId} message={trailingCps[j]} messageIdx={previousMessages.length} isCheckpointGhost={(previousMessages.length) > (currCheckpointIdx ?? Infinity)} threadIsRunning={!!isRunning} />)
+		// }
 
-		prevMsgCacheRef.current = { html: result, len: previousMessages.length, mountStart, msgs: previousMessages, threadId, checkpointIdx: currCheckpointIdx, scrollCb: scrollToBottomCb, pendingIdx: firstPendingToolRequestIdx, readOnly: threadIsReadOnly, compactBoundary: compactionBoundaryIdx }
+		prevMsgCacheRef.current = { html: result, len: previousMessages.length, mountStart, msgs: previousMessages, threadId, /* checkpointIdx: currCheckpointIdx, */ scrollCb: scrollToBottomCb, pendingIdx: firstPendingToolRequestIdx, readOnly: threadIsReadOnly, compactBoundary: compactionBoundaryIdx }
 		return result
 	})()
 
@@ -3003,7 +2995,7 @@ const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOn
 	const streamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
 		<ChatBubble
 			key={streamingChatIdx}
-			currCheckpointIdx={undefined}
+			/* currCheckpointIdx={undefined} */
 			chatMessage={{
 				role: 'assistant',
 				displayContent: displayContentSoFar ?? '',
@@ -3325,7 +3317,8 @@ export const SidebarChat = () => {
 	const keybindingString = accessor.get('IKeybindingService').lookupKeybinding(VOID_CTRL_L_ACTION_ID)?.getLabel()
 
 	const threadId = currentThread.id
-	const currCheckpointIdx = chatThreadsState.allThreads[threadId]?.state?.currCheckpointIdx ?? undefined  // if not exist, treat like checkpoint is last message (infinity)
+	// checkpoint disabled — see checkpoint-storage-refactor.md
+	// const currCheckpointIdx = chatThreadsState.allThreads[threadId]?.state?.currCheckpointIdx ?? undefined
 
 
 

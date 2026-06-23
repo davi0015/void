@@ -940,8 +940,6 @@ export class ToolsService implements IToolsService {
 						const paramsStr = JSON.stringify(msg.rawParams ?? {}).slice(0, 300)
 						const resultStr = ('result' in msg ? (typeof msg.result === 'string' ? msg.result : JSON.stringify(msg.result ?? {})) : '(no result yet)').slice(0, 500)
 						return `${prefix} [TOOL:${msg.name} type=${msg.type}]: params=${paramsStr}\n  result=${resultStr}`
-					} else if (msg.role === 'checkpoint') {
-						return `${prefix} [CHECKPOINT]`
 					} else if (msg.role === 'interrupted_streaming_tool') {
 						return `${prefix} [INTERRUPTED:${msg.name}]`
 					} else {
