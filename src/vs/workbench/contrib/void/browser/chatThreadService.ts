@@ -1168,11 +1168,18 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// After removal, old checkpoint entries will be silently included as
 		// messages (harmless — no code creates them anymore).
 		let writeIdx = 0
+		let lastIdx = -1
+		let checkpointsBeforeBoundary = 0
+		const oldCompactionBoundaryIdx = metadataParsed.compactionBoundaryIdx
 		for (let i = 0; ; i++) {
 			const msgRaw = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
 			if (msgRaw === undefined) break
+			lastIdx = i
 			const msg = JSON.parse(msgRaw, ChatThreadService._storageReviver) as any
-			if (msg.role === 'checkpoint') continue // discard old checkpoint data
+			if (msg.role === 'checkpoint') {
+				if (oldCompactionBoundaryIdx !== undefined && i < oldCompactionBoundaryIdx) checkpointsBeforeBoundary++
+				continue // discard old checkpoint data
+			}
 			if (writeIdx !== i) {
 				this._storageService.store(MESSAGE_KEY_PREFIX + threadId + '.' + writeIdx, JSON.stringify(msg), StorageScope.APPLICATION, StorageTarget.USER)
 				this._storageService.remove(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
@@ -1180,11 +1187,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			messages.push(msg)
 			writeIdx++
 		}
-		// Delete any remaining keys after compaction
-		for (let i = writeIdx; ; i++) {
+		// Delete any remaining keys after compaction (writeIdx to lastIdx).
+		// Don't break on undefined — compaction creates gaps where keys were
+		// moved. Scan the full range to catch leftover checkpoint keys.
+		for (let i = writeIdx; i <= lastIdx; i++) {
 			const key = MESSAGE_KEY_PREFIX + threadId + '.' + i
-			if (this._storageService.get(key, StorageScope.APPLICATION) === undefined) break
-			this._storageService.remove(key, StorageScope.APPLICATION)
+			if (this._storageService.get(key, StorageScope.APPLICATION) !== undefined) {
+				this._storageService.remove(key, StorageScope.APPLICATION)
+			}
 		}
 
 		// checkpoint disabled — delete any old checkpoint keys
@@ -1193,6 +1203,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const checkpointKey = CHECKPOINT_KEY_PREFIX + threadId + '.' + i
 			if (this._storageService.get(checkpointKey, StorageScope.APPLICATION) === undefined) break
 			this._storageService.remove(checkpointKey, StorageScope.APPLICATION)
+		}
+
+		// Remap compactionBoundaryIdx — message indices shifted during compaction
+		// (checkpoints removed before the boundary). Only works for threads that
+		// still have checkpoints in storage. Already-migrated threads can't be
+		// remapped (checkpoints gone), but the LLM code clamps via Math.min.
+		if (oldCompactionBoundaryIdx !== undefined && checkpointsBeforeBoundary > 0) {
+			metadataParsed.compactionBoundaryIdx = oldCompactionBoundaryIdx - checkpointsBeforeBoundary
+			this._storageService.store(THREAD_KEY_PREFIX + threadId, JSON.stringify(metadataParsed), StorageScope.APPLICATION, StorageTarget.USER)
 		}
 
 		// Ensure state exists (may be missing if metadata was written by
