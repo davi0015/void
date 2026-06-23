@@ -1162,18 +1162,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// const checkpoints: CheckpointEntry[] = []
 
 		// @deprecated Migration 2: old per-message format. Checkpoints were
-		// stored inline in void.chatMsg.* keys. Read sequentially, discard old
-		// checkpoint data, compact indices. Safe to remove once all users have
+		// stored inline in void.chatMsg.* keys. Read all keys, skip gaps (from
+		// old deleted messages/checkpoints) and discard old checkpoint entries,
+		// compact to contiguous indices. Safe to remove once all users have
 		// migrated (check: no threads with checkpoint entries in message keys).
-		// After removal, old checkpoint entries will be silently included as
-		// messages (harmless — no code creates them anymore).
 		let writeIdx = 0
 		let lastIdx = -1
 		let checkpointsBeforeBoundary = 0
 		const oldCompactionBoundaryIdx = metadataParsed.compactionBoundaryIdx
-		for (let i = 0; ; i++) {
+		// Old threads may have gaps in key indices (from previous deletes).
+		// Loop up to a generous limit and skip gaps instead of breaking.
+		for (let i = 0; i < 100000; i++) {
 			const msgRaw = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
-			if (msgRaw === undefined) break
+			if (msgRaw === undefined) continue
 			lastIdx = i
 			const msg = JSON.parse(msgRaw, ChatThreadService._storageReviver) as any
 			if (msg.role === 'checkpoint') {
