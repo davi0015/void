@@ -809,7 +809,7 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 			componentParams.info = persistentTerminalNameOfId(toolMessage.params.persistentTerminalId)
 		}
 
-		componentParams.children = <ToolChildrenWrapper className='whitespace-pre text-nowrap overflow-auto text-sm'>
+		componentParams.children = <ToolChildrenWrapper className='whitespace-pre text-nowrap overflow-auto text-sm max-h-[300px] overflow-y-auto'>
 			<div className='!select-text cursor-auto'>
 				<pre className='m-0 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto text-void-fg-2'>{msg.trim()}</pre>
 			</div>
@@ -831,7 +831,7 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 	}
 
 	return <>
-		<ToolHeaderWrapper {...componentParams} isOpen={type === 'run_command' && toolMessage.type === 'running_now' ? true : undefined} />
+		<ToolHeaderWrapper {...componentParams} isOpen={type === 'run_command' && (toolMessage.type === 'running_now' || toolMessage.type === 'success') ? true : undefined} />
 	</>
 }
 
