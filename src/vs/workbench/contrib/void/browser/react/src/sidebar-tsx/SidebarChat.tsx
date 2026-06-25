@@ -28,7 +28,7 @@ import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, Too
 import { generateUuid } from '../../../../../../../base/common/uuid.js';
 import { VSBuffer } from '../../../../../../../base/common/buffer.js';
 import { joinPath } from '../../../../../../../base/common/resources.js';
-import type { ToolName } from '../../../../common/toolsServiceTypes.js';
+import { approvalTypeOfBuiltinToolName, type ToolName } from '../../../../common/toolsServiceTypes.js';
 import { IconShell1, StatusIndicator } from '../markdown/ApplyBlockHoverButtons.js';
 import { IsRunningType, isThreadReadOnly, shouldShowOwnershipBanner } from '../../../chatThreadService.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
@@ -2025,9 +2025,10 @@ const _ChatBubble = ({ threadId, chatMessage, /* currCheckpointIdx, */ isCommitt
 						/>
 					</ErrorBoundary>
 				</div>
-				{chatMessage.type === 'tool_request' && messageIdx === firstPendingToolRequestIdx ?
+				{chatMessage.type === 'tool_request' && messageIdx === firstPendingToolRequestIdx
+					&& (isABuiltinToolName(chatMessage.name) ? !!approvalTypeOfBuiltinToolName[chatMessage.name] : true) ?
 					<div className={`${/* isCheckpointGhost ? 'opacity-50 pointer-events-none' : '' */ ''}`}>
-						<ToolRequestAcceptRejectButtons toolName={chatMessage.name} />
+						<ToolRequestAcceptRejectButtons toolName={chatMessage.name} threadId={threadId} toolId={chatMessage.id} params={chatMessage.params} />
 					</div> : null}
 			</>
 		return null

@@ -13,7 +13,7 @@ import { VoidDiffEditor } from '../util/inputs.js';
 import { extractSearchReplaceBlocks } from '../../../../common/helpers/extractCodeFromResult.js';
 import { AlertTriangle, Ban, ChevronRight, CircleEllipsis } from 'lucide-react';
 import { ChatMessage, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
-import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, LintErrorItem, ToolName } from '../../../../common/toolsServiceTypes.js';
+import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, LintErrorItem, normalizeAutoApproveMode, ToolCallParams, ToolName } from '../../../../common/toolsServiceTypes.js';
 import { Edit } from '../../../../common/editCodeServiceTypes.js';
 import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE } from '../../../../common/prompt/prompts.js';
 import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
@@ -581,28 +581,57 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 	}
 }
 
-export const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolName }) => {
+export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, params }: { toolName: ToolName, threadId: string, toolId: string, params?: ToolCallParams<ToolName> }) => {
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
 	const metricsService = accessor.get('IMetricsService')
 	const voidSettingsService = accessor.get('IVoidSettingsService')
 	const voidSettingsState = useSettingsState()
+	const workspaceContextService = accessor.get('IWorkspaceContextService')
+
+	// Terminal tools use per-tool approve/reject (concurrent execution).
+	// Non-terminal tools use the serial approve-latest/reject-latest path.
+	const approvalType = isABuiltinToolName(toolName) ? approvalTypeOfBuiltinToolName[toolName] : 'MCP tools'
+	const isTerminal = approvalType === 'terminal'
+
+	// Don't render the button if this tool will be auto-approved anyway.
+	// This prevents a race condition where the button flashes for tools that
+	// will run immediately when the batch processor reaches them.
+	if (approvalType) {
+		const mode = normalizeAutoApproveMode(voidSettingsState.globalSettings.autoApprove[approvalType])
+		if (mode === 'all') return null
+		if (mode === 'workspace' && approvalIsWorkspaceScoped(approvalType) && params) {
+			const p = params as { uri?: URI, sourceUri?: URI, targetUri?: URI }
+			const uris = [p.uri, p.sourceUri, p.targetUri].filter((u): u is URI => !!u)
+			if (uris.length > 0 && uris.every(u => workspaceContextService.isInsideWorkspace(u))) return null
+		}
+		// 'workspace' for non-workspace-scoped tiers (terminal, MCP) === 'all'
+		if (mode === 'workspace' && !approvalIsWorkspaceScoped(approvalType)) return null
+	}
 
 	const onAccept = useCallback(() => {
-		try { // this doesn't need to be wrapped in try/catch anymore
-			const threadId = chatThreadsService.state.currentThreadId
-			chatThreadsService.approveLatestToolRequest(threadId)
+		try {
+			const tid = chatThreadsService.state.currentThreadId
+			if (isTerminal) {
+				chatThreadsService.approveToolRequest(tid, toolId)
+			} else {
+				chatThreadsService.approveLatestToolRequest(tid)
+			}
 			metricsService.capture('Tool Request Accepted', {})
 		} catch (e) { console.error('Error while approving message in chat:', e) }
-	}, [chatThreadsService, metricsService])
+	}, [chatThreadsService, metricsService, isTerminal, toolId])
 
 	const onReject = useCallback(() => {
 		try {
-			const threadId = chatThreadsService.state.currentThreadId
-			chatThreadsService.rejectLatestToolRequest(threadId)
+			const tid = chatThreadsService.state.currentThreadId
+			if (isTerminal) {
+				chatThreadsService.rejectToolRequest(tid, toolId)
+			} else {
+				chatThreadsService.rejectLatestToolRequest(tid)
+			}
 		} catch (e) { console.error('Error while approving message in chat:', e) }
 		metricsService.capture('Tool Request Rejected', {})
-	}, [chatThreadsService, metricsService])
+	}, [chatThreadsService, isTerminal, toolId])
 
 	const approveButton = (
 		<button
@@ -636,11 +665,15 @@ export const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolNam
 		</button>
 	)
 
-	const approvalType = isABuiltinToolName(toolName) ? approvalTypeOfBuiltinToolName[toolName] : 'MCP tools'
 	const approvalToggle = approvalType ? <div key={approvalType} className="flex items-center ml-2 gap-x-1">
 		<ToolApprovalTypeSwitch size='xs' approvalType={approvalType} desc={`Auto-approve ${approvalType}`} />
 	</div> : null
 
+	// The buttons are always visible for the first pending tool_request. The
+	// service-layer guard in approveLatestToolRequest/approveToolRequest
+	// (isRunning !== 'awaiting_user') prevents premature execution — if the
+	// user clicks while a tool is still running, the guard silently blocks it.
+	// This avoids the button disappearing for 2s during lint checks after edits.
 	return <div className="flex gap-2 mx-0.5 items-center">
 		{approveButton}
 		{cancelButton}

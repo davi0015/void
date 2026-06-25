@@ -550,6 +550,9 @@ export interface IChatThreadService {
 	// approve/reject
 	approveLatestToolRequest(threadId: string): void;
 	rejectLatestToolRequest(threadId: string): void;
+	// Per-tool approve/reject for terminal tools (concurrent execution)
+	approveToolRequest(threadId: string, toolId: string): void;
+	rejectToolRequest(threadId: string, toolId: string): void;
 
 	// checkpoint disabled — see checkpoint-storage-refactor.md
 	// jumpToCheckpointBeforeMessageIdx(opts: { threadId: string, messageIdx: number, jumpToUserModified: boolean }): void;
@@ -600,6 +603,22 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	//    _tryDrainPendingBatch encounters that sibling.
 	private readonly _pendingMergeSiblingIds = new Map<string, string[]>()
 	private readonly _mergedEditToolOutcomes = new Map<string, 'success' | string>()
+	// Concurrent terminal tool execution: tracks how many terminal tools are
+	// currently running concurrently per thread, and their interruptor promises
+	// so abortRunning can interrupt all of them. Terminal tools are independent
+	// (each has its own terminalId) so they can safely run in parallel.
+	private readonly _concurrentRunningCountOfThreadId = new Map<string, number>()
+	private readonly _concurrentInterruptorsOfThreadId = new Map<string, Promise<() => void>[]>()
+	// Prevents double-resume: when a concurrent tool finishes and triggers
+	// _checkAndContinueAfterConcurrentResolution, this flag ensures only one
+	// _runChatAgent call is made even if multiple tools finish in rapid succession.
+	private readonly _concurrentResumeStartedOfThreadId = new Set<string>()
+	// Queued approval: when the user clicks Approve while a tool is still
+	// running (e.g. during the 2s lint wait after edit_file), we remember the
+	// intent here. When _tryDrainPendingBatch reaches the next tool that pauses
+	// for approval, it consumes this flag and auto-approves instead of showing
+	// the button — so the user's click isn't swallowed.
+	private readonly _queuedApprovalOfThreadId = new Set<string>()
 	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
@@ -1763,6 +1782,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	 * not-yet-executed tools in the current batch. The user-facing "awaiting approval"
 	 * tool is always the FIRST of this list (the batch processor runs them in order, so
 	 * any tool before the paused one is already in a terminal state like `success`).
+	 *
+	 * Consecutive trailing is correct even with concurrent terminal execution: tools are
+	 * approved in order, so a `running_now` tool is always before the remaining
+	 * `tool_request` tools in the message list, never between them.
 	 */
 	private _getPendingBatchTools = (threadId: string): (ToolMessage<ToolName> & { type: 'tool_request' })[] => {
 		const messages = this.state.allThreads[threadId]?.messages ?? []
@@ -1828,7 +1851,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	private _tryDrainPendingBatch = async (threadId: string): Promise<'done' | 'awaiting_user' | 'interrupted'> => {
 		while (true) {
 			const pending = this._getPendingBatchTools(threadId)
-			if (pending.length === 0) return 'done'
+			if (pending.length === 0) {
+				// No more pending tools — if concurrent terminal tools are still
+				// running, return 'awaiting_user' so the caller doesn't resume the
+				// agent prematurely. _checkAndContinueAfterConcurrentResolution
+				// (called from each concurrent tool's finally block) will resume
+				// the agent when all concurrent tools finish.
+				if ((this._concurrentRunningCountOfThreadId.get(threadId) ?? 0) > 0)
+					return 'awaiting_user'
+				return 'done'
+			}
 			const next = pending[0]
 
 			// If this tool was already merged into a prior tool, resolve it
@@ -1870,6 +1902,49 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				}
 			}
 
+			// Auto-approved terminal tools fire concurrently instead of being
+			// awaited — the user shouldn't wait for one terminal to finish before
+			// seeing the next tool's approval button. Validation is done here so
+			// invalid params fall through to _runToolCall's error handling.
+			if (isABuiltinToolName(next.name)) {
+				const nextApprovalType = approvalTypeOfBuiltinToolName[next.name]
+				if (nextApprovalType === 'terminal') {
+					const mode = normalizeAutoApproveMode(this._settingsService.state.globalSettings.autoApprove.terminal)
+					// Terminal tools are NOT workspace-scoped, so 'workspace' === 'all'
+					if (mode === 'all' || mode === 'workspace') {
+						try {
+							const validated = this._toolsService.validateParams[next.name](next.rawParams)
+							this._fireConcurrentTerminal(threadId, { ...next, params: validated })
+							continue // immediately process next tool
+						} catch {
+							// Validation failed — fall through to serial _runToolCall
+						}
+					}
+				}
+			}
+
+			// If the user queued an approval while a previous tool was running,
+			// skip the approval pause and run directly. The validated params are
+			// already on the tool_request message (validated when the batch was
+			// pre-added), so we can pass them straight through.
+			if (this._queuedApprovalOfThreadId.has(threadId)) {
+				this._queuedApprovalOfThreadId.delete(threadId)
+				const { interrupted: interruptedQ } = await this._runToolCall(
+					threadId, next.name, next.id, next.mcpServerName,
+					{ preapproved: true, unvalidatedToolParams: mergedParams, rawParamsStr: next.rawParamsStr, validatedParams: next.params }
+				)
+				if (mergedSiblingIds.length > 0) {
+					this._pendingMergeSiblingIds.set(next.id, mergedSiblingIds)
+				}
+				if (!interruptedQ) {
+					this._recordMergedSiblingOutcomes(threadId, next.id)
+				}
+				if (interruptedQ) return 'interrupted'
+				continue
+			}
+
+
+			// Normal flow: validate, check approval, run or pause
 			const { awaitingUserApproval, interrupted } = await this._runToolCall(
 				threadId, next.name, next.id, next.mcpServerName,
 				{ preapproved: false, unvalidatedToolParams: mergedParams, rawParamsStr: next.rawParamsStr }
@@ -1893,6 +1968,20 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (this._isThreadMutationBlocked(threadId, 'approveLatestToolRequest')) return
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
+
+		// Guard: only allow approval when the thread is actually awaiting user
+		// input. Without this, clicking Approve while a tool is still running (the
+		// next pending tool_request is already visible in the UI because all tools
+		// in a batch are pre-added) would start a concurrent _runChatAgent that
+		// bypasses the approval check via `preapproved: true`, causing one Approve
+		// click to run multiple tools.
+		if (this.streamState[threadId]?.isRunning !== 'awaiting_user') {
+			// Queue the approval — the user clicked while a tool is still running
+			// (e.g. during the 2s lint wait after edit_file). When the next tool
+			// pauses for approval, _tryDrainPendingBatch will auto-approve it.
+			this._queuedApprovalOfThreadId.add(threadId)
+			return
+		}
 
 		// In batch mode multiple tool_requests can be pending at the tail of the thread —
 		// the one awaiting approval is the FIRST (tools that already ran have transitioned
@@ -1931,6 +2020,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (resumeAgent && this._isThreadMutationBlocked(threadId, 'rejectLatestToolRequest')) return
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
+
+		// Clear any queued approval — rejecting cancels the intent to approve.
+		this._queuedApprovalOfThreadId.delete(threadId)
+
+		// Guard (user-initiated only): only allow rejection when the thread is
+		// awaiting user input. The abort path (resumeAgent: false) is exempt so
+		// it can clean up stale streams in any state.
+		if (resumeAgent && this.streamState[threadId]?.isRunning !== 'awaiting_user') return
 
 		// Reject-all semantics: if the user rejected any tool in a batch, reject all its
 		// pending siblings too. Partial execution (run 1 and 2, reject 3, continue to 4)
@@ -1980,6 +2077,178 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 	}
 
+	/**
+	 * Approve a specific terminal tool by ID. The tool starts running
+	 * immediately and concurrently with any other already-approved terminal
+	 * tools — the user doesn't have to wait for one terminal to finish before
+	 * approving the next. When all pending tools are resolved (approved +
+	 * finished, or rejected), the agent loop resumes automatically.
+	 */
+	approveToolRequest(threadId: string, toolId: string) {
+		if (this._isThreadMutationBlocked(threadId, 'approveToolRequest')) return
+		// Only allow when awaiting user input (same guard as approveLatestToolRequest)
+		if (this.streamState[threadId]?.isRunning !== 'awaiting_user') return
+
+		const pending = this._getPendingBatchTools(threadId)
+		const tool = pending.find(t => t.id === toolId)
+		if (!tool) return
+
+		this._fireConcurrentTerminal(threadId, tool)
+	}
+
+	/**
+	 * Fire a terminal tool concurrently (fire-and-forget). The tool starts
+	 * running immediately without blocking the batch processor — the next
+	 * pending tool's approval button appears right away. Tracking via the
+	 * counter + interruptor list ensures abortRunning can cancel all running
+	 * terminals, and the agent loop resumes only when all are resolved.
+	 */
+	private _fireConcurrentTerminal(threadId: string, tool: ToolMessage<ToolName> & { type: 'tool_request' }) {
+		const count = (this._concurrentRunningCountOfThreadId.get(threadId) ?? 0) + 1
+		this._concurrentRunningCountOfThreadId.set(threadId, count)
+		this._runConcurrentToolAndCheck(threadId, tool)
+	}
+
+	/**
+	 * Reject a specific terminal tool by ID. Unlike rejectLatestToolRequest
+	 * (which has reject-all semantics), this rejects only the specified tool,
+	 * allowing the user to reject one terminal command while approving others.
+	 */
+	rejectToolRequest(threadId: string, toolId: string) {
+		if (this._isThreadMutationBlocked(threadId, 'rejectToolRequest')) return
+		if (this.streamState[threadId]?.isRunning !== 'awaiting_user') return
+
+		const pending = this._getPendingBatchTools(threadId)
+		const tool = pending.find(t => t.id === toolId)
+		if (!tool) return
+
+		this._updateLatestTool(threadId, {
+			role: 'tool', type: 'rejected',
+			params: tool.params, name: tool.name,
+			content: this.toolErrMsgs.rejected, result: null,
+			id: tool.id, rawParams: tool.rawParams, rawParamsStr: tool.rawParamsStr,
+			mcpServerName: tool.mcpServerName,
+		})
+
+		this._checkAndContinueAfterConcurrentResolution(threadId)
+	}
+
+	/**
+	 * Runs a single concurrently-approved tool, then checks whether the agent
+	 * loop should resume (all tools resolved) or wait (more pending/running).
+	 */
+	private async _runConcurrentToolAndCheck(threadId: string, tool: ToolMessage<ToolName> & { type: 'tool_request' }) {
+		try {
+			const { interrupted } = await this._runToolCall(
+				threadId, tool.name, tool.id, tool.mcpServerName,
+				{
+					preapproved: true,
+					unvalidatedToolParams: tool.rawParams,
+					rawParamsStr: tool.rawParamsStr,
+					validatedParams: tool.params,
+					isConcurrent: true,
+					onInterruptorReady: (p) => {
+						let interruptors = this._concurrentInterruptorsOfThreadId.get(threadId)
+						if (!interruptors) {
+							interruptors = []
+							this._concurrentInterruptorsOfThreadId.set(threadId, interruptors)
+						}
+						interruptors.push(p)
+					},
+				}
+			)
+			if (interrupted) {
+				this._updateLatestTool(threadId, {
+					role: 'tool', type: 'rejected', name: tool.name, params: tool.params,
+					content: this.toolErrMsgs.interrupted, result: null,
+					id: tool.id, rawParams: tool.rawParams, rawParamsStr: tool.rawParamsStr,
+					mcpServerName: tool.mcpServerName,
+				})
+			}
+		} finally {
+			// Decrement the concurrent running counter
+			const count = (this._concurrentRunningCountOfThreadId.get(threadId) ?? 1) - 1
+			if (count > 0) {
+				this._concurrentRunningCountOfThreadId.set(threadId, count)
+			} else {
+				this._concurrentRunningCountOfThreadId.delete(threadId)
+				this._concurrentInterruptorsOfThreadId.delete(threadId)
+			}
+			this._checkAndContinueAfterConcurrentResolution(threadId)
+		}
+	}
+
+	/**
+	 * Called after a concurrent tool finishes or a per-tool rejection. Decides
+	 * whether to resume the agent loop (all tools resolved), keep waiting
+	 * (more pending tools), or do nothing (agent already running or aborted).
+	 */
+	private _checkAndContinueAfterConcurrentResolution(threadId: string) {
+		// Still have concurrent tools running — wait for them
+		const runningCount = this._concurrentRunningCountOfThreadId.get(threadId) ?? 0
+		if (runningCount > 0) return
+
+		// Already started resuming — don't double-resume
+		if (this._concurrentResumeStartedOfThreadId.has(threadId)) return
+
+		// Don't resume if the stream was cleared (aborted)
+		if (this.streamState[threadId] === undefined) return
+
+		// If an agent loop is already actively running (LLM streaming or a
+		// non-concurrent tool executing), let it handle the rest. We DON'T check
+		// for 'idle' here because 'idle' is a transient decorative state set by
+		// _runChatAgent between operations — checking it would cause a race where
+		// a concurrent tool finishing during an idle window prevents the agent
+		// from ever resuming.
+		const isRunning = this.streamState[threadId]?.isRunning
+		if (isRunning === 'LLM' || isRunning === 'tool') return
+
+		const pending = this._getPendingBatchTools(threadId)
+		if (pending.length > 0) {
+			// Still have pending tools — keep awaiting user
+			this._setStreamState(threadId, { isRunning: 'awaiting_user' })
+			return
+		}
+
+		// All tools resolved — resume the agent loop
+		this._concurrentResumeStartedOfThreadId.add(threadId)
+		this._wrapRunAgentToNotify(
+			this._runChatAgent({ threadId, ...this._currentModelSelectionProps() })
+				.finally(() => { this._concurrentResumeStartedOfThreadId.delete(threadId) }),
+			threadId
+		)
+	}
+
+	/**
+	 * Wait for all concurrent terminal tools to finish. Used when resuming the
+	 * agent loop (e.g. after rejection) to ensure concurrent tool results are
+	 * in the message history before sending a new LLM request. Polls the
+	 * counter at 50ms intervals — terminal commands take seconds, so this
+	 * granularity is more than sufficient. Bails early if the thread is
+	 * aborted (stream state becomes undefined).
+	 */
+	private async _waitForConcurrentTools(threadId: string) {
+		while ((this._concurrentRunningCountOfThreadId.get(threadId) ?? 0) > 0) {
+			await timeout(50)
+			if (this.streamState[threadId]?.isRunning === undefined) return
+		}
+	}
+
+	/**
+	 * Interrupts all concurrently running terminal tools. Called from
+	 * abortRunning so the user's Stop action cancels all running terminals.
+	 */
+	private async _interruptConcurrentTools(threadId: string) {
+		const interruptors = this._concurrentInterruptorsOfThreadId.get(threadId)
+		if (!interruptors || interruptors.length === 0) return
+		const fns = await Promise.all(interruptors)
+		for (const fn of fns) fn()
+		this._concurrentInterruptorsOfThreadId.delete(threadId)
+		this._concurrentRunningCountOfThreadId.delete(threadId)
+		this._concurrentResumeStartedOfThreadId.delete(threadId)
+		this._queuedApprovalOfThreadId.delete(threadId)
+	}
+
 	private _computeMCPServerOfToolName = (toolName: string) => {
 		return this._mcpService.getMCPTools()?.find(t => t.name === toolName)?.mcpServerName
 	}
@@ -1987,6 +2256,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	async abortRunning(threadId: string) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
+
+		// Clear any queued approval on abort.
+		this._queuedApprovalOfThreadId.delete(threadId)
 
 		// add assistant message
 		if (this.streamState[threadId]?.isRunning === 'LLM') {
@@ -2009,6 +2281,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// a hard stop from the user; we don't want to restart the LLM loop with rejection
 		// feedback (which is what the normal reject-button path does).
 		else if (this.streamState[threadId]?.isRunning === 'awaiting_user') {
+			// Interrupt any concurrently running terminal tools before rejecting
+			// pending ones — otherwise they'd keep running in the background.
+			await this._interruptConcurrentTools(threadId)
 			this.rejectLatestToolRequest(threadId, false)
 		}
 		else if (this.streamState[threadId]?.isRunning === 'idle') {
@@ -2053,7 +2328,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		toolName: ToolName,
 		toolId: string,
 		mcpServerName: string | undefined,
-		opts: { preapproved: true, unvalidatedToolParams: RawToolParamsObj, validatedParams: ToolCallParams<ToolName>, rawParamsStr?: string } | { preapproved: false, unvalidatedToolParams: RawToolParamsObj, rawParamsStr?: string },
+		opts: ({ preapproved: true, unvalidatedToolParams: RawToolParamsObj, validatedParams: ToolCallParams<ToolName>, rawParamsStr?: string } | { preapproved: false, unvalidatedToolParams: RawToolParamsObj, rawParamsStr?: string }) & { isConcurrent?: boolean, onInterruptorReady?: (p: Promise<() => void>) => void },
 	): Promise<{ awaitingUserApproval?: boolean, interrupted?: boolean }> => {
 		// Carry the model's original serialized arguments string (when available) into
 		// every tool message we persist. This lets the replay path send byte-identical
@@ -2187,8 +2462,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					// pre-added a tool_request with batchIndex/batchSize, and this call now
 					// replaces its placeholder unvalidated params with the validated ones while
 					// preserving the batch metadata.
-					this._updateLatestTool(threadId, { role: 'tool', type: 'tool_request', content: '(Awaiting user permission...)', result: null, name: toolName, params: toolParams, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
-					return { awaitingUserApproval: true }
+				this._updateLatestTool(threadId, { role: 'tool', type: 'tool_request', content: '(Awaiting user permission...)', result: null, name: toolName, params: toolParams, id: toolId, rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName })
+				// Set the stream state to 'awaiting_user' synchronously with the tool
+				// state transition. Without this, there is a microtask gap between the
+				// tool becoming tool_request and the caller setting 'awaiting_user',
+				// during which React may render with a stale isRunning ('idle'/'tool')
+				// and the approval buttons won't appear.
+				this._setStreamState(threadId, { isRunning: 'awaiting_user' })
+				return { awaitingUserApproval: true }
 				}
 			}
 		}
@@ -2212,8 +2493,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const interruptorPromise = new Promise<() => void>(res => { resolveInterruptor = res })
 		try {
 
-			// set stream state
-			this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams, id: toolId, content: 'interrupted...', rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName } })
+			// set stream state (or delegate to caller for concurrent tools)
+			if (opts.isConcurrent && opts.onInterruptorReady) {
+				opts.onInterruptorReady(interruptorPromise)
+			} else {
+				this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams, id: toolId, content: 'interrupted...', rawParams: opts.unvalidatedToolParams, rawParamsStr, mcpServerName } })
+			}
+
+			// Yield to the event loop so React can flush the batched state updates
+			// (tool → running_now, isRunning → 'tool') and render the loading
+			// indicator before the tool starts executing. Without this, the first
+			// await inside the tool (e.g. voidModelService.initializeModel for a
+			// new file) blocks the render for its full duration.
+			await timeout(0)
 
 			if (isBuiltInTool) {
 				const { result, interruptTool } = await this._toolsService.callTool[toolName](toolParams as any)
@@ -2291,6 +2583,20 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		let interruptedWhenIdle = false
 		const idleInterruptor = Promise.resolve(() => { interruptedWhenIdle = true })
 		// _runToolCall does not need setStreamState({idle}) before it, but it needs it after it. (handles its own setStreamState)
+
+		// When resuming without callThisToolFirst (e.g. after rejection or after
+		// all concurrent tools finished), wait for any still-running concurrent
+		// terminal tools so their results are in history before the next LLM call.
+		// Only check for abort if we were actually waiting for concurrent tools —
+		// a fresh user message has streamState === undefined at this point and
+		// should NOT be treated as an abort.
+		if (!callThisToolFirst) {
+			const hadConcurrent = (this._concurrentRunningCountOfThreadId.get(threadId) ?? 0) > 0
+			if (hadConcurrent) {
+				await this._waitForConcurrentTools(threadId)
+				if (this.streamState[threadId]?.isRunning === undefined) return
+			}
+		}
 
 		// above just defines helpers, below starts the actual function
 		const { chatMode } = this._settingsService.state.globalSettings // should not change as we loop even if user changes it, so it goes here
@@ -2652,7 +2958,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					if (batchRes === 'awaiting_user') { isRunningWhenEnd = 'awaiting_user' }
 					else { shouldSendAnotherMessage = true }
 
-					this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' }) // just decorative, for clarity
+					// Only transition to 'idle' when continuing the loop. When awaiting
+					// user approval, setting 'idle' here (before the final
+					// _setStreamState below sets 'awaiting_user') can cause a brief
+					// intermediate render where approval buttons flicker off and on.
+					if (shouldSendAnotherMessage)
+						this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' }) // just decorative, for clarity
 				}
 
 			} // end while (attempts)
@@ -2708,7 +3019,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._storeMessageKey(threadId, messageIdx, newMessage)
 		const newThreads = { ...allThreads, [threadId]: updatedThread }
 		this._storeThread(threadId, updatedThread)
-		this._setState({ allThreads: newThreads })
+		// doNotRefreshMountInfo: true — editing an existing message doesn't change
+		// whether the thread is mounted, so skip the cascading _setThreadState
+		// call inside _setState that creates a new mount-info promise and fires
+		// a second _onDidChangeCurrentThread event. This cuts the state-update
+		// work in half for every tool state transition (tool_request → running_now
+		// → success), eliminating the ~0.5s render delay on approve.
+		this._setState({ allThreads: newThreads }, true)
 	}
 
 	// checkpoint disabled — see checkpoint-storage-refactor.md
