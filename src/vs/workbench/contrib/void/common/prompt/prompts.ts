@@ -108,12 +108,17 @@ ${tripleTick[1]}`
 
 
 const editsTool_description = `\
-A JSON array of edit objects: { "original": string, "updated": string, "delete"?: boolean }.
+A JSON array of edit objects. Each edit object MUST have exactly these field names:
+  { "original": string, "updated": string, "delete"?: boolean }
+
+Field names are case-sensitive and must be exactly "original", "updated", and "delete". Do NOT use "replacement", "new", "new_content", "replacement_value", or any other variant — only "updated".
+
 - "original": lines in the file to replace. Must EXACTLY match (including whitespace), be unique, and be DISJOINT from other "original" values. Bias towards minimal length.
 - "updated": the new code replacing "original". Must be non-empty unless "delete" is true — an empty "updated" without "delete": true will be rejected.
 - "delete": set to true to delete the "original" code.
 
-Example: [{"original": "let x = 6", "updated": "let x = 6.5"}, {"original": "let y = 7", "delete": true}]`
+Correct: [{"original": "let x = 6", "updated": "let x = 6.5"}, {"original": "let y = 7", "delete": true}]
+Wrong (will be rejected): [{"original": "let x = 6", "replacement": "let x = 6.5"}]`
 
 
 // ======================================================== tools ========================================================

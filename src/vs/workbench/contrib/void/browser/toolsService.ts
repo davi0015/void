@@ -178,11 +178,25 @@ const validateEdits = (editsUnknown: unknown): Edit[] => {
 		if (item === null || typeof item !== 'object') throw new Error(`Invalid LLM output format: edits[${i}] must be an object, but got ${typeof item}.`)
 		const obj = item as Record<string, unknown>
 		const original = obj.original
-		const updated = obj.updated
+		if (typeof original !== 'string') {
+			const providedKeys = Object.keys(obj)
+			throw new Error(`Invalid LLM output format: edits[${i}] must have an "original" field (string). Provided field names: ${providedKeys.join(', ')}. Only "original", "updated", and "delete" are supported.`)
+		}
+
 		const del = obj.delete
-		if (typeof original !== 'string') throw new Error(`Invalid LLM output format: edits[${i}].original must be a string.`)
-		if (updated !== undefined && typeof updated !== 'string') throw new Error(`Invalid LLM output format: edits[${i}].updated must be a string.`)
 		const deleteBool = del === true || del === 'true'
+		const updated = obj.updated
+		if (typeof updated !== 'string') {
+			const providedKeys = Object.keys(obj)
+			if (deleteBool) {
+				// delete is set, updated is optional — but if provided it must be a string
+				if (updated !== undefined) {
+					throw new Error(`Invalid LLM output format: edits[${i}]."updated" must be a string. Provided field names: ${providedKeys.join(', ')}. Only "original", "updated", and "delete" are supported.`)
+				}
+			} else {
+				throw new Error(`Invalid LLM output format: edits[${i}] must have an "updated" field (string). Provided field names: ${providedKeys.join(', ')}. Only "original", "updated", and "delete" are supported.`)
+			}
+		}
 		edits.push({ original, updated: typeof updated === 'string' ? updated : '', delete: deleteBool || undefined })
 	}
 	if (edits.length === 0) throw new Error(`Invalid LLM output format: edits must contain at least one edit object.`)
