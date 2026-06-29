@@ -857,6 +857,15 @@ Resp Nemotron: 3 tool calls, search + read convertToLLMMessageService.ts + read 
   - **Concurrent terminal execution** — Terminal tools (`run_command`, `run_persistent_command`, etc.) now run concurrently instead of serially. `approveToolRequest(threadId, toolId)` / `rejectToolRequest(threadId, toolId)` provide per-tool approve/reject for terminals. Auto-approved terminals fire concurrently in `_tryDrainPendingBatch` without blocking the next tool's approval. `_checkAndContinueAfterConcurrentResolution` resumes the agent loop only when all concurrent tools finish. `abortRunning` interrupts all running terminals via `_interruptConcurrentTools`. `_waitForConcurrentTools` (50ms polling) ensures concurrent tool results are in history before the next LLM call. Non-terminal tools (edits, deletes, MCP) remain serial.
   - **Queued approval + render perf** — Clicking Approve while a tool is still running (e.g. during the 2s lint wait after `edit_file`) no longer swallows the click: the intent is queued in `_queuedApprovalOfThreadId` and consumed by `_tryDrainPendingBatch` when the next tool pauses for approval. `timeout(0)` after the `running_now` state transition lets React flush before the tool starts executing (was blocked by `voidModelService.initializeModel` for new files). `_editMessageInThread` passes `doNotRefreshMountInfo: true` to `_setState`, cutting the cascading double state-update (mount-info refresh) that doubled render work on every tool state transition.
   - Files: `chatThreadService.ts` (concurrent terminal infra, queued approval, guards, render perf), `ToolResultComponents.tsx` (per-tool approve/reject, auto-approve check), `SidebarChat.tsx` (approval-type filter, toolId/params props).
+- **Persistent terminal output fix** ✅ DONE — Fixed jumbled and missing terminal output when persistent terminal commands time out. Three root causes:
+  - **Timeout read entire scrollback buffer** — `readTerminal` on timeout captured the entire xterm.js buffer (all previous commands). Added `readTerminalFromLine(terminalId, fromLine)` that reads only from a marker line forward. Uses `registerMarker(0)` before `sendText` to track the start position through buffer scrolls (raw `buffer.length` is capacity, not content position).
+  - **`onCommandFinished` captured wrong command** — the listener fired for any command that finished, including stale commands from previous runs. Added `commandSent` flag to reject commands that finished before our `sendText`. Changed the bail condition from `if (resolveReason)` to `if (resolveReason?.type === 'done')` so `onCommandFinished` can override a timeout during the grace period.
+  - **Fixed 5s timeout raced with 5s commands (50% success)** — replaced the fixed timeout for persistent terminals with inactivity-based timeout (same mechanism as temporary terminals). A backstop timeout (2×) ensures long-running processes still return. Grace period poll (1s) catches `onCommandFinished` just after timeout. Moved listener disposal after timeout handling so the listener stays alive during the grace period.
+  - Also trimmed trailing blank lines from xterm buffer output (large gaps between output and timeout message).
+  - Files: `terminalToolService.ts`.
+- **edit_file field name enforcement** ✅ DONE — The `edits` parameter is sent to the LLM as `type: 'string'` (JSON-stringified array), so field names (`original`, `updated`, `delete`) only appear in the description text. Models that don't reliably extract field names from prose used `replacement`, `new`, `new_content` etc. instead of `updated`, causing the misleading 'updated cannot be empty, specify delete true instead' error.
+  - `prompts.ts`: explicit field-name enforcement in `editsTool_description` with correct/wrong examples.
+  - `toolsService.ts`: `validateEdits` now requires `updated` field (string) unless `delete` is true. Reports actual provided field names in error message instead of guessing wrong names. Prevents the misleading 'empty replacement' error from `editCodeService` when the model used a wrong field name.
 
 ### Next — Performance & billing-honesty (promoted from backlog)
 
@@ -1240,7 +1249,8 @@ Asked "what brings Void to the next level?" → audited the codebase to separate
 - *Plus our recent additions:* compaction (Perf 2), parallel tool calls (Perf 4), emergency trim + telemetry, write-tool silent-failure fix, Phase A1+A2 / A3+A4 / C prompt work.
 
 *Actually missing* (grounded in grep, not guesswork):
-- **Codebase indexing / semantic search** — zero matches for `embedding` / `vector` / `semantic search` outside of code-sample string literals. No embedding pipeline, no vector store, no `semantic_search` tool. This is the single biggest capability gap vs. Cursor — every "agent made wrong lexical query → got nothing → retried with different keywords" symptom in our eval logs traces back here.
+~~**Codebase indexing / semantic search**~~ ✅ DONE — fully implemented. See the Semantic search entry in the Done section above and `docs/designs/semantic-search.md`. Embedding-based `semantic_search` tool, `SemanticIndexService` with chunking/Matryoshka truncation/file-watcher/incremental save, IPC channel for embedding calls, settings UI with model dropdown. The original audit below is preserved for historical context:
+  - *Original audit:* zero matches for `embedding` / `vector` / `semantic search` outside of code-sample string literals. No embedding pipeline, no vector store, no `semantic_search` tool. This was the single biggest capability gap vs. Cursor — every "agent made wrong lexical query → got nothing → retried with different keywords" symptom in eval logs traced back here.
 - **`.cursor/rules` / `AGENTS.md` auto-loading** — no matches for `.cursor/rules`, `.cursorrules`, `AGENTS.md`, or `.mdc` parsing in the Void codebase. Per-project conventions have to be pasted into chat manually each time. The prompt-injection plumbing (`chat_systemMessage` composition) already exists in `prompts.ts` — the missing piece is just the file watcher + parser + frontmatter matcher.
 - **`@`-mention variety** — only `File` / `Folder` / `CodeSelection` in `StagingSelectionItem`. Missing: `@git-diff`, `@recent-changes` (modified since last commit), `@problems` (current diagnostics), `@terminal`, `@pr`, `@web`, `@docs`, `@codebase`. Each missing type is a workflow where the user pastes context manually today.
 - ~~**LSP navigation tools (`go_to_definition`, `go_to_usages`)**~~ ✅ DONE — fully implemented in `prompts.ts` (tool definitions + descriptions) and `toolsService.ts` (execution). Tested across MiniMax (ideal 1-call flow), Gemma (ignored LSP, used read_file), Nemotron (grep-party, never reached for LSP). Base-model capability issue for weaker models, not a prompt issue. See "Prompt Phase C6+C7" section for details.
@@ -1249,7 +1259,7 @@ Asked "what brings Void to the next level?" → audited the codebase to separate
 
 ### Next — Path X: Tier-2 daily-use wins (Phase E)
 
-Path decision from the audit: **do the small, concrete wins first, then decide on indexing based on daily-use data.** Alternative (Path Y = commit to indexing / Phase F first) is not ruled out, but starting with the cheap items has better risk/reward — delivers working stuff in days, gives real data on whether semantic search is genuinely needed.
+Path decision from the audit: **do the small, concrete wins first, then decide on indexing based on daily-use data.** Alternative (Path Y = commit to indexing / Phase F first) is not ruled out, but starting with the cheap items has better risk/reward — delivers working stuff in days, gives real data on whether semantic search is genuinely needed. *(Update: semantic search was subsequently implemented — see Phase F / Semantic search DONE entries.)*
 
 **Phase E — Three small daily-use wins, independently shippable.** Ordered by ROI per hour (highest first).
 
@@ -1434,22 +1444,57 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 
 **Execution order & commit strategy**
 - E1 ✅ done (own commit). E2 pivoted into E2' (`.voidrules` fix + chip) ✅ done (own commit). E2' cache-busting fix (freeze-on-first-send + indicator) ✅ done. E4 (per-request telemetry) ✅ done (own commit) — supersedes E3. E5 ✅ core logic shipped (own commit).
-- E9 ✅ done (viewport rendering + code block height fix). E10 ✅ done (sticky question header). E11 ✅ done (LaTeX rendering). D2 ✅ done (editing philosophy + formatting). D3 ✅ done (agent persona). **Up next**: E8 (search in chat). E5 dog-food continues passively. E6 evaluation after E5 data. E7 ✅ shipped.
+- E9 ✅ done (viewport rendering + code block height fix). E10 ✅ done (sticky question header). E11 ✅ done (LaTeX rendering). D2 ✅ done (editing philosophy + formatting). D3 ✅ done (agent persona). **Up next**: E8 (search in chat, low priority). Agent-driven skills (designed, not yet implemented — see Design section below). E5 dog-food continues passively. E6 evaluation after E5 data. E7 ✅ shipped.
 - **After E5 dog-food**: evaluate E4 telemetry data (resultLen distribution on `read_file`, follow-up-with-ranges hit rate) before deciding whether E6 is worth doing.
 - After each phase, dog-food with a one-day daily-use window before committing the next. If a phase's real-world impact is smaller than projected (or reveals a different problem), the later phases can be resequenced / dropped.
 - Phase D deferred below — no observed pain to justify it.
-- Phase F (indexing) held pending Phase E daily-use data.
+- Phase F (indexing / semantic search) ✅ DONE — see Semantic search entry in Done section.
 
 **Phase D — Output structure (optional polish, deferred)**
 - Ask the model to emit `<plan>...</plan>` blocks at the start of multi-step tasks, with per-step checkbox markers.
 - Parse plan blocks in `ChatMarkdownRender` and render as collapsible checklists (Cursor/Claude Code style).
 - Honest caveat: this is UI polish, not a capability upgrade. No concrete pain in eval logs or prior sessions points to it. Re-open only if daily use reveals "lost track of what the agent was doing on a long task" as a recurring symptom.
 
-**Phase F — Codebase indexing / semantic search (held)**
-- The single biggest capability gap vs. Cursor (see audit above). Not deferred because it's unimportant — held pending Phase E daily-use data, because the Phase E tools (especially LSP + rules) might partially substitute for semantic search on small/medium codebases.
-- Rough scope (to refine when this actually starts): local embeddings via Ollama's `/api/embeddings` endpoint (no external services, reuses existing Ollama infra); SQLite-backed vector store; file-watcher-driven incremental reindex with debounce; new `semantic_search` tool in `prompts.ts` alongside the lexical tools (hybrid, not replacement); `.gitignore` + `.voidignore` respect.
-- Estimated: ~1-2 weeks of focused work. Not a weekend project.
-- Decision trigger: after ~2 weeks of Phase-E-enabled daily use, if the symptom "agent fished for the right keyword via lexical search" still dominates the pain log → commit to Phase F. If Phase E subsumes it → keep deferred.
+~~**Phase F — Codebase indexing / semantic search (held)**~~ ✅ DONE — fully implemented (see Semantic search entry in Done section above). The original plan below is preserved for historical context:
+- *Original plan:* held pending Phase E daily-use data, because the Phase E tools (especially LSP + rules) might partially substitute for semantic search on small/medium codebases. Rough scope: local embeddings via Ollama's `/api/embeddings` endpoint; SQLite-backed vector store; file-watcher-driven incremental reindex with debounce; new `semantic_search` tool in `prompts.ts` alongside the lexical tools (hybrid, not replacement); `.gitignore` + `.voidignore` respect. Estimated ~1-2 weeks of focused work.
+- *What was actually built:* JSON index format (not SQLite — see Known limitations in design doc), OpenAI `/v1/embeddings` endpoint via IPC channel (works with Ollama, OpenAI, OpenRouter, vLLM, LM Studio, litellm, sglang), Matryoshka truncation, base64 Float32Array on disk, content read on demand. Design doc: `docs/designs/semantic-search.md`.
+
+### Design: Agent-driven skills (not yet implemented)
+
+**Concept:** Anthropic-style skills — modular instruction files (markdown) with a name and description. The agent sees a compact index of available skills (names + one-line descriptions only) injected into the system prompt. When a skill is relevant to the current task, the agent calls a `load_skill` tool to pull in the full instructions on-demand. The full content arrives as a tool result for that turn, not permanently in the system prompt.
+
+**Why this over always-on injection:** keeps the base system prompt lean (only the index, not all skill bodies), lets the agent self-serve specialized knowledge without the user pasting instructions, and avoids token bloat from instructions only relevant sometimes. A workspace with 15 skills averaging 500 tokens each would add 7.5k tokens to every request if always-on; with on-demand loading, only the ~150-token index is always in context and the relevant skill body is pulled in only when needed.
+
+**Relationship to `.voidrules`:** `.voidrules` stays as always-on baseline rules ("rules the agent must always follow"); skills are on-demand specialized knowledge ("knowledge the agent loads when relevant"). `.voidrules` is injected into the system prompt via `GUIDELINES (from the user's .voidrules file):\n{contents}` at `convertToLLMMessageService.ts:643`. Skills are a separate, larger, opt-in layer.
+
+**Architecture:**
+
+1. **Skill files** — markdown files in `.void/skills/*.md` (workspace-level). Optional frontmatter (`name`, `description`, `when_to_use`); if no frontmatter, filename is the name and first paragraph is the description. Example: `.void/skills/react-debugging.md` with frontmatter `name: react-debugging`, `description: Debug React component rendering and state issues`.
+
+2. **Skills index in system prompt** — compact list injected into `chat_systemMessage` (`prompts.ts:545`). Just names + descriptions, ~20-50 tokens total. Example: `Available skills: react-debugging (debug React component rendering and state issues), git-workflow (branch/commit/PR conventions), deploy-aws (deployment steps). Use the load_skill tool to load a skill's full instructions when relevant.`
+
+3. **`load_skill` tool** — reads the skill file from disk, returns the full content as a tool result. Agent calls it when the task matches a skill's description. Content is in context for that turn and subsequent turns (as a tool result in history), not permanently in the system prompt. Read-only, no approval needed (same as `read_file`).
+
+4. **Discovery** — file watcher (same pattern as the existing `.voidrules` watcher at `convertToLLMMessageService.ts:1003`) scans `.void/skills/` and builds the index. Skills can be added/edited mid-session. The index is regenerated and injected into the next request's system prompt.
+
+5. **Scope** — workspace-scoped only (`.void/skills/`) for v1. Global/user-level skills that travel across workspaces can be a later addition if needed.
+
+**Design decisions:**
+
+- **Agent-driven, not heuristic auto-loading** — the agent decides when to call `load_skill` based on the task and the skill descriptions. Pro: zero token cost when irrelevant, no detection logic to maintain. Con: depends on model capability — weaker models (Gemma, Nemotron) may not reliably recognize when a skill applies. This is the same capability ceiling seen with LSP tools and parallel reads: strong models (MiniMax, Claude) will use it well, weaker ones won't. Consistent with existing Void philosophy — provide the capability, don't cripple it for the lowest common denominator.
+- **Index in system prompt, not a `list_skills` tool** — injecting the compact index directly into the system prompt means the agent always knows what skills exist without an extra tool round-trip. The index is small (~150 tokens for 15 skills) and stable (only changes when skill files change), so it stays prefix-cached. A `list_skills` tool would require the agent to call it before knowing what's available, adding latency and a round-trip.
+- **Skill content as tool result, not system prompt mutation** — loading a skill doesn't modify the system prompt (which would break prefix cache). The content arrives as a tool result in the conversation history, which is already cache-warm territory.
+
+**Scope estimate:** Medium. Pieces:
+- Skill file scanning + watcher (reuses `.voidrules` watcher pattern)
+- `load_skill` tool definition + implementation (like `read_file` but scoped to skills dir, read-only)
+- Skills index generation + injection into `chat_systemMessage` (compact list)
+- Settings UI for enable/disable + skills directory override (optional for v1)
+
+**Risks:**
+- **Model compliance** — weaker models may not call `load_skill` when they should. Fallback: `.voidrules` can include a hint like "If your task involves React, load the react-debugging skill first." Same empirical-testing approach as the memory system design.
+- **Skill quality** — poorly written skills mislead the agent. Mitigated by: skills are user-authored (user controls quality), and skill content is visible in the conversation as a tool result (user can see what was loaded).
+- **Discovery friction** — users need to know to create `.void/skills/` files. Could ship a few built-in starter skills, or add a "create skill" command.
 
 ### Reference — OpenCode + Oh-My-OpenAgent + Karpathy LLM Wiki analysis (May 2026)
 
