@@ -2490,8 +2490,12 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			initialFillDoneRef.current = true
 			scrollToBottom(scrollContainerRef)
 		} else if (mountStartChanged) {
-			const delta = contentH - prevContentH
-			scrollEl.scrollTop += delta
+			if (isAtBottomRef.current) {
+				scrollToBottom(scrollContainerRef)
+			} else {
+				const delta = contentH - prevContentH
+				scrollEl.scrollTop += delta
+			}
 			lastScrollTopRef.current = scrollEl.scrollTop
 		} else {
 			// New message appended at the end — stay at bottom if we were there
@@ -2593,6 +2597,21 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	}, [scrollContainerRef, msgsForPx])
 
 	const hasMore = mountStart > 0
+
+	const trimFromTop = useCallback(() => {
+		const el = scrollContainerRef.current
+		if (!el) return
+		const currScrollTop = el.scrollTop
+		if (currScrollTop <= el.clientHeight * 3) return
+		const mounted = totalCountRef.current - mountStartRef.current
+		const avgH = mounted > 0 ? (contentRef.current?.offsetHeight ?? el.scrollHeight) / mounted : 200
+		const msgsAbove = Math.floor(currScrollTop / avgH)
+		const msgsToKeepAbove = Math.ceil((el.clientHeight * 5) / avgH)
+		const msgsToRemove = msgsAbove - msgsToKeepAbove
+		if (msgsToRemove > 0) {
+			setMountStart(prev => Math.min(prev + msgsToRemove, Math.max(0, totalCountRef.current - 1)))
+		}
+	}, [scrollContainerRef])
 
 	// Sticky question header: shows the last user message that scrolled
 	// above the viewport top. Updated via direct DOM manipulation to avoid
@@ -2696,16 +2715,9 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					// Skip trim when we were at the bottom — auto-scroll
 					// triggers scroll-down events, trimming here would
 					// desync scroll position and break auto-scroll.
+					// Post-stream trim is handled by the isRunning effect.
 					if (isAtBottomRef.current) return
-
-					const mounted = totalCountRef.current - mountStartRef.current
-					const avgH = mounted > 0 ? (contentRef.current?.offsetHeight ?? el.scrollHeight) / mounted : 200
-					const msgsAbove = Math.floor(currScrollTop / avgH)
-					const msgsToKeepAbove = Math.ceil((el.clientHeight * 5) / avgH)
-					const msgsToRemove = msgsAbove - msgsToKeepAbove
-					if (msgsToRemove > 0) {
-						setMountStart(prev => Math.min(prev + msgsToRemove, Math.max(0, totalCountRef.current - 1)))
-					}
+					trimFromTop()
 				}
 			})
 		}
@@ -2715,7 +2727,19 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			cancelAnimationFrame(rafId)
 			el.removeEventListener('scroll', onScroll)
 		}
-	}, [scrollContainerRef, expandUp, updateStickyQuestion])
+	}, [scrollContainerRef, expandUp, updateStickyQuestion, trimFromTop])
+
+	// Trim old messages from the top when streaming completes. The scroll
+	// handler skips trim when at the bottom (to avoid desyncing auto-scroll
+	// during streaming), so without this old messages stay mounted after
+	// new ones are appended without scrolling.
+	const prevIsRunningRef = useRef<typeof isRunning>(undefined)
+	useEffect(() => {
+		if (prevIsRunningRef.current && !isRunning) {
+			trimFromTop()
+		}
+		prevIsRunningRef.current = isRunning
+	}, [isRunning, trimFromTop])
 
 	// Initialize sticky question on activation — double-rAF to ensure
 	// scroll-to-bottom and initial fill have settled first.
