@@ -1462,40 +1462,7 @@ Path decision from the audit: **do the small, concrete wins first, then decide o
 
 ### Design: Agent-driven skills (not yet implemented)
 
-**Concept:** Anthropic-style skills — modular instruction files (markdown) with a name and description. The agent sees a compact index of available skills (names + one-line descriptions only) injected into the system prompt. When a skill is relevant to the current task, the agent calls a `load_skill` tool to pull in the full instructions on-demand. The full content arrives as a tool result for that turn, not permanently in the system prompt.
-
-**Why this over always-on injection:** keeps the base system prompt lean (only the index, not all skill bodies), lets the agent self-serve specialized knowledge without the user pasting instructions, and avoids token bloat from instructions only relevant sometimes. A workspace with 15 skills averaging 500 tokens each would add 7.5k tokens to every request if always-on; with on-demand loading, only the ~150-token index is always in context and the relevant skill body is pulled in only when needed.
-
-**Relationship to `.voidrules`:** `.voidrules` stays as always-on baseline rules ("rules the agent must always follow"); skills are on-demand specialized knowledge ("knowledge the agent loads when relevant"). `.voidrules` is injected into the system prompt via `GUIDELINES (from the user's .voidrules file):\n{contents}` at `convertToLLMMessageService.ts:643`. Skills are a separate, larger, opt-in layer.
-
-**Architecture:**
-
-1. **Skill files** — markdown files in `.void/skills/*.md` (workspace-level). Optional frontmatter (`name`, `description`, `when_to_use`); if no frontmatter, filename is the name and first paragraph is the description. Example: `.void/skills/react-debugging.md` with frontmatter `name: react-debugging`, `description: Debug React component rendering and state issues`.
-
-2. **Skills index in system prompt** — compact list injected into `chat_systemMessage` (`prompts.ts:545`). Just names + descriptions, ~20-50 tokens total. Example: `Available skills: react-debugging (debug React component rendering and state issues), git-workflow (branch/commit/PR conventions), deploy-aws (deployment steps). Use the load_skill tool to load a skill's full instructions when relevant.`
-
-3. **`load_skill` tool** — reads the skill file from disk, returns the full content as a tool result. Agent calls it when the task matches a skill's description. Content is in context for that turn and subsequent turns (as a tool result in history), not permanently in the system prompt. Read-only, no approval needed (same as `read_file`).
-
-4. **Discovery** — file watcher (same pattern as the existing `.voidrules` watcher at `convertToLLMMessageService.ts:1003`) scans `.void/skills/` and builds the index. Skills can be added/edited mid-session. The index is regenerated and injected into the next request's system prompt.
-
-5. **Scope** — workspace-scoped only (`.void/skills/`) for v1. Global/user-level skills that travel across workspaces can be a later addition if needed.
-
-**Design decisions:**
-
-- **Agent-driven, not heuristic auto-loading** — the agent decides when to call `load_skill` based on the task and the skill descriptions. Pro: zero token cost when irrelevant, no detection logic to maintain. Con: depends on model capability — weaker models (Gemma, Nemotron) may not reliably recognize when a skill applies. This is the same capability ceiling seen with LSP tools and parallel reads: strong models (MiniMax, Claude) will use it well, weaker ones won't. Consistent with existing Void philosophy — provide the capability, don't cripple it for the lowest common denominator.
-- **Index in system prompt, not a `list_skills` tool** — injecting the compact index directly into the system prompt means the agent always knows what skills exist without an extra tool round-trip. The index is small (~150 tokens for 15 skills) and stable (only changes when skill files change), so it stays prefix-cached. A `list_skills` tool would require the agent to call it before knowing what's available, adding latency and a round-trip.
-- **Skill content as tool result, not system prompt mutation** — loading a skill doesn't modify the system prompt (which would break prefix cache). The content arrives as a tool result in the conversation history, which is already cache-warm territory.
-
-**Scope estimate:** Medium. Pieces:
-- Skill file scanning + watcher (reuses `.voidrules` watcher pattern)
-- `load_skill` tool definition + implementation (like `read_file` but scoped to skills dir, read-only)
-- Skills index generation + injection into `chat_systemMessage` (compact list)
-- Settings UI for enable/disable + skills directory override (optional for v1)
-
-**Risks:**
-- **Model compliance** — weaker models may not call `load_skill` when they should. Fallback: `.voidrules` can include a hint like "If your task involves React, load the react-debugging skill first." Same empirical-testing approach as the memory system design.
-- **Skill quality** — poorly written skills mislead the agent. Mitigated by: skills are user-authored (user controls quality), and skill content is visible in the conversation as a tool result (user can see what was loaded).
-- **Discovery friction** — users need to know to create `.void/skills/` files. Could ship a few built-in starter skills, or add a "create skill" command.
+Full design in `docs/designs/skills.md`. Summary: Anthropic-style skills — modular instruction files (`.void/skills/*.md` workspace + `~/.void/skills/*.md` global) with a compact index injected into the system prompt via the existing `aiInstructions` path (frozen on first send, prefix-cache-friendly). Agent calls a `load_skill` tool to pull full instructions on-demand as a tool result. 4 files to change, all within `src/vs/workbench/contrib/void`. No settings UI or file watcher for v1.
 
 ### Reference — OpenCode + Oh-My-OpenAgent + Karpathy LLM Wiki analysis (May 2026)
 
