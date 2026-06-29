@@ -234,6 +234,48 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 
 
+	// Reads terminal output starting from a specific line number. Used by
+	// runCommand's timeout path to capture only the current command's output
+	// instead of the entire scrollback buffer (which includes all previous
+	// commands on persistent terminals).
+	readTerminalFromLine = async (terminalId: string, fromLine: number): Promise<string> => {
+		const terminal = this.getPersistentTerminal(terminalId) ?? this.getTemporaryTerminal(terminalId);
+		if (!terminal) {
+			throw new Error(`Read Terminal: Terminal with ID ${terminalId} does not exist.`);
+		}
+		if (!terminal.xterm) {
+			throw new Error('Read Terminal: The requested terminal has not yet been rendered and therefore has no scrollback buffer available.');
+		}
+
+		const buffer = terminal.xterm.raw.buffer.active;
+		const endLine = buffer.length;
+		const lines: string[] = [];
+		for (let i = endLine; i >= fromLine; i--) {
+			let line = buffer.getLine(i);
+			if (!line) continue;
+			let lineData = line.translateToString(true);
+			let lineIndex = i;
+			while (lineIndex > fromLine && line.isWrapped) {
+				line = buffer.getLine(--lineIndex);
+				if (!line) break;
+				lineData = line.translateToString(false) + lineData;
+			}
+			lines.unshift(lineData);
+			i = lineIndex;
+		}
+
+		let result = removeAnsiEscapeCodes(lines.join('\n'));
+		// Trim trailing empty lines — the xterm buffer includes blank lines below
+		// the cursor, which create large gaps between the output and the
+		// timeout message in the stringifier.
+		result = result.replace(/\n+$/, '');
+		if (result.length > MAX_TERMINAL_CHARS) {
+			const half = MAX_TERMINAL_CHARS / 2;
+			result = result.slice(0, half) + '\n...\n' + result.slice(result.length - half);
+		}
+		return result;
+	};
+
 	readTerminal: ITerminalToolService['readTerminal'] = async (terminalId) => {
 		// Try persistent first, then temporary
 		const terminal = this.getPersistentTerminal(terminalId) ?? this.getTemporaryTerminal(terminalId);
@@ -325,12 +367,24 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 				const cmdCap = await this._waitForCommandDetectionCapability(terminal)
 				// if (!cmdCap) throw new Error(`There was an error using the terminal: CommandDetection capability did not mount yet. Please try again in a few seconds or report this to the Void team.`)
 
+				// Register a marker before sending the command. It tracks its line
+				// through buffer scrolls so we can read only this command's output on
+				// timeout (not the entire scrollback).
+				const startMarker = terminal.xterm?.raw.registerMarker(0)
+				if (startMarker) disposables.push(startMarker)
+
+				// Track whether we've sent our command yet. The listener is attached
+				// before sendText, so any onCommandFinished that fires before we set
+				// this flag is from a previous command and should be ignored.
+				let commandSent = false
+
 				// Prefer the structured command-detection capability when available
 
 				const waitUntilDone = new Promise<void>(resolve => {
 					if (!cmdCap) return
 					const l = cmdCap.onCommandFinished(cmd => {
-						if (resolveReason) return // already resolved
+						if (resolveReason?.type === 'done') return // already resolved with structured output
+						if (!commandSent) return // stale command from before we sent ours
 						resolveReason = { type: 'done', exitCode: cmd.exitCode ?? 0 };
 						result = cmd.getOutput() ?? ''
 						l.dispose()
@@ -342,44 +396,64 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 				// send the command now that listeners are attached
 				await terminal.sendText(command, true)
+				commandSent = true
 
-				const waitUntilInterrupt = isPersistent ?
-					// timeout after X seconds
-					new Promise<void>((res) => {
-						setTimeout(() => {
+				const waitUntilInterrupt =
+					// Inactivity-based timeout for both persistent and temporary terminals.
+					// When a command finishes it produces output (resetting the timer), then
+					// onCommandFinished fires and returns structured output before the
+					// inactivity timeout can fire. Persistent terminals also get a backstop
+					// timeout so long-running processes still return.
+					new Promise<void>(res => {
+						let inactivityTimeoutId: ReturnType<typeof setTimeout>;
+						let backstopTimeoutId: ReturnType<typeof setTimeout>;
+						const inactivityMs = (isPersistent ? MAX_TERMINAL_BG_COMMAND_TIME : MAX_TERMINAL_INACTIVE_TIME) * 1000;
+						const backstopMs = isPersistent ? MAX_TERMINAL_BG_COMMAND_TIME * 1000 * 2 : Infinity;
+
+						const fire = () => {
+							if (resolveReason) return
+							clearTimeout(inactivityTimeoutId);
+							clearTimeout(backstopTimeoutId);
 							resolveReason = { type: 'timeout' };
-							res()
-						}, MAX_TERMINAL_BG_COMMAND_TIME * 1000)
-					})
-					// inactivity-based timeout
-					: new Promise<void>(res => {
-						let globalTimeoutId: ReturnType<typeof setTimeout>;
-						const resetTimer = () => {
-							clearTimeout(globalTimeoutId);
-							globalTimeoutId = setTimeout(() => {
-								if (resolveReason) return
-
-								resolveReason = { type: 'timeout' };
-								res();
-							}, MAX_TERMINAL_INACTIVE_TIME * 1000);
+							res();
+						};
+						const resetInactivity = () => {
+							clearTimeout(inactivityTimeoutId);
+							inactivityTimeoutId = setTimeout(fire, inactivityMs);
 						};
 
-						const dTimeout = terminal.onData(() => { resetTimer(); });
-						disposables.push(dTimeout, toDisposable(() => clearTimeout(globalTimeoutId)));
-						resetTimer();
+						const dTimeout = terminal.onData(() => { resetInactivity(); });
+						disposables.push(dTimeout, toDisposable(() => { clearTimeout(inactivityTimeoutId); clearTimeout(backstopTimeoutId); }));
+						resetInactivity();
+						if (isPersistent) {
+							backstopTimeoutId = setTimeout(fire, backstopMs);
+						}
 					})
 
 				// wait for result
 				await Promise.any([waitUntilDone, waitUntilInterrupt])
-					.finally(() => disposables.forEach(d => d.dispose()))
 
 
 
 				// read result if timed out, since we didn't get it (could clean this code up but it's ok)
-				if (resolveReason?.type === 'timeout') {
-					const terminalId = isPersistent ? params.persistentTerminalId : params.terminalId
-					result = await this.readTerminal(terminalId)
+					if (resolveReason?.type === 'timeout') {
+					// Grace period — onCommandFinished may fire just after the inactivity
+					// timeout. Listener is still alive (disposed after this block).
+					if (cmdCap) {
+						for (let i = 0; i < 10; i++) {
+							if (result) break
+							await timeout(100)
+						}
+					}
+					if (!result) {
+						const terminalId = isPersistent ? params.persistentTerminalId : params.terminalId
+						const fromLine = startMarker?.line ?? 0
+						result = await this.readTerminalFromLine(terminalId, fromLine)
+					}
 				}
+
+				// Dispose all listeners now that we have the result
+				disposables.forEach(d => d.dispose())
 
 				if (!resolveReason) throw new Error('Unexpected internal error: Promise.any should have resolved with a reason.')
 
