@@ -4,7 +4,8 @@ import { IModelService } from '../../../../editor/common/services/model.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
-import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
+import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js'
+import { IPathService } from '../../../services/path/common/pathService.js';
 import { IEditorService } from '../../../services/editor/common/editorService.js';
 import { ChatMessage, CompactionInfo } from '../common/chatThreadServiceTypes.js';
 import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities } from '../common/modelCapabilities.js';
@@ -935,6 +936,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		@IMCPService private readonly mcpService: IMCPService,
 		@IFileService private readonly fileService: IFileService,
 		@IRequestTelemetryService private readonly requestTelemetryService: IRequestTelemetryService,
+		@IPathService private readonly pathService: IPathService,
 	) {
 		super()
 	}
@@ -1117,6 +1119,83 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		}
 	}
 
+	// Scan workspace .void/skills/ and global ~/.void/skills/ for skill files.
+	// Supports both <name>/SKILL.md (directory) and <name>.md (flat file).
+	// Returns a compact index string injected into aiInstructions so it gets
+	// frozen on first send (prefix cache stability). Returns empty string if no
+	// skills found.
+	private async _getSkillsIndex(): Promise<string> {
+		const descriptionOfSkillName: Map<string, string> = new Map()
+		const seenNames = new Set<string>()
+
+		const scanDir = async (skillsDirUri: URI) => {
+			let stat
+			try {
+				if (!(await this.fileService.exists(skillsDirUri))) return
+				stat = await this.fileService.resolve(skillsDirUri)
+			} catch { return }
+			if (!stat.children) return
+
+			for (const child of stat.children) {
+				let name: string | null = null
+				let description: string | null = null
+
+				if (child.isDirectory) {
+					// <name>/SKILL.md
+					const skillFileUri = URI.joinPath(child.resource, 'SKILL.md')
+					try {
+						if (!(await this.fileService.exists(skillFileUri))) continue
+						const content = (await this.fileService.readFile(skillFileUri)).value.toString()
+						const parsed = this._parseSkillFrontmatter(content)
+						name = parsed.name ?? child.name
+						description = parsed.description ?? ''
+					} catch { continue }
+				} else if (child.name.endsWith('.md')) {
+					// <name>.md
+					try {
+						const content = (await this.fileService.readFile(child.resource)).value.toString()
+						const parsed = this._parseSkillFrontmatter(content)
+						name = parsed.name ?? child.name.replace(/\.md$/, '')
+						description = parsed.description ?? ''
+					} catch { continue }
+				}
+
+				if (name && !seenNames.has(name)) {
+					seenNames.add(name)
+					descriptionOfSkillName.set(name, description ?? '')
+				}
+			}
+		}
+
+		// Workspace skills first (take precedence on name collision)
+		for (const folder of this.workspaceContextService.getWorkspace().folders) {
+			await scanDir(URI.joinPath(folder.uri, '.void', 'skills'))
+		}
+		// Global skills
+		try {
+			const userHome = await this.pathService.userHome()
+			await scanDir(URI.joinPath(userHome, '.void', 'skills'))
+		} catch { /* home dir not available */ }
+
+		if (descriptionOfSkillName.size === 0) return ''
+
+		return `AVAILABLE SKILLS (call the load_skill tool with the skill name to load full instructions — do not use read_file to read skill files directly):\n${Array.from(descriptionOfSkillName.entries()).map(([name, desc]) => `- ${name}${desc ? ': ' + desc : ''}`).join('\n')}`
+	}
+
+	// Parse YAML frontmatter from a skill file. Returns name and description
+	// if present, otherwise null for both.
+	private _parseSkillFrontmatter(content: string): { name: string | null, description: string | null } {
+		const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n/)
+		if (!fmMatch) return { name: null, description: null }
+		const frontmatter = fmMatch[1]
+		const nameMatch = frontmatter.match(/^name:\s*(.+)$/m)
+		const descMatch = frontmatter.match(/^description:\s*(.+)$/m)
+		return {
+			name: nameMatch ? nameMatch[1].trim() : null,
+			description: descMatch ? descMatch[1].trim() : null,
+		}
+	}
+
 	// Async combined-instructions getter used by the chat flow. Reads `.voidrules`
 	// fresh on every request so rules edits take effect immediately on the next
 	// user message (no Void restart, no thread recreate).
@@ -1129,6 +1208,8 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		if (globalAIInstructions) ans.push(globalAIInstructions)
 		if (voidRulesFileContent) ans.push(voidRulesFileContent)
 		if (folderRulesContent) ans.push(folderRulesContent)
+		const skillsIndex = await this._getSkillsIndex()
+		if (skillsIndex) ans.push(skillsIndex)
 		return ans.join('\n\n')
 	}
 

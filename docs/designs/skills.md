@@ -32,7 +32,23 @@ Skills are layered on top of `aiInstructions` — the index is appended to the s
 
 ### 1. Skill files
 
-Markdown files with optional YAML frontmatter:
+Two file layouts are supported:
+
+**Directory layout** (recommended — allows reference files alongside the skill):
+```
+.void/skills/using-confluence-cli/
+├── SKILL.md          # main skill file (frontmatter + body)
+└── reference/        # optional supporting files
+    ├── parameters.md
+    └── pull-request.md
+```
+
+**Flat file layout** (simpler, for short skills):
+```
+.void/skills/react-debugging.md
+```
+
+Both use optional YAML frontmatter:
 
 ```markdown
 ---
@@ -45,7 +61,7 @@ When debugging React components:
 ...
 ```
 
-If no frontmatter, the filename (without `.md`) is the name and the first paragraph is the description.
+If no frontmatter: for directory layout, the directory name is the skill name; for flat file, the filename (without `.md`) is the name. Description is empty if not specified.
 
 ### 2. Skill locations
 
@@ -62,7 +78,7 @@ Two directories, merged into one index:
 
 **Path resolution:**
 - Workspace: `URI.joinPath(folder.uri, '.void', 'skills')` — same pattern as `.voidrules` at `convertToLLMMessageService.ts:1003`
-- Global: `joinPath(environmentService.userHome, '.void', 'skills')` — `userHome` is the OS home directory (`~` on macOS/Linux, `%USERPROFILE%` on Windows)
+- Global: `joinPath(pathService.userHome(), '.void', 'skills')` — `userHome` is the OS home directory (`~` on macOS/Linux, `%USERPROFILE%` on Windows)
 
 ### 3. Skills index injection
 
@@ -94,7 +110,7 @@ Read-only tool (no approval, not in `approvalTypeOfBuiltinToolName`). Available 
 { content: string }  // full skill file body (frontmatter stripped)
 ```
 
-**Implementation:** reads `.void/skills/<skill_name>.md` from the first workspace folder that has it, falling back to `~/.void/skills/<skill_name>.md`. Uses `fileService.readFile` (same as `.voidrules` reader). Returns an error string if the skill doesn't exist.
+**Implementation:** tries each candidate path in order: workspace `.void/skills/<skill_name>/SKILL.md`, workspace `.void/skills/<skill_name>.md`, global `~/.void/skills/<skill_name>/SKILL.md`, global `~/.void/skills/<skill_name>.md`. Returns the first match (frontmatter stripped). Returns an error string if no match.
 
 **Tool description** (in `prompts.ts`):
 > Loads the full instructions for a named skill. Use this when the current task matches a skill listed in the AVAILABLE SKILLS section of the system prompt. Returns the skill's full content as text. Only load skills that are relevant to the current task — don't load skills you don't need.

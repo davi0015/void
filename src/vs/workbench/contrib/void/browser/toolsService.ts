@@ -977,26 +977,29 @@ export class ToolsService implements IToolsService {
 			},
 
 			load_skill: async ({ skillName }) => {
-				// Check workspace .void/skills/ first, then global ~/.void/skills/
-				const folders = workspaceContextService.getWorkspace().folders
-				for (const folder of folders) {
-					const uri = URI.joinPath(folder.uri, '.void', 'skills', `${skillName}.md`)
+				// Strip frontmatter and return body
+				const stripFrontmatter = (content: string) => {
+					const bodyMatch = content.match(/^---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/)
+					return (bodyMatch ? bodyMatch[1] : content).trim()
+				}
+				// Try each candidate path: workspace .void/skills/ then global ~/.void/skills/
+				// Supports both <name>/SKILL.md (directory) and <name>.md (flat file)
+				const candidateUris: URI[] = []
+				for (const folder of workspaceContextService.getWorkspace().folders) {
+					candidateUris.push(URI.joinPath(folder.uri, '.void', 'skills', skillName, 'SKILL.md'))
+					candidateUris.push(URI.joinPath(folder.uri, '.void', 'skills', `${skillName}.md`))
+				}
+				const userHome = await this.pathService.userHome()
+				candidateUris.push(URI.joinPath(userHome, '.void', 'skills', skillName, 'SKILL.md'))
+				candidateUris.push(URI.joinPath(userHome, '.void', 'skills', `${skillName}.md`))
+
+				for (const uri of candidateUris) {
 					if (await fileService.exists(uri)) {
 						const content = (await fileService.readFile(uri)).value.toString()
-						// Strip frontmatter if present
-						const bodyMatch = content.match(/^---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/)
-						return { result: { content: (bodyMatch ? bodyMatch[1] : content).trim() } }
+						return { result: { content: stripFrontmatter(content) } }
 					}
 				}
-				// Fall back to global ~/.void/skills/
-				const userHome = await this.pathService.userHome()
-				const globalUri = URI.joinPath(userHome, '.void', 'skills', `${skillName}.md`)
-				if (await fileService.exists(globalUri)) {
-					const content = (await fileService.readFile(globalUri)).value.toString()
-					const bodyMatch = content.match(/^---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/)
-					return { result: { content: (bodyMatch ? bodyMatch[1] : content).trim() } }
-				}
-				return { result: { content: `Skill "${skillName}" not found. Check the AVAILABLE SKILLS section for the correct name, or create it at .void/skills/${skillName}.md or ~/.void/skills/${skillName}.md` } }
+				return { result: { content: `Skill "${skillName}" not found. Check the AVAILABLE SKILLS section for the correct name.` } }
 			},
 		}
 
