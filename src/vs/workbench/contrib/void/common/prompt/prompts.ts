@@ -398,6 +398,15 @@ export const builtinTools: {
 		},
 	},
 
+	// --- skills ---
+	load_skill: {
+		name: 'load_skill',
+		description: `Loads the full instructions for a named skill. Use this when the current task matches a skill listed in the AVAILABLE SKILLS section of the system prompt. Returns the skill's full content as text. Only load skills that are relevant to the current task — don't load skills you don't need.`,
+		params: {
+			skill_name: { description: `The name of the skill to load, as it appears in the AVAILABLE SKILLS section of the system prompt.` },
+		},
+	},
+
 } satisfies { [T in keyof BuiltinToolResultType]: InternalToolInfo }
 
 

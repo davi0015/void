@@ -106,6 +106,8 @@ export type BuiltinToolCallParams = {
 	'semantic_search': { query: string, nResults: number, includePattern: string | null },
 	// --- history ---
 	'search_history': { query: string | null, toolName: string | null, resultStatus: 'error' | 'success' | null, contextRadius: number },
+	// --- skills ---
+	'load_skill': { skillName: string },
 }
 
 // RESULT OF TOOL CALL
@@ -137,6 +139,8 @@ export type BuiltinToolResultType = {
 	'fetch_url': { title: string, content: string, url: string },
 	// --- history ---
 	'search_history': { matches: string, totalMatches: number },
+	// --- skills ---
+	'load_skill': { content: string },
 }
 
 
