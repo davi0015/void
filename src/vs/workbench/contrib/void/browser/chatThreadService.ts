@@ -40,6 +40,7 @@ import { deepClone } from '../../../../base/common/objects.js';
 import { IWorkspaceContextService, toWorkspaceIdentifier } from '../../../../platform/workspace/common/workspace.js';
 import { basename as resourceBasename, joinPath } from '../../../../base/common/resources.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
+import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
 import { buildTestMessages, runSimulatedStream } from './chatThreadDevTools.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
@@ -249,6 +250,11 @@ export type ThreadType = {
 	// users curate their tab strip without editing message content.
 	// Persisted as part of the thread blob — no separate storage key.
 	customTitle?: string;
+
+	// Ephemeral (not persisted) — computed during metadata-only reads by
+	// reading the first few message keys. Used by the UI as a label fallback
+	// when messages aren't loaded (lazy loading). Skipped in _splitThreadForStorage.
+	title?: string;
 
 	// this doesn't need to go in a state object, but feels right
 	state: {
@@ -651,6 +657,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IMCPService private readonly _mcpService: IMCPService,
 		@IRequestTelemetryService private readonly _requestTelemetryService: IRequestTelemetryService,
 		@IEnvironmentService private readonly _environmentService: IEnvironmentService,
+		@ILifecycleService private readonly _lifecycleService: ILifecycleService,
 	) {
 		super()
 		void this._editCodeService // checkpoint disabled — kept for DI, see checkpoint-storage-refactor.md
@@ -833,6 +840,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// 	disposablesOfModelId[e.id].forEach(d => d.dispose())
 		// }))
 
+		// Flush pending writes on shutdown so reload/close doesn't lose
+		// the last 500ms of message/usage/metadata writes. Without this,
+		// a reload window can drop the most recent messages, causing
+		// compaction boundary mismatches and prefix cache invalidation.
+		this._register(this._lifecycleService.onWillShutdown(() => {
+			this._flushPendingThreadWrites()
+		}))
+
 	}
 
 	async focusCurrentChat() {
@@ -877,6 +892,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// Wipe every workspace's pin bucket on reset — `resetState` is the
 		// "nuclear option" for clearing user data, scope-agnostic.
 		for (const k of Object.keys(this._pinnedThreadIdsByWorkspace)) delete this._pinnedThreadIdsByWorkspace[k]
+		this._loadedMessageThreadIds.clear()
 		this._storePinnedThreadIdsByWorkspace()
 		this.openNewThread()
 		this._onDidChangeCurrentThread.fire()
@@ -947,6 +963,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	private _pendingUsageWrites = new Map<string, object>()       // usage stats
 	private _pendingMessageKeyWrites = new Map<string, ChatMessage>() // individual msg keys
+	// Tracks which threads have their messages loaded into memory.
+	// At startup, only metadata is loaded for all threads; messages are
+	// loaded on demand when the user switches to a thread.
+	private _loadedMessageThreadIds = new Set<string>()
 	// checkpoint disabled — see checkpoint-storage-refactor.md
 	// private _pendingCheckpointKeyWrites = new Map<string, CheckpointEntry>()
 
@@ -978,6 +998,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const usage: Record<string, unknown> = {}
 		for (const [key, value] of Object.entries(thread)) {
 			if (key === 'messages') continue // checkpoint disabled — checkpoints field removed
+			if (key === 'title') continue // ephemeral — computed on read, not persisted
 			if (ChatThreadService._USAGE_FIELDS.has(key)) {
 				usage[key] = value
 			} else {
@@ -1133,14 +1154,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	private _writeThreadIndex(delta?: { added?: string, removed?: string }) {
-		const baseIds = Object.keys(this.state.allThreads).filter(id => this.state.allThreads[id] !== undefined)
-		const ids = new Set(baseIds)
+		// Read the current index from storage (not in-memory allThreads) to
+		// avoid dropping threads added by other windows that this window
+		// doesn't know about yet. Rebuilding from allThreads would overwrite
+		// the index with this window's potentially-stale view, orphaning any
+		// threads created in other windows since this window's startup.
+		const indexStr = this._storageService.get(THREAD_INDEX_KEY, StorageScope.APPLICATION)
+		const ids = new Set<string>(indexStr ? JSON.parse(indexStr) as string[] : [])
 		if (delta?.added) ids.add(delta.added)
 		if (delta?.removed) ids.delete(delta.removed)
 		this._storageService.store(THREAD_INDEX_KEY, JSON.stringify([...ids]), StorageScope.APPLICATION, StorageTarget.USER)
 	}
 
-	private _readThread(threadId: string): ThreadType | undefined {
+	private _readThread(threadId: string, loadMessages: boolean = true): ThreadType | undefined {
 		const metadataRaw = this._storageService.get(THREAD_KEY_PREFIX + threadId, StorageScope.APPLICATION)
 		if (!metadataRaw) return undefined
 
@@ -1152,6 +1178,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// inline `messages` in metadata). After removal, threads in this format
 		// will return undefined and be silently dropped.
 		if (metadataParsed.messages && Array.isArray(metadataParsed.messages)) {
+			if (!loadMessages) {
+				// Defer migration — return metadata only with empty messages.
+				// Migration will run when the thread is opened via _ensureMessagesLoaded.
+				const inlineMessages = metadataParsed.messages as any[]
+				delete metadataParsed.messages
+				const firstUserMsg = inlineMessages.find(m => m.role === 'user')
+				const title = firstUserMsg?.displayContent || undefined
+				const thread = { ...metadataParsed, messages: [] as ChatMessage[], title } as ThreadType
+				if (!thread.state) {
+					thread.state = { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {} }
+				}
+				return thread
+			}
 			const allMessages = metadataParsed.messages as any[]
 			const messages: ChatMessage[] = []
 			let msgIdx = 0
@@ -1175,6 +1214,27 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// Read metadata + usage
 		const usageRaw = this._storageService.get(USAGE_KEY_PREFIX + threadId, StorageScope.APPLICATION)
 		const usageParsed = usageRaw ? JSON.parse(usageRaw, ChatThreadService._storageReviver) as any : {}
+
+		if (!loadMessages) {
+			// Metadata-only load — skip message reading and migration.
+			// Messages will be loaded when the thread is opened via _ensureMessagesLoaded.
+			// Read the first few message keys to extract a title for the tab label.
+			let title: string | undefined
+			for (let i = 0; i < 5; i++) {
+				const msgRaw = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
+				if (msgRaw === undefined) continue
+				const msg = JSON.parse(msgRaw, ChatThreadService._storageReviver) as any
+				if (msg.role === 'user' && msg.displayContent) {
+					title = msg.displayContent
+					break
+				}
+			}
+			const thread: ThreadType = { ...metadataParsed, ...usageParsed, messages: [] as ChatMessage[], title } as ThreadType
+			if (!thread.state) {
+				thread.state = { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {} }
+			}
+			return thread
+		}
 
 		const messages: ChatMessage[] = []
 		// checkpoint disabled — see checkpoint-storage-refactor.md
@@ -1249,6 +1309,30 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		return thread
 	}
 
+	/** Load messages for a thread on demand (lazy message loading).
+	 *  At startup, only metadata is loaded for all threads to avoid
+	 *  deserializing 25k+ messages into renderer memory. This method
+	 *  is called when the user switches to a thread, loading its
+	 *  messages and running any pending migration. */
+	private _ensureMessagesLoaded(threadId: string): void {
+		if (this._loadedMessageThreadIds.has(threadId)) return
+		const existing = this.state.allThreads[threadId]
+		if (!existing) return
+
+		const fullThread = this._readThread(threadId, true)
+		if (!fullThread) return
+
+		this._loadedMessageThreadIds.add(threadId)
+
+		// Only trigger a state update if we actually got messages —
+		// avoids a redundant re-render for threads that are genuinely empty
+		if (fullThread.messages.length > 0) {
+			const updatedThread = { ...existing, messages: fullThread.messages }
+			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
+			this._setState({ allThreads: newThreads })
+		}
+	}
+
 	private _readAllThreadsSplit(): ChatThreads | null {
 		const indexStr = this._storageService.get(THREAD_INDEX_KEY, StorageScope.APPLICATION)
 		if (!indexStr) return null
@@ -1256,7 +1340,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (ids.length === 0) return null
 		const threads: ChatThreads = {}
 		for (const id of ids) {
-			threads[id] = this._readThread(id)
+			threads[id] = this._readThread(id, false) // metadata only — messages loaded on demand
 		}
 		return threads
 	}
@@ -3825,6 +3909,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// is unaffected. Use `_landOnThread` for non-user-initiated
 		// transitions (startup restore, normalize) where the tab strip
 		// should stay exactly as the user left it.
+		this._ensureMessagesLoaded(threadId)
 		const alreadyPinned = this.state.pinnedThreadIds.includes(threadId)
 		if (alreadyPinned) {
 			this._setState({ currentThreadId: threadId })
@@ -3843,6 +3928,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// `switchToThread` so a reload-landing thread still gets remembered.
 	private _landOnThread(threadId: string): void {
 		if (!this.state.allThreads[threadId]) return
+		this._ensureMessagesLoaded(threadId)
 		this._setState({ currentThreadId: threadId })
 		this._afterCurrentThreadChanged(threadId)
 	}
@@ -4044,6 +4130,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		for (const threadId in currentThreads) {
 			const t = currentThreads[threadId]
 			if (!t || t.messages.length !== 0) continue
+			// Skip threads whose messages haven't been loaded — they might
+			// have messages in storage that just aren't in memory yet.
+			if (!this._loadedMessageThreadIds.has(threadId)) continue
 			if (!isThreadInWorkspaceScope(t, currentWorkspaceUri)) continue
 			// Claim BEFORE switch: if we reuse an unscoped legacy empty
 			// thread in a workspaced window, tag it so it's no longer "shared
@@ -4066,6 +4155,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			? this.state.pinnedThreadIds
 			: [...this.state.pinnedThreadIds, newThread.id]
 		this._storeThread(newThread.id, newThread, true)
+		this._loadedMessageThreadIds.add(newThread.id) // new threads start empty — no need to load
 		this._setPinsForCurrentWorkspace(newPinned, { allThreads: newThreads, currentThreadId: newThread.id })
 	}
 
@@ -4074,9 +4164,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const { allThreads: currentThreads } = this.state
 		const deletedThread = currentThreads[threadId]
 
-		// Clean up image files owned by this thread
+		// Clean up image files owned by this thread.
+		// Load messages first so image paths are available for cleanup.
 		if (deletedThread) {
-			this._deleteOrphanedImages(deletedThread.messages, [])
+			this._ensureMessagesLoaded(threadId)
+			this._deleteOrphanedImages(this.state.allThreads[threadId]?.messages ?? [], [])
 		}
 
 		// delete the thread
@@ -4107,6 +4199,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._telemetryRidByThread.delete(threadId)
 		this._pendingImageBytesByThread.delete(threadId)
 		this._requestTelemetryService.forgetThread(threadId)
+		this._loadedMessageThreadIds.delete(threadId)
 
 		// Phase E — also clear any per-workspace last-active pointers to this
 		// thread so it doesn't get auto-pinned back via restore on next reload.
@@ -4120,6 +4213,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	duplicateThread(threadId: string) {
+		this._ensureMessagesLoaded(threadId)
 		const { allThreads: currentThreads } = this.state
 		const threadToDuplicate = currentThreads[threadId]
 		if (!threadToDuplicate) return
@@ -4143,6 +4237,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		else newPinned.splice(srcIdx + 1, 0, newThread.id)
 
 		this._storeThread(newThread.id, newThread, true)
+		this._loadedMessageThreadIds.add(newThread.id) // duplicated thread already has messages in memory
 		this._setPinsForCurrentWorkspace(newPinned, { allThreads: newThreads })
 	}
 
@@ -4160,6 +4255,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// on. Returns the new id so the caller (banner button) can follow up
 	// with UI work if needed.
 	copyThreadToCurrentWorkspace(threadId: string): string | undefined {
+		this._ensureMessagesLoaded(threadId)
 		const source = this.state.allThreads[threadId]
 		if (!source) return undefined
 		const identity = this._getCurrentWorkspaceIdentity()
@@ -4190,6 +4286,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// 	this._storeCheckpointKey(newId, i, cloned.checkpoints[i])
 		// }
 		this._storeThread(newId, cloned, true)
+		this._loadedMessageThreadIds.add(newId) // cloned thread already has messages in memory
 		// Drop in-memory telemetry mirrors for the new id (defensive — should
 		// be empty since the id is fresh, but keeps the maps strictly
 		// in-sync with what's persisted on the thread).

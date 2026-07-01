@@ -41,7 +41,14 @@ const partitionThreadsByWorkspaceScope = (
 
 	const sortedIds = Object.keys(allThreads)
 		.sort((a, b) => ((allThreads[a]?.lastModified ?? '') > (allThreads[b]?.lastModified ?? '') ? -1 : 1))
-		.filter(id => (allThreads[id]?.messages.length ?? 0) !== 0)
+		.filter(id => {
+			const t = allThreads[id]
+			if (!t) return false
+			// With lazy message loading, non-active threads have messages: []
+			// in memory. Use lastModified vs createdAt to detect used threads.
+			if (t.messages.length > 0) return true // messages loaded — has content
+			return (t.lastModified ?? '') > (t.createdAt ?? '') // not loaded but was used
+		})
 
 	for (const id of sortedIds) {
 		const t = allThreads[id]
@@ -366,20 +373,27 @@ const PastThreadElement = ({ pastThread, idx, hoveredIdx, setHoveredIdx, isRunni
 		if (firstUserMsgIdx !== -1) {
 			const firsUsertMsgObj = pastThread.messages[firstUserMsgIdx];
 			firstMsg = firsUsertMsgObj.role === 'user' && firsUsertMsgObj.displayContent || '';
+		} else if (pastThread.title) {
+			// Messages not loaded (lazy loading) — use ephemeral title
+			firstMsg = pastThread.title;
 		} else {
 			firstMsg = '""';
 		}
 	}
 
-	const numMessages = pastThread.messages.filter((msg) => msg.role === 'assistant' || msg.role === 'user').length;
+	// With lazy loading, non-active threads have messages: []. Don't show
+	// a misleading "0" — hide the count until messages are loaded.
+	const numMessages = pastThread.messages.length > 0
+		? pastThread.messages.filter((msg) => msg.role === 'assistant' || msg.role === 'user').length
+		: null;
 
 	const detailsHTML = <span
 	// data-tooltip-id='void-tooltip'
 	// data-tooltip-content={`Last modified ${formatTime(new Date(pastThread.lastModified))}`}
 	// data-tooltip-place='top'
 	>
-		<span className='opacity-60'>{numMessages}</span>
-		{` `}
+		{numMessages !== null && <span className='opacity-60'>{numMessages}</span>}
+		{numMessages !== null && ` `}
 		{formatDate(new Date(pastThread.lastModified))}
 		{/* {` messages `} */}
 	</span>
@@ -857,6 +871,8 @@ export const SidebarThreadTabs = React.memo(() => {
 
 					// Label cascade: user-set custom title (trimmed, non-empty) wins;
 					// otherwise fall back to first user message's displayContent;
+					// otherwise the ephemeral `title` field (set during metadata-only
+					// reads when messages aren't loaded — lazy loading);
 					// otherwise "New Chat" so empty threads aren't blank. The
 					// custom title is editable via double-click or right-click →
 					// Rename. Whitespace-only customTitle resets to default.
@@ -864,7 +880,7 @@ export const SidebarThreadTabs = React.memo(() => {
 					const firstUser = t.messages.find(m => m.role === 'user')
 					const firstMsgLabel = firstUser && firstUser.role === 'user' && firstUser.displayContent
 						? firstUser.displayContent
-						: 'New Chat'
+						: (t.title || 'New Chat')
 					const label = customTitle || firstMsgLabel
 					const isEditingThis = editingThreadId === id
 
@@ -1188,7 +1204,7 @@ export const SidebarThreadTabs = React.memo(() => {
 				if (!t) return null
 				const customTitle = t.customTitle?.trim()
 				const firstUser = t.messages.find(m => m.role === 'user')
-				const firstMsgLabel = firstUser && firstUser.role === 'user' && firstUser.displayContent ? firstUser.displayContent : 'New Chat'
+				const firstMsgLabel = firstUser && firstUser.role === 'user' && firstUser.displayContent ? firstUser.displayContent : (t.title || 'New Chat')
 				const ghostLabel = customTitle || firstMsgLabel
 				return (
 					<div
