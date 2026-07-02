@@ -153,7 +153,7 @@ export type OnAbort = () => void
 export type AbortRef = { current: (() => void) | null }
 
 
-// service types
+// service types — browser → service (keeps chatMode; the service computes the tool list)
 type SendLLMType = {
 	messagesType: 'chatMessages';
 	messages: LLMChatMessage[]; // the type of raw chat messages that we send to Anthropic, OAI, etc
@@ -176,6 +176,19 @@ export type ServiceSendLLMMessageParams = {
 	onAbort: OnAbort;
 } & SendLLMType;
 
+// service → electron-main (pre-resolved tool list; electron-main is tool-agnostic)
+type MainLLMType = {
+	messagesType: 'chatMessages';
+	messages: LLMChatMessage[];
+	separateSystemMessage: string | undefined;
+	tools: InternalToolInfo[] | undefined;
+} | {
+	messagesType: 'FIMMessage';
+	messages: LLMFIMMessage;
+	separateSystemMessage?: undefined;
+	tools: InternalToolInfo[] | undefined;
+}
+
 // params to the true sendLLMMessage function
 export type SendLLMMessageParams = {
 	onText: OnText;
@@ -189,14 +202,13 @@ export type SendLLMMessageParams = {
 	overridesOfModel: OverridesOfModel | undefined;
 
 	settingsOfProvider: SettingsOfProvider;
-	mcpTools: InternalToolInfo[] | undefined;
-} & SendLLMType
+} & MainLLMType
 
 
 
 // can't send functions across a proxy, use listeners instead
 export type BlockedMainLLMMessageParams = 'onText' | 'onFinalMessage' | 'onError' | 'abortRef'
-export type MainSendLLMMessageParams = Omit<SendLLMMessageParams, BlockedMainLLMMessageParams> & { requestId: string } & SendLLMType
+export type MainSendLLMMessageParams = Omit<SendLLMMessageParams, BlockedMainLLMMessageParams> & { requestId: string } & MainLLMType
 
 export type MainLLMMessageAbortParams = { requestId: string }
 

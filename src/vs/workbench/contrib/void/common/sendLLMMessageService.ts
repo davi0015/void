@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import { EventLLMMessageOnTextParams, EventLLMMessageOnErrorParams, EventLLMMessageOnFinalMessageParams, ServiceSendLLMMessageParams, MainSendLLMMessageParams, MainLLMMessageAbortParams, ServiceModelListParams, EventModelListOnSuccessParams, EventModelListOnErrorParams, MainModelListParams, OllamaModelResponse, OpenaiCompatibleModelResponse, } from './sendLLMMessageTypes.js';
+import { availableTools } from './prompt/prompts.js';
 
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
@@ -117,7 +118,7 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 	}
 
 	sendLLMMessage(params: ServiceSendLLMMessageParams) {
-		const { onText, onFinalMessage, onError, onAbort, modelSelection, ...proxyParams } = params;
+		const { onText, onFinalMessage, onError, onAbort, modelSelection, chatMode, ...proxyParams } = params;
 
 		// throw an error if no model/provider selected (this should usually never be reached, the UI should check this first, but might happen in cases like Apply where we haven't built much UI/checks yet, good practice to have check logic on backend)
 		if (modelSelection === null) {
@@ -134,7 +135,10 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 
 		const { settingsOfProvider, } = this.voidSettingsService.state
 
+		// Resolve the tool list here so electron-main stays tool-agnostic — it just
+		// formats whatever InternalToolInfo[] it receives into provider schemas.
 		const mcpTools = this.mcpService.getMCPTools()
+		const tools = availableTools(chatMode ?? null, mcpTools)
 
 		// add state for request id
 		const requestId = generateUuid();
@@ -150,7 +154,7 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 			requestId,
 			settingsOfProvider,
 			modelSelection,
-			mcpTools,
+			tools,
 		} satisfies MainSendLLMMessageParams);
 
 		return requestId
