@@ -20,8 +20,8 @@ export const sendLLMMessage = async ({
 	modelSelection,
 	modelSelectionOptions,
 	overridesOfModel,
-	tools,
 	separateSystemMessage,
+	tools,
 }: SendLLMMessageParams,
 
 	metricsService: IMetricsService

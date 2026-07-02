@@ -10,7 +10,6 @@ import { OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../
 import { ToolName, ToolParamName } from '../../common/toolsServiceTypes.js'
 
 
-
 // =============== reasoning ===============
 
 // could simplify this - this assumes we can never add a tag without committing it to the user's screen, but that's not true
