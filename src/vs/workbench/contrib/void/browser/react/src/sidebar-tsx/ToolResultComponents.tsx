@@ -20,6 +20,7 @@ import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } f
 import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
 import { persistentTerminalNameOfId } from '../../../terminalToolService.js';
 import { removeMCPToolNamePrefix } from '../../../../common/mcpServiceTypes.js';
+import { toolUIOfToolName } from '../../../tools/toolUIRegistry.js';
 
 import {
 	getBasename,
@@ -412,10 +413,11 @@ export const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name
 	// built-in title
 	else {
 		const toolName = t.name as BuiltinToolName
+		const titleInfo = toolUIOfToolName[toolName]?.title ?? titleOfBuiltinToolName[toolName]
 		const base =
-			t.type === 'success' ? titleOfBuiltinToolName[toolName].done
-				: t.type === 'running_now' ? titleOfBuiltinToolName[toolName].running
-					: titleOfBuiltinToolName[toolName].proposed
+			t.type === 'success' ? titleInfo.done
+				: t.type === 'running_now' ? titleInfo.running
+					: titleInfo.proposed
 		return prefix ? `${prefix}${base}` : base
 	}
 }
@@ -429,6 +431,10 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 	if (!_toolParams) {
 		return { desc1: '', };
 	}
+
+	// Check if this tool has been migrated to the new per-file definition
+	const uiDef = toolUIOfToolName[toolName]
+	if (uiDef) return uiDef.desc(_toolParams as any, accessor)
 
 	const x = {
 		'read_file': () => {
@@ -931,6 +937,14 @@ export const MCPToolWrapper = ({ toolMessage }: WrapperProps<string>) => {
 }
 
 export type ResultWrapper<T extends ToolName> = (props: WrapperProps<T>) => React.ReactNode
+
+// Returns the resultWrapper for a built-in tool, checking the UI registry first
+// (for migrated tools) and falling back to the old static map.
+export const getToolResultWrapper = (toolName: BuiltinToolName): ResultWrapper<ToolName> | undefined => {
+	const uiDef = toolUIOfToolName[toolName]
+	if (uiDef) return uiDef.resultWrapper as ResultWrapper<ToolName>
+	return builtinToolNameToComponent[toolName]?.resultWrapper as ResultWrapper<ToolName>
+}
 
 export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: ResultWrapper<T>, } } = {
 	'read_file': {

@@ -38,6 +38,7 @@ import { type LLMUsage, RawToolCallObj } from '../../../../common/sendLLMMessage
 import ErrorBoundary from './ErrorBoundary.js';
 import {
 	builtinToolNameToComponent,
+	getToolResultWrapper,
 	CanceledTool,
 	EditToolChildren,
 	InvalidTool,
@@ -2003,7 +2004,7 @@ const _ChatBubble = ({ threadId, chatMessage, /* currCheckpointIdx, */ isCommitt
 
 		const toolName = chatMessage.name
 		const isBuiltInTool = isABuiltinToolName(toolName)
-		const ToolResultWrapper = isBuiltInTool ? builtinToolNameToComponent[toolName]?.resultWrapper as ResultWrapper<ToolName>
+		const ToolResultWrapper = isBuiltInTool ? getToolResultWrapper(toolName)
 			: MCPToolWrapper as ResultWrapper<ToolName>
 
 		if (ToolResultWrapper)

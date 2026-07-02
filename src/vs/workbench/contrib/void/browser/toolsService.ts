@@ -29,6 +29,9 @@ import { IFetchUrlService } from '../common/fetchUrlService.js'
 import type { ChatMessage } from '../common/chatThreadServiceTypes.js'
 
 
+import { toolDefinitionOfToolName } from './tools/toolRegistry.js'
+import type { ToolCtx } from './tools/toolTypes.js'
+
 // tool use for AI
 type ValidateBuiltinParams = { [T in BuiltinToolName]: (p: RawToolParamsObj) => BuiltinToolCallParams[T] }
 type CallBuiltinTool = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T]) => Promise<{ result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>, interruptTool?: () => void }> }
@@ -39,7 +42,7 @@ const isFalsy = (u: unknown) => {
 	return !u || u === 'null' || u === 'undefined'
 }
 
-const safeFence = (content: string): string => {
+export const safeFence = (content: string): string => {
 	let maxRun = 2
 	const re = /`{3,}/g
 	let m: RegExpExecArray | null
@@ -49,7 +52,9 @@ const safeFence = (content: string): string => {
 	return '`'.repeat(maxRun + 1)
 }
 
-const validateStr = (argName: string, value: unknown) => {
+export const nextPageStr = (hasNextPage: boolean) => hasNextPage ? '\n\n(more on next page...)' : ''
+
+export const validateStr = (argName: string, value: unknown) => {
 	if (value === null) throw new Error(`Invalid LLM output: ${argName} was null.`)
 	if (typeof value !== 'string') throw new Error(`Invalid LLM output format: ${argName} must be a string, but its type is "${typeof value}". Full value: ${JSON.stringify(value)}.`)
 	return value
@@ -118,7 +123,7 @@ const validateOptionalStr = (argName: string, str: unknown) => {
 }
 
 
-const validatePageNum = (pageNumberUnknown: unknown) => {
+export const validatePageNum = (pageNumberUnknown: unknown) => {
 	if (!pageNumberUnknown) return 1
 	const parsedInt = Number.parseInt(pageNumberUnknown + '')
 	if (!Number.isInteger(parsedInt)) throw new Error(`Page number was not an integer: "${pageNumberUnknown}".`)
@@ -126,7 +131,7 @@ const validatePageNum = (pageNumberUnknown: unknown) => {
 	return parsedInt
 }
 
-const validateNumber = (numStr: unknown, opts: { default: number | null }) => {
+export const validateNumber = (numStr: unknown, opts: { default: number | null }) => {
 	if (typeof numStr === 'number')
 		return numStr
 	if (isFalsy(numStr)) return opts.default
@@ -301,7 +306,7 @@ function renderMarkdownHeadingOutline(content: string): string | null {
 	return result.join('\n')
 }
 
-async function getFileOutline(
+export async function getFileOutline(
 	model: ITextModel,
 	languageFeaturesService: ILanguageFeaturesService,
 	uri: URI,
@@ -1004,7 +1009,6 @@ export class ToolsService implements IToolsService {
 		}
 
 
-		const nextPageStr = (hasNextPage: boolean) => hasNextPage ? '\n\n(more on next page...)' : ''
 
 		const stringifyLintErrors = (lintErrors: LintErrorItem[]) => {
 			return lintErrors
@@ -1178,6 +1182,35 @@ export class ToolsService implements IToolsService {
 		}
 
 
+		// --- Tool registry delegation ---
+		// Build ToolCtx from injected services so converted tools can access DI.
+		const toolCtx: ToolCtx = {
+			fileService,
+			workspaceContextService,
+			searchService,
+			queryBuilder,
+			voidModelService,
+			editCodeService,
+			terminalToolService: this.terminalToolService,
+			commandBarService: this.commandBarService,
+			directoryStrService: this.directoryStrService,
+			markerService: this.markerService,
+			voidSettingsService: this.voidSettingsService,
+			languageFeaturesService,
+			fetchUrlService: this.fetchUrlService,
+			pathService: this.pathService,
+			validateURI,
+			validateOptionalURI,
+		}
+
+		// Override entries for converted tools with registry delegations.
+		// Unconverted tools keep using the inline maps above.
+		const readFileDef = toolDefinitionOfToolName.read_file
+		if (readFileDef) {
+			this.validateParams.read_file = (raw) => readFileDef.validateParams(raw, toolCtx)
+			this.callTool.read_file = (params) => readFileDef.callTool(params, toolCtx)
+			this.stringOfResult.read_file = (params, result) => readFileDef.stringOfResult(params, result, toolCtx)
+		}
 
 	}
 
@@ -1197,7 +1230,6 @@ export class ToolsService implements IToolsService {
 		if (!lintErrors.length) return { lintErrors: null }
 		return { lintErrors, }
 	}
-
 
 }
 
