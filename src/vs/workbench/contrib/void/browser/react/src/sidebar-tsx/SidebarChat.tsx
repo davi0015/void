@@ -2025,8 +2025,8 @@ const _ChatBubble = ({ threadId, chatMessage, /* currCheckpointIdx, */ isCommitt
 						/>
 					</ErrorBoundary>
 				</div>
-				{chatMessage.type === 'tool_request' && messageIdx === firstPendingToolRequestIdx
-					&& (isABuiltinToolName(chatMessage.name) ? !!approvalTypeOfBuiltinToolName[chatMessage.name] : true) ?
+			{chatMessage.type === 'tool_request' && messageIdx === firstPendingToolRequestIdx
+				&& (isABuiltinToolName(chatMessage.name) ? !!approvalTypeOfBuiltinToolName[chatMessage.name] : true) ?
 					<div className={`${/* isCheckpointGhost ? 'opacity-50 pointer-events-none' : '' */ ''}`}>
 						<ToolRequestAcceptRejectButtons toolName={chatMessage.name} threadId={threadId} toolId={chatMessage.id} params={chatMessage.params} />
 					</div> : null}
