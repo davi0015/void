@@ -9,7 +9,8 @@ import { IWorkspaceContextService } from '../../../../../platform/workspace/comm
 import { ISearchService } from '../../../../services/search/common/search.js'
 import { IPathService } from '../../../../services/path/common/pathService.js'
 import { IMarkerService } from '../../../../../platform/markers/common/markers.js'
-import { ILanguageFeaturesService } from '../../../../../editor/common/services/languageFeatures.jsom '../../../../services/search/common/queryBuilder.js'
+import { ILanguageFeaturesService } from '../../../../../editor/common/services/languageFeatures.js'
+import { QueryBuilder } from '../../../../services/search/common/queryBuilder.js'
 
 import { IEditCodeService } from '../editCodeServiceInterface.js'
 import { ITerminalToolService } from '../terminalToolService.js'
