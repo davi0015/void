@@ -342,7 +342,8 @@ const loadingTitleWrapper = (item: React.ReactNode): React.ReactNode => {
 }
 
 export const titleOfBuiltinToolName = {
-	'read_file': { done: 'Read file', proposed: 'Read file', running: loadingTitleWrapper('Reading file') },
+	// read_file title is now in toolUIRegistry — this stub satisfies the type
+	'read_file': { done: '', proposed: '', running: '' },
 	'ls_dir': { done: 'Inspected folder', proposed: 'Inspect folder', running: loadingTitleWrapper('Inspecting folder') },
 	'get_dir_tree': { done: 'Inspected folder tree', proposed: 'Inspect folder tree', running: loadingTitleWrapper('Inspecting folder tree') },
 	'search_pathnames_only': { done: 'Searched by file name', proposed: 'Search by file name', running: loadingTitleWrapper('Searching by file name') },

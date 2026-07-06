@@ -21,7 +21,7 @@ import { computeDirectoryTree1Deep, IDirectoryStrService, stringifyDirectoryTree
 import { IMarkerService, MarkerSeverity } from '../../../../platform/markers/common/markers.js'
 import { timeout } from '../../../../base/common/async.js'
 import { RawToolParamsObj } from '../common/sendLLMMessageTypes.js'
-import { AUTO_OUTLINE_THRESHOLD, MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js'
+import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js'
 import { DocumentSymbol, SymbolKind } from '../../../../editor/common/languages.js'
 import { IVoidSettingsService } from '../common/voidSettingsService.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
@@ -379,19 +379,7 @@ export class ToolsService implements IToolsService {
 		const validateOptionalURI = (uriStr: unknown) => validateOptionalURIWithRoot(uriStr, getWorkspaceRoot())
 
 		this.validateParams = {
-			read_file: (params: RawToolParamsObj) => {
-				const { uri: uriStr, start_line: startLineUnknown, end_line: endLineUnknown, page_number: pageNumberUnknown } = params
-				const uri = validateURI(uriStr)
-				const pageNumber = validatePageNum(pageNumberUnknown)
-
-				let startLine = validateNumber(startLineUnknown, { default: null })
-				let endLine = validateNumber(endLineUnknown, { default: null })
-
-				if (startLine !== null && startLine < 1) startLine = null
-				if (endLine !== null && endLine < 1) endLine = null
-
-				return { uri, startLine, endLine, pageNumber }
-			},
+			read_file: (_raw) => { throw new Error('read_file not initialized — should be overridden by registry') },
 			ls_dir: (params: RawToolParamsObj) => {
 				const { uri: uriStr, page_number: pageNumberUnknown } = params
 
@@ -576,45 +564,7 @@ export class ToolsService implements IToolsService {
 
 
 		this.callTool = {
-			read_file: async ({ uri, startLine, endLine, pageNumber }) => {
-				await voidModelService.initializeModel(uri)
-				const { model } = await voidModelService.getModelSafe(uri)
-				if (model === null) { throw new Error(`No contents; File does not exist.`) }
-
-				const totalNumLines = model.getLineCount()
-
-				if (startLine === null && endLine === null && pageNumber === 1 && this.voidSettingsService.state.globalSettings.autoOutlineReadFile) {
-					const fullContent = model.getValue(EndOfLinePreference.LF)
-					if (fullContent.length > AUTO_OUTLINE_THRESHOLD) {
-						const outlineText = await getFileOutline(model, languageFeaturesService, uri)
-						if (outlineText !== null) {
-							return { result: { outlined: true as const, outlineText, totalFileLen: fullContent.length, totalNumLines } }
-						}
-						// No outline available — return first ~1KB as fallback
-						const truncated = fullContent.slice(0, 1024)
-						const fallbackText = `(No symbol outline available for this file type. Showing first ~1KB.)\n\n${truncated}`
-						return { result: { outlined: true as const, outlineText: fallbackText, totalFileLen: fullContent.length, totalNumLines } }
-					}
-				}
-
-				let contents: string
-				if (startLine === null && endLine === null) {
-					contents = model.getValue(EndOfLinePreference.LF)
-				}
-				else {
-					const startLineNumber = startLine === null ? 1 : startLine
-					const endLineNumber = endLine === null ? model.getLineCount() : endLine
-					contents = model.getValueInRange({ startLineNumber, startColumn: 1, endLineNumber, endColumn: Number.MAX_SAFE_INTEGER }, EndOfLinePreference.LF)
-				}
-
-				const fromIdx = MAX_FILE_CHARS_PAGE * (pageNumber - 1)
-				const toIdx = MAX_FILE_CHARS_PAGE * pageNumber - 1
-				const fileContents = contents.slice(fromIdx, toIdx + 1) // paginate
-				const hasNextPage = (contents.length - 1) - toIdx >= 1
-				const totalFileLen = contents.length
-				return { result: { outlined: false as const, fileContents, totalFileLen, hasNextPage, totalNumLines } }
-			},
-
+			read_file: async () => { throw new Error('read_file not initialized — should be overridden by registry') },
 			ls_dir: async ({ uri, pageNumber }) => {
 				const dirResult = await computeDirectoryTree1Deep(fileService, uri, pageNumber)
 				return { result: dirResult }
@@ -1019,15 +969,7 @@ export class ToolsService implements IToolsService {
 
 		// given to the LLM after the call for successful tool calls
 		this.stringOfResult = {
-			read_file: (params, result) => {
-				return voidModelService.withModel(params.uri, () => {
-					if (result.outlined) {
-						return `SUCCESS: File outline retrieved for ${params.uri.fsPath} (${result.totalNumLines} lines, ${result.totalFileLen} characters).\nThis file is too large to read all at once. The outline below shows the file's structure with line numbers.\n\nIMPORTANT: Do NOT retry this call without line numbers — you will get the same outline.\nUse start_line and end_line to read specific sections.\n\n${result.outlineText}\n\nNEXT STEPS: To read a specific section, call read_file with the same path plus start_line and end_line from the outline above.`
-					}
-					const fence = safeFence(result.fileContents)
-					return `${params.uri.fsPath}\n${fence}\n${result.fileContents}\n${fence}${nextPageStr(result.hasNextPage)}${result.hasNextPage ? `\nMore info because truncated: this file has ${result.totalNumLines} lines, or ${result.totalFileLen} characters.` : ''}`
-				})
-			},
+			read_file: () => { throw new Error('read_file not initialized — should be overridden by registry') },
 			ls_dir: (params, result) => {
 				const dirTreeStr = stringifyDirectoryTree1Deep(params, result)
 				return dirTreeStr // + nextPageStr(result.hasNextPage) // already handles num results remaining
