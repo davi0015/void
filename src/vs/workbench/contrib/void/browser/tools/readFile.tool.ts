@@ -3,13 +3,13 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { EndOfLinePreference } from '../../../../editor/common/model.js'
+import { EndOfLinePreference } from '../../../../../editor/common/model.js'
 
 import { AUTO_OUTLINE_THRESHOLD, MAX_FILE_CHARS_PAGE } from '../../common/prompt/prompts.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr, validatePageNum, validateNumber, safeFence, nextPageStr, getFileOutline } from '../toolsService.js'
+import { validatePageNum, validateNumber, safeFence, nextPageStr, getFileOutline } from '../toolsService.js'
 
 
 export const readFileToolCore: ToolDefinitionCore<'read_file'> = {
