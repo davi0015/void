@@ -20,7 +20,6 @@ import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } f
 import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
 import { persistentTerminalNameOfId } from '../../../terminalToolService.js';
 import { removeMCPToolNamePrefix } from '../../../../common/mcpServiceTypes.js';
-import { toolUIOfToolName } from '../../../tools/toolUIRegistry.js';
 
 import {
 	getBasename,
@@ -343,7 +342,7 @@ const loadingTitleWrapper = (item: React.ReactNode): React.ReactNode => {
 
 export const titleOfBuiltinToolName = {
 	// read_file title is now in toolUIRegistry — this stub satisfies the type
-	'read_file': { done: '', proposed: '', running: '' },
+	'read_file': { done: 'Read file', proposed: 'Read file', running: loadingTitleWrapper('Reading file') },
 	'ls_dir': { done: 'Inspected folder', proposed: 'Inspect folder', running: loadingTitleWrapper('Inspecting folder') },
 	'get_dir_tree': { done: 'Inspected folder tree', proposed: 'Inspect folder tree', running: loadingTitleWrapper('Inspecting folder tree') },
 	'search_pathnames_only': { done: 'Searched by file name', proposed: 'Search by file name', running: loadingTitleWrapper('Searching by file name') },
@@ -414,11 +413,10 @@ export const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name
 	// built-in title
 	else {
 		const toolName = t.name as BuiltinToolName
-		const titleInfo = toolUIOfToolName[toolName]?.title ?? titleOfBuiltinToolName[toolName]
 		const base =
-			t.type === 'success' ? titleInfo.done
-				: t.type === 'running_now' ? titleInfo.running
-					: titleInfo.proposed
+			t.type === 'success' ? titleOfBuiltinToolName[toolName].done
+				: t.type === 'running_now' ? titleOfBuiltinToolName[toolName].running
+					: titleOfBuiltinToolName[toolName].proposed
 		return prefix ? `${prefix}${base}` : base
 	}
 }
@@ -432,10 +430,6 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 	if (!_toolParams) {
 		return { desc1: '', };
 	}
-
-	// Check if this tool has been migrated to the new per-file definition
-	const uiDef = toolUIOfToolName[toolName]
-	if (uiDef) return uiDef.desc(_toolParams as any, accessor)
 
 	const x = {
 		'read_file': () => {
@@ -938,14 +932,6 @@ export const MCPToolWrapper = ({ toolMessage }: WrapperProps<string>) => {
 }
 
 export type ResultWrapper<T extends ToolName> = (props: WrapperProps<T>) => React.ReactNode
-
-// Returns the resultWrapper for a built-in tool, checking the UI registry first
-// (for migrated tools) and falling back to the old static map.
-export const getToolResultWrapper = (toolName: BuiltinToolName): ResultWrapper<ToolName> | undefined => {
-	const uiDef = toolUIOfToolName[toolName]
-	if (uiDef) return uiDef.resultWrapper as ResultWrapper<ToolName>
-	return builtinToolNameToComponent[toolName]?.resultWrapper as ResultWrapper<ToolName>
-}
 
 export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: ResultWrapper<T>, } } = {
 	'read_file': {

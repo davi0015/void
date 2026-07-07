@@ -36,9 +36,9 @@ import { isABuiltinToolName, MAX_TERMINAL_INACTIVE_TIME } from '../../../../comm
 import { getBasename, getFolderName, getRelative, voidOpenFileFn, IconLoading, SmallProseWrapper } from './sidebarChatHelpers.js';
 import { type LLMUsage, RawToolCallObj } from '../../../../common/sendLLMMessageTypes.js';
 import ErrorBoundary from './ErrorBoundary.js';
+import { toolUIOfToolName } from '../../../tools/toolUIRegistry.js';
 import {
 	builtinToolNameToComponent,
-	getToolResultWrapper,
 	CanceledTool,
 	EditToolChildren,
 	InvalidTool,
@@ -2004,7 +2004,8 @@ const _ChatBubble = ({ threadId, chatMessage, /* currCheckpointIdx, */ isCommitt
 
 		const toolName = chatMessage.name
 		const isBuiltInTool = isABuiltinToolName(toolName)
-		const ToolResultWrapper = isBuiltInTool ? getToolResultWrapper(toolName)
+		const uiDef = isBuiltInTool ? toolUIOfToolName[toolName] : undefined
+		const ToolResultWrapper = isBuiltInTool ? (uiDef?.resultWrapper ?? builtinToolNameToComponent[toolName]?.resultWrapper) as ResultWrapper<ToolName>
 			: MCPToolWrapper as ResultWrapper<ToolName>
 
 		if (ToolResultWrapper)
