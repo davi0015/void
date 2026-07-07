@@ -5,6 +5,7 @@
 
 import { URI } from '../../../../../base/common/uri.js'
 import { IFileService } from '../../../../../platform/files/common/files.js'
+import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js'
 import { IWorkspaceContextService } from '../../../../../platform/workspace/common/workspace.js'
 import { ISearchService } from '../../../../services/search/common/search.js'
 import { IPathService } from '../../../../services/path/common/pathService.js'
@@ -47,6 +48,7 @@ voidSettingsService: IVoidSettingsService
 languageFeaturesService: ILanguageFeaturesService
 fetchUrlService: IFetchUrlService
 pathService: IPathService
+instantiationService: IInstantiationService
 
 // Validation helpers — resolve relative paths against the workspace root
 validateURI: (uriStr: unknown) => URI

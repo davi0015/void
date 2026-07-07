@@ -38,7 +38,7 @@ type CallBuiltinTool = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T]) =
 type BuiltinToolResultToString = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T], result: Awaited<BuiltinToolResultType[T]>) => string }
 
 
-const isFalsy = (u: unknown) => {
+export const isFalsy = (u: unknown) => {
 	return !u || u === 'null' || u === 'undefined'
 }
 
@@ -117,7 +117,7 @@ const validateOptionalURIWithRoot = (uriStr: unknown, workspaceRoot?: URI | null
 	return validateURIWithRoot(uriStr, workspaceRoot)
 }
 
-const validateOptionalStr = (argName: string, str: unknown) => {
+export const validateOptionalStr = (argName: string, str: unknown) => {
 	if (isFalsy(str)) return null
 	return validateStr(argName, str)
 }
@@ -145,13 +145,13 @@ export const validateNumber = (numStr: unknown, opts: { default: number | null }
 	return opts.default
 }
 
-const validateProposedTerminalId = (terminalIdUnknown: unknown) => {
+export const validateProposedTerminalId = (terminalIdUnknown: unknown) => {
 	if (!terminalIdUnknown) throw new Error(`A value for terminalID must be specified, but the value was "${terminalIdUnknown}"`)
 	const terminalId = terminalIdUnknown + ''
 	return terminalId
 }
 
-const validateBoolean = (b: unknown, opts: { default: boolean }) => {
+export const validateBoolean = (b: unknown, opts: { default: boolean }) => {
 	if (typeof b === 'string') {
 		if (b === 'true') return true
 		if (b === 'false') return false
@@ -163,13 +163,13 @@ const validateBoolean = (b: unknown, opts: { default: boolean }) => {
 }
 
 
-const checkIfIsFolder = (uriStr: string) => {
+export const checkIfIsFolder = (uriStr: string) => {
 	uriStr = uriStr.trim()
 	if (uriStr.endsWith('/') || uriStr.endsWith('\\')) return true
 	return false
 }
 
-const validateEdits = (editsUnknown: unknown): Edit[] => {
+export const validateEdits = (editsUnknown: unknown): Edit[] => {
 	if (typeof editsUnknown !== 'string') throw new Error(`Invalid LLM output format: edits must be a JSON string, but its type is "${typeof editsUnknown}".`)
 	let parsed: unknown
 	try {
@@ -229,7 +229,7 @@ const findFirstSymbolOccurrence = (model: ITextModel, symbolName: string): { lin
 // Priority: explicit lineHint if the symbol is actually on that line (word-boundary);
 // otherwise fall back to first whole-word occurrence anywhere in the file.
 // Returns null only when the symbol does not appear in the file at all.
-const resolveSymbolPosition = (model: ITextModel, symbolName: string, lineHint: number | null): { line: number, column: number } | null => {
+export const resolveSymbolPosition = (model: ITextModel, symbolName: string, lineHint: number | null): { line: number, column: number } | null => {
 	const lineCount = model.getLineCount()
 	if (lineHint !== null && lineHint >= 1 && lineHint <= lineCount) {
 		const escaped = symbolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -331,6 +331,13 @@ export async function getFileOutline(
 	}
 
 	return null
+}
+
+export const stringifyLintErrors = (lintErrors: LintErrorItem[]) => {
+	return lintErrors
+		.map((e, i) => `Error ${i + 1}:\nLines Affected: ${e.startLineNumber}-${e.endLineNumber}\nError message:${e.message}`)
+		.join('\n\n')
+		.substring(0, MAX_FILE_CHARS_PAGE)
 }
 
 export interface IToolsService {
@@ -959,14 +966,6 @@ export class ToolsService implements IToolsService {
 		}
 
 
-
-		const stringifyLintErrors = (lintErrors: LintErrorItem[]) => {
-			return lintErrors
-				.map((e, i) => `Error ${i + 1}:\nLines Affected: ${e.startLineNumber}-${e.endLineNumber}\nError message:${e.message}`)
-				.join('\n\n')
-				.substring(0, MAX_FILE_CHARS_PAGE)
-		}
-
 		// given to the LLM after the call for successful tool calls
 		this.stringOfResult = {
 			read_file: () => { throw new Error('read_file not initialized — should be overridden by registry') },
@@ -1141,17 +1140,66 @@ export class ToolsService implements IToolsService {
 			languageFeaturesService,
 			fetchUrlService: this.fetchUrlService,
 			pathService: this.pathService,
+			instantiationService: this.instantiationService,
 			validateURI,
 			validateOptionalURI,
 		}
 
 		// Override entries for converted tools with registry delegations.
 		// Unconverted tools keep using the inline maps above.
-		const readFileDef = toolDefinitionOfToolName.read_file
-		if (readFileDef) {
-			this.validateParams.read_file = (raw) => readFileDef.validateParams(raw, toolCtx)
-			this.callTool.read_file = (params) => readFileDef.callTool(params, toolCtx)
-			this.stringOfResult.read_file = (params, result) => readFileDef.stringOfResult(params, result, toolCtx)
+		if (toolDefinitionOfToolName.read_file) {
+			const d = toolDefinitionOfToolName.read_file
+			this.validateParams.read_file = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.read_file = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.read_file = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.ls_dir) {
+			const d = toolDefinitionOfToolName.ls_dir
+			this.validateParams.ls_dir = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.ls_dir = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.ls_dir = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.get_dir_tree) {
+			const d = toolDefinitionOfToolName.get_dir_tree
+			this.validateParams.get_dir_tree = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.get_dir_tree = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.get_dir_tree = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.search_pathnames_only) {
+			const d = toolDefinitionOfToolName.search_pathnames_only
+			this.validateParams.search_pathnames_only = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.search_pathnames_only = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.search_pathnames_only = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.search_for_files) {
+			const d = toolDefinitionOfToolName.search_for_files
+			this.validateParams.search_for_files = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.search_for_files = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.search_for_files = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.search_in_file) {
+			const d = toolDefinitionOfToolName.search_in_file
+			this.validateParams.search_in_file = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.search_in_file = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.search_in_file = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.go_to_definition) {
+			const d = toolDefinitionOfToolName.go_to_definition
+			this.validateParams.go_to_definition = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.go_to_definition = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.go_to_definition = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.go_to_usages) {
+			const d = toolDefinitionOfToolName.go_to_usages
+			this.validateParams.go_to_usages = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.go_to_usages = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.go_to_usages = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.read_lint_errors) {
+			const d = toolDefinitionOfToolName.read_lint_errors
+			this.validateParams.read_lint_errors = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.read_lint_errors = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.read_lint_errors = (params, result) => d.stringOfResult(params, result, toolCtx)
 		}
 
 	}
