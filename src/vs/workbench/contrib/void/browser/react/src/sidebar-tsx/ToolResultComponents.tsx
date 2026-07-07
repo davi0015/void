@@ -20,6 +20,7 @@ import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } f
 import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
 import { persistentTerminalNameOfId } from '../../../terminalToolService.js';
 import { removeMCPToolNamePrefix } from '../../../../common/mcpServiceTypes.js';
+import { toolDefinitionOfToolName } from '../../../tools/toolRegistry.js';
 
 import {
 	getBasename,
@@ -412,10 +413,11 @@ export const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name
 	// built-in title
 	else {
 		const toolName = t.name as BuiltinToolName
+		const regTitle = toolDefinitionOfToolName[toolName]?.title
 		const base =
-			t.type === 'success' ? titleOfBuiltinToolName[toolName].done
-				: t.type === 'running_now' ? titleOfBuiltinToolName[toolName].running
-					: titleOfBuiltinToolName[toolName].proposed
+			t.type === 'success' ? (regTitle?.done ?? titleOfBuiltinToolName[toolName].done)
+				: t.type === 'running_now' ? (regTitle ? loadingTitleWrapper(regTitle.running) : titleOfBuiltinToolName[toolName].running)
+					: (regTitle?.proposed ?? titleOfBuiltinToolName[toolName].proposed)
 		return prefix ? `${prefix}${base}` : base
 	}
 }

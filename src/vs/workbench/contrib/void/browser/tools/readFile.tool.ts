@@ -85,4 +85,6 @@ export const readFileToolCore: ToolDefinitionCore<'read_file'> = {
 			return `${params.uri.fsPath}\n${fence}\n${result.fileContents}\n${fence}${nextPageStr(result.hasNextPage)}${result.hasNextPage ? `\nMore info because truncated: this file has ${result.totalNumLines} lines, or ${result.totalFileLen} characters.` : ''}`
 		})
 	},
+
+	title: { done: 'Read file', proposed: 'Read file', running: 'Reading file' },
 }

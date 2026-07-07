@@ -71,5 +71,9 @@ callTool: (params: BuiltinToolCallParams[T], ctx: ToolCtx) => Promise<{
 result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>
 interruptTool?: () => void
 }>
-stringOfResult: (params: BuiltinToolCallParams[T], result: Awaited<BuiltinToolResultType[T]>, ctx: ToolCtx) => string
+	stringOfResult: (params: BuiltinToolCallParams[T], result: Awaited<BuiltinToolResultType[T]>, ctx: ToolCtx) => string
+
+	// --- UI (plain strings, no JSX) ---
+	// loadingTitleWrapper is applied at render time by getTitle().
+	title: { done: string, proposed: string, running: string }
 }
