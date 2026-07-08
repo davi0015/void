@@ -19,12 +19,10 @@ import { IVoidCommandBarService } from './voidCommandBarService.js'
 import { IDirectoryStrService } from '../common/directoryStrService.js'
 import { IMarkerService, MarkerSeverity } from '../../../../platform/markers/common/markers.js'
 import { RawToolParamsObj } from '../common/sendLLMMessageTypes.js'
-import { MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js'
+import { MAX_FILE_CHARS_PAGE } from '../common/prompt/prompts.js'
 import { DocumentSymbol, SymbolKind } from '../../../../editor/common/languages.js'
 import { IVoidSettingsService } from '../common/voidSettingsService.js'
-import { generateUuid } from '../../../../base/common/uuid.js'
 import { IFetchUrlService } from '../common/fetchUrlService.js'
-import type { ChatMessage } from '../common/chatThreadServiceTypes.js'
 
 
 import { toolDefinitionOfToolName } from './tools/toolRegistry.js'
@@ -420,63 +418,14 @@ export class ToolsService implements IToolsService {
 
 			// ---
 
-			run_command: (params: RawToolParamsObj) => {
-				const { command: commandUnknown, cwd: cwdUnknown } = params
-				const command = validateStr('command', commandUnknown)
-				const cwd = validateOptionalStr('cwd', cwdUnknown)
-				const terminalId = generateUuid()
-				return { command, cwd, terminalId }
-			},
-			run_persistent_command: (params: RawToolParamsObj) => {
-				const { command: commandUnknown, persistent_terminal_id: persistentTerminalIdUnknown } = params;
-				const command = validateStr('command', commandUnknown);
-				const persistentTerminalId = validateProposedTerminalId(persistentTerminalIdUnknown)
-				return { command, persistentTerminalId };
-			},
-			open_persistent_terminal: (params: RawToolParamsObj) => {
-				const { cwd: cwdUnknown } = params;
-				const cwd = validateOptionalStr('cwd', cwdUnknown)
-				// No parameters needed; will open a new background terminal
-				return { cwd };
-			},
-			kill_persistent_terminal: (params: RawToolParamsObj) => {
-				const { persistent_terminal_id: terminalIdUnknown } = params;
-				const persistentTerminalId = validateProposedTerminalId(terminalIdUnknown);
-				return { persistentTerminalId };
-			},
-
-			fetch_url: (params: RawToolParamsObj) => {
-				const { url: urlUnknown } = params;
-				const url = validateStr('url', urlUnknown);
-				if (!/^https?:\/\//i.test(url)) {
-					throw new Error(`Invalid URL: "${url}". URL must start with http:// or https://.`);
-				}
-				return { url };
-			},
-
-			semantic_search: (params: RawToolParamsObj) => {
-				const { query: queryUnknown, n_results: nResultsUnknown, include_pattern: includePatternUnknown } = params
-				const query = validateStr('query', queryUnknown)
-				const nResults = validateNumber(nResultsUnknown, { default: 10 }) ?? 10
-				const includePattern = isFalsy(includePatternUnknown) ? null : validateStr('include_pattern', includePatternUnknown)
-				return { query, nResults, includePattern }
-			},
-
-			search_history: (params: RawToolParamsObj) => {
-				const { query: queryUnknown, tool_name: toolNameUnknown, result_status: resultStatusUnknown, context_radius: contextRadiusUnknown } = params
-				const query = isFalsy(queryUnknown) ? null : validateStr('query', queryUnknown)
-				const toolName = isFalsy(toolNameUnknown) ? null : validateStr('toolName', toolNameUnknown)
-				const resultStatus = isFalsy(resultStatusUnknown) ? null : (resultStatusUnknown === 'error' || resultStatusUnknown === 'success' ? resultStatusUnknown : null) as 'error' | 'success' | null
-				const contextRadiusRaw = validateNumber(contextRadiusUnknown, { default: 3 })
-				const contextRadius = Math.max(1, Math.min(contextRadiusRaw ?? 3, 10))
-				return { query, toolName, resultStatus, contextRadius }
-			},
-
-			load_skill: (params: RawToolParamsObj) => {
-				const { skill_name: skillNameUnknown } = params
-				const skillName = validateStr('skill_name', skillNameUnknown)
-				return { skillName }
-			},
+			run_command: () => { throw new Error('overridden by registry') },
+			run_persistent_command: () => { throw new Error('overridden by registry') },
+			open_persistent_terminal: () => { throw new Error('overridden by registry') },
+			kill_persistent_terminal: () => { throw new Error('overridden by registry') },
+			fetch_url: () => { throw new Error('overridden by registry') },
+			semantic_search: () => { throw new Error('overridden by registry') },
+			search_history: () => { throw new Error('overridden by registry') },
+			load_skill: () => { throw new Error('overridden by registry') },
 
 		}
 
@@ -500,151 +449,15 @@ export class ToolsService implements IToolsService {
 			rewrite_file: async () => { throw new Error('overridden by registry') },
 			edit_file: async () => { throw new Error('overridden by registry') },
 			// ---
-			run_command: async ({ command, cwd, terminalId }) => {
-				const { resPromise, interrupt } = await this.terminalToolService.runCommand(command, { type: 'temporary', cwd, terminalId })
-				return { result: resPromise, interruptTool: interrupt }
-			},
-			run_persistent_command: async ({ command, persistentTerminalId }) => {
-				const { resPromise, interrupt } = await this.terminalToolService.runCommand(command, { type: 'persistent', persistentTerminalId })
-				return { result: resPromise, interruptTool: interrupt }
-			},
-			open_persistent_terminal: async ({ cwd }) => {
-				const persistentTerminalId = await this.terminalToolService.createPersistentTerminal({ cwd })
-				return { result: { persistentTerminalId } }
-			},
-			kill_persistent_terminal: async ({ persistentTerminalId }) => {
-				// Close the background terminal by sending exit
-				await this.terminalToolService.killPersistentTerminal(persistentTerminalId)
-				return { result: {} }
-			},
+			run_command: async () => { throw new Error('overridden by registry') },
+			run_persistent_command: async () => { throw new Error('overridden by registry') },
+			open_persistent_terminal: async () => { throw new Error('overridden by registry') },
+			kill_persistent_terminal: async () => { throw new Error('overridden by registry') },
+			fetch_url: async () => { throw new Error('overridden by registry') },
+			semantic_search: async () => { throw new Error('overridden by registry') },
+			search_history: async () => { throw new Error('overridden by registry') },
+			load_skill: async () => { throw new Error('overridden by registry') },
 
-			fetch_url: async ({ url }) => {
-				const result = await this.fetchUrlService.fetchUrl(url);
-				return { result };
-			},
-
-			semantic_search: async ({ query, nResults, includePattern }) => {
-				const { ISemanticIndexService } = await import('./semanticIndexService.js')
-				const semanticIndexService = this.instantiationService.invokeFunction(accessor => accessor.get(ISemanticIndexService))
-				const { results, noResultReason } = await semanticIndexService.search(query, nResults, includePattern ?? undefined)
-				return { result: { results, noResultReason } }
-			},
-
-			search_history: async ({ query, toolName, resultStatus, contextRadius }) => {
-				const { IChatThreadService } = await import('./chatThreadService.js')
-				const chatThreadService = this.instantiationService.invokeFunction(accessor => accessor.get(IChatThreadService))
-				const thread = chatThreadService.getCurrentThread()
-				if (!thread) {
-					return { result: { matches: 'No active conversation thread.', totalMatches: 0 } }
-				}
-				const messages = thread.messages
-				const queryLower = query?.toLowerCase() ?? null
-
-				// Find matching message indices
-				const matchIndices: number[] = []
-
-				for (let i = 0; i < messages.length; i++) {
-					const msg = messages[i]
-
-					// Filter by tool_name
-					if (toolName && msg.role !== 'tool') continue
-					if (toolName && msg.role === 'tool' && msg.name !== toolName) continue
-
-					// Filter by result_status
-					if (resultStatus && msg.role !== 'tool') continue
-					if (resultStatus && msg.role === 'tool') {
-						if (resultStatus === 'error' && msg.type !== 'tool_error') continue
-						if (resultStatus === 'success' && msg.type !== 'success') continue
-					}
-
-					// Text search
-					if (queryLower) {
-						let textToSearch = ''
-						if (msg.role === 'user') textToSearch = (msg.content ?? '') + ' ' + (msg.displayContent ?? '')
-						else if (msg.role === 'assistant') textToSearch = (msg.displayContent ?? '') + ' ' + (msg.reasoning ?? '')
-						else if (msg.role === 'tool') {
-							textToSearch = (msg.content ?? '')
-								+ ' ' + JSON.stringify(msg.rawParams ?? {})
-								+ ' ' + (typeof msg.result === 'string' ? msg.result : JSON.stringify(msg.result ?? {}))
-						}
-
-						if (!textToSearch.toLowerCase().includes(queryLower)) continue
-					}
-
-					// If no filters at all, skip (don't return everything)
-					if (!queryLower && !toolName && !resultStatus) continue
-
-					matchIndices.push(i)
-				}
-
-				if (matchIndices.length === 0) {
-					return { result: { matches: 'No matching messages found.', totalMatches: 0 } }
-				}
-
-				// Build context windows around matches, merging overlapping ranges
-				const maxMatches = 20
-				const limitedIndices = matchIndices.slice(0, maxMatches)
-
-				// Collect unique message indices to include
-				const includeIndices = new Set<number>()
-				for (const idx of limitedIndices) {
-					for (let j = Math.max(0, idx - contextRadius); j <= Math.min(messages.length - 1, idx + contextRadius); j++) {
-						includeIndices.add(j)
-					}
-				}
-
-				// Format messages
-				const formatMessage = (msg: ChatMessage, idx: number): string => {
-					const prefix = `[${idx}]`
-					if (msg.role === 'user') {
-						return `${prefix} [USER]: ${(msg.displayContent || msg.content || '(empty)').slice(0, 500)}`
-					} else if (msg.role === 'assistant') {
-						const content = msg.displayContent || msg.reasoning || '(empty)'
-						const reasoning = (!msg.displayContent && msg.reasoning) ? '' : msg.reasoning ? `\n  Reasoning: ${msg.reasoning.slice(0, 300)}` : ''
-						return `${prefix} [ASSISTANT]: ${content.slice(0, 500)}${reasoning}`
-					} else if (msg.role === 'tool') {
-						const paramsStr = JSON.stringify(msg.rawParams ?? {}).slice(0, 300)
-						const resultStr = ('result' in msg ? (typeof msg.result === 'string' ? msg.result : JSON.stringify(msg.result ?? {})) : '(no result yet)').slice(0, 500)
-						return `${prefix} [TOOL:${msg.name} type=${msg.type}]: params=${paramsStr}\n  result=${resultStr}`
-					} else if (msg.role === 'interrupted_streaming_tool') {
-						return `${prefix} [INTERRUPTED:${msg.name}]`
-					} else {
-						return `${prefix} [UNKNOWN]`
-					}
-				}
-
-				const sortedIndices = Array.from(includeIndices).sort((a, b) => a - b)
-				const formattedLines = sortedIndices.map(idx => formatMessage(messages[idx], idx))
-				const matches = formattedLines.join('\n\n')
-
-				return { result: { matches, totalMatches: matchIndices.length } }
-			},
-
-			load_skill: async ({ skillName }) => {
-				// Strip frontmatter and return body
-				const stripFrontmatter = (content: string) => {
-					const bodyMatch = content.match(/^---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/)
-					return (bodyMatch ? bodyMatch[1] : content).trim()
-				}
-				// Try each candidate path: workspace .void/skills/ then global ~/.void/skills/
-				// Supports both <name>/SKILL.md (directory) and <name>.md (flat file)
-				const candidateUris: URI[] = []
-				for (const folder of workspaceContextService.getWorkspace().folders) {
-					candidateUris.push(URI.joinPath(folder.uri, '.void', 'skills', skillName, 'SKILL.md'))
-					candidateUris.push(URI.joinPath(folder.uri, '.void', 'skills', `${skillName}.md`))
-				}
-				const userHome = await this.pathService.userHome()
-				candidateUris.push(URI.joinPath(userHome, '.void', 'skills', skillName, 'SKILL.md'))
-				candidateUris.push(URI.joinPath(userHome, '.void', 'skills', `${skillName}.md`))
-
-				for (const uri of candidateUris) {
-					if (await fileService.exists(uri)) {
-						const content = (await fileService.readFile(uri)).value.toString()
-						return { result: { content: stripFrontmatter(content) } }
-					}
-				}
-				return { result: { content: `Skill "${skillName}" not found. Check the AVAILABLE SKILLS section for the correct name.` } }
-			},
 		}
 
 
@@ -665,71 +478,14 @@ export class ToolsService implements IToolsService {
 			rename_file_or_folder: () => { throw new Error('overridden by registry') },
 			edit_file: () => { throw new Error('overridden by registry') },
 			rewrite_file: () => { throw new Error('overridden by registry') },
-			run_command: (params, result) => {
-				const { resolveReason, result: result_, } = result
-				// success
-				if (resolveReason.type === 'done') {
-					return `${result_}\n(exit code ${resolveReason.exitCode})`
-				}
-				// normal command
-				if (resolveReason.type === 'timeout') {
-					return `${result_}\nTerminal command ran, but was automatically killed by Void after ${MAX_TERMINAL_INACTIVE_TIME}s of inactivity and did not finish successfully. To try with more time, open a persistent terminal and run the command there.`
-				}
-				throw new Error(`Unexpected internal error: Terminal command did not resolve with a valid reason.`)
-			},
-
-			run_persistent_command: (params, result) => {
-				const { resolveReason, result: result_, } = result
-				const { persistentTerminalId } = params
-				// success
-				if (resolveReason.type === 'done') {
-					return `${result_}\n(exit code ${resolveReason.exitCode})`
-				}
-				// bg command
-				if (resolveReason.type === 'timeout') {
-					return `${result_}\nTerminal command is running in terminal ${persistentTerminalId}. The given outputs are the results after ${MAX_TERMINAL_BG_COMMAND_TIME} seconds.`
-				}
-				throw new Error(`Unexpected internal error: Terminal command did not resolve with a valid reason.`)
-			},
-
-			open_persistent_terminal: (_params, result) => {
-				const { persistentTerminalId } = result;
-				return `Successfully created persistent terminal. persistentTerminalId="${persistentTerminalId}"`;
-			},
-			kill_persistent_terminal: (params, _result) => {
-				return `Successfully closed terminal "${params.persistentTerminalId}".`;
-			},
-
-			fetch_url: (_params, result) => {
-				return `# ${result.title}\n\nSource: ${result.url}\n\n${result.content}`;
-			},
-
-			semantic_search: (_params, result) => {
-				const statusNote = result.results.length > 0 && result.results[0].indexStatus === 'indexing'
-					? `\nNote: Index is still being built (${result.results[0].indexProgress.indexed}/${result.results[0].indexProgress.total} files indexed). Results may be incomplete.`
-					: ''
-				const reasonMap: Record<string, string> = {
-					'disabled': ' Semantic search is disabled in settings.',
-					'noModel': ' No embedding model configured. Add a model with supportsEmbedding: true in Void settings.',
-					'notReady': ' Index is not built yet. Wait for indexing to complete.',
-				}
-				const reasonNote = result.results.length === 0 && result.noResultReason ? reasonMap[result.noResultReason] ?? '' : ''
-				if (result.results.length === 0) return `No semantic search results found.${reasonNote}${statusNote}`
-				const lines = result.results.map((r, i) => {
-					const scoreStr = r.score.toFixed(2)
-					return `${i + 1}. ${r.uri.fsPath}:${r.startLine}-${r.endLine} (score: ${scoreStr})\n\`\`\`\n${r.snippet}\n\`\`\``
-				})
-				return `Found ${result.results.length} result(s):\n\n${lines.join('\n\n')}${statusNote}`
-			},
-
-			search_history: (_params, result) => {
-				const totalStr = result.totalMatches > 20 ? ` (showing first 20 of ${result.totalMatches})` : ''
-				return `Found ${result.totalMatches} matching message(s)${totalStr}:\n\n${result.matches}`
-			},
-
-			load_skill: (_params, result) => {
-				return result.content
-			},
+			run_command: () => { throw new Error('overridden by registry') },
+			run_persistent_command: () => { throw new Error('overridden by registry') },
+			open_persistent_terminal: () => { throw new Error('overridden by registry') },
+			kill_persistent_terminal: () => { throw new Error('overridden by registry') },
+			fetch_url: () => { throw new Error('overridden by registry') },
+			semantic_search: () => { throw new Error('overridden by registry') },
+			search_history: () => { throw new Error('overridden by registry') },
+			load_skill: () => { throw new Error('overridden by registry') },
 		}
 
 
@@ -840,6 +596,54 @@ export class ToolsService implements IToolsService {
 			this.validateParams.rewrite_file = (raw) => d.validateParams(raw, toolCtx)
 			this.callTool.rewrite_file = (params) => d.callTool(params, toolCtx)
 			this.stringOfResult.rewrite_file = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.run_command) {
+			const d = toolDefinitionOfToolName.run_command
+			this.validateParams.run_command = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.run_command = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.run_command = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.run_persistent_command) {
+			const d = toolDefinitionOfToolName.run_persistent_command
+			this.validateParams.run_persistent_command = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.run_persistent_command = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.run_persistent_command = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.open_persistent_terminal) {
+			const d = toolDefinitionOfToolName.open_persistent_terminal
+			this.validateParams.open_persistent_terminal = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.open_persistent_terminal = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.open_persistent_terminal = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.kill_persistent_terminal) {
+			const d = toolDefinitionOfToolName.kill_persistent_terminal
+			this.validateParams.kill_persistent_terminal = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.kill_persistent_terminal = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.kill_persistent_terminal = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.fetch_url) {
+			const d = toolDefinitionOfToolName.fetch_url
+			this.validateParams.fetch_url = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.fetch_url = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.fetch_url = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.semantic_search) {
+			const d = toolDefinitionOfToolName.semantic_search
+			this.validateParams.semantic_search = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.semantic_search = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.semantic_search = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.search_history) {
+			const d = toolDefinitionOfToolName.search_history
+			this.validateParams.search_history = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.search_history = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.search_history = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.load_skill) {
+			const d = toolDefinitionOfToolName.load_skill
+			this.validateParams.load_skill = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.load_skill = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.load_skill = (params, result) => d.stringOfResult(params, result, toolCtx)
 		}
 
 	}
