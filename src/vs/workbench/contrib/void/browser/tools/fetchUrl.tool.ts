@@ -1,6 +1,6 @@
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr } from '../toolsService.js'
+import { validateStr } from './toolHelpers.js'
 
 export const fetchUrlToolCore: ToolDefinitionCore<'fetch_url'> = {
 	name: 'fetch_url',

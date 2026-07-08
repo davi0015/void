@@ -341,32 +341,7 @@ const loadingTitleWrapper = (item: React.ReactNode): React.ReactNode => {
 	</span>
 }
 
-export const titleOfBuiltinToolName = {
-	'read_file': { done: 'Read file', proposed: 'Read file', running: loadingTitleWrapper('Reading file') },
-	'ls_dir': { done: 'Inspected folder', proposed: 'Inspect folder', running: loadingTitleWrapper('Inspecting folder') },
-	'get_dir_tree': { done: 'Inspected folder tree', proposed: 'Inspect folder tree', running: loadingTitleWrapper('Inspecting folder tree') },
-	'search_pathnames_only': { done: 'Searched by file name', proposed: 'Search by file name', running: loadingTitleWrapper('Searching by file name') },
-	'search_for_files': { done: 'Searched', proposed: 'Search', running: loadingTitleWrapper('Searching') },
-	'create_file_or_folder': { done: `Created`, proposed: `Create`, running: loadingTitleWrapper(`Creating`) },
-	'delete_file_or_folder': { done: `Deleted`, proposed: `Delete`, running: loadingTitleWrapper(`Deleting`) },
-	'rename_file_or_folder': { done: `Renamed`, proposed: `Rename`, running: loadingTitleWrapper(`Renaming`) },
-	'edit_file': { done: `Edited file`, proposed: 'Edit file', running: loadingTitleWrapper('Editing file') },
-	'rewrite_file': { done: `Wrote file`, proposed: 'Write file', running: loadingTitleWrapper('Writing file') },
-	'run_command': { done: `Ran terminal`, proposed: 'Run terminal', running: loadingTitleWrapper('Running terminal') },
-	'run_persistent_command': { done: `Ran terminal`, proposed: 'Run terminal', running: loadingTitleWrapper('Running terminal') },
 
-	'open_persistent_terminal': { done: `Opened terminal`, proposed: 'Open terminal', running: loadingTitleWrapper('Opening terminal') },
-	'kill_persistent_terminal': { done: `Killed terminal`, proposed: 'Kill terminal', running: loadingTitleWrapper('Killing terminal') },
-
-	'read_lint_errors': { done: `Read lint errors`, proposed: 'Read lint errors', running: loadingTitleWrapper('Reading lint errors') },
-	'search_in_file': { done: 'Searched in file', proposed: 'Search in file', running: loadingTitleWrapper('Searching in file') },
-	'go_to_definition': { done: 'Found definition', proposed: 'Go to definition', running: loadingTitleWrapper('Finding definition') },
-	'go_to_usages': { done: 'Found usages', proposed: 'Go to usages', running: loadingTitleWrapper('Finding usages') },
-	'fetch_url': { done: 'Fetched URL', proposed: 'Fetch URL', running: loadingTitleWrapper('Fetching URL') },
-	'semantic_search': { done: 'Searched semantically', proposed: 'Search semantically', running: loadingTitleWrapper('Searching semantically') },
-	'search_history': { done: 'Searched history', proposed: 'Search history', running: loadingTitleWrapper('Searching history') },
-	'load_skill': { done: 'Loaded skill', proposed: 'Load skill', running: loadingTitleWrapper('Loading skill') },
-} as const satisfies Record<BuiltinToolName, { done: any, proposed: any, running: any }>
 
 
 // Prefix like "(1/2) " when this tool is part of a multi-tool batch emitted in one
@@ -413,11 +388,11 @@ export const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name
 	// built-in title
 	else {
 		const toolName = t.name as BuiltinToolName
-		const regTitle = toolDefinitionOfToolName[toolName]?.title
+		const title = toolDefinitionOfToolName[toolName]!.title
 		const base =
-			t.type === 'success' ? (regTitle?.done ?? titleOfBuiltinToolName[toolName].done)
-				: t.type === 'running_now' ? (regTitle ? loadingTitleWrapper(regTitle.running) : titleOfBuiltinToolName[toolName].running)
-					: (regTitle?.proposed ?? titleOfBuiltinToolName[toolName].proposed)
+			t.type === 'success' ? title.done
+				: t.type === 'running_now' ? loadingTitleWrapper(title.running)
+					: title.proposed
 		return prefix ? `${prefix}${base}` : base
 	}
 }

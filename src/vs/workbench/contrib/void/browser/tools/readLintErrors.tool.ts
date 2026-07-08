@@ -3,7 +3,7 @@ import { MarkerSeverity } from '../../../../../platform/markers/common/markers.j
 import { LintErrorItem } from '../../common/toolsServiceTypes.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { stringifyLintErrors } from '../toolsService.js'
+import { stringifyLintErrors } from './toolHelpers.js'
 
 export const readLintErrorsToolCore: ToolDefinitionCore<'read_lint_errors'> = {
 	name: 'read_lint_errors',

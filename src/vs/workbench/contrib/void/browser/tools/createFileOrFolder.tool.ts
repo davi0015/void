@@ -1,6 +1,6 @@
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr, checkIfIsFolder } from '../toolsService.js'
+import { validateStr, checkIfIsFolder } from './toolHelpers.js'
 
 export const createFileOrFolderToolCore: ToolDefinitionCore<'create_file_or_folder'> = {
 	name: 'create_file_or_folder',

@@ -1,6 +1,6 @@
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr, validateNumber, isFalsy } from '../toolsService.js'
+import { validateStr, validateNumber, isFalsy } from './toolHelpers.js'
 
 export const semanticSearchToolCore: ToolDefinitionCore<'semantic_search'> = {
 	name: 'semantic_search',

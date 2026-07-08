@@ -1,7 +1,7 @@
 import { URI } from '../../../../../base/common/uri.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr } from '../toolsService.js'
+import { validateStr } from './toolHelpers.js'
 
 export const loadSkillToolCore: ToolDefinitionCore<'load_skill'> = {
 	name: 'load_skill',

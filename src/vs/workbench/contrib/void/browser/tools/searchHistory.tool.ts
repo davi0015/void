@@ -1,7 +1,7 @@
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import type { ChatMessage } from '../../common/chatThreadServiceTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr, validateNumber, isFalsy } from '../toolsService.js'
+import { validateStr, validateNumber, isFalsy } from './toolHelpers.js'
 
 export const searchHistoryToolCore: ToolDefinitionCore<'search_history'> = {
 	name: 'search_history',

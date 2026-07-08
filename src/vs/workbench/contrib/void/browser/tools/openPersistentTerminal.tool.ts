@@ -1,6 +1,6 @@
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateOptionalStr } from '../toolsService.js'
+import { validateOptionalStr } from './toolHelpers.js'
 
 const cwdHelper = 'Optional. The directory in which to run the command. Defaults to the first workspace folder.'
 

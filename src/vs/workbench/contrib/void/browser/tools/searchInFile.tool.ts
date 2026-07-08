@@ -1,7 +1,7 @@
 import { EndOfLinePreference } from '../../../../../editor/common/model.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr, validateBoolean } from '../toolsService.js'
+import { validateStr, validateBoolean } from './toolHelpers.js'
 
 export const searchInFileToolCore: ToolDefinitionCore<'search_in_file'> = {
 	name: 'search_in_file',

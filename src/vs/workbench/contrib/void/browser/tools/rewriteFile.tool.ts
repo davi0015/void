@@ -1,7 +1,7 @@
 import { timeout } from '../../../../../base/common/async.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr, stringifyLintErrors, getLintErrors } from '../toolsService.js'
+import { validateStr, stringifyLintErrors, getLintErrors } from './toolHelpers.js'
 
 export const rewriteFileToolCore: ToolDefinitionCore<'rewrite_file'> = {
 	name: 'rewrite_file',

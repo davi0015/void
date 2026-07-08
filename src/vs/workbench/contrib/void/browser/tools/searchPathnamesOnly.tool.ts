@@ -2,7 +2,7 @@ import { CancellationToken } from '../../../../../base/common/cancellation.js'
 import { MAX_CHILDREN_URIs_PAGE } from '../../common/prompt/prompts.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr, validatePageNum, validateOptionalStr, nextPageStr } from '../toolsService.js'
+import { validateStr, validatePageNum, validateOptionalStr, nextPageStr } from './toolHelpers.js'
 
 export const searchPathnamesOnlyToolCore: ToolDefinitionCore<'search_pathnames_only'> = {
 	name: 'search_pathnames_only',

@@ -1,7 +1,7 @@
 import { URI } from '../../../../../base/common/uri.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr, validateBoolean, checkIfIsFolder } from '../toolsService.js'
+import { validateStr, validateBoolean, checkIfIsFolder } from './toolHelpers.js'
 
 export const deleteFileOrFolderToolCore: ToolDefinitionCore<'delete_file_or_folder'> = {
 	name: 'delete_file_or_folder',

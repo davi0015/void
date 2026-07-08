@@ -9,7 +9,7 @@ import { AUTO_OUTLINE_THRESHOLD, MAX_FILE_CHARS_PAGE } from '../../common/prompt
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validatePageNum, validateNumber, safeFence, nextPageStr, getFileOutline } from '../toolsService.js'
+import { validatePageNum, validateNumber, safeFence, nextPageStr, getFileOutline } from './toolHelpers.js'
 
 
 export const readFileToolCore: ToolDefinitionCore<'read_file'> = {

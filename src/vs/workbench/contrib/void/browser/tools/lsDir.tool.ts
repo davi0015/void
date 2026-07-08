@@ -1,7 +1,7 @@
 import { computeDirectoryTree1Deep, stringifyDirectoryTree1Deep } from '../../common/directoryStrService.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validatePageNum } from '../toolsService.js'
+import { validatePageNum } from './toolHelpers.js'
 
 export const lsDirToolCore: ToolDefinitionCore<'ls_dir'> = {
 	name: 'ls_dir',

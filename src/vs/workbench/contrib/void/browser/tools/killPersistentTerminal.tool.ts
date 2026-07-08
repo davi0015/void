@@ -1,6 +1,6 @@
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateProposedTerminalId } from '../toolsService.js'
+import { validateProposedTerminalId } from './toolHelpers.js'
 
 export const killPersistentTerminalToolCore: ToolDefinitionCore<'kill_persistent_terminal'> = {
 	name: 'kill_persistent_terminal',

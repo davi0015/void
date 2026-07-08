@@ -1,7 +1,7 @@
 import { URI } from '../../../../../base/common/uri.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateBoolean } from '../toolsService.js'
+import { validateBoolean } from './toolHelpers.js'
 
 export const renameFileOrFolderToolCore: ToolDefinitionCore<'rename_file_or_folder'> = {
 	name: 'rename_file_or_folder',

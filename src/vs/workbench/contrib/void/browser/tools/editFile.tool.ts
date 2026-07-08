@@ -1,7 +1,7 @@
 import { timeout } from '../../../../../base/common/async.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateEdits, stringifyLintErrors, getLintErrors } from '../toolsService.js'
+import { validateEdits, stringifyLintErrors, getLintErrors } from './toolHelpers.js'
 
 const editsDescription = `\
 A JSON array of edit objects. Each edit object MUST have exactly these field names:

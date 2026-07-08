@@ -4,7 +4,7 @@ import { getReferencesAtPosition } from '../../../../../editor/contrib/gotoSymbo
 import { MAX_CHILDREN_URIs_PAGE } from '../../common/prompt/prompts.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr, validateNumber, validatePageNum, resolveSymbolPosition } from '../toolsService.js'
+import { validateStr, validateNumber, validatePageNum, resolveSymbolPosition } from './toolHelpers.js'
 
 export const goToUsagesToolCore: ToolDefinitionCore<'go_to_usages'> = {
 	name: 'go_to_usages',

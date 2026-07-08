@@ -3,7 +3,7 @@ import { Position } from '../../../../../editor/common/core/position.js'
 import { getDefinitionsAtPosition } from '../../../../../editor/contrib/gotoSymbol/browser/goToSymbol.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr, validateNumber, resolveSymbolPosition } from '../toolsService.js'
+import { validateStr, validateNumber, resolveSymbolPosition } from './toolHelpers.js'
 
 export const goToDefinitionToolCore: ToolDefinitionCore<'go_to_definition'> = {
 	name: 'go_to_definition',
