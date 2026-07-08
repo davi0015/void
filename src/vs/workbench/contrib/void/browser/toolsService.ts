@@ -18,7 +18,6 @@ import { ILanguageFeaturesService } from '../../../../editor/common/services/lan
 import { IVoidCommandBarService } from './voidCommandBarService.js'
 import { IDirectoryStrService } from '../common/directoryStrService.js'
 import { IMarkerService, MarkerSeverity } from '../../../../platform/markers/common/markers.js'
-import { timeout } from '../../../../base/common/async.js'
 import { RawToolParamsObj } from '../common/sendLLMMessageTypes.js'
 import { MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js'
 import { DocumentSymbol, SymbolKind } from '../../../../editor/common/languages.js'
@@ -339,6 +338,22 @@ export const stringifyLintErrors = (lintErrors: LintErrorItem[]) => {
 		.substring(0, MAX_FILE_CHARS_PAGE)
 }
 
+export const getLintErrors = (markerService: IMarkerService, uri: URI): { lintErrors: LintErrorItem[] | null } => {
+	const lintErrors = markerService
+		.read({ resource: uri })
+		.filter(l => l.severity === MarkerSeverity.Error || l.severity === MarkerSeverity.Warning)
+		.slice(0, 100)
+		.map(l => ({
+			code: typeof l.code === 'string' ? l.code : l.code?.value || '',
+			message: (l.severity === MarkerSeverity.Error ? '(error) ' : '(warning) ') + l.message,
+			startLineNumber: l.startLineNumber,
+			endLineNumber: l.endLineNumber,
+		} satisfies LintErrorItem))
+
+	if (!lintErrors.length) return { lintErrors: null }
+	return { lintErrors, }
+}
+
 export interface IToolsService {
 	readonly _serviceBrand: undefined;
 	validateParams: ValidateBuiltinParams;
@@ -397,44 +412,11 @@ export class ToolsService implements IToolsService {
 
 			// ---
 
-			create_file_or_folder: (params: RawToolParamsObj) => {
-				const { uri: uriUnknown } = params
-				const uri = validateURI(uriUnknown)
-				const uriStr = validateStr('uri', uriUnknown)
-				const isFolder = checkIfIsFolder(uriStr)
-				return { uri, isFolder }
-			},
-
-			delete_file_or_folder: (params: RawToolParamsObj) => {
-				const { uri: uriUnknown, is_recursive: isRecursiveUnknown } = params
-				const uri = validateURI(uriUnknown)
-				const isRecursive = validateBoolean(isRecursiveUnknown, { default: false })
-				const uriStr = validateStr('uri', uriUnknown)
-				const isFolder = checkIfIsFolder(uriStr)
-				return { uri, isRecursive, isFolder }
-			},
-
-			rename_file_or_folder: (params: RawToolParamsObj) => {
-				const { source_uri: sourceUnknown, target_uri: targetUnknown, overwrite: overwriteUnknown } = params
-				const sourceUri = validateURI(sourceUnknown)
-				const targetUri = validateURI(targetUnknown)
-				const overwrite = validateBoolean(overwriteUnknown, { default: false })
-				return { sourceUri, targetUri, overwrite }
-			},
-
-			rewrite_file: (params: RawToolParamsObj) => {
-				const { uri: uriStr, new_content: newContentUnknown } = params
-				const uri = validateURI(uriStr)
-				const newContent = validateStr('newContent', newContentUnknown)
-				return { uri, newContent }
-			},
-
-			edit_file: (params: RawToolParamsObj) => {
-				const { uri: uriStr, edits: editsUnknown } = params
-				const uri = validateURI(uriStr)
-				const edits = validateEdits(editsUnknown)
-				return { uri, edits }
-			},
+			create_file_or_folder: () => { throw new Error('overridden by registry') },
+			delete_file_or_folder: () => { throw new Error('overridden by registry') },
+			rename_file_or_folder: () => { throw new Error('overridden by registry') },
+			rewrite_file: () => { throw new Error('overridden by registry') },
+			edit_file: () => { throw new Error('overridden by registry') },
 
 			// ---
 
@@ -512,102 +494,11 @@ export class ToolsService implements IToolsService {
 
 			// ---
 
-			create_file_or_folder: async ({ uri, isFolder }) => {
-				if (isFolder)
-					await fileService.createFolder(uri)
-				else {
-					await fileService.createFile(uri)
-				}
-				return { result: {} }
-			},
-
-			delete_file_or_folder: async ({ uri, isRecursive }) => {
-				// Clean up any pending diffs for the file (or files under the folder)
-				// before deletion, so the diff UI doesn't reference stale URIs.
-				const uriPath = uri.fsPath
-				for (const trackedPath of Object.keys(editCodeService.diffAreasOfURI)) {
-					if (trackedPath === uriPath || (isRecursive && trackedPath.startsWith(uriPath + '/'))) {
-						const trackedUri = URI.file(trackedPath)
-						editCodeService.acceptOrRejectAllDiffAreas({ uri: trackedUri, removeCtrlKs: true, behavior: 'accept', _addToHistory: false })
-					}
-				}
-				await fileService.del(uri, { recursive: isRecursive })
-				return { result: {} }
-			},
-
-			rename_file_or_folder: async ({ sourceUri, targetUri, overwrite }) => {
-				// Clean up any pending diffs for the source before moving
-				const sourcePath = sourceUri.fsPath
-				for (const trackedPath of Object.keys(editCodeService.diffAreasOfURI)) {
-					if (trackedPath === sourcePath || trackedPath.startsWith(sourcePath + '/')) {
-						const trackedUri = URI.file(trackedPath)
-						editCodeService.acceptOrRejectAllDiffAreas({ uri: trackedUri, removeCtrlKs: true, behavior: 'accept', _addToHistory: false })
-					}
-				}
-				await fileService.move(sourceUri, targetUri, overwrite)
-				return { result: {} }
-			},
-
-			rewrite_file: async ({ uri, newContent }) => {
-				// Check file existence BEFORE `initializeModel` — the latter silently
-				// swallows FileNotFound (catches and logs) and returns void, making the
-				// whole chain (initializeModel → instantlyRewriteFile → _startStreamingDiffZone
-				// → "if (!model) return") fall through quietly. Net result before this
-				// fix: agent sees "Change successfully made" with zero lint errors, but
-				// nothing actually got written. Reported by the user as "rewrite_file
-				// only works after create_file_or_folder is called, otherwise it
-				// returns without error". Auto-creating here matches the intent of
-				// `rewrite_file` (produce a file with the given contents) and aligns
-				// with user preference for this tool specifically.
-				if (!(await fileService.exists(uri))) {
-					await fileService.createFile(uri)
-				}
-				await voidModelService.initializeModel(uri)
-				if (this.commandBarService.getStreamState(uri) === 'streaming') {
-					throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
-				}
-				await editCodeService.callBeforeApplyOrEdit(uri)
-				
-				editCodeService.instantlyRewriteFile({ uri, newContent })
-				// at end, get lint errors
-				const lintErrorsPromise = Promise.resolve().then(async () => {
-					await timeout(2000)
-					const { lintErrors } = this._getLintErrors(uri)
-					return { lintErrors }
-				})
-				return { result: lintErrorsPromise }
-			},
-
-			edit_file: async ({ uri, edits }) => {
-				// Same silent-fallthrough issue as rewrite_file (see comment there),
-				// but the right behavior is different: edit_file uses search/replace
-				// blocks which require existing content to match against. Auto-creating
-				// an empty file would make every search block fail to match — silent
-				// no-op again. Throwing a clear error is the honest behavior and
-				// nudges the agent toward the right alternative (rewrite_file for
-				// wholesale new-file authoring, create_file_or_folder + edit_file
-				// for incremental build-up).
-				if (!(await fileService.exists(uri))) {
-					throw new Error(`File not found at ${uri.fsPath}. edit_file requires an existing file to apply search/replace blocks against. Use rewrite_file to create a new file with full contents, or create_file_or_folder first then edit_file.`)
-				}
-				await voidModelService.initializeModel(uri)
-				if (this.commandBarService.getStreamState(uri) === 'streaming') {
-					throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
-				}
-				await editCodeService.callBeforeApplyOrEdit(uri)
-				
-				editCodeService.instantlyApplyEdits({ uri, edits })
-
-				// at end, get lint errors
-				const lintErrorsPromise = Promise.resolve().then(async () => {
-					await timeout(2000)
-					const { lintErrors } = this._getLintErrors(uri)
-					
-					return { lintErrors }
-				})
-
-				return { result: lintErrorsPromise }
-			},
+			create_file_or_folder: async () => { throw new Error('overridden by registry') },
+			delete_file_or_folder: async () => { throw new Error('overridden by registry') },
+			rename_file_or_folder: async () => { throw new Error('overridden by registry') },
+			rewrite_file: async () => { throw new Error('overridden by registry') },
+			edit_file: async () => { throw new Error('overridden by registry') },
 			// ---
 			run_command: async ({ command, cwd, terminalId }) => {
 				const { resPromise, interrupt } = await this.terminalToolService.runCommand(command, { type: 'temporary', cwd, terminalId })
@@ -769,33 +660,11 @@ export class ToolsService implements IToolsService {
 			go_to_usages: () => { throw new Error('overridden by registry') },
 			read_lint_errors: () => { throw new Error('overridden by registry') },
 			// ---
-			create_file_or_folder: (params, result) => {
-				return `URI ${params.uri.fsPath} successfully created.`
-			},
-			delete_file_or_folder: (params, result) => {
-				return `URI ${params.uri.fsPath} successfully deleted.`
-			},
-			rename_file_or_folder: (params, result) => {
-				return `Successfully renamed ${params.sourceUri.fsPath} to ${params.targetUri.fsPath}.`
-			},
-			edit_file: (params, result) => {
-				const lintErrsString = (
-					this.voidSettingsService.state.globalSettings.includeToolLintErrors ?
-						(result.lintErrors ? ` Lint errors found after change:\n${stringifyLintErrors(result.lintErrors)}.\nIf this is related to a change made while calling this tool, you might want to fix the error.`
-							: ` No lint errors found.`)
-						: '')
-
-				return `Change successfully made to ${params.uri.fsPath}.${lintErrsString}`
-			},
-			rewrite_file: (params, result) => {
-				const lintErrsString = (
-					this.voidSettingsService.state.globalSettings.includeToolLintErrors ?
-						(result.lintErrors ? ` Lint errors found after change:\n${stringifyLintErrors(result.lintErrors)}.\nIf this is related to a change made while calling this tool, you might want to fix the error.`
-							: ` No lint errors found.`)
-						: '')
-
-				return `Change successfully made to ${params.uri.fsPath}.${lintErrsString}`
-			},
+			create_file_or_folder: () => { throw new Error('overridden by registry') },
+			delete_file_or_folder: () => { throw new Error('overridden by registry') },
+			rename_file_or_folder: () => { throw new Error('overridden by registry') },
+			edit_file: () => { throw new Error('overridden by registry') },
+			rewrite_file: () => { throw new Error('overridden by registry') },
 			run_command: (params, result) => {
 				const { resolveReason, result: result_, } = result
 				// success
@@ -942,24 +811,37 @@ export class ToolsService implements IToolsService {
 			this.callTool.read_lint_errors = (params) => d.callTool(params, toolCtx)
 			this.stringOfResult.read_lint_errors = (params, result) => d.stringOfResult(params, result, toolCtx)
 		}
+		if (toolDefinitionOfToolName.create_file_or_folder) {
+			const d = toolDefinitionOfToolName.create_file_or_folder
+			this.validateParams.create_file_or_folder = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.create_file_or_folder = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.create_file_or_folder = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.delete_file_or_folder) {
+			const d = toolDefinitionOfToolName.delete_file_or_folder
+			this.validateParams.delete_file_or_folder = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.delete_file_or_folder = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.delete_file_or_folder = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.rename_file_or_folder) {
+			const d = toolDefinitionOfToolName.rename_file_or_folder
+			this.validateParams.rename_file_or_folder = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.rename_file_or_folder = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.rename_file_or_folder = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.edit_file) {
+			const d = toolDefinitionOfToolName.edit_file
+			this.validateParams.edit_file = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.edit_file = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.edit_file = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
+		if (toolDefinitionOfToolName.rewrite_file) {
+			const d = toolDefinitionOfToolName.rewrite_file
+			this.validateParams.rewrite_file = (raw) => d.validateParams(raw, toolCtx)
+			this.callTool.rewrite_file = (params) => d.callTool(params, toolCtx)
+			this.stringOfResult.rewrite_file = (params, result) => d.stringOfResult(params, result, toolCtx)
+		}
 
-	}
-
-
-	private _getLintErrors(uri: URI): { lintErrors: LintErrorItem[] | null } {
-		const lintErrors = this.markerService
-			.read({ resource: uri })
-			.filter(l => l.severity === MarkerSeverity.Error || l.severity === MarkerSeverity.Warning)
-			.slice(0, 100)
-			.map(l => ({
-				code: typeof l.code === 'string' ? l.code : l.code?.value || '',
-				message: (l.severity === MarkerSeverity.Error ? '(error) ' : '(warning) ') + l.message,
-				startLineNumber: l.startLineNumber,
-				endLineNumber: l.endLineNumber,
-			} satisfies LintErrorItem))
-
-		if (!lintErrors.length) return { lintErrors: null }
-		return { lintErrors, }
 	}
 
 }

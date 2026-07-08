@@ -9,6 +9,11 @@ import { searchInFileToolCore } from './searchInFile.tool.js'
 import { goToDefinitionToolCore } from './goToDefinition.tool.js'
 import { goToUsagesToolCore } from './goToUsages.tool.js'
 import { readLintErrorsToolCore } from './readLintErrors.tool.js'
+import { createFileOrFolderToolCore } from './createFileOrFolder.tool.js'
+import { deleteFileOrFolderToolCore } from './deleteFileOrFolder.tool.js'
+import { renameFileOrFolderToolCore } from './renameFileOrFolder.tool.js'
+import { editFileToolCore } from './editFile.tool.js'
+import { rewriteFileToolCore } from './rewriteFile.tool.js'
 
 
 export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDefinitionCore<T> }> = {
@@ -21,6 +26,11 @@ export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDef
 	go_to_definition: goToDefinitionToolCore,
 	go_to_usages: goToUsagesToolCore,
 	read_lint_errors: readLintErrorsToolCore,
+	create_file_or_folder: createFileOrFolderToolCore,
+	delete_file_or_folder: deleteFileOrFolderToolCore,
+	rename_file_or_folder: renameFileOrFolderToolCore,
+	edit_file: editFileToolCore,
+	rewrite_file: rewriteFileToolCore,
 }
 
 
