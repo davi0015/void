@@ -10,6 +10,7 @@ import { IEditorService } from '../../../services/editor/common/editorService.js
 import { ChatMessage, CompactionInfo } from '../common/chatThreadServiceTypes.js';
 import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities } from '../common/modelCapabilities.js';
 import { reParsedToolXMLString, chat_systemMessage, chat_volatileContext } from '../common/prompt/prompts.js';
+import { availableTools } from './tools/toolRegistry.js';
 import { AnthropicLLMChatMessage, AnthropicReasoning, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, OpenAILLMChatMessage, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { ChatMode, FeatureName, ModelSelection, ProviderName } from '../common/voidSettingsTypes.js';
@@ -1252,9 +1253,12 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	// by the chat thread creation path — that keeps historical turns byte-identical
 	// across requests so the provider's prefix cache stays warm.
 	private _generateChatSystemMessage = (chatMode: ChatMode, specialToolFormat: 'openai-style' | 'anthropic-style' | 'gemini-style' | undefined) => {
-		const includeXMLToolDefinitions = !specialToolFormat
 		const mcpTools = this.mcpService.getMCPTools()
-		return chat_systemMessage({ chatMode, mcpTools, includeXMLToolDefinitions })
+		// When the provider supports native tool calling (specialToolFormat set),
+		// tools are sent via the provider's API and should NOT be embedded in the
+		// system prompt. Otherwise, tool definitions are embedded as XML.
+		const tools = specialToolFormat ? undefined : availableTools(chatMode, mcpTools)
+		return chat_systemMessage({ chatMode, tools })
 	}
 
 	private async _getDirectoryPaths(): Promise<string[]> {

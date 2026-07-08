@@ -1,4 +1,6 @@
-import { BuiltinToolName } from '../../common/toolsServiceTypes.js'
+import { BuiltinToolName, approvalTypeOfBuiltinToolName } from '../../common/toolsServiceTypes.js'
+import { InternalToolInfo, builtinToolNames } from '../../common/prompt/prompts.js'
+import { ChatMode } from '../../common/voidSettingsTypes.js'
 import { ToolDefinitionCore } from './toolTypes.js'
 import { readFileToolCore } from './readFile.tool.js'
 import { lsDirToolCore } from './lsDir.tool.js'
@@ -53,4 +55,34 @@ export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDef
 // Whether a tool has been migrated to the new per-file definition.
 export const isConvertedTool = (toolName: BuiltinToolName): boolean => {
 	return toolName in toolDefinitionOfToolName
+}
+
+// Resolve the effective tool list for a given chat mode. Builtin tool info
+// (name, description, params) is sourced from the per-file registry — no more
+// duplicated descriptions in prompts.ts. MCP tools are only included in agent
+// mode.
+export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined): InternalToolInfo[] | undefined => {
+	const builtinNames: BuiltinToolName[] | undefined = chatMode === 'normal' ? undefined
+		: chatMode === 'gather' ? builtinToolNames.filter(toolName => !(toolName in approvalTypeOfBuiltinToolName))
+			: chatMode === 'agent' ? builtinToolNames
+				: undefined
+
+	const effectiveBuiltinTools = builtinNames?.map(name => {
+		const def = toolDefinitionOfToolName[name]!
+		return {
+			name: def.name,
+			description: def.description,
+			params: def.params as { [paramName: string]: { description: string } },
+		}
+	}) ?? undefined
+
+	const effectiveMCPTools = chatMode === 'agent' ? mcpTools : undefined
+
+	const tools: InternalToolInfo[] | undefined = !(builtinNames || mcpTools) ? undefined
+		: [
+			...effectiveBuiltinTools ?? [],
+			...effectiveMCPTools ?? [],
+		]
+
+	return tools
 }
