@@ -342,8 +342,6 @@ const loadingTitleWrapper = (item: React.ReactNode): React.ReactNode => {
 }
 
 
-
-
 // Prefix like "(1/2) " when this tool is part of a multi-tool batch emitted in one
 // assistant turn. The prefix is purely decorative (helps the user see that one reply
 // contains multiple tools and track how many are done) and is omitted for solo tools

@@ -94,139 +94,21 @@ export class ToolsService implements IToolsService {
 			validateOptionalURI,
 		}
 
-		// Override entries for converted tools with registry delegations.
-		if (toolDefinitionOfToolName.read_file) {
-			const d = toolDefinitionOfToolName.read_file
-			this.validateParams.read_file = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.read_file = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.read_file = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.ls_dir) {
-			const d = toolDefinitionOfToolName.ls_dir
-			this.validateParams.ls_dir = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.ls_dir = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.ls_dir = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.get_dir_tree) {
-			const d = toolDefinitionOfToolName.get_dir_tree
-			this.validateParams.get_dir_tree = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.get_dir_tree = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.get_dir_tree = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.search_pathnames_only) {
-			const d = toolDefinitionOfToolName.search_pathnames_only
-			this.validateParams.search_pathnames_only = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.search_pathnames_only = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.search_pathnames_only = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.search_for_files) {
-			const d = toolDefinitionOfToolName.search_for_files
-			this.validateParams.search_for_files = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.search_for_files = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.search_for_files = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.search_in_file) {
-			const d = toolDefinitionOfToolName.search_in_file
-			this.validateParams.search_in_file = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.search_in_file = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.search_in_file = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.go_to_definition) {
-			const d = toolDefinitionOfToolName.go_to_definition
-			this.validateParams.go_to_definition = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.go_to_definition = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.go_to_definition = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.go_to_usages) {
-			const d = toolDefinitionOfToolName.go_to_usages
-			this.validateParams.go_to_usages = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.go_to_usages = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.go_to_usages = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.read_lint_errors) {
-			const d = toolDefinitionOfToolName.read_lint_errors
-			this.validateParams.read_lint_errors = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.read_lint_errors = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.read_lint_errors = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.create_file_or_folder) {
-			const d = toolDefinitionOfToolName.create_file_or_folder
-			this.validateParams.create_file_or_folder = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.create_file_or_folder = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.create_file_or_folder = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.delete_file_or_folder) {
-			const d = toolDefinitionOfToolName.delete_file_or_folder
-			this.validateParams.delete_file_or_folder = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.delete_file_or_folder = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.delete_file_or_folder = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.rename_file_or_folder) {
-			const d = toolDefinitionOfToolName.rename_file_or_folder
-			this.validateParams.rename_file_or_folder = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.rename_file_or_folder = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.rename_file_or_folder = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.edit_file) {
-			const d = toolDefinitionOfToolName.edit_file
-			this.validateParams.edit_file = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.edit_file = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.edit_file = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.rewrite_file) {
-			const d = toolDefinitionOfToolName.rewrite_file
-			this.validateParams.rewrite_file = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.rewrite_file = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.rewrite_file = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.run_command) {
-			const d = toolDefinitionOfToolName.run_command
-			this.validateParams.run_command = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.run_command = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.run_command = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.run_persistent_command) {
-			const d = toolDefinitionOfToolName.run_persistent_command
-			this.validateParams.run_persistent_command = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.run_persistent_command = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.run_persistent_command = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.open_persistent_terminal) {
-			const d = toolDefinitionOfToolName.open_persistent_terminal
-			this.validateParams.open_persistent_terminal = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.open_persistent_terminal = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.open_persistent_terminal = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.kill_persistent_terminal) {
-			const d = toolDefinitionOfToolName.kill_persistent_terminal
-			this.validateParams.kill_persistent_terminal = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.kill_persistent_terminal = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.kill_persistent_terminal = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.fetch_url) {
-			const d = toolDefinitionOfToolName.fetch_url
-			this.validateParams.fetch_url = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.fetch_url = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.fetch_url = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.semantic_search) {
-			const d = toolDefinitionOfToolName.semantic_search
-			this.validateParams.semantic_search = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.semantic_search = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.semantic_search = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.search_history) {
-			const d = toolDefinitionOfToolName.search_history
-			this.validateParams.search_history = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.search_history = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.search_history = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
-		if (toolDefinitionOfToolName.load_skill) {
-			const d = toolDefinitionOfToolName.load_skill
-			this.validateParams.load_skill = (raw) => d.validateParams(raw, toolCtx)
-			this.callTool.load_skill = (params) => d.callTool(params, toolCtx)
-			this.stringOfResult.load_skill = (params, result) => d.stringOfResult(params, result, toolCtx)
-		}
+		// Build dispatch maps from the registry. Object.fromEntries + cast is
+		// necessary because TypeScript loses the key-value type correlation through
+		// iteration (the mapped type { [T in K]: V<T> } collapses to an intersection
+		// when indexed with the full union K). The cast is on the result, not on
+		// individual values.
+		const entries = Object.entries(toolDefinitionOfToolName)
+		this.validateParams = Object.fromEntries(entries.map(([name, def]) =>
+			[name, (raw: RawToolParamsObj) => def.validateParams(raw, toolCtx)]
+		)) as ValidateBuiltinParams
+		this.callTool = Object.fromEntries(entries.map(([name, def]) =>
+			[name, (params: never) => def.callTool(params, toolCtx)]
+		)) as CallBuiltinTool
+		this.stringOfResult = Object.fromEntries(entries.map(([name, def]) =>
+			[name, (params: never, result: never) => def.stringOfResult(params, result, toolCtx)]
+		)) as BuiltinToolResultToString
 
 	}
 
