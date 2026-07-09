@@ -2600,16 +2600,42 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 
 	const trimFromTop = useCallback(() => {
 		const el = scrollContainerRef.current
-		if (!el) return
+		const contentEl = contentRef.current
+		if (!el || !contentEl) return
 		const currScrollTop = el.scrollTop
 		if (currScrollTop <= el.clientHeight * 3) return
-		const mounted = totalCountRef.current - mountStartRef.current
-		const avgH = mounted > 0 ? (contentRef.current?.offsetHeight ?? el.scrollHeight) / mounted : 200
-		const msgsAbove = Math.floor(currScrollTop / avgH)
-		const msgsToKeepAbove = Math.ceil((el.clientHeight * 5) / avgH)
-		const msgsToRemove = msgsAbove - msgsToKeepAbove
-		if (msgsToRemove > 0) {
-			setMountStart(prev => Math.min(prev + msgsToRemove, Math.max(0, totalCountRef.current - 1)))
+
+		// Pixel-aware trim using actual DOM heights. The old per-message
+		// average badly underestimated a single tall code block, so trim
+		// removed it in one shot — `scrollTop += delta` clamped to 0 and the
+		// fill loop (content < 3 viewports) immediately re-mounted it, yanking
+		// the viewport back to the top on every scroll-down (infinite loop
+		// with 2+ long code blocks). Two guards break the cycle:
+		//   1. keep-buffer: only drop messages whose bottom is >5 viewports
+		//      above the viewport, so removed height < scrollTop and the
+		//      scrollTop compensation never clamps to 0.
+		//   2. target: never drop total content below the fill target
+		//      (3 viewports), or the fill loop re-mounts it and oscillates.
+		const containerTop = el.getBoundingClientRect().top
+		const keepBufferPx = el.clientHeight * 5
+		const target = el.clientHeight * VIEWPORT_FILL_FACTOR
+		const contentH = contentEl.offsetHeight
+
+		const children = contentEl.children
+		let removeCount = 0
+		let removedHeight = 0
+		for (let i = 0; i < children.length; i++) {
+			const rect = children[i].getBoundingClientRect()
+			// childBottom < 0 = above the viewport; < -keepBufferPx = past the buffer
+			const childBottom = rect.bottom - containerTop
+			if (childBottom >= -keepBufferPx) break
+			if (contentH - (removedHeight + rect.height) < target) break
+			removedHeight += rect.height
+			removeCount++
+		}
+
+		if (removeCount > 0) {
+			setMountStart(prev => Math.min(prev + removeCount, Math.max(0, totalCountRef.current - 1)))
 		}
 	}, [scrollContainerRef])
 
