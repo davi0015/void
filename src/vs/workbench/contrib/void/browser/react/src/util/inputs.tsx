@@ -1654,6 +1654,18 @@ type TokenSpan = { className: string; text: string }
 const tokenizedCache = new Map<string, TokenSpan[][]>()
 const tokenizedCacheMaxSize = 500
 
+// Inverse of VS Code's strings.escape() (src/vs/base/common/strings.ts),
+// which is what tokenizeToString uses to escape span text. It produces
+// exactly 3 entities: &lt;, &gt;, &amp;. &amp; must be unescaped last so
+// a literal "&amp;" in source code (escaped to "&amp;amp;" by the
+// tokenizer) round-trips correctly instead of collapsing to "&".
+const unescapeHtml = (s: string): string => {
+	return s
+		.replace(/&lt;/g, '<')
+		.replace(/&gt;/g, '>')
+		.replace(/&amp;/g, '&')
+}
+
 // Parse the HTML from _tokenizeToString into a structured token array.
 // Output format: array of lines, each line is an array of { className, text } spans.
 const parseTokenizedHtml = (html: string): TokenSpan[][] => {
@@ -1678,7 +1690,7 @@ const parseTokenizedHtml = (html: string): TokenSpan[][] => {
 				currentLine = []
 			}
 		}
-		currentLine.push({ className: match[1], text: match[2] })
+		currentLine.push({ className: match[1], text: unescapeHtml(match[2]) })
 		lastIndex = match.index + match[0].length
 	}
 	// Check for trailing <br/>
