@@ -387,10 +387,12 @@ export const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name
 	else {
 		const toolName = t.name as BuiltinToolName
 		const title = toolDefinitionOfToolName[toolName]!.title
-		const base =
-			t.type === 'success' ? title.done
-				: t.type === 'running_now' ? loadingTitleWrapper(title.running)
-					: title.proposed
+		// loadingTitleWrapper returns a React element; if we also have a batch
+		// prefix, wrap both in a fragment instead of `${prefix}${base}` (which
+		// would stringify the element to '[object Object]').
+		if (t.type === 'running_now')
+			return prefix ? <>{prefix}{loadingTitleWrapper(title.running)}</> : loadingTitleWrapper(title.running)
+		const base = t.type === 'success' ? title.done : title.proposed
 		return prefix ? `${prefix}${base}` : base
 	}
 }

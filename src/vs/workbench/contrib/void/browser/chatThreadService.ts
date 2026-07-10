@@ -2287,18 +2287,27 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const isRunning = this.streamState[threadId]?.isRunning
 		if (isRunning === 'LLM' || isRunning === 'tool') return
 
-		const pending = this._getPendingBatchTools(threadId)
-		if (pending.length > 0) {
-			// Still have pending tools — keep awaiting user
-			this._setStreamState(threadId, { isRunning: 'awaiting_user' })
-			return
-		}
-
-		// All tools resolved — resume the agent loop
+		// Drain any remaining pending tools instead of blindly setting 'awaiting_user'.
+		// When a terminal tool was approved via approveToolRequest (concurrent path),
+		// non-terminal siblings like read_file are still pre-added as tool_request but
+		// have never been processed. They don't need approval and should run automatically.
+		// _tryDrainPendingBatch runs them and only pauses if a tool genuinely requires
+		// user approval.
 		this._concurrentResumeStartedOfThreadId.add(threadId)
 		this._wrapRunAgentToNotify(
-			this._runChatAgent({ threadId, ...this._currentModelSelectionProps() })
-				.finally(() => { this._concurrentResumeStartedOfThreadId.delete(threadId) }),
+			(async () => {
+				const drainRes = await this._tryDrainPendingBatch(threadId)
+				if (drainRes === 'interrupted') {
+					this._setStreamState(threadId, undefined)
+					return
+				}
+				if (drainRes === 'awaiting_user') {
+					this._setStreamState(threadId, { isRunning: 'awaiting_user' })
+					return
+				}
+				// drainRes === 'done': all tools resolved — resume the agent loop
+				await this._runChatAgent({ threadId, ...this._currentModelSelectionProps() })
+			})().finally(() => { this._concurrentResumeStartedOfThreadId.delete(threadId) }),
 			threadId
 		)
 	}
