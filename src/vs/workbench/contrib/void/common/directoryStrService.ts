@@ -346,6 +346,11 @@ export async function getAllUrisInDirectory(
 				if (!child.isDirectory) {
 					result.push(child.resource);
 
+					// Yield every 100 files to avoid blocking the renderer
+					if (result.length % 100 === 0) {
+						await new Promise<void>(resolve => setTimeout(resolve, 0));
+					}
+
 					// Check if we've hit the limit
 					if (result.length >= maxResults) {
 						return false;

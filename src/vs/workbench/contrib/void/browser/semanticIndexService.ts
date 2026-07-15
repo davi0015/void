@@ -68,6 +68,16 @@ interface SemanticIndex {
 	chunks: SerializedChunk[] // serialized format on disk
 }
 
+// Lightweight metadata stored separately so startup doesn't need to read
+// and parse the ~240MB embeddings file just to check mtimes.
+interface IndexMetadata {
+	version: number
+	embeddingModel: string
+	fileHashOfUri: Record<string, string>
+	mtimeOfUri: Record<string, number>
+	chunkMetas: { uri: string, startLine: number, endLine: number, contentHash: string }[]
+}
+
 export interface ISemanticIndexService {
 	readonly _serviceBrand: undefined
 	search(query: string, nResults: number, includePattern?: string): Promise<{ results: SemanticSearchResult[], noResultReason?: SemanticSearchNoResultReason }>
@@ -228,10 +238,11 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 
 	private _status: IndexStatus = 'idle'
 	private _progress = { indexed: 0, total: 0 } // indexed = files fully indexed, total = total files to index
-	private _chunks: Chunk[] = [] // only chunks with valid embeddings
+	private _chunks: Chunk[] = [] // chunk metadata always loaded; embeddings loaded lazily
 	private _fileHashOfUri: Record<string, string> = {} // only files with ALL chunks embedded
 	private _mtimeOfUri: Record<string, number> = {}
 	private _currentEmbeddingModel: string = ''
+	private _embeddingsLoaded = false // true after _ensureEmbeddingsLoaded has decoded all embeddings
 
 	// During embedding, temporarily stores hashes/mtimes for files being processed.
 	// Moved to _fileHashOfUri/_mtimeOfUri only when all chunks for a file are embedded.
@@ -309,9 +320,10 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 			}
 		}))
 
-		// Wait for settings to load from storage before indexing
+		// Wait for settings to load, then defer indexing past startup so it
+		// doesn't compete with editor initialization and extension activation.
 		this.voidSettingsService.waitForInitState.then(() => {
-			this._indexWorkspace()
+			setTimeout(() => this._indexWorkspace(), 3000)
 		})
 	}
 
@@ -368,7 +380,8 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 
 			// Filter to indexable files
 			const indexableUris: URI[] = []
-			for (const uri of allUris) {
+			for (let i = 0; i < allUris.length; i++) {
+				const uri = allUris[i]
 				if (shouldSkipFile(uri)) continue
 				try {
 					const stat = await this.fileService.stat(uri)
@@ -376,6 +389,10 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 					indexableUris.push(uri)
 				} catch {
 					// skip
+				}
+				// Yield to the event loop every 50 files to avoid blocking the UI
+				if (i % 50 === 49) {
+					await new Promise<void>(resolve => setTimeout(resolve, 0))
 				}
 			}
 
@@ -457,6 +474,12 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 
 			// Process any file changes that occurred during initial indexing
 			await this._processPendingFileChanges()
+
+			// Pre-warm embeddings in the background so the first search is fast.
+			// Not awaited — this runs concurrently and yields to avoid freezing.
+			// If files were re-embedded above, _saveCurrentIndex already loaded
+			// them, so this is a no-op.
+			void this._ensureEmbeddingsLoaded()
 		} catch (e) {
 			console.error('[semanticIndex] Indexing failed:', e)
 			this.setStatus('idle')
@@ -747,6 +770,9 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 			return { results: [], noResultReason: 'notReady' }
 		}
 
+		// Lazily load embeddings from disk if not yet loaded (deferred past startup)
+		await this._ensureEmbeddingsLoaded()
+
 		// Embed the query
 		const [queryEmbedding] = await this.embeddingService.embed(
 			model.providerName,
@@ -810,140 +836,192 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 		return joinPath(this.environmentService.userRoamingDataHome, 'voidSemanticIndex', `${workspaceHash}.json`)
 	}
 
+	private _metaPath(): URI {
+		const folders = this.workspaceContextService.getWorkspace().folders
+		const workspaceHash = folders.length > 0 ? String(hash(folders.map(f => f.uri.toString()).join(','))) : 'default'
+		return joinPath(this.environmentService.userRoamingDataHome, 'voidSemanticIndex', `${workspaceHash}.meta.json`)
+	}
+
+	// One-time migration: extract metadata from the legacy single-file index
+	// (.json) into the new split format (.meta.json). Preserves existing
+	// embeddings so users don't need a full re-index on first launch after update.
+	private async _migrateFromLegacyIndex(expectedModel: string, indexableUris: URI[]): Promise<string[]> {
+		const legacyPath = this._indexPath()
+		const legacyExists = await this.fileService.exists(legacyPath)
+		if (!legacyExists) return indexableUris.map(u => u.fsPath)
+
+		try {
+
+			const content = await this.fileService.readFile(legacyPath)
+			await new Promise<void>(resolve => setTimeout(resolve, 0))
+			const index: SemanticIndex = JSON.parse(content.value.toString())
+
+			if (index.version !== INDEX_VERSION || index.embeddingModel !== expectedModel) {
+				return indexableUris.map(u => u.fsPath)
+			}
+
+			// Populate chunk metadata (no embeddings decoded yet)
+			this._chunks = index.chunks.map(sc => ({
+				uri: sc.uri,
+				startLine: sc.startLine,
+				endLine: sc.endLine,
+				content: '',
+				contentHash: sc.contentHash,
+				embedding: [],
+			}))
+			this._embeddingsLoaded = false
+			this._fileHashOfUri = { ...index.fileHashOfUri }
+			this._mtimeOfUri = { ...index.mtimeOfUri }
+			this._currentEmbeddingModel = expectedModel
+
+			// Write the .meta.json file so future loads are fast
+			await this._saveCurrentIndex()
+
+
+			// Now run the normal mtime check to find changed files
+			return await this._checkMtimes(indexableUris)
+		} catch {
+			return indexableUris.map(u => u.fsPath)
+		}
+	}
+
+	// Extracted mtime-check logic so both _loadIndex and the migration
+	// path can call it without duplicating code.
+	private async _checkMtimes(indexableUris: URI[]): Promise<string[]> {
+		const fsPathsToEmbed: string[] = []
+		for (let idx = 0; idx < indexableUris.length; idx++) {
+			if (idx % 50 === 49) {
+				await new Promise<void>(resolve => setTimeout(resolve, 0))
+			}
+			const uri = indexableUris[idx]
+			const fsPath = uri.fsPath
+			const savedMtime = this._mtimeOfUri[fsPath]
+			const savedHash = this._fileHashOfUri[fsPath]
+
+			if (savedHash === undefined) {
+				fsPathsToEmbed.push(fsPath)
+				continue
+			}
+
+			if (savedMtime !== undefined) {
+				try {
+					const stat = await this.fileService.stat(uri)
+					this._mtimeOfUri[fsPath] = stat.mtime
+					if (stat.mtime === savedMtime) continue
+					const fileContent = await this.fileService.readFile(uri)
+					const currentHash = contentHash(fileContent.value.toString())
+					if (currentHash === savedHash) continue
+					this._chunks = this._chunks.filter(c => c.uri !== fsPath)
+					delete this._fileHashOfUri[fsPath]
+					fsPathsToEmbed.push(fsPath)
+				} catch { }
+			} else {
+				try {
+					const fileContent = await this.fileService.readFile(uri)
+					const currentHash = contentHash(fileContent.value.toString())
+					if (currentHash === savedHash) continue
+					this._chunks = this._chunks.filter(c => c.uri !== fsPath)
+					delete this._fileHashOfUri[fsPath]
+					fsPathsToEmbed.push(fsPath)
+				} catch { }
+			}
+		}
+
+		const indexableFsPathSet = new Set(indexableUris.map(u => u.fsPath))
+		this._chunks = this._chunks.filter(c => indexableFsPathSet.has(c.uri) && !shouldSkipFile(URI.file(c.uri)))
+		for (const fsPath of Object.keys(this._fileHashOfUri)) {
+			if (!indexableFsPathSet.has(fsPath) || shouldSkipFile(URI.file(fsPath))) {
+				delete this._fileHashOfUri[fsPath]
+				delete this._mtimeOfUri[fsPath]
+			}
+		}
+
+		return fsPathsToEmbed
+	}
+
 	// Load existing index and return the list of fsPaths that still need embedding.
 	// Populates this._chunks, this._fileHashOfUri, this._mtimeOfUri with existing data.
 	// Returns all indexable fsPaths that are not yet in the index (or whose content changed).
 	private async _loadIndex(expectedModel: string, indexableUris: URI[]): Promise<string[]> {
 		try {
-			const path = this._indexPath()
-			const exists = await this.fileService.exists(path)
-			if (!exists) return indexableUris.map(u => u.fsPath)
+			// Try the metadata file first (small, fast to parse). This avoids
+			// reading and parsing the ~240MB embeddings file at startup just
+			// to check mtimes. Embeddings are loaded lazily by
+			// _ensureEmbeddingsLoaded when search() is called.
+			const metaPath = this._metaPath()
+			const metaExists = await this.fileService.exists(metaPath)
+			if (!metaExists) {
+				// Migration: if .meta.json doesn't exist but the old .json does,
+				// extract metadata from it so we don't lose existing embeddings.
+				return this._migrateFromLegacyIndex(expectedModel, indexableUris)
+			}
 
-			const content = await this.fileService.readFile(path)
-			const index: SemanticIndex = JSON.parse(content.value.toString())
+			const metaContent = await this.fileService.readFile(metaPath)
+			const meta: IndexMetadata = JSON.parse(metaContent.value.toString())
 
-			if (index.version !== INDEX_VERSION) return indexableUris.map(u => u.fsPath)
-			// Full re-index if embedding model changed (different vector space)
-			if (index.embeddingModel !== expectedModel) return indexableUris.map(u => u.fsPath)
+			if (meta.version !== INDEX_VERSION) return indexableUris.map(u => u.fsPath)
+			if (meta.embeddingModel !== expectedModel) return indexableUris.map(u => u.fsPath)
 
-			// Deserialize chunks: decode base64 embeddings back to float arrays
-			this._chunks = index.chunks.map(sc => ({
-				uri: sc.uri,
-				startLine: sc.startLine,
-				endLine: sc.endLine,
-				content: '', // read from source file on demand during search
-				contentHash: sc.contentHash,
-				embedding: decodeEmbedding(sc.embedding_b64),
+			// Populate chunk metadata WITHOUT embeddings — they'll be decoded
+			// lazily by _ensureEmbeddingsLoaded when search is called.
+			this._chunks = meta.chunkMetas.map(cm => ({
+				uri: cm.uri,
+				startLine: cm.startLine,
+				endLine: cm.endLine,
+				content: '',
+				contentHash: cm.contentHash,
+				embedding: [],
 			}))
-			this._fileHashOfUri = { ...index.fileHashOfUri }
-			this._mtimeOfUri = { ...index.mtimeOfUri }
+			this._embeddingsLoaded = false
+			this._fileHashOfUri = { ...meta.fileHashOfUri }
+			this._mtimeOfUri = { ...meta.mtimeOfUri }
 
-			// Check which indexable files need (re-)embedding
-			// A file is considered indexed if it has an entry in _fileHashOfUri
-			const fsPathsToEmbed: string[] = []
-
-			for (const uri of indexableUris) {
-				const fsPath = uri.fsPath
-				const savedMtime = this._mtimeOfUri[fsPath]
-				const savedHash = this._fileHashOfUri[fsPath]
-
-				// File not in index at all — needs embedding
-				if (savedHash === undefined) {
-					fsPathsToEmbed.push(fsPath)
-					continue
-				}
-
-				// File in index — check if content changed via mtime
-				if (savedMtime !== undefined) {
-					try {
-						const stat = await this.fileService.stat(uri)
-						this._mtimeOfUri[fsPath] = stat.mtime
-						if (stat.mtime === savedMtime) {
-							// mtime unchanged — file is the same, skip
-							continue
-						}
-						// mtime changed — re-hash to confirm
-						const fileContent = await this.fileService.readFile(uri)
-						const currentHash = contentHash(fileContent.value.toString())
-						if (currentHash === savedHash) {
-							// Content actually unchanged (e.g. touch), skip
-							continue
-						}
-						// Content changed — remove old chunks and hash, re-embed
-						this._chunks = this._chunks.filter(c => c.uri !== fsPath)
-						delete this._fileHashOfUri[fsPath]
-						fsPathsToEmbed.push(fsPath)
-					} catch {
-						// Can't stat — assume unchanged
-					}
-				} else {
-					// No saved mtime — need to re-hash
-					try {
-						const fileContent = await this.fileService.readFile(uri)
-						const currentHash = contentHash(fileContent.value.toString())
-						if (currentHash === savedHash) {
-							continue
-						}
-						this._chunks = this._chunks.filter(c => c.uri !== fsPath)
-						delete this._fileHashOfUri[fsPath]
-						fsPathsToEmbed.push(fsPath)
-					} catch {
-						// Can't read — skip
-					}
-				}
-			}
-
-			// Remove chunks and hashes for files that no longer exist or should now be skipped
-			const indexableFsPathSet = new Set(indexableUris.map(u => u.fsPath))
-			this._chunks = this._chunks.filter(c => indexableFsPathSet.has(c.uri) && !shouldSkipFile(URI.file(c.uri)))
-			for (const fsPath of Object.keys(this._fileHashOfUri)) {
-				if (!indexableFsPathSet.has(fsPath) || shouldSkipFile(URI.file(fsPath))) {
-					delete this._fileHashOfUri[fsPath]
-					delete this._mtimeOfUri[fsPath]
-				}
-			}
-
-			// Handle files with chunks but no hash entry (left over from incomplete embedding).
-			// If all chunks have valid embeddings, compute the real file hash so we don't re-embed.
-			const noHashFsPaths = new Set<string>()
-			for (const chunk of this._chunks) {
-				if (this._fileHashOfUri[chunk.uri] === undefined) {
-					noHashFsPaths.add(chunk.uri)
-				}
-			}
-			if (noHashFsPaths.size > 0) {
-				for (const fsPath of noHashFsPaths) {
-					const fileChunks = this._chunks.filter(c => c.uri === fsPath)
-					const allValid = fileChunks.length > 0 && fileChunks.every(c => c.embedding.length > 0 && c.embedding[0] !== 0)
-					if (allValid) {
-						// All chunks have valid embeddings — compute real file hash
-						const uri = URI.file(fsPath)
-						try {
-							const fileContent = await this.fileService.readFile(uri)
-							const text = sanitizeText(fileContent.value.toString())
-							this._fileHashOfUri[fsPath] = contentHash(text)
-							const stat = await this.fileService.stat(uri)
-							this._mtimeOfUri[fsPath] = stat.mtime
-						} catch {
-							// Can't read — remove chunks and re-queue
-							this._chunks = this._chunks.filter(c => c.uri !== fsPath)
-							if (!fsPathsToEmbed.includes(fsPath)) {
-								fsPathsToEmbed.push(fsPath)
-							}
-						}
-					} else {
-						// Chunks have zero/empty embeddings — remove and re-queue
-						this._chunks = this._chunks.filter(c => c.uri !== fsPath)
-						if (!fsPathsToEmbed.includes(fsPath)) {
-							fsPathsToEmbed.push(fsPath)
-						}
-					}
-				}
-			}
-
-			return fsPathsToEmbed
+			return await this._checkMtimes(indexableUris)
 		} catch {
 			return indexableUris.map(u => u.fsPath)
+		}
+	}
+
+	// Lazily load and decode embeddings from the full index file. Called
+	// from search() before cosine similarity, and before saving if new
+	// chunks were added (to preserve existing embeddings). No-op if already
+	// loaded. The embeddings file is ~240MB for large workspaces, so this
+	// is deferred past startup to avoid freezing the renderer.
+	private async _ensureEmbeddingsLoaded(): Promise<void> {
+		if (this._embeddingsLoaded) return
+		this._embeddingsLoaded = true
+
+		try {
+			const path = this._indexPath()
+			const exists = await this.fileService.exists(path)
+			if (!exists) return
+
+			const content = await this.fileService.readFile(path)
+			await new Promise<void>(resolve => setTimeout(resolve, 0))
+			const index: SemanticIndex = JSON.parse(content.value.toString())
+
+			// Build a lookup of existing embeddings by a composite key so we
+			// can match them to the chunk metadata already in _chunks.
+			const embeddingOfChunkKey: Record<string, number[]> = {}
+			for (let i = 0; i < index.chunks.length; i++) {
+				const sc = index.chunks[i]
+				const key = `${sc.uri}:${sc.startLine}:${sc.endLine}`
+				embeddingOfChunkKey[key] = decodeEmbedding(sc.embedding_b64)
+				if (i % 200 === 199) {
+					await new Promise<void>(resolve => setTimeout(resolve, 0))
+				}
+			}
+
+			// Fill in embeddings for chunks that have metadata but no embedding yet
+			for (const chunk of this._chunks) {
+				const key = `${chunk.uri}:${chunk.startLine}:${chunk.endLine}`
+				const emb = embeddingOfChunkKey[key]
+				if (emb) {
+					chunk.embedding = emb
+				}
+			}
+		} catch (e) {
+			console.error('[semanticIndex] Failed to lazily load embeddings:', e)
 		}
 	}
 
@@ -951,14 +1029,45 @@ class SemanticIndexService extends Disposable implements ISemanticIndexService {
 		// Don't save empty indexes — they'd overwrite a valid partial index
 		if (this._chunks.length === 0 || !this._currentEmbeddingModel) return
 
+		// Always save the small metadata file (fast, needed at startup)
 		try {
-			const path = this._indexPath()
+			const metaPath = this._metaPath()
 			const dir = joinPath(this.environmentService.userRoamingDataHome, 'voidSemanticIndex')
 			const dirExists = await this.fileService.exists(dir)
 			if (!dirExists) {
 				await this.fileService.createFolder(dir)
 			}
-			// Truncate + serialize chunks: encode embeddings as base64 Float32Array
+			const meta: IndexMetadata = {
+				version: INDEX_VERSION,
+				embeddingModel: this._currentEmbeddingModel,
+				fileHashOfUri: this._fileHashOfUri,
+				mtimeOfUri: this._mtimeOfUri,
+				chunkMetas: this._chunks.map(c => ({
+					uri: c.uri,
+					startLine: c.startLine,
+					endLine: c.endLine,
+					contentHash: c.contentHash,
+				})),
+			}
+			await this.fileService.writeFile(metaPath, VSBuffer.fromString(JSON.stringify(meta)))
+		} catch (e) {
+			console.error('[semanticIndex] Failed to save metadata:', e)
+		}
+
+		// If re-embedding happened (some chunks have real embeddings) but old
+		// embeddings weren't loaded yet, load them now so we can save a
+		// complete index file. Without this, re-embedded chunks' embeddings
+		// would be lost on restart because the old chunks have empty arrays.
+		const hasNewEmbeddings = this._chunks.some(c => c.embedding.length > 0)
+		if (hasNewEmbeddings && !this._embeddingsLoaded) {
+			await this._ensureEmbeddingsLoaded()
+		}
+		if (!this._embeddingsLoaded) return
+
+		try {
+			const path = this._indexPath()
+
+			// Save full index with embeddings
 			const serializedChunks: SerializedChunk[] = this._chunks.map(c => {
 				const truncated = c.embedding.length > this._embeddingDimensions ? c.embedding.slice(0, this._embeddingDimensions) : c.embedding
 				return {
