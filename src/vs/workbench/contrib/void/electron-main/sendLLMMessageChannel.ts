@@ -103,9 +103,11 @@ export class LLMMessageChannel implements IServerChannel {
 			},
 			onFinalMessage: (p) => {
 				this.llmMessageEmitters.onFinalMessage.fire({ requestId, ...p });
+				delete this._infoOfRunningRequest[requestId];
 			},
 			onError: (p) => {
 				this.llmMessageEmitters.onError.fire({ requestId, ...p });
+				delete this._infoOfRunningRequest[requestId];
 			},
 			abortRef: this._infoOfRunningRequest[requestId].abortRef,
 		}
@@ -118,6 +120,7 @@ export class LLMMessageChannel implements IServerChannel {
 		if (!(requestId in this._infoOfRunningRequest)) return
 		const { abortRef } = this._infoOfRunningRequest[requestId]
 		abortRef?.current?.()
+		delete this._infoOfRunningRequest[requestId]
 	}
 
 

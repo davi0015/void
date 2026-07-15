@@ -206,6 +206,7 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		delete this.llmMessageHooks.onText[requestId]
 		delete this.llmMessageHooks.onFinalMessage[requestId]
 		delete this.llmMessageHooks.onError[requestId]
+		delete this.llmMessageHooks.onAbort[requestId]
 		delete this.modelInfoOfRequestId[requestId]
 
 		delete this.listHooks.ollama.success[requestId]
