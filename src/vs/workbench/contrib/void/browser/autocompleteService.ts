@@ -11,7 +11,10 @@ import { Position } from '../../../../editor/common/core/position.js';
 import { InlineCompletion, } from '../../../../editor/common/languages.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Range } from '../../../../editor/common/core/range.js';
+import { URI } from '../../../../base/common/uri.js';
+import { IRange } from '../../../../editor/common/core/range.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
+import { IFileService } from '../../../../platform/files/common/files.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { isWindows } from '../../../../base/common/platform.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
@@ -413,6 +416,7 @@ const getLSPTypeContext = async (
 	model: ITextModel,
 	position: Position,
 	languageFeaturesService: ILanguageFeaturesService,
+	fileService: IFileService,
 ): Promise<string | null> => {
 	const hoverProvider = languageFeaturesService.hoverProvider.ordered(model).at(0)
 	if (!hoverProvider) return null
@@ -469,6 +473,69 @@ const getLSPTypeContext = async (
 			}
 		} catch {
 			// hover provider failed, skip
+		}
+	}
+
+	// Follow type definitions to get actual type declarations. The hover
+	// tells us the type NAME (e.g. "providerName: ProviderName") but not
+	// the actual values. typeDefinitionProvider gives us the source location
+	// where the type is declared, so we can read the real definition.
+	const typeDefProvider = languageFeaturesService.typeDefinitionProvider.ordered(model).at(0)
+	if (typeDefProvider) {
+		// Check type definitions at the cursor and word positions
+		const typeDefPositions = positionsToCheck.slice(0, 2) // limit to cursor + word
+		for (const pos of typeDefPositions) {
+			try {
+				const typeDefPromise = typeDefProvider.provideTypeDefinition(model, pos, CancellationToken.None)
+				const timeoutPromise = timeout(300).then(() => null)
+				const typeDef = await Promise.race([typeDefPromise, timeoutPromise])
+				if (!typeDef) continue
+
+				// Normalize to array of locations
+				const locations: { uri: URI, range: IRange }[] = []
+				if (Array.isArray(typeDef)) {
+					for (const loc of typeDef) {
+						if ('uri' in loc) locations.push(loc)
+					}
+				} else if (typeDef && 'uri' in typeDef) {
+					locations.push(typeDef)
+				}
+				if (locations.length === 0) continue
+
+				for (const loc of locations.slice(0, 2)) { // limit to 2 type defs
+					let lines: string[]
+					if (loc.uri.toString() === model.uri.toString()) {
+						// Same file — read from model
+						const startLine = Math.max(1, loc.range.startLineNumber - 2)
+						const endLine = Math.min(model.getLineCount(), loc.range.endLineNumber + 10)
+						lines = []
+						for (let l = startLine; l <= endLine; l++) {
+							lines.push(model.getLineContent(l))
+						}
+					} else {
+						// Different file — read from disk
+						try {
+							const content = (await fileService.readFile(loc.uri)).value.toString()
+							const allLines = content.split('\n')
+							const startLine = Math.max(0, loc.range.startLineNumber - 3)
+							const endLine = Math.min(allLines.length, loc.range.endLineNumber + 12)
+							lines = allLines.slice(startLine, endLine)
+						} catch {
+							continue // file not found or unreadable
+						}
+					}
+
+					const snippet = lines.join('\n').trim()
+					if (snippet.length < 5 || snippet.length > 800) continue
+					const key = `typedef:${snippet.slice(0, 50)}`
+					if (seenContents.has(key)) continue
+					seenContents.add(key)
+						typeInfos.push(snippet)
+				}
+			} catch {
+				// type definition provider failed, skip
+			}
+			break // only need to find type defs from one position
 		}
 	}
 
@@ -626,9 +693,9 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 
 		// Gather extra context: imports and LSP type info. These run in
 		// parallel to minimize latency. Imports are synchronous (fast),
-		// LSP hover is async with a 300ms timeout per position.
+		// LSP hover + type definitions are async with timeouts.
 		const importBlock = getImportBlock(model)
-		const typeContext = await getLSPTypeContext(model, position, this._langFeatureService)
+		const typeContext = await getLSPTypeContext(model, position, this._langFeatureService, this._fileService)
 
 		const { shouldGenerate, predictionType, llmPrefix, llmSuffix, stopTokens } = getCompletionOptions(prefixAndSuffix, importBlock, typeContext, justAcceptedAutocompletion)
 
@@ -708,6 +775,7 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 		@ILLMMessageService private readonly _llmMessageService: ILLMMessageService,
 		@IVoidSettingsService private readonly _settingsService: IVoidSettingsService,
 		@IConvertToLLMMessageService private readonly _convertToLLMMessageService: IConvertToLLMMessageService,
+		@IFileService private readonly _fileService: IFileService,
 	) {
 		super()
 
