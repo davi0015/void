@@ -11,15 +11,12 @@ import { Position } from '../../../../editor/common/core/position.js';
 import { InlineCompletion, } from '../../../../editor/common/languages.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Range } from '../../../../editor/common/core/range.js';
-import { IEditorService } from '../../../services/editor/common/editorService.js';
-import { isCodeEditor } from '../../../../editor/browser/editorBrowser.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { isWindows } from '../../../../base/common/platform.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { FeatureName } from '../common/voidSettingsTypes.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
-// import { IContextGatheringService } from './contextGatheringService.js';
 
 
 
@@ -387,8 +384,8 @@ const getCompletionOptions = (prefixAndSuffix: PrefixAndSuffixInfo, relevantCont
 	let { prefix, suffix, prefixToTheLeftOfCursor, suffixToTheRightOfCursor, suffixLines, prefixLines } = prefixAndSuffix
 
 	// trim prefix and suffix to not be very large
-	suffixLines = suffix.split(_ln).slice(0, 25)
-	prefixLines = prefix.split(_ln).slice(-25)
+	suffixLines = suffix.split(_ln).slice(0, 50)
+	prefixLines = prefix.split(_ln).slice(-50)
 	prefix = prefixLines.join(_ln)
 	suffix = suffixLines.join(_ln)
 
@@ -457,26 +454,7 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 	_serviceBrand: undefined;
 
 	private _lastCompletionStart = 0
-	private _lastCompletionAccept = 0
 	private _pendingRequestId: string | null = null
-	// Trigger VS Code to re-query the inline completions provider
-	private _triggerInlineCompletions() {
-		try {
-			const activePane = this._editorService.activeEditorPane
-			if (activePane) {
-				const control = activePane.getControl()
-				if (control && isCodeEditor(control)) {
-					const controller = control.getContribution('editor.contrib.inlineCompletionsController') as any
-					const model = controller?.model?.get()
-					if (model) {
-						model.trigger()
-					}
-				}
-			}
-		} catch (e) {
-			// Ignore
-		}
-	}
 
 	// used internally by vscode
 	// fires after every keystroke and returns the completion to show
@@ -492,15 +470,10 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 		const prefixAndSuffix = getPrefixAndSuffixInfo(model, position)
 
 
-		// Skip debounce if we just accepted a completion — we want the
-		// follow-up (multi-line body) immediately before the
-		// justAcceptedAutocompletion flag expires.
-		const justAcceptedAutocompletion = Date.now() - this._lastCompletionAccept < 500
-
 		// wait DEBOUNCE_TIME for the user to stop typing
 		const thisTime = Date.now()
 		this._lastCompletionStart = thisTime
-		const didTypingHappenDuringDebounce = justAcceptedAutocompletion ? false : await new Promise((resolve, reject) =>
+		const didTypingHappenDuringDebounce = await new Promise((resolve, reject) =>
 			setTimeout(() => {
 				if (this._lastCompletionStart === thisTime) {
 					resolve(false)
@@ -521,10 +494,7 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 			this._pendingRequestId = null
 		}
 
-		const relevantContext = ''
-		const { shouldGenerate, predictionType, llmPrefix, llmSuffix, stopTokens } = getCompletionOptions(prefixAndSuffix, relevantContext, justAcceptedAutocompletion)
-
-
+		const { shouldGenerate, predictionType, llmPrefix, llmSuffix, stopTokens } = getCompletionOptions(prefixAndSuffix, '', false)
 
 		if (!shouldGenerate) return []
 
@@ -552,7 +522,7 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 				onText: () => {
 					// Non-streaming FIM delivers all text at once in onFinalMessage
 				},
-					onFinalMessage: ({ fullText }) => {
+				onFinalMessage: ({ fullText }) => {
 					this._pendingRequestId = null
 
 					let text = cleanFIMText(fullText)
@@ -562,7 +532,7 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 						text = _ln + text
 					}
 
-						resolve(text)
+					resolve(text)
 				},
 				onError: ({ message }) => {
 					this._pendingRequestId = null
@@ -578,9 +548,9 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 		})
 
 		try {
-			const insertText = await insertTextPromise
+			let insertText = await insertTextPromise
 
-				if (token?.isCancellationRequested) {
+			if (token?.isCancellationRequested) {
 				return []
 			}
 
@@ -600,9 +570,8 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 	constructor(
 		@ILanguageFeaturesService private _langFeatureService: ILanguageFeaturesService,
 		@ILLMMessageService private readonly _llmMessageService: ILLMMessageService,
-		@IEditorService private readonly _editorService: IEditorService,
 		@IVoidSettingsService private readonly _settingsService: IVoidSettingsService,
-		@IConvertToLLMMessageService private readonly _convertToLLMMessageService: IConvertToLLMMessageService
+		@IConvertToLLMMessageService private readonly _convertToLLMMessageService: IConvertToLLMMessageService,
 	) {
 		super()
 
@@ -613,12 +582,6 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 				return { items: items, }
 			},
 			freeInlineCompletions: (completions) => {
-				if (completions.items.length > 0) {
-					this._lastCompletionAccept = Date.now()
-					// After accepting, trigger a follow-up completion
-					// (e.g. multi-line body after if(condition))
-					this._triggerInlineCompletions()
-				}
 			},
 		}))
 	}
