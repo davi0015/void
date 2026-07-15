@@ -454,6 +454,7 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 	_serviceBrand: undefined;
 
 	private _lastCompletionStart = 0
+	private _lastCompletionAccept = 0
 	private _pendingRequestId: string | null = null
 
 	// used internally by vscode
@@ -470,10 +471,15 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 		const prefixAndSuffix = getPrefixAndSuffixInfo(model, position)
 
 
+		// Skip debounce if we just accepted a completion — we want the
+		// follow-up (multi-line body) immediately before the
+		// justAcceptedAutocompletion flag expires.
+		const justAcceptedAutocompletion = Date.now() - this._lastCompletionAccept < 500
+
 		// wait DEBOUNCE_TIME for the user to stop typing
 		const thisTime = Date.now()
 		this._lastCompletionStart = thisTime
-		const didTypingHappenDuringDebounce = await new Promise((resolve, reject) =>
+		const didTypingHappenDuringDebounce = justAcceptedAutocompletion ? false : await new Promise((resolve, reject) =>
 			setTimeout(() => {
 				if (this._lastCompletionStart === thisTime) {
 					resolve(false)
@@ -494,7 +500,7 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 			this._pendingRequestId = null
 		}
 
-		const { shouldGenerate, predictionType, llmPrefix, llmSuffix, stopTokens } = getCompletionOptions(prefixAndSuffix, '', false)
+		const { shouldGenerate, predictionType, llmPrefix, llmSuffix, stopTokens } = getCompletionOptions(prefixAndSuffix, '', justAcceptedAutocompletion)
 
 		if (!shouldGenerate) return []
 
@@ -582,6 +588,9 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 				return { items: items, }
 			},
 			freeInlineCompletions: (completions) => {
+				if (completions.items.length > 0) {
+					this._lastCompletionAccept = Date.now()
+				}
 			},
 		}))
 	}
