@@ -17,6 +17,7 @@ import { isWindows } from '../../../../base/common/platform.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { FeatureName } from '../common/voidSettingsTypes.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
+import { timeout } from '../../../../base/common/async.js';
 
 
 
@@ -372,6 +373,110 @@ const getPrefixAndSuffixInfo = (model: ITextModel, position: Position): PrefixAn
 }
 
 
+// Extract the import block from the top of the file. FIM models need imports
+// to know what types and functions are available, but the 50-line prefix
+// window often misses them in large files. Returns the import lines as a
+// string, or null if no imports are found or they're already in the prefix window.
+const getImportBlock = (model: ITextModel): string | null => {
+	const lineCount = model.getLineCount()
+	const importLines: string[] = []
+	let foundImport = false
+
+	for (let i = 1; i <= Math.min(lineCount, 100); i++) {
+		const line = model.getLineContent(i)
+		const trimmed = line.trim()
+
+		// Skip blank lines and comments before the first import
+		if (!foundImport && (trimmed === '' || trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*'))) continue
+
+		// Match import statements: ES6 import, require(), or TypeScript import type
+		if (/^(import|export\s+.*\s+from|const\s+\{.*\}\s*=\s*require|\/\/\/\s+<reference)/.test(trimmed)) {
+			foundImport = true
+			importLines.push(line)
+			continue
+		}
+
+		// After finding imports, stop at the first non-import line (allowing blank lines between imports)
+		if (foundImport && trimmed !== '') break
+	}
+
+	if (importLines.length === 0) return null
+	return importLines.join(_ln)
+}
+
+
+// Gather type information from the LSP hover provider at and around the cursor
+// position. This gives the FIM model type signatures for identifiers it can see,
+// which is especially important for project-specific types not in training data.
+// Returns a compact string of type info, or null if nothing useful was found.
+const getLSPTypeContext = async (
+	model: ITextModel,
+	position: Position,
+	languageFeaturesService: ILanguageFeaturesService,
+): Promise<string | null> => {
+	const hoverProvider = languageFeaturesService.hoverProvider.ordered(model).at(0)
+	if (!hoverProvider) return null
+
+	// Collect hovers at the cursor and a few nearby positions on the current
+	// and previous lines. This captures the enclosing function signature and
+	// nearby variable types.
+	const positionsToCheck: Position[] = [position]
+
+	// Check word at cursor (may be different from cursor position itself)
+	const wordAtPos = model.getWordAtPosition(position)
+	if (wordAtPos) {
+		positionsToCheck.push(new Position(position.lineNumber, wordAtPos.startColumn))
+	}
+
+	// Check the previous line (often the function signature)
+	if (position.lineNumber > 1) {
+		const prevLineContent = model.getLineContent(position.lineNumber - 1)
+		const prevWordMatch = prevLineContent.match(/\b([a-zA-Z_$][a-zA-Z0-9_$]*)\b/g)
+		if (prevWordMatch) {
+			// Check the last identifier on the previous line (likely a parameter or variable)
+			const lastWord = prevWordMatch[prevWordMatch.length - 1]
+			const idx = prevLineContent.lastIndexOf(lastWord)
+			if (idx >= 0) {
+				positionsToCheck.push(new Position(position.lineNumber - 1, idx + 2))
+			}
+		}
+	}
+
+	const typeInfos: string[] = []
+	const seenContents = new Set<string>()
+
+	for (const pos of positionsToCheck) {
+		try {
+			// Race the hover against a timeout — LSP can be slow on first call
+			const hoverPromise = hoverProvider.provideHover(model, pos, CancellationToken.None)
+			const timeoutPromise = timeout(300).then(() => null)
+			const hover = await Promise.race([hoverPromise, timeoutPromise])
+			if (!hover || !hover.contents) continue
+
+			for (const content of hover.contents) {
+				// contents can be IMarkdownString or string
+				const text = typeof content === 'string' ? content : content.value
+				// Strip markdown code fences and excess whitespace
+				const cleaned = text
+					.replace(/```[a-z]*\n/g, '')
+					.replace(/```/g, '')
+					.replace(/^\s*\|.*$/gm, '') // strip markdown tables
+					.trim()
+				if (cleaned.length < 5 || cleaned.length > 500) continue // skip trivial or huge hovers
+				if (seenContents.has(cleaned)) continue
+				seenContents.add(cleaned)
+				typeInfos.push(cleaned)
+			}
+		} catch {
+			// hover provider failed, skip
+		}
+	}
+
+	if (typeInfos.length === 0) return null
+	return typeInfos.join('\n')
+}
+
+
 type CompletionOptions = {
 	predictionType: AutocompletionPredictionType,
 	shouldGenerate: boolean,
@@ -379,7 +484,7 @@ type CompletionOptions = {
 	llmSuffix: string,
 	stopTokens: string[],
 }
-const getCompletionOptions = (prefixAndSuffix: PrefixAndSuffixInfo, relevantContext: string, justAcceptedAutocompletion: boolean): CompletionOptions => {
+const getCompletionOptions = (prefixAndSuffix: PrefixAndSuffixInfo, importBlock: string | null, typeContext: string | null, justAcceptedAutocompletion: boolean): CompletionOptions => {
 
 	let { prefix, suffix, prefixToTheLeftOfCursor, suffixToTheRightOfCursor, suffixLines, prefixLines } = prefixAndSuffix
 
@@ -388,6 +493,25 @@ const getCompletionOptions = (prefixAndSuffix: PrefixAndSuffixInfo, relevantCont
 	prefixLines = prefix.split(_ln).slice(-50)
 	prefix = prefixLines.join(_ln)
 	suffix = suffixLines.join(_ln)
+
+	// Prepend imports and type context to the prefix so the FIM model knows
+	// what types and functions are available. This is injected as a comment
+	// block to avoid confusing the model — it reads the types as context,
+	// not as code to complete.
+	const contextParts: string[] = []
+	if (importBlock) {
+		// Check if imports are already fully contained in the prefix window
+		const firstPrefixLine = prefixLines[0] ?? ''
+		if (!firstPrefixLine.includes('import') || !prefix.startsWith(importBlock)) {
+			contextParts.push(importBlock)
+		}
+	}
+	if (typeContext) {
+		contextParts.push(typeContext)
+	}
+	const contextBlock = contextParts.length > 0
+		? `// --- context ---\n${contextParts.join('\n\n')}\n// --- end context ---\n\n`
+		: ''
 
 	// Strip leading blank lines from the suffix sent to FIM. When
 	// there's a blank line between the cursor and the next code, the
@@ -416,16 +540,16 @@ const getCompletionOptions = (prefixAndSuffix: PrefixAndSuffixInfo, relevantCont
 	// All completions use stop=\n\n to let the model decide how much
 	// to produce. This gives full blocks like "condition) {\n\tbody\n}"
 	// in one tab instead of requiring separate condition + body tabs.
-	let llmPrefix = prefix
+	let llmPrefix = contextBlock + prefix
 	let llmSuffix = suffixStringIgnoringThisLine
 
 	if (suffixIsJustBracketAfterAccept) {
 		// After accepting a condition with auto-close ")", include
 		// ") {" in the prefix so the model produces body text.
-		llmPrefix = prefix + suffixToTheRightOfCursor[0] + ' {' + _ln
+		llmPrefix = contextBlock + prefix + suffixToTheRightOfCursor[0] + ' {' + _ln
 	} else if (prefixToTheLeftOfCursor.trimEnd().endsWith('{')) {
 		// Line already ends with "{", predict body on next line
-		llmPrefix = prefix + _ln
+		llmPrefix = contextBlock + prefix + _ln
 	}
 
 	let completionOptions: CompletionOptions
@@ -500,7 +624,13 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 			this._pendingRequestId = null
 		}
 
-		const { shouldGenerate, predictionType, llmPrefix, llmSuffix, stopTokens } = getCompletionOptions(prefixAndSuffix, '', justAcceptedAutocompletion)
+		// Gather extra context: imports and LSP type info. These run in
+		// parallel to minimize latency. Imports are synchronous (fast),
+		// LSP hover is async with a 300ms timeout per position.
+		const importBlock = getImportBlock(model)
+		const typeContext = await getLSPTypeContext(model, position, this._langFeatureService)
+
+		const { shouldGenerate, predictionType, llmPrefix, llmSuffix, stopTokens } = getCompletionOptions(prefixAndSuffix, importBlock, typeContext, justAcceptedAutocompletion)
 
 		if (!shouldGenerate) return []
 
