@@ -11,16 +11,12 @@ import { Position } from '../../../../editor/common/core/position.js';
 import { InlineCompletion, } from '../../../../editor/common/languages.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Range } from '../../../../editor/common/core/range.js';
-import { URI } from '../../../../base/common/uri.js';
-import { IRange } from '../../../../editor/common/core/range.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
-import { IFileService } from '../../../../platform/files/common/files.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { isWindows } from '../../../../base/common/platform.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { FeatureName } from '../common/voidSettingsTypes.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
-import { timeout } from '../../../../base/common/async.js';
 
 
 
@@ -408,142 +404,6 @@ const getImportBlock = (model: ITextModel): string | null => {
 }
 
 
-// Gather type information from the LSP hover provider at and around the cursor
-// position. This gives the FIM model type signatures for identifiers it can see,
-// which is especially important for project-specific types not in training data.
-// Returns a compact string of type info, or null if nothing useful was found.
-const getLSPTypeContext = async (
-	model: ITextModel,
-	position: Position,
-	languageFeaturesService: ILanguageFeaturesService,
-	fileService: IFileService,
-): Promise<string | null> => {
-	const hoverProvider = languageFeaturesService.hoverProvider.ordered(model).at(0)
-	if (!hoverProvider) return null
-
-	// Collect hovers at the cursor and a few nearby positions on the current
-	// and previous lines. This captures the enclosing function signature and
-	// nearby variable types.
-	const positionsToCheck: Position[] = [position]
-
-	// Check word at cursor (may be different from cursor position itself)
-	const wordAtPos = model.getWordAtPosition(position)
-	if (wordAtPos) {
-		positionsToCheck.push(new Position(position.lineNumber, wordAtPos.startColumn))
-	}
-
-	// Check the previous line (often the function signature)
-	if (position.lineNumber > 1) {
-		const prevLineContent = model.getLineContent(position.lineNumber - 1)
-		const prevWordMatch = prevLineContent.match(/\b([a-zA-Z_$][a-zA-Z0-9_$]*)\b/g)
-		if (prevWordMatch) {
-			// Check the last identifier on the previous line (likely a parameter or variable)
-			const lastWord = prevWordMatch[prevWordMatch.length - 1]
-			const idx = prevLineContent.lastIndexOf(lastWord)
-			if (idx >= 0) {
-				positionsToCheck.push(new Position(position.lineNumber - 1, idx + 2))
-			}
-		}
-	}
-
-	const typeInfos: string[] = []
-	const seenContents = new Set<string>()
-
-	for (const pos of positionsToCheck) {
-		try {
-			// Race the hover against a timeout — LSP can be slow on first call
-			const hoverPromise = hoverProvider.provideHover(model, pos, CancellationToken.None)
-			const timeoutPromise = timeout(300).then(() => null)
-			const hover = await Promise.race([hoverPromise, timeoutPromise])
-			if (!hover || !hover.contents) continue
-
-			for (const content of hover.contents) {
-				// contents can be IMarkdownString or string
-				const text = typeof content === 'string' ? content : content.value
-				// Strip markdown code fences and excess whitespace
-				const cleaned = text
-					.replace(/```[a-z]*\n/g, '')
-					.replace(/```/g, '')
-					.replace(/^\s*\|.*$/gm, '') // strip markdown tables
-					.trim()
-				if (cleaned.length < 5 || cleaned.length > 500) continue // skip trivial or huge hovers
-				if (seenContents.has(cleaned)) continue
-				seenContents.add(cleaned)
-				typeInfos.push(cleaned)
-			}
-		} catch {
-			// hover provider failed, skip
-		}
-	}
-
-	// Follow type definitions to get actual type declarations. The hover
-	// tells us the type NAME (e.g. "providerName: ProviderName") but not
-	// the actual values. typeDefinitionProvider gives us the source location
-	// where the type is declared, so we can read the real definition.
-	const typeDefProvider = languageFeaturesService.typeDefinitionProvider.ordered(model).at(0)
-	if (typeDefProvider) {
-		// Check type definitions at the cursor and word positions
-		const typeDefPositions = positionsToCheck.slice(0, 2) // limit to cursor + word
-		for (const pos of typeDefPositions) {
-			try {
-				const typeDefPromise = typeDefProvider.provideTypeDefinition(model, pos, CancellationToken.None)
-				const timeoutPromise = timeout(300).then(() => null)
-				const typeDef = await Promise.race([typeDefPromise, timeoutPromise])
-				if (!typeDef) continue
-
-				// Normalize to array of locations
-				const locations: { uri: URI, range: IRange }[] = []
-				if (Array.isArray(typeDef)) {
-					for (const loc of typeDef) {
-						if ('uri' in loc) locations.push(loc)
-					}
-				} else if (typeDef && 'uri' in typeDef) {
-					locations.push(typeDef)
-				}
-				if (locations.length === 0) continue
-
-				for (const loc of locations.slice(0, 2)) { // limit to 2 type defs
-					let lines: string[]
-					if (loc.uri.toString() === model.uri.toString()) {
-						// Same file — read from model
-						const startLine = Math.max(1, loc.range.startLineNumber - 2)
-						const endLine = Math.min(model.getLineCount(), loc.range.endLineNumber + 10)
-						lines = []
-						for (let l = startLine; l <= endLine; l++) {
-							lines.push(model.getLineContent(l))
-						}
-					} else {
-						// Different file — read from disk
-						try {
-							const content = (await fileService.readFile(loc.uri)).value.toString()
-							const allLines = content.split('\n')
-							const startLine = Math.max(0, loc.range.startLineNumber - 3)
-							const endLine = Math.min(allLines.length, loc.range.endLineNumber + 12)
-							lines = allLines.slice(startLine, endLine)
-						} catch {
-							continue // file not found or unreadable
-						}
-					}
-
-					const snippet = lines.join('\n').trim()
-					if (snippet.length < 5 || snippet.length > 800) continue
-					const key = `typedef:${snippet.slice(0, 50)}`
-					if (seenContents.has(key)) continue
-					seenContents.add(key)
-						typeInfos.push(snippet)
-				}
-			} catch {
-				// type definition provider failed, skip
-			}
-			break // only need to find type defs from one position
-		}
-	}
-
-	if (typeInfos.length === 0) return null
-	return typeInfos.join('\n')
-}
-
-
 type CompletionOptions = {
 	predictionType: AutocompletionPredictionType,
 	shouldGenerate: boolean,
@@ -551,7 +411,7 @@ type CompletionOptions = {
 	llmSuffix: string,
 	stopTokens: string[],
 }
-const getCompletionOptions = (prefixAndSuffix: PrefixAndSuffixInfo, importBlock: string | null, typeContext: string | null, justAcceptedAutocompletion: boolean): CompletionOptions => {
+const getCompletionOptions = (prefixAndSuffix: PrefixAndSuffixInfo, importBlock: string | null, justAcceptedAutocompletion: boolean): CompletionOptions => {
 
 	let { prefix, suffix, prefixToTheLeftOfCursor, suffixToTheRightOfCursor, suffixLines, prefixLines } = prefixAndSuffix
 
@@ -561,24 +421,19 @@ const getCompletionOptions = (prefixAndSuffix: PrefixAndSuffixInfo, importBlock:
 	prefix = prefixLines.join(_ln)
 	suffix = suffixLines.join(_ln)
 
-	// Prepend imports and type context to the prefix so the FIM model knows
-	// what types and functions are available. This is injected as a comment
-	// block to avoid confusing the model — it reads the types as context,
-	// not as code to complete.
-	const contextParts: string[] = []
+	// Prepend imports to the prefix so the FIM model knows what types and
+	// functions are available. Imports are real code (not a comment block),
+	// so they're in-distribution for FIM models. LSP type context was removed
+	// because comment blocks with type info are out-of-distribution and cause
+	// the model to generate conservative single-line completions.
+	let contextBlock = ''
 	if (importBlock) {
 		// Check if imports are already fully contained in the prefix window
 		const firstPrefixLine = prefixLines[0] ?? ''
 		if (!firstPrefixLine.includes('import') || !prefix.startsWith(importBlock)) {
-			contextParts.push(importBlock)
+			contextBlock = importBlock + _ln + _ln
 		}
 	}
-	if (typeContext) {
-		contextParts.push(typeContext)
-	}
-	const contextBlock = contextParts.length > 0
-		? `// --- context ---\n${contextParts.join('\n\n')}\n// --- end context ---\n\n`
-		: ''
 
 	// Strip leading blank lines from the suffix sent to FIM. When
 	// there's a blank line between the cursor and the next code, the
@@ -695,9 +550,8 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 		// parallel to minimize latency. Imports are synchronous (fast),
 		// LSP hover + type definitions are async with timeouts.
 		const importBlock = getImportBlock(model)
-		const typeContext = await getLSPTypeContext(model, position, this._langFeatureService, this._fileService)
 
-		const { shouldGenerate, predictionType, llmPrefix, llmSuffix, stopTokens } = getCompletionOptions(prefixAndSuffix, importBlock, typeContext, justAcceptedAutocompletion)
+		const { shouldGenerate, predictionType, llmPrefix, llmSuffix, stopTokens } = getCompletionOptions(prefixAndSuffix, importBlock, justAcceptedAutocompletion)
 
 		if (!shouldGenerate) return []
 
@@ -775,7 +629,6 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 		@ILLMMessageService private readonly _llmMessageService: ILLMMessageService,
 		@IVoidSettingsService private readonly _settingsService: IVoidSettingsService,
 		@IConvertToLLMMessageService private readonly _convertToLLMMessageService: IConvertToLLMMessageService,
-		@IFileService private readonly _fileService: IFileService,
 	) {
 		super()
 
