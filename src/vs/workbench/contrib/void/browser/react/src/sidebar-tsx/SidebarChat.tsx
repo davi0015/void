@@ -1422,7 +1422,9 @@ const UserMessageComponent = ({ chatMessage, messageIdx, /* isCheckpointGhost, *
 
 	}, [chatMessage, mode, _justEnabledEdit, textAreaRefState, textAreaFnsRef.current, _justEnabledEdit.current, _mustInitialize.current])
 
-	useLayoutEffect(() => {
+	// useEffect (not useLayoutEffect) so scrollHeight/clientHeight reads reuse the
+	// layout already computed for paint, instead of forcing a synchronous reflow.
+	useEffect(() => {
 		const el = bubbleRef.current
 		if (el && mode === 'display') {
 			setIsTruncated(el.scrollHeight > el.clientHeight + 1)
@@ -2440,10 +2442,10 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 
 	const VIEWPORT_FILL_FACTOR = 3
 
-	// Single layout effect: measure actual content height, enforce the
-	// VIEWPORT_FILL_FACTOR invariant, set spacer, and compensate scroll.
-	// This runs on every mountStart/totalCount change — for initial fill,
-	// scrolling expand/trim, and new messages during streaming.
+	// Scroll compensation: runs synchronously before paint to adjust
+	// scrollTop after mountStart/totalCount changes. This MUST be a
+	// useLayoutEffect — if deferred to useEffect, the user sees a 1-frame
+	// scroll jump (content shifts before scrollTop is corrected).
 	const initialFillDoneRef = useRef(false)
 	const prevMountStartRef = useRef(mountStart)
 	const wasHiddenRef = useRef(true)
@@ -2468,15 +2470,6 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		}
 
 		const contentH = getContentHeight()
-		const target = scrollEl.clientHeight * VIEWPORT_FILL_FACTOR
-
-		// Enforce 3-viewport invariant: if content is too short and there
-		// are unmounted messages above, expand mountStart by one message.
-		// The layout effect re-measures after each expansion.
-		if (contentH < target && mountStart > 0) {
-			setMountStart(mountStart - 1)
-			return
-		}
 
 		// Track content height for scroll compensation
 		const prevContentH = spacerHeightRef.current
@@ -2505,6 +2498,25 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			lastScrollTopRef.current = scrollEl.scrollTop
 		}
 	}, [mountStart, totalCount, isActive, scrollContainerRef, getContentHeight])
+
+	// Fill check: runs AFTER paint as a useEffect so its setMountStart
+	// doesn't force a synchronous re-render. If content is too short,
+	// expand by enough to fill the gap. The 1-frame delay before new
+	// content appears is invisible during fast scroll-up.
+	useEffect(() => {
+		if (!isActive) return
+		const scrollEl = scrollContainerRef.current
+		if (!scrollEl || scrollEl.clientHeight === 0) return
+
+		const contentH = getContentHeight()
+		const target = scrollEl.clientHeight * VIEWPORT_FILL_FACTOR
+
+		if (contentH < target && mountStart > 0) {
+			const deficit = target - contentH
+			const batch = Math.max(1, msgsForPx(deficit))
+			setMountStart(Math.max(0, mountStart - batch))
+		}
+	}, [mountStart, totalCount, isActive, scrollContainerRef, getContentHeight, msgsForPx])
 
 	// ResizeObserver: sync wrapper height + scrollTop when content resizes
 	// (e.g., LaTeX rendering, LazyBlockCode placeholder → Monaco swap).
@@ -2988,7 +3000,10 @@ const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOn
 	// bottom. isAtBottomRef is updated synchronously in onScroll (before
 	// rAF), so stream ticks always see the correct value — the user can
 	// escape by scrolling >100px from the bottom without needing hysteresis.
-	useLayoutEffect(() => {
+	// useEffect (not useLayoutEffect) so the browser can paint new content before
+	// we force a layout reflow via scrollTop. The 1-frame delay is imperceptible at
+	// ~10Hz streaming and avoids blocking the main thread on every token.
+	useEffect(() => {
 		if (isAtBottomRef.current) {
 			scrollToBottom(scrollContainerRef)
 			isAtBottomRef.current = true
