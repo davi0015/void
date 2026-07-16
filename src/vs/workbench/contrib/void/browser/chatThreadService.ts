@@ -1934,6 +1934,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	private _tryDrainPendingBatch = async (threadId: string): Promise<'done' | 'awaiting_user' | 'interrupted'> => {
 		while (true) {
+			// If the stream was cleared (e.g. by abortRunning) while a tool was
+			// finishing, stop processing — the caller must not continue the
+			// agent loop or it will overwrite the cleared state.
+			if (this.streamState[threadId] === undefined) return 'interrupted'
 			const pending = this._getPendingBatchTools(threadId)
 			if (pending.length === 0) {
 				// No more pending tools — if concurrent terminal tools are still
@@ -2301,12 +2305,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					this._setStreamState(threadId, undefined)
 					return
 				}
-				if (drainRes === 'awaiting_user') {
-					this._setStreamState(threadId, { isRunning: 'awaiting_user' })
-					return
-				}
-				// drainRes === 'done': all tools resolved — resume the agent loop
-				await this._runChatAgent({ threadId, ...this._currentModelSelectionProps() })
+			if (drainRes === 'awaiting_user') {
+				this._setStreamState(threadId, { isRunning: 'awaiting_user' })
+				return
+			}
+			// drainRes === 'done': all tools resolved — resume the agent loop.
+			// But bail if the stream was cleared (e.g. by abortRunning) while
+			// we were draining. Without this, _runChatAgent would set the
+			// state back to 'idle'/'LLM', undoing the abort.
+			if (this.streamState[threadId] === undefined) return
+			await this._runChatAgent({ threadId, ...this._currentModelSelectionProps() })
 			})().finally(() => { this._concurrentResumeStartedOfThreadId.delete(threadId) }),
 			threadId
 		)
@@ -2634,6 +2642,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			return {}
 		}
 
+		// If the stream was cleared (e.g. by abortRunning) while the tool was
+		// finishing, don't overwrite the rejected state with success.
+		if (this.streamState[threadId] === undefined) return { interrupted: true }
+
 		// 4. stringify the result to give to the LLM
 		try {
 			if (isBuiltInTool) {
@@ -2727,7 +2739,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				return
 			}
 			// drainRes === 'done': fall through to the main LLM loop below.
+
+			// Bail if the stream was cleared (e.g. by abortRunning) while we
+			// were running the approved tool or draining the batch. Without
+			// this, the agent loop would resume and overwrite the cleared
+			// state, making it impossible to stop.
+			if (this.streamState[threadId] === undefined) return
 		}
+
 		this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' })  // just decorative, for clarity
 
 
@@ -3049,7 +3068,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						return
 					}
 					if (batchRes === 'awaiting_user') { isRunningWhenEnd = 'awaiting_user' }
-					else { shouldSendAnotherMessage = true }
+					else {
+						// Abort may have fired while tools were running. If so,
+						// streamState is undefined — don't continue the loop.
+						if (this.streamState[threadId] === undefined) return
+						shouldSendAnotherMessage = true
+					}
 
 					// Only transition to 'idle' when continuing the loop. When awaiting
 					// user approval, setting 'idle' here (before the final
