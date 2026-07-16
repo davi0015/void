@@ -199,34 +199,39 @@ const CodespanWithLink = ({ text, rawText, chatMessageLocation }: { text: string
 
 	const { messageIdx, threadId } = chatMessageLocation
 
-	const [didComputeCodespanLink, setDidComputeCodespanLink] = useState<boolean>(false)
+	const [link, setLink] = useState<CodespanLocationLink | undefined | null>(undefined)
 
-	let link: CodespanLocationLink | undefined = undefined
-	let tooltip: string | undefined = undefined
+	useEffect(() => {
+		if (!rawText.endsWith('`')) return
+
+		// check cache first — synchronous
+		const cached = chatThreadService.getCodespanLink({ codespanStr: text, messageIdx, threadId })
+		if (cached !== undefined) {
+			setLink(cached)
+			return
+		}
+
+		// generate link only if not cached — fires after mount, not during render
+		let cancelled = false
+		chatThreadService.generateCodespanLink({ codespanStr: text, threadId })
+			.then(generatedLink => {
+				if (cancelled) return
+				chatThreadService.addCodespanLink({ newLinkText: text, newLinkLocation: generatedLink, messageIdx, threadId })
+				setLink(generatedLink)
+			})
+		return () => { cancelled = true }
+	}, [text, threadId, messageIdx, rawText])
+
 	let displayText = text
+	let tooltip: string | undefined = undefined
 
+	if (link?.displayText) {
+		displayText = link.displayText
+	}
 
-	if (rawText.endsWith('`')) {
-		// get link from cache
-		link = chatThreadService.getCodespanLink({ codespanStr: text, messageIdx, threadId })
-
-		if (link === undefined) {
-			// if no link, generate link and add to cache
-			chatThreadService.generateCodespanLink({ codespanStr: text, threadId })
-				.then(link => {
-					chatThreadService.addCodespanLink({ newLinkText: text, newLinkLocation: link, messageIdx, threadId })
-					setDidComputeCodespanLink(true) // rerender
-				})
-		}
-
-		if (link?.displayText) {
-			displayText = link.displayText
-		}
-
-		if (isValidUri(displayText)) {
-			tooltip = getRelative(URI.file(displayText), accessor)  // Full path as tooltip
-			displayText = getBasename(displayText)
-		}
+	if (isValidUri(displayText)) {
+		tooltip = getRelative(URI.file(displayText), accessor)  // Full path as tooltip
+		displayText = getBasename(displayText)
 	}
 
 
