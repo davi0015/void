@@ -372,6 +372,7 @@ const RenderToken = React.memo(({ token, inPTag, codeURI, chatMessageLocation, t
 					initValue={contents.trimEnd()} // \n\n adds a permanent newline which creates a flash
 					language={language}
 					isStreaming={options.isStreaming}
+					showHeader={false}
 				/>
 			</BlockCodeApplyWrapper>
 		}

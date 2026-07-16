@@ -3,12 +3,12 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { useState, useEffect, useCallback, useRef, Fragment } from 'react'
+import React, { useState, useEffect, useCallback, useRef, Fragment } from 'react'
 import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useCommandBarState, useCommandBarURIListener, useSettingsState } from '../util/services.js'
 import { usePromise, useRefState } from '../util/helpers.js'
 import { isFeatureNameDisabled } from '../../../../common/voidSettingsTypes.js'
 import { URI } from '../../../../../../../base/common/uri.js'
-import { FileSymlink, LucideIcon, RotateCw, Terminal } from 'lucide-react'
+import { ChevronRight, FileSymlink, LucideIcon, RotateCw, Terminal } from 'lucide-react'
 import { Check, X, Square, Copy, Play, } from 'lucide-react'
 import { getBasename, ListableToolItem, voidOpenFileFn, ToolChildrenWrapper } from '../sidebar-tsx/SidebarChat.js'
 import { PlacesType, VariantType } from 'react-tooltip'
@@ -523,6 +523,7 @@ export const BlockCodeApplyWrapper = ({
 	const commandService = accessor.get('ICommandService')
 	const { currStreamStateRef } = useApplyStreamState({ applyBoxId })
 	const currStreamState = currStreamStateRef.current
+	const [isCollapsed, setIsCollapsed] = React.useState(false)
 
 
 	const name = uri !== 'current' ?
@@ -537,24 +538,31 @@ export const BlockCodeApplyWrapper = ({
 
 	return <div className='border border-void-border-3 rounded overflow-hidden bg-void-bg-3 my-1'>
 		{/* header */}
-		<div className=" select-none flex justify-between items-center py-1 px-2 border-b border-void-border-3 cursor-default">
+		<div
+			className="select-none flex justify-between items-center py-1 px-2 border-b border-void-border-3 cursor-pointer hover:bg-void-bg-2-hover transition-colors"
+			onClick={() => setIsCollapsed(v => !v)}
+		>
 			<div className="flex items-center">
+				<ChevronRight
+					className={`mr-0.5 h-4 w-4 flex-shrink-0 transition-transform duration-100 ease-[cubic-bezier(0.4,0,0.2,1)] ${isCollapsed ? '' : 'rotate-90'}`}
+				/>
 				<StatusIndicatorForApplyButton uri={uri} applyBoxId={applyBoxId} />
 				<span className="text-[13px] font-light text-void-fg-3">
 					{name}
 				</span>
 			</div>
-			<div className={`${canApply ? '' : 'hidden'} flex items-center gap-1`}>
+			<div className={`${canApply ? '' : 'hidden'} flex items-center gap-1`} onClick={e => e.stopPropagation()}>
 				<JumpToFileButton uri={uri} />
 				{currStreamState === 'idle-no-changes' && <CopyButton codeStr={codeStr} toolTipName='Copy' />}
-				<ApplyButtonsHTML uri={uri} applyBoxId={applyBoxId} codeStr={codeStr} language={language} />
 			</div>
 		</div>
 
 		{/* contents */}
-		<ToolChildrenWrapper>
-			{children}
-		</ToolChildrenWrapper>
+		{!isCollapsed && (
+			<ToolChildrenWrapper>
+				{children}
+			</ToolChildrenWrapper>
+		)}
 	</div>
 
 }

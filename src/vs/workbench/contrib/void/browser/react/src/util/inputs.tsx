@@ -1646,7 +1646,7 @@ const normalizeIndentation = (code: string): string => {
 }
 
 
-export type BlockCodeProps = { initValue: string, language?: string, maxHeight?: number, showScrollbars?: boolean, isStreaming?: boolean }
+export type BlockCodeProps = { initValue: string, language?: string, maxHeight?: number, showScrollbars?: boolean, isStreaming?: boolean, showHeader?: boolean }
 
 type TokenSpan = { className: string; text: string }
 
@@ -1711,13 +1711,15 @@ const parseTokenizedHtml = (html: string): TokenSpan[][] => {
 // Lightweight code block — uses VS Code's built-in tokenizer for syntax
 // highlighting instead of Monaco editors. Avoids creating/destroying
 // heavy editors on every virtualization scroll cycle.
-const BlockCode = ({ initValue, language, maxHeight, isStreaming }: BlockCodeProps) => {
+const BlockCode = ({ initValue, language, maxHeight, isStreaming, showHeader = true }: BlockCodeProps) => {
 	const accessor = useAccessor()
 	const languageService = accessor.get('ILanguageService')
 	const normalized = normalizeIndentation(initValue)
-	const MAX_HEIGHT = maxHeight ?? Infinity
-	const maxHeightStyle = MAX_HEIGHT !== Infinity ? { maxHeight: `${MAX_HEIGHT}px` } as React.CSSProperties : undefined
+	const MAX_HEIGHT = maxHeight ?? 400
+	const maxHeightStyle: React.CSSProperties = { maxHeight: `${MAX_HEIGHT}px` }
 	const selectableStyle: React.CSSProperties = { userSelect: 'text', WebkitUserSelect: 'text' }
+
+	const [isCollapsed, setIsCollapsed] = useState(false)
 
 	// During streaming, skip tokenization — it's expensive and the content
 	// changes every ~200ms anyway. Render plain text until streaming stops.
@@ -1765,20 +1767,33 @@ const BlockCode = ({ initValue, language, maxHeight, isStreaming }: BlockCodePro
 	}, [normalized, language, isStreaming, languageService])
 
 	return (
-		<div className='relative z-0 px-2 py-1 bg-void-bg-3' style={{ ...maxHeightStyle, ...selectableStyle }}>
-			<pre className='m-0 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto overflow-y-auto text-void-fg-2' style={{ ...maxHeightStyle, ...selectableStyle }}>
-				{tokenLines
-					? <code className="monaco-tokenized-source">{tokenLines.map((line, i) =>
-						<React.Fragment key={i}>
-							{i > 0 && '\n'}
-							{line.map((span, j) =>
-								<span key={j} className={span.className}>{span.text}</span>
-							)}
-						</React.Fragment>
-					)}</code>
-					: <code>{normalized}</code>
-				}
-			</pre>
+		<div className='relative z-0 bg-void-bg-3'>
+			{showHeader && (
+				<button
+					onClick={() => setIsCollapsed(v => !v)}
+					className='select-none w-full flex items-center py-0.5 px-2 text-[13px] font-light text-void-fg-3 hover:bg-void-bg-2-hover transition-colors'
+				>
+					<ChevronRight
+						className={`mr-0.5 h-4 w-4 flex-shrink-0 transition-transform duration-100 ease-[cubic-bezier(0.4,0,0.2,1)] ${isCollapsed ? '' : 'rotate-90'}`}
+					/>
+					<span>{language || 'code'}</span>
+				</button>
+			)}
+			{!isCollapsed && (
+				<pre className='m-0 px-2 py-1 font-mono text-[13px] leading-[19px] whitespace-pre overflow-x-auto overflow-y-auto text-void-fg-2' style={{ ...maxHeightStyle, ...selectableStyle }}>
+					{tokenLines
+						? <code className="monaco-tokenized-source">{tokenLines.map((line, i) =>
+							<React.Fragment key={i}>
+								{i > 0 && '\n'}
+								{line.map((span, j) =>
+									<span key={j} className={span.className}>{span.text}</span>
+								)}
+							</React.Fragment>
+						)}</code>
+						: <code>{normalized}</code>
+					}
+				</pre>
+			)}
 		</div>
 	)
 }
@@ -1814,8 +1829,8 @@ const scheduleLazyMount = (cb: () => void) => {
 
 // BlockCode is now lightweight (<pre><code>), so no need for IntersectionObserver
 // or lazy mounting. We keep the export name so call-sites don't change.
-export const LazyBlockCode = ({ initValue, language, maxHeight, isStreaming }: BlockCodeProps) => {
-	return <BlockCode initValue={initValue} language={language} maxHeight={maxHeight} isStreaming={isStreaming} />
+export const LazyBlockCode = ({ initValue, language, maxHeight, isStreaming, showHeader }: BlockCodeProps) => {
+	return <BlockCode initValue={initValue} language={language} maxHeight={maxHeight} isStreaming={isStreaming} showHeader={showHeader} />
 }
 
 
