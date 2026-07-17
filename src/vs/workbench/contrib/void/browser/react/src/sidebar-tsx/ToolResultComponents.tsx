@@ -388,11 +388,11 @@ export const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name
 	else {
 		const toolName = t.name as BuiltinToolName
 		const title = toolDefinitionOfToolName[toolName]!.title
-		// loadingTitleWrapper returns a React element; if we also have a batch
-		// prefix, wrap both in a fragment instead of `${prefix}${base}` (which
-		// would stringify the element to '[object Object]').
+		// Put the prefix INSIDE loadingTitleWrapper so the prefix text and the
+		// (block-level) flex span stay on one line. Putting prefix outside the
+		// flex span made the inline prefix wrap onto its own line while running.
 		if (t.type === 'running_now')
-			return prefix ? <>{prefix}{loadingTitleWrapper(title.running)}</> : loadingTitleWrapper(title.running)
+			return loadingTitleWrapper(prefix ? <>{prefix}{title.running}</> : title.running)
 		const base = t.type === 'success' ? title.done : title.proposed
 		return prefix ? `${prefix}${base}` : base
 	}
