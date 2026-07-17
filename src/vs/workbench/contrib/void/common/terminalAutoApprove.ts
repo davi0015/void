@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { parse, NodeType, type BaseNode } from './shellParser/parser.js'
-import { getTopLevelCommands, type Command } from './shellParser/command.js'
+import { getTopLevelCommands } from './shellParser/command.js'
 
 // Commands that execute arbitrary code by nature — never auto-approve
 // regardless of allowlist. `eval` runs a string as code, `source`/`.`
@@ -22,6 +22,15 @@ const hasCommandSubstitution = (node: BaseNode): boolean => {
 	return node.children.some(child => hasCommandSubstitution(child))
 }
 
+// Check if a node tree contains a Pipeline (pipe operator |). Used to prevent
+// prefix matching across pipe boundaries — `git status` should NOT match
+// `git status | sh` because the pipe introduces a new, potentially dangerous
+// command.
+const hasPipeline = (node: BaseNode): boolean => {
+	if (node.type === NodeType.Pipeline) return true
+	return node.children.some(child => hasPipeline(child))
+}
+
 // Process substitution (<(), >()) is not parsed by the parser — it's left as
 // raw text in word nodes. Scan for it in the command text. This is
 // conservative: `echo a<(b` would require manual approval even though it might
@@ -30,69 +39,107 @@ const hasProcessSubstitution = (commandText: string): boolean => {
 	return /<\(/.test(commandText) || />\)/.test(commandText)
 }
 
-// Parse a command string into individual Command objects. Returns empty array
-// on parse failure.
-const parseCommands = (command: string): Command[] => {
+// Walk the AST, splitting only on &&/||/; (List nodes) and statement
+// separators. Pipelines (|) are treated as atomic units — the entire pipeline
+// is one entry. This prevents `cat` from being stored as a standalone prefix
+// when the user approves `git diff | cat`.
+const splitChainUnits = (tree: BaseNode): BaseNode[] => {
+	const results: BaseNode[] = []
+	const walk = (node: BaseNode) => {
+		if (node.type === NodeType.List) {
+			// && or || — recurse into parts
+			for (const child of node.children) walk(child)
+		} else if (
+			node.type === NodeType.Program ||
+			node.type === NodeType.CompoundStatement ||
+			node.type === NodeType.Subshell
+		) {
+			// Containers — recurse into children
+			for (const child of node.children) walk(child)
+		} else if (node.type === NodeType.AssignmentList) {
+			// Extract the Command child, skip pure assignments
+			const cmdChild = node.children.find(c => c.type === NodeType.Command)
+			if (cmdChild) walk(cmdChild)
+		} else {
+			// Command, Pipeline, or other — atomic
+			const text = node.text.trim()
+			if (text) results.push(node)
+		}
+	}
+	walk(tree)
+	return results
+}
+
+const getUnitText = (node: BaseNode): string => {
+	return node.text.trim()
+}
+
+// Split a command string into chain units (split on &&/||/; only, not |).
+// Pipelines are treated as a single unit. Used by the UI to know what to
+// store in the allowlist when the user clicks "Always Approve".
+export const splitCommands = (command: string): string[] => {
+	let tree: BaseNode
 	try {
-		const tree = parse(command)
-		return getTopLevelCommands(tree)
+		tree = parse(command)
 	} catch {
 		return []
 	}
+	const units = splitChainUnits(tree)
+	return units.map(getUnitText).filter(t => t.length > 0)
 }
 
-// Get the normalized text of a command (quotes stripped, env vars removed).
-// This is what gets stored in the allowlist and matched against.
-const getCommandText = (cmd: Command): string => {
-	return cmd.tokens.map(t => t.text).join(' ').trim()
-}
-
-// Split a command string into normalized command texts. Useful for the UI
-// to know what to store in the allowlist when the user clicks "Always approve".
-export const splitCommands = (command: string): string[] => {
-	const commands = parseCommands(command)
-	const result: string[] = []
-	for (const cmd of commands) {
-		const text = getCommandText(cmd)
-		if (text) {
-			result.push(text)
-		}
-	}
-	return result
-}
-
-// Returns true if every command in the command string matches a prefix in
+// Returns true if every chain unit in the command string matches a prefix in
 // the allowlist AND no dangerous patterns are detected. Returns false
 // (require manual approval) if:
 //   - The allowlist is empty
-//   - Parsing fails or yields zero commands
-//   - Any command contains command substitution ($(), backticks)
-//   - Any command contains process substitution (<(), >())
-//   - Any command's name is eval/source/exec/.
-//   - Any command doesn't match an allowlist prefix
+//   - Parsing fails or yields zero units
+//   - Any unit contains command substitution ($(), backticks)
+//   - Any unit contains process substitution (<(), >())
+//   - Any unit's command name is eval/source/exec/.
+//   - Any unit doesn't match an allowlist prefix
+//   - A pipeline unit matches a non-pipeline prefix (prevents `git status`
+//     from matching `git status | sh`)
 export const shouldAutoApprove = (command: string, allowlist: string[]): boolean => {
 	if (allowlist.length === 0) return false
 
-	const commands = parseCommands(command)
-	if (commands.length === 0) return false
+	let tree: BaseNode
+	try {
+		tree = parse(command)
+	} catch {
+		return false
+	}
 
-	for (const cmd of commands) {
-		const cmdText = getCommandText(cmd)
-		if (!cmdText) continue
+	const units = splitChainUnits(tree)
+	if (units.length === 0) return false
 
-		// Check if command name is a dangerous builtin
-		const cmdName = cmd.tokens[0]?.text
-		if (cmdName && DANGEROUS_COMMAND_NAMES.has(cmdName)) return false
+	for (const unit of units) {
+		const unitText = getUnitText(unit)
+		if (!unitText) continue
 
-		// Check for command substitution in the AST ($(), backticks)
-		if (hasCommandSubstitution(cmd.tree)) return false
+		// Check for dangerous builtins in ALL commands within this unit
+		// (a pipeline like `git diff | eval "..."` must be caught)
+		const commandsInUnit = getTopLevelCommands(unit)
+		for (const cmd of commandsInUnit) {
+			const cmdName = cmd.tokens[0]?.text
+			if (cmdName && DANGEROUS_COMMAND_NAMES.has(cmdName)) return false
+		}
 
-		// Check for process substitution in raw text (<(), >())
-		if (hasProcessSubstitution(cmdText)) return false
+		// Check for command substitution in the AST
+		if (hasCommandSubstitution(unit)) return false
 
-		// Prefix-match against allowlist
+		// Check for process substitution
+		if (hasProcessSubstitution(unitText)) return false
+
+		// Check if this unit is a pipeline
+		const unitHasPipeline = hasPipeline(unit)
+
+		// Prefix-match against allowlist. If the unit is a pipeline, the
+		// prefix must also contain a `|` — this prevents `git status` from
+		// matching `git status | sh`.
 		const matched = allowlist.some(prefix =>
-			cmdText === prefix || cmdText.startsWith(prefix + ' ')
+			unitText === prefix
+			|| (unitText.startsWith(prefix + ' ')
+				&& (!unitHasPipeline || prefix.includes('|')))
 		)
 		if (!matched) return false
 	}
