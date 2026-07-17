@@ -1823,7 +1823,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			}
 
 			// fallback: match via line-level search (handles whitespace differences)
-			const res = findTextInCode(e.original, modelStr, true, { returnType: 'lines' })
+			const res = findTextInCode(e.original, modelStr, false, { returnType: 'lines' })
 			if (typeof res === 'string')
 				throw new Error(this._errContentOfInvalidStr(res, e.original))
 			let [startLine, endLine] = res
