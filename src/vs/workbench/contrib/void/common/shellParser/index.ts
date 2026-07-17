@@ -9,3 +9,4 @@
 
 export * from './parser.js';
 export * from './command.js';
+export * from './autoApprove.js';
