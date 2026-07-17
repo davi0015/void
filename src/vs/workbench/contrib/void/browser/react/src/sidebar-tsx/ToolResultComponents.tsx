@@ -19,6 +19,7 @@ import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE } from '../..
 import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
 import { persistentTerminalNameOfId } from '../../../terminalToolService.js';
+import { splitCommands } from '../../../../common/terminalAutoApprove.js';
 import { removeMCPToolNamePrefix } from '../../../../common/mcpServiceTypes.js';
 import { toolDefinitionOfToolName } from '../../../tools/toolRegistry.js';
 
@@ -576,6 +577,7 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 	const voidSettingsService = accessor.get('IVoidSettingsService')
 	const voidSettingsState = useSettingsState()
 	const workspaceContextService = accessor.get('IWorkspaceContextService')
+	const terminalToolService = accessor.get('ITerminalToolService')
 
 	// Terminal tools use per-tool approve/reject (concurrent execution).
 	// Non-terminal tools use the serial approve-latest/reject-latest path.
@@ -621,6 +623,24 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 		metricsService.capture('Tool Request Rejected', {})
 	}, [chatThreadsService, isTerminal, toolId])
 
+	// "Always approve" — adds the command prefix to the per-workspace allowlist,
+	// then approves the current request. Only shown for terminal tools with a
+	// command string.
+	const terminalParams = isTerminal ? params as BuiltinToolCallParams['run_command'] | BuiltinToolCallParams['run_persistent_command'] | undefined : undefined
+	const hasCommand = !!(terminalParams && 'command' in terminalParams && terminalParams.command)
+	const onAlwaysApprove = useCallback(() => {
+		if (!terminalParams || !('command' in terminalParams) || !terminalParams.command) return
+		const commands = splitCommands(terminalParams.command)
+		for (const cmd of commands) {
+			terminalToolService.addToAutoApproveAllowlist(cmd)
+		}
+		try {
+			const tid = chatThreadsService.state.currentThreadId
+			chatThreadsService.approveToolRequest(tid, toolId)
+			metricsService.capture('Tool Request Always Approved', {})
+		} catch (e) { console.error('Error while always-approving message in chat:', e) }
+	}, [terminalParams, terminalToolService, chatThreadsService, metricsService, toolId])
+
 	const approveButton = (
 		<button
 			onClick={onAccept}
@@ -636,6 +656,23 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 			Approve
 		</button>
 	)
+
+	const alwaysApproveButton = hasCommand ? (
+		<button
+			onClick={onAlwaysApprove}
+			className={`
+                px-2 py-1
+                bg-[var(--vscode-button-background)]
+                text-[var(--vscode-button-foreground)]
+                hover:bg-[var(--vscode-button-hoverBackground)]
+                rounded
+                text-sm font-medium
+                opacity-80
+            `}
+		>
+			Always Approve
+		</button>
+	) : null
 
 	const cancelButton = (
 		<button
@@ -664,6 +701,7 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 	// This avoids the button disappearing for 2s during lint checks after edits.
 	return <div className="flex gap-2 mx-0.5 items-center">
 		{approveButton}
+		{alwaysApproveButton}
 		{cancelButton}
 		{approvalToggle}
 	</div>

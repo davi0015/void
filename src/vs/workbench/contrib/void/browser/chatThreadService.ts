@@ -29,6 +29,7 @@ import { IMetricsService } from '../common/metricsService.js';
 import { IVoidModelService } from '../common/voidModelService.js';
 import { findLast } from '../../../../base/common/arraysFind.js';
 import { IEditCodeService } from './editCodeServiceInterface.js';
+import { ITerminalToolService } from './terminalToolService.js';
 // import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js'; // checkpoint disabled — see checkpoint-storage-refactor.md
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
@@ -46,6 +47,7 @@ import { buildTestMessages, runSimulatedStream } from './chatThreadDevTools.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IMCPService } from '../common/mcpService.js';
 import { RawMCPToolCall } from '../common/mcpServiceTypes.js';
+import { shouldAutoApprove } from '../common/terminalAutoApprove.js';
 
 
 // related to retrying when LLM message has error
@@ -658,6 +660,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IRequestTelemetryService private readonly _requestTelemetryService: IRequestTelemetryService,
 		@IEnvironmentService private readonly _environmentService: IEnvironmentService,
 		@ILifecycleService private readonly _lifecycleService: ILifecycleService,
+		@ITerminalToolService private readonly _terminalToolService: ITerminalToolService,
 	) {
 		super()
 		void this._editCodeService // checkpoint disabled — kept for DI, see checkpoint-storage-refactor.md
@@ -1999,7 +2002,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				if (nextApprovalType === 'terminal') {
 					const mode = normalizeAutoApproveMode(this._settingsService.state.globalSettings.autoApprove.terminal)
 					// Terminal tools are NOT workspace-scoped, so 'workspace' === 'all'
-					if (mode === 'all' || mode === 'workspace') {
+					// Also check the per-workspace command allowlist
+					let isAutoApproved = mode === 'all' || mode === 'workspace'
+					if (!isAutoApproved) {
+						const terminalParams = next.params as BuiltinToolCallParams['run_command'] | BuiltinToolCallParams['run_persistent_command'] | undefined
+						if (terminalParams && 'command' in terminalParams) {
+							const allowlist = this._terminalToolService.getAutoApproveAllowlist()
+							isAutoApproved = shouldAutoApprove(terminalParams.command, allowlist)
+						}
+					}
+					if (isAutoApproved) {
 						try {
 							const validated = this._toolsService.validateParams[next.name](next.rawParams)
 							this._fireConcurrentTerminal(threadId, { ...next, params: validated })
@@ -2553,6 +2565,18 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						autoApprove = urisToCheck.length > 0 && urisToCheck.every(u => this._workspaceContextService.isInsideWorkspace(u))
 					} else {
 						autoApprove = true
+					}
+				}
+
+				// Terminal command allowlist — check if the command matches a prefix
+				// in the per-workspace allowlist (added via "Always approve" button).
+				if (!autoApprove && approvalType === 'terminal' && isBuiltInTool) {
+					const terminalParams = toolParams as BuiltinToolCallParams['run_command'] | BuiltinToolCallParams['run_persistent_command']
+					if (terminalParams && 'command' in terminalParams) {
+						const allowlist = this._terminalToolService.getAutoApproveAllowlist()
+						if (shouldAutoApprove(terminalParams.command, allowlist)) {
+							autoApprove = true
+						}
 					}
 				}
 
