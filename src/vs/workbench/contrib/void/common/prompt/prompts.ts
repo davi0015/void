@@ -161,7 +161,7 @@ export const builtinToolNames: BuiltinToolName[] = [
 	'go_to_definition', 'go_to_usages', 'read_lint_errors',
 	'create_file_or_folder', 'delete_file_or_folder', 'rename_file_or_folder',
 	'edit_file', 'rewrite_file',
-	'run_command', 'run_persistent_command', 'open_persistent_terminal', 'kill_persistent_terminal',
+	'run_command', 'run_persistent_command', 'open_persistent_terminal', 'kill_persistent_terminal', 'read_terminal',
 	'fetch_url', 'semantic_search', 'search_history', 'load_skill',
 ]
 const toolNamesSet = new Set<string>(builtinToolNames)

@@ -496,6 +496,10 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 			const toolParams = _toolParams as BuiltinToolCallParams['kill_persistent_terminal']
 			return { desc1: toolParams.persistentTerminalId }
 		},
+		'read_terminal': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['read_terminal']
+			return { desc1: toolParams.terminalName }
+		},
 		'get_dir_tree': () => {
 			const toolParams = _toolParams as BuiltinToolCallParams['get_dir_tree']
 			return {
@@ -1550,6 +1554,42 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 				const { persistentTerminalId } = params
 				componentParams.desc1 = persistentTerminalNameOfId(persistentTerminalId)
 				componentParams.onClick = () => terminalToolsService.focusPersistentTerminal(persistentTerminalId)
+			}
+			else if (toolMessage.type === 'tool_error') {
+				const { result } = toolMessage
+				componentParams.bottomChildren = <BottomChildren title='Error'>
+					<CodeChildren>
+						{result}
+					</CodeChildren>
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		},
+	},
+	'read_terminal': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const title = getTitle(toolMessage)
+			const icon = null
+
+			const isError = false
+			const isRejected = toolMessage.type === 'rejected'
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper {...componentParams} />
+			}
+
+			if (toolMessage.type === 'success') {
+				const { result } = toolMessage
+				componentParams.desc1 = result.status
+				componentParams.bottomChildren = <BottomChildren title='Terminal output'>
+					<CodeChildren>
+						{result.output}
+					</CodeChildren>
+				</BottomChildren>
 			}
 			else if (toolMessage.type === 'tool_error') {
 				const { result } = toolMessage

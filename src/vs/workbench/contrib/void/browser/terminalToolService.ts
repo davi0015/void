@@ -33,6 +33,8 @@ export interface ITerminalToolService {
 
 	readTerminal(terminalId: string): Promise<string>
 
+	readTerminalByName(terminalName: string): Promise<{ output: string, status: string, commands: { command: string, exitCode: number | null, duration: number }[] }>
+
 	createPersistentTerminal(opts: { cwd: string | null }): Promise<string>
 	killPersistentTerminal(terminalId: string): Promise<void>
 
@@ -311,6 +313,40 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 		return result
 	};
+
+	readTerminalByName: ITerminalToolService['readTerminalByName'] = async (terminalName) => {
+		// Find terminal by name across all instances (Void + user-created)
+		const terminal = [...this.terminalService.instances].find(t => t.title === terminalName)
+		if (!terminal) {
+			throw new Error(`Read Terminal: No terminal found with name "${terminalName}". The terminal may have been closed.`)
+		}
+		if (!terminal.xterm) {
+			throw new Error('Read Terminal: The requested terminal has not yet been rendered and therefore has no scrollback buffer available.')
+		}
+
+		// Read scrollback buffer
+		const lines: string[] = []
+		for (const line of terminal.xterm.getBufferReverseIterator()) {
+			lines.unshift(line)
+		}
+		let output = removeAnsiEscapeCodes(lines.join('\n'))
+		output = output.replace(/\n+$/, '')
+		if (output.length > MAX_TERMINAL_CHARS) {
+			const half = MAX_TERMINAL_CHARS / 2
+			output = output.slice(0, half) + '\n...\n' + output.slice(output.length - half)
+		}
+
+		// Get status and command history from CommandDetection
+		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection)
+		const status = this._getTerminalStatus(terminal)
+		const commands = cmdCap ? cmdCap.commands.map(cmd => ({
+			command: cmd.command,
+			exitCode: cmd.exitCode ?? null,
+			duration: cmd.duration,
+		})) : []
+
+		return { output, status, commands }
+	}
 
 	private async _waitForCommandDetectionCapability(terminal: ITerminalInstance) {
 		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection);

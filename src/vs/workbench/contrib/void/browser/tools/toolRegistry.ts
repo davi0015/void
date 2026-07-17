@@ -20,6 +20,7 @@ import { runCommandToolCore } from './runCommand.tool.js'
 import { runPersistentCommandToolCore } from './runPersistentCommand.tool.js'
 import { openPersistentTerminalToolCore } from './openPersistentTerminal.tool.js'
 import { killPersistentTerminalToolCore } from './killPersistentTerminal.tool.js'
+import { readTerminalToolCore } from './readTerminal.tool.js'
 import { fetchUrlToolCore } from './fetchUrl.tool.js'
 import { semanticSearchToolCore } from './semanticSearch.tool.js'
 import { searchHistoryToolCore } from './searchHistory.tool.js'
@@ -45,6 +46,7 @@ export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDef
 	run_persistent_command: runPersistentCommandToolCore,
 	open_persistent_terminal: openPersistentTerminalToolCore,
 	kill_persistent_terminal: killPersistentTerminalToolCore,
+	read_terminal: readTerminalToolCore,
 	fetch_url: fetchUrlToolCore,
 	semantic_search: semanticSearchToolCore,
 	search_history: searchHistoryToolCore,
