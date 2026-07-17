@@ -114,9 +114,17 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 	private _getTerminalStatus(terminal: ITerminalInstance): string {
 		const exitCode = terminal.exitCode
-		return exitCode !== undefined
-			? `exited (code ${exitCode})`
-			: 'running'
+		if (exitCode !== undefined) return `exited (code ${exitCode})`
+		// Use CommandDetection to distinguish idle (shell at prompt) from
+		// running (command executing). Falls back to 'running' when shell
+		// integration is not available.
+		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection)
+		if (!cmdCap) return 'running'
+		if (cmdCap.executingCommand) {
+			const cmd = cmdCap.executingCommand
+			return `running: ${cmd.length > 60 ? cmd.slice(0, 57) + '...' : cmd}`
+		}
+		return 'idle'
 	}
 
 	listAllTerminals(): { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[] {
