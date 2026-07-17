@@ -63,3 +63,8 @@ export const OPT_OUT_KEY = 'void.app.optOutAll'
 // existed when the window was shut down. Rehydrated on next startup so the
 // user doesn't lose the ability to review/reject edits after a restart.
 export const PENDING_DIFFS_STORAGE_KEY = 'void.pendingDiffsI'
+
+// Per-workspace allowlist of terminal command prefixes that skip manual
+// approval. The user adds entries by clicking "Always approve" on a terminal
+// tool request. Stored at WORKSPACE scope so it's project-specific.
+export const TERMINAL_AUTO_APPROVE_KEY = 'void.terminalAutoApproveI'

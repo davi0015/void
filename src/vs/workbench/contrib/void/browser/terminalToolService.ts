@@ -11,9 +11,11 @@ import { registerSingleton, InstantiationType } from '../../../../platform/insta
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { TerminalLocation } from '../../../../platform/terminal/common/terminal.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
+import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { ITerminalService, ITerminalInstance, ICreateTerminalOptions } from '../../../../workbench/contrib/terminal/browser/terminal.js';
 import { MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_CHARS, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js';
 import { TerminalResolveReason } from '../common/toolsServiceTypes.js';
+import { TERMINAL_AUTO_APPROVE_KEY } from '../common/storageKeys.js';
 import { timeout } from '../../../../base/common/async.js';
 
 
@@ -40,6 +42,9 @@ export interface ITerminalToolService {
 
 	getPersistentTerminal(terminalId: string): ITerminalInstance | undefined
 	getTemporaryTerminal(terminalId: string): ITerminalInstance | undefined
+
+	getAutoApproveAllowlist(): string[]
+	addToAutoApproveAllowlist(command: string): void
 }
 export const ITerminalToolService = createDecorator<ITerminalToolService>('TerminalToolService');
 
@@ -76,6 +81,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 	constructor(
 		@ITerminalService private readonly terminalService: ITerminalService,
 		@IWorkspaceContextService private readonly workspaceContextService: IWorkspaceContextService,
+		@IStorageService private readonly storageService: IStorageService,
 	) {
 		super();
 
@@ -102,6 +108,28 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 			terminalService.onDidCreateInstance(terminal => { initializeTerminal(terminal) })
 		)
 
+	}
+
+	// Per-workspace allowlist of terminal command prefixes that skip manual
+	// approval. Stored at WORKSPACE scope so it's project-specific.
+	getAutoApproveAllowlist(): string[] {
+		const raw = this.storageService.get(TERMINAL_AUTO_APPROVE_KEY, StorageScope.WORKSPACE)
+		if (!raw) return []
+		try {
+			const parsed = JSON.parse(raw)
+			if (!Array.isArray(parsed)) return []
+			return parsed.filter((v): v is string => typeof v === 'string')
+		} catch {
+			return []
+		}
+	}
+
+	addToAutoApproveAllowlist(command: string): void {
+		const allowlist = this.getAutoApproveAllowlist()
+		if (!allowlist.includes(command)) {
+			allowlist.push(command)
+			this.storageService.store(TERMINAL_AUTO_APPROVE_KEY, JSON.stringify(allowlist), StorageScope.WORKSPACE, StorageTarget.USER)
+		}
 	}
 
 
