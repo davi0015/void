@@ -103,7 +103,7 @@ export type BuiltinToolCallParams = {
 	'run_persistent_command': { command: string; persistentTerminalId: string },
 	'kill_persistent_terminal': { persistentTerminalId: string },
 	// --- terminal read ---
-	'read_terminal': { terminalName: string },
+	'read_terminal': { terminalName: string, lastNCommands: number | null },
 	// --- web ---
 	'fetch_url': { url: string },
 	// --- semantic search ---

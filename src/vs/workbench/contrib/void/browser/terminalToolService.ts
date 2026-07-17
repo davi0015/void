@@ -33,7 +33,7 @@ export interface ITerminalToolService {
 
 	readTerminal(terminalId: string): Promise<string>
 
-	readTerminalByName(terminalName: string): Promise<{ output: string, status: string, commands: { command: string, exitCode: number | null, duration: number }[] }>
+	readTerminalByName(terminalName: string, lastNCommands?: number | null): Promise<{ output: string, status: string, commands: { command: string, exitCode: number | null, duration: number }[] }>
 
 	createPersistentTerminal(opts: { cwd: string | null }): Promise<string>
 	killPersistentTerminal(terminalId: string): Promise<void>
@@ -314,7 +314,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		return result
 	};
 
-	readTerminalByName: ITerminalToolService['readTerminalByName'] = async (terminalName) => {
+	readTerminalByName: ITerminalToolService['readTerminalByName'] = async (terminalName, lastNCommands?) => {
 		// Find terminal by name across all instances (Void + user-created)
 		const terminal = [...this.terminalService.instances].find(t => t.title === terminalName)
 		if (!terminal) {
@@ -324,7 +324,41 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 			throw new Error('Read Terminal: The requested terminal has not yet been rendered and therefore has no scrollback buffer available.')
 		}
 
-		// Read scrollback buffer
+		// Get status and command history from CommandDetection
+		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection)
+		const status = this._getTerminalStatus(terminal)
+		const allCommands = cmdCap ? cmdCap.commands : []
+
+		// Filter to the last N commands — return their combined output via
+		// CommandDetection markers (more reliable than the raw scrollback, which
+		// may be truncated for long-running terminals).
+		if (lastNCommands !== null && lastNCommands !== undefined && lastNCommands > 0) {
+			if (allCommands.length === 0) {
+				throw new Error(`Read Terminal: last_n_commands was ${lastNCommands}, but no commands have been detected in this terminal. Shell integration may not be available.`)
+			}
+			const start = Math.max(0, allCommands.length - lastNCommands)
+			const selectedCommands = allCommands.slice(start)
+			const outputParts: string[] = []
+			for (const cmd of selectedCommands) {
+				const rawOutput = cmd.getOutput()
+				const cleanOutput = rawOutput ? removeAnsiEscapeCodes(rawOutput).replace(/\n+$/, '') : '(no output captured for this command)'
+				const exitStr = cmd.exitCode === undefined ? '(running)' : `(exit ${cmd.exitCode})`
+				outputParts.push(`$ ${cmd.command} ${exitStr}\n${cleanOutput}`)
+			}
+			let output = outputParts.join('\n\n')
+			if (output.length > MAX_TERMINAL_CHARS) {
+				const half = MAX_TERMINAL_CHARS / 2
+				output = output.slice(0, half) + '\n...\n' + output.slice(output.length - half)
+			}
+			const commands = selectedCommands.map(cmd => ({
+				command: cmd.command,
+				exitCode: cmd.exitCode ?? null,
+				duration: cmd.duration,
+			}))
+			return { output, status, commands }
+		}
+
+		// No filter — return full scrollback buffer
 		const lines: string[] = []
 		for (const line of terminal.xterm.getBufferReverseIterator()) {
 			lines.unshift(line)
@@ -336,14 +370,11 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 			output = output.slice(0, half) + '\n...\n' + output.slice(output.length - half)
 		}
 
-		// Get status and command history from CommandDetection
-		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection)
-		const status = this._getTerminalStatus(terminal)
-		const commands = cmdCap ? cmdCap.commands.map(cmd => ({
+		const commands = allCommands.map(cmd => ({
 			command: cmd.command,
 			exitCode: cmd.exitCode ?? null,
 			duration: cmd.duration,
-		})) : []
+		}))
 
 		return { output, status, commands }
 	}

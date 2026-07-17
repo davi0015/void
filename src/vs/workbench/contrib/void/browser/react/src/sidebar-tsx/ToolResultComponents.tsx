@@ -498,7 +498,7 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 		},
 		'read_terminal': () => {
 			const toolParams = _toolParams as BuiltinToolCallParams['read_terminal']
-			return { desc1: toolParams.terminalName }
+			return { desc1: toolParams.lastNCommands !== null ? `${toolParams.terminalName} (last ${toolParams.lastNCommands})` : toolParams.terminalName }
 		},
 		'get_dir_tree': () => {
 			const toolParams = _toolParams as BuiltinToolCallParams['get_dir_tree']
@@ -1584,7 +1584,7 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 
 			if (toolMessage.type === 'success') {
 				const { result } = toolMessage
-				componentParams.desc1 = result.status
+				componentParams.desc1Info = result.status
 				componentParams.bottomChildren = <BottomChildren title='Terminal output'>
 					<CodeChildren>
 						{result.output}
