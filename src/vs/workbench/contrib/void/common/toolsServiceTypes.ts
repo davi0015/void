@@ -6,7 +6,9 @@ import { RawToolParamsObj } from './sendLLMMessageTypes.js';
 
 
 
-export type TerminalResolveReason = { type: 'timeout' } | { type: 'done', exitCode: number }
+export type TerminalResolveReason =
+	| { type: 'timeout', reason: 'inactivity' | 'backstop' }
+	| { type: 'done', exitCode: number }
 
 export type LintErrorItem = { code: string, message: string, startLineNumber: number, endLineNumber: number }
 

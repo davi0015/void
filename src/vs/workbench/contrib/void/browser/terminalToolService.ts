@@ -129,15 +129,15 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 	listAllTerminals(): { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[] {
 		return [...this.terminalService.instances].map(terminal => {
-				const voidId = idOfPersistentTerminalName(terminal.title)
-				const isVoidTerminal = voidId !== null
-				return {
-					name: isVoidTerminal ? `Void Agent ${voidId === '1' ? '' : `(${voidId})`}`.trim() : terminal.title,
-					status: this._getTerminalStatus(terminal),
-					lastCommand: this._getLastCommand(terminal),
-					isVoidTerminal,
-				}
-			})
+			const voidId = idOfPersistentTerminalName(terminal.title)
+			const isVoidTerminal = voidId !== null
+			return {
+				name: isVoidTerminal ? `Void Agent ${voidId === '1' ? '' : `(${voidId})`}`.trim() : terminal.title,
+				status: this._getTerminalStatus(terminal),
+				lastCommand: this._getLastCommand(terminal),
+				isVoidTerminal,
+			}
+		})
 	}
 
 	getValidNewTerminalId(): string {
@@ -418,23 +418,23 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 						const inactivityMs = (isPersistent ? MAX_TERMINAL_BG_COMMAND_TIME : MAX_TERMINAL_INACTIVE_TIME) * 1000;
 						const backstopMs = isPersistent ? MAX_TERMINAL_BG_COMMAND_TIME * 1000 * 2 : Infinity;
 
-						const fire = () => {
+						const fire = (timeoutReason: 'inactivity' | 'backstop') => {
 							if (resolveReason) return
 							clearTimeout(inactivityTimeoutId);
 							clearTimeout(backstopTimeoutId);
-							resolveReason = { type: 'timeout' };
+							resolveReason = { type: 'timeout', reason: timeoutReason };
 							res();
 						};
 						const resetInactivity = () => {
 							clearTimeout(inactivityTimeoutId);
-							inactivityTimeoutId = setTimeout(fire, inactivityMs);
+							inactivityTimeoutId = setTimeout(() => fire('inactivity'), inactivityMs);
 						};
 
 						const dTimeout = terminal.onData(() => { resetInactivity(); });
 						disposables.push(dTimeout, toDisposable(() => { clearTimeout(inactivityTimeoutId); clearTimeout(backstopTimeoutId); }));
 						resetInactivity();
 						if (isPersistent) {
-							backstopTimeoutId = setTimeout(fire, backstopMs);
+							backstopTimeoutId = setTimeout(() => fire('backstop'), backstopMs);
 						}
 					})
 
@@ -444,7 +444,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 
 				// read result if timed out, since we didn't get it (could clean this code up but it's ok)
-					if (resolveReason?.type === 'timeout') {
+				if (resolveReason?.type === 'timeout') {
 					// Grace period — onCommandFinished may fire just after the inactivity
 					// timeout. Listener is still alive (disposed after this block).
 					if (cmdCap) {

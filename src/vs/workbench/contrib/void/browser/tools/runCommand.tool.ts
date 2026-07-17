@@ -42,7 +42,10 @@ export const runCommandToolCore: ToolDefinitionCore<'run_command'> = {
 		}
 		// normal command
 		if (resolveReason.type === 'timeout') {
-			return `${result_}\nTerminal command ran, but was automatically killed by Void after ${MAX_TERMINAL_INACTIVE_TIME}s of inactivity and did not finish successfully. To try with more time, open a persistent terminal and run the command there.`
+			if (resolveReason.reason === 'inactivity') {
+				return `${result_}\nCommand timed out after ${MAX_TERMINAL_INACTIVE_TIME}s of no output. It may be waiting for input (e.g. a pager, y/n prompt). The terminal was killed. To try with more time, open a persistent terminal and run the command there.`
+			}
+			return `${result_}\nCommand timed out after ${MAX_TERMINAL_INACTIVE_TIME}s. The terminal was killed.`
 		}
 		throw new Error(`Unexpected internal error: Terminal command did not resolve with a valid reason.`)
 	},

@@ -39,7 +39,10 @@ export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_co
 		}
 		// bg command
 		if (resolveReason.type === 'timeout') {
-			return `${result_}\nTerminal command is running in terminal ${persistentTerminalId}. The given outputs are the results after ${MAX_TERMINAL_BG_COMMAND_TIME} seconds.`
+			if (resolveReason.reason === 'inactivity') {
+				return `${result_}\nCommand timed out after ${MAX_TERMINAL_BG_COMMAND_TIME}s of no output. It may be waiting for input (e.g. a pager, y/n prompt). The terminal is still running in terminal ${persistentTerminalId}.`
+			}
+			return `${result_}\nCommand is still running and producing output after ${MAX_TERMINAL_BG_COMMAND_TIME}s. The terminal is still running in terminal ${persistentTerminalId}.`
 		}
 		throw new Error(`Unexpected internal error: Terminal command did not resolve with a valid reason.`)
 	},
