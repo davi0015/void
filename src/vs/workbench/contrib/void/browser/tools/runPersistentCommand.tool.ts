@@ -3,7 +3,11 @@ import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
 import { validateStr, validateProposedTerminalId } from './toolHelpers.js'
 
-const terminalDescHelper = `This tool is for shell commands that aren't available as a dedicated tool. Do NOT use it for: reading files (use \`read_file\`), listing directories (use \`ls_dir\` or \`get_dir_tree\`), finding files by name (use \`search_pathnames_only\`), searching text inside files (use \`search_in_file\` or \`search_for_files\`), or editing files (use \`edit_file\` / \`rewrite_file\`). Use it for commands like \`npm install\`, \`git status\`, \`pytest\`, build commands, or shell operations the dedicated tools don't cover. When working with tools that open an editor (e.g. \`git diff\`), pipe to \`cat\` so the command doesn't get stuck in vim.`
+const terminalDescHelper =
+	'Shell commands not covered by dedicated tools (e.g. `npm install`, `git status`, `pytest`).' +
+	' Do NOT use for: reading files, listing directories, finding files, searching text, or editing files.' +
+	' Avoid interactive commands that wait for input (pagers, editors, REPLs, y/n prompts).' +
+	' Pipe pagers to `cat` (e.g. `git diff | cat`). If a command hangs, it may be waiting for input.'
 
 export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_command'> = {
 	name: 'run_persistent_command',
