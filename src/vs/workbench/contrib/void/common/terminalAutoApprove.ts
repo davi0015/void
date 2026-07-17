@@ -3,8 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { parse, NodeType, type BaseNode } from './parser.js'
-import { getTopLevelCommands, type Command } from './command.js'
+import { parse, NodeType, type BaseNode } from './shellParser/parser.js'
+import { getTopLevelCommands, type Command } from './shellParser/command.js'
 
 // Commands that execute arbitrary code by nature — never auto-approve
 // regardless of allowlist. `eval` runs a string as code, `source`/`.`
