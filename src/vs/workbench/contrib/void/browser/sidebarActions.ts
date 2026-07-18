@@ -31,6 +31,8 @@ import { TERMINAL_VIEW_ID } from '../../terminal/common/terminal.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { StagingSelectionItem } from '../common/chatThreadServiceTypes.js';
 import { Codicon } from '../../../../base/common/codicons.js';
+import { ITerminalToolService } from './terminalToolService.js';
+import { IQuickInputService } from '../../../../platform/quickinput/common/quickInput.js';
 
 // ---------- Register commands and keybindings ----------
 
@@ -214,36 +216,6 @@ registerAction2(class extends Action2 {
 	}
 })
 
-// History menu button
-registerAction2(class extends Action2 {
-	constructor() {
-		super({
-			id: 'void.historyAction',
-			title: 'View Past Chats',
-			icon: { id: 'history' },
-			menu: [{ id: MenuId.ViewTitle, group: 'navigation', when: ContextKeyExpr.equals('view', VOID_VIEW_ID), }]
-		});
-	}
-	async run(accessor: ServicesAccessor): Promise<void> {
-
-		// do not do anything if there are no messages (without this it clears all of the user's selections if the button is pressed)
-		// TODO the history button should be disabled in this case so we can remove this logic
-		const thread = accessor.get(IChatThreadService).getCurrentThread()
-		if (thread.messages.length === 0) {
-			return;
-		}
-
-		const metricsService = accessor.get(IMetricsService)
-
-		const commandService = accessor.get(ICommandService)
-
-		metricsService.capture('Chat Navigation', { type: 'History' })
-		commandService.executeCommand(VOID_CMD_SHIFT_L_ACTION_ID)
-
-	}
-})
-
-
 // Settings gear
 registerAction2(class extends Action2 {
 	constructor() {
@@ -257,6 +229,47 @@ registerAction2(class extends Action2 {
 	async run(accessor: ServicesAccessor): Promise<void> {
 		const commandService = accessor.get(ICommandService)
 		commandService.executeCommand(VOID_TOGGLE_SETTINGS_ACTION_ID)
+	}
+})
+
+
+// Manage terminal auto-approve allowlist
+registerAction2(class extends Action2 {
+	constructor() {
+		super({
+			id: 'void.terminalManageAllowlist',
+			title: 'Manage Terminal Allowlist',
+			icon: Codicon.shield,
+			menu: [{ id: MenuId.ViewTitle, group: 'navigation', when: ContextKeyExpr.equals('view', VOID_VIEW_ID), }]
+		});
+	}
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const terminalToolService = accessor.get(ITerminalToolService)
+		const quickInputService = accessor.get(IQuickInputService)
+		const notificationService = accessor.get(INotificationService)
+
+		const allowlist = terminalToolService.getAutoApproveAllowlist()
+		if (allowlist.length === 0) {
+			notificationService.notify({
+				severity: Severity.Info,
+				message: 'Void: No commands in the terminal allowlist yet. Use the \u201cAllow\u201d button on a terminal command to add one.',
+			})
+			return
+		}
+
+		const pick = quickInputService.createQuickPick<{ label: string, command: string }>()
+		pick.items = allowlist.map(cmd => ({ label: cmd, command: cmd }))
+		pick.canSelectMany = true
+		pick.title = 'Terminal Allowlist'
+		pick.placeholder = 'Select commands to remove, then confirm'
+		pick.buttons = [{ iconClass: 'codicon-check', tooltip: 'Remove selected' }]
+		pick.onDidAccept(() => {
+			for (const item of pick.selectedItems) {
+				terminalToolService.removeFromAutoApproveAllowlist(item.command)
+			}
+			pick.hide()
+		})
+		pick.show()
 	}
 })
 
