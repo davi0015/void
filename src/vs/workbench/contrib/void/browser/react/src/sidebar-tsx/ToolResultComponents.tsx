@@ -623,7 +623,7 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 		metricsService.capture('Tool Request Rejected', {})
 	}, [chatThreadsService, isTerminal, toolId])
 
-	// "Always" — adds the command prefix to the per-workspace allowlist,
+	// "Allow" — adds the command prefix to the per-workspace allowlist,
 	// then approves the current request. Only shown for terminal tools with a
 	// command string, and only if at least one chain unit can be auto-approved
 	// (no dangerous patterns like while/for/eval) AND isn't already approved.
@@ -644,7 +644,7 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 			(s.isApproved ? '✓ ' : '+ ') + s.text
 		).join('\n')
 		: ''
-	const onAlwaysApprove = useCallback(() => {
+	const onAllow = useCallback(() => {
 		for (const s of commandStatuses) {
 			if (s.canApprove && !s.isApproved) {
 				terminalToolService.addToAutoApproveAllowlist(s.text)
@@ -653,8 +653,8 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 		try {
 			const tid = chatThreadsService.state.currentThreadId
 			chatThreadsService.approveToolRequest(tid, toolId)
-			metricsService.capture('Tool Request Always Approved', {})
-		} catch (e) { console.error('Error while always-approving message in chat:', e) }
+			metricsService.capture('Tool Request Added To Allowlist', {})
+		} catch (e) { console.error('Error while allowing message in chat:', e) }
 	}, [commandStatuses, terminalToolService, chatThreadsService, metricsService, toolId])
 
 	const approveButton = (
@@ -673,9 +673,9 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 		</button>
 	)
 
-	const alwaysApproveButton = hasNewCommands ? (
+	const allowButton = hasNewCommands ? (
 		<button
-			onClick={onAlwaysApprove}
+			onClick={onAllow}
 			data-tooltip-id='void-tooltip'
 			data-tooltip-content={tooltipContent}
 			data-tooltip-place='top'
@@ -690,7 +690,7 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
                 opacity-80
             `}
 		>
-			Always
+			Allow
 		</button>
 	) : null
 
@@ -721,7 +721,7 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 	// This avoids the button disappearing for 2s during lint checks after edits.
 	return <div className="flex gap-2 mx-0.5 items-center">
 		{approveButton}
-		{alwaysApproveButton}
+		{allowButton}
 		{cancelButton}
 		{approvalToggle}
 	</div>
