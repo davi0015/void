@@ -45,6 +45,7 @@ export interface ITerminalToolService {
 
 	getAutoApproveAllowlist(): string[]
 	addToAutoApproveAllowlist(command: string): void
+	removeFromAutoApproveAllowlist(command: string): void
 }
 export const ITerminalToolService = createDecorator<ITerminalToolService>('TerminalToolService');
 
@@ -132,6 +133,14 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		}
 	}
 
+	removeFromAutoApproveAllowlist(command: string): void {
+		const allowlist = this.getAutoApproveAllowlist()
+		const idx = allowlist.indexOf(command)
+		if (idx !== -1) {
+			allowlist.splice(idx, 1)
+			this.storageService.store(TERMINAL_AUTO_APPROVE_KEY, JSON.stringify(allowlist), StorageScope.WORKSPACE, StorageTarget.USER)
+		}
+	}
 
 	private _getLastCommand(terminal: ITerminalInstance): string {
 		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection)

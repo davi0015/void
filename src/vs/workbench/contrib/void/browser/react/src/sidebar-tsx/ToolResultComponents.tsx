@@ -578,6 +578,7 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 	const voidSettingsState = useSettingsState()
 	const workspaceContextService = accessor.get('IWorkspaceContextService')
 	const terminalToolService = accessor.get('ITerminalToolService')
+	const quickInputService = accessor.get('IQuickInputService')
 
 	// Terminal tools use per-tool approve/reject (concurrent execution).
 	// Non-terminal tools use the serial approve-latest/reject-latest path.
@@ -639,6 +640,24 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 	// approved, and shouldAutoApprove will still block the full chain if any
 	// unit is dangerous.
 	const hasNewCommands = commandStatuses.length > 0 && commandStatuses.some(s => s.canApprove && !s.isApproved)
+	const hasApprovedCommands = commandStatuses.some(s => s.isApproved) || terminalToolService.getAutoApproveAllowlist().length > 0
+	const onManageAllowlist = useCallback(() => {
+		const allowlist = terminalToolService.getAutoApproveAllowlist()
+		if (allowlist.length === 0) return
+		const pick = quickInputService.createQuickPick<{ label: string, command: string }>()
+		pick.items = allowlist.map(cmd => ({ label: cmd, command: cmd }))
+		pick.canSelectMany = true
+		pick.title = 'Terminal Allowlist'
+		pick.placeholder = 'Select commands to remove, then confirm'
+		pick.buttons = [{ iconClass: 'codicon-check', tooltip: 'Remove selected' }]
+		pick.onDidAccept(() => {
+			for (const item of pick.selectedItems) {
+				terminalToolService.removeFromAutoApproveAllowlist(item.command)
+			}
+			pick.hide()
+		})
+		pick.show()
+	}, [quickInputService, terminalToolService])
 	const tooltipContent = commandStatuses.length > 0
 		? 'Auto-approve next time:\n' + commandStatuses.filter(s => s.canApprove).map(s =>
 			(s.isApproved ? '✓ ' : '+ ') + s.text
@@ -722,6 +741,21 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 	return <div className="flex gap-2 mx-0.5 items-center">
 		{approveButton}
 		{allowButton}
+		{hasApprovedCommands ? (
+			<button
+				onClick={onManageAllowlist}
+				className={`
+                    px-2 py-1
+                    text-[var(--vscode-button-secondaryForeground)]
+                    hover:bg-[var(--vscode-button-secondaryHoverBackground)]
+                    rounded
+                    text-sm font-medium
+                    opacity-80
+                `}
+			>
+				Manage
+			</button>
+		) : null}
 		{cancelButton}
 		{approvalToggle}
 	</div>
