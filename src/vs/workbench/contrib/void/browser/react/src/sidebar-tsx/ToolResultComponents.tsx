@@ -19,7 +19,7 @@ import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE } from '../..
 import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
 import { persistentTerminalNameOfId } from '../../../terminalToolService.js';
-import { splitCommands } from '../../../../common/terminalAutoApprove.js';
+import { splitCommandsWithApproval } from '../../../../common/terminalAutoApprove.js';
 import { removeMCPToolNamePrefix } from '../../../../common/mcpServiceTypes.js';
 import { toolDefinitionOfToolName } from '../../../tools/toolRegistry.js';
 
@@ -623,23 +623,39 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 		metricsService.capture('Tool Request Rejected', {})
 	}, [chatThreadsService, isTerminal, toolId])
 
-	// "Always approve" — adds the command prefix to the per-workspace allowlist,
+	// "Always" — adds the command prefix to the per-workspace allowlist,
 	// then approves the current request. Only shown for terminal tools with a
-	// command string.
+	// command string, and only if at least one chain unit can be auto-approved
+	// (no dangerous patterns like while/for/eval) AND isn't already approved.
 	const terminalParams = isTerminal ? params as BuiltinToolCallParams['run_command'] | BuiltinToolCallParams['run_persistent_command'] | undefined : undefined
-	const hasCommand = !!(terminalParams && 'command' in terminalParams && terminalParams.command)
+	const commandStatuses = useMemo(() => {
+		if (!terminalParams || !('command' in terminalParams) || !terminalParams.command) return []
+		const allowlist = terminalToolService.getAutoApproveAllowlist()
+		return splitCommandsWithApproval(terminalParams.command, allowlist)
+	}, [terminalParams, terminalToolService])
+	// Show the button if there's at least one NEW safe command. Dangerous
+	// units (while/for/eval) are excluded from the allowlist — they'll always
+	// require manual approval. But safe units in the same chain CAN be
+	// approved, and shouldAutoApprove will still block the full chain if any
+	// unit is dangerous.
+	const hasNewCommands = commandStatuses.length > 0 && commandStatuses.some(s => s.canApprove && !s.isApproved)
+	const tooltipContent = commandStatuses.length > 0
+		? 'Auto-approve next time:\n' + commandStatuses.filter(s => s.canApprove).map(s =>
+			(s.isApproved ? '✓ ' : '+ ') + s.text
+		).join('\n')
+		: ''
 	const onAlwaysApprove = useCallback(() => {
-		if (!terminalParams || !('command' in terminalParams) || !terminalParams.command) return
-		const commands = splitCommands(terminalParams.command)
-		for (const cmd of commands) {
-			terminalToolService.addToAutoApproveAllowlist(cmd)
+		for (const s of commandStatuses) {
+			if (s.canApprove && !s.isApproved) {
+				terminalToolService.addToAutoApproveAllowlist(s.text)
+			}
 		}
 		try {
 			const tid = chatThreadsService.state.currentThreadId
 			chatThreadsService.approveToolRequest(tid, toolId)
 			metricsService.capture('Tool Request Always Approved', {})
 		} catch (e) { console.error('Error while always-approving message in chat:', e) }
-	}, [terminalParams, terminalToolService, chatThreadsService, metricsService, toolId])
+	}, [commandStatuses, terminalToolService, chatThreadsService, metricsService, toolId])
 
 	const approveButton = (
 		<button
@@ -657,9 +673,13 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 		</button>
 	)
 
-	const alwaysApproveButton = hasCommand ? (
+	const alwaysApproveButton = hasNewCommands ? (
 		<button
 			onClick={onAlwaysApprove}
+			data-tooltip-id='void-tooltip'
+			data-tooltip-content={tooltipContent}
+			data-tooltip-place='top'
+			data-tooltip-delay-show={300}
 			className={`
                 px-2 py-1
                 bg-[var(--vscode-button-background)]
@@ -670,7 +690,7 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
                 opacity-80
             `}
 		>
-			Always Approve
+			Always
 		</button>
 	) : null
 
