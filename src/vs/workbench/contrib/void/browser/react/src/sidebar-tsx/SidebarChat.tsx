@@ -1172,7 +1172,7 @@ export const SelectedFiles = (
 				answer.push({
 					type: 'File',
 					uri: uri,
-					language: (await modelReferenceService.getModelSafe(uri)).model?.getLanguageId() || 'plaintext',
+					language: await modelReferenceService.asyncWithModel(uri, async ({ model }) => model?.getLanguageId() || 'plaintext'),
 					state: { wasAddedAsCurrentFile: false },
 				})
 			}

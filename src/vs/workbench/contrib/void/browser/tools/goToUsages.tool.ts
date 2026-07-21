@@ -28,52 +28,50 @@ export const goToUsagesToolCore: ToolDefinitionCore<'go_to_usages'> = {
 	},
 
 	callTool: async ({ uri, symbolName, line, pageNumber }, ctx) => {
-		await ctx.voidModelService.initializeModel(uri)
-		const { model } = await ctx.voidModelService.getModelSafe(uri)
-		if (model === null) throw new Error(`File does not exist: ${uri.fsPath}.`)
+		return ctx.voidModelService.asyncWithModel(uri, async ({ model }) => {
+			if (model === null) throw new Error(`File does not exist: ${uri.fsPath}.`)
 
-		const position = resolveSymbolPosition(model, symbolName, line)
-		if (position === null) throw new Error(`Symbol \`${symbolName}\` not found anywhere in ${uri.fsPath}. Check the spelling of the symbol or the file path.`)
+			const position = resolveSymbolPosition(model, symbolName, line)
+			if (position === null) throw new Error(`Symbol \`${symbolName}\` not found anywhere in ${uri.fsPath}. Check the spelling of the symbol or the file path.`)
 
-		const providers = ctx.languageFeaturesService.referenceProvider.ordered(model)
-		if (providers.length === 0) throw new Error(`No LSP reference provider is registered for ${model.getLanguageId()} files. Use \`search_for_files\` with \`${symbolName}\` as the query instead.`)
+			const providers = ctx.languageFeaturesService.referenceProvider.ordered(model)
+			if (providers.length === 0) throw new Error(`No LSP reference provider is registered for ${model.getLanguageId()} files. Use \`search_for_files\` with \`${symbolName}\` as the query instead.`)
 
-		const links = await getReferencesAtPosition(
-			ctx.languageFeaturesService.referenceProvider,
-			model,
-			new Position(position.line, position.column),
-			false,
-			false,
-			CancellationToken.None,
-		)
+			const links = await getReferencesAtPosition(
+				ctx.languageFeaturesService.referenceProvider,
+				model,
+				new Position(position.line, position.column),
+				false,
+				false,
+				CancellationToken.None,
+			)
 
-		const fromIdx = MAX_CHILDREN_URIs_PAGE * (pageNumber - 1)
-		const toIdx = MAX_CHILDREN_URIs_PAGE * pageNumber - 1
-		const pageLinks = links.slice(fromIdx, toIdx + 1)
-		const hasNextPage = (links.length - 1) - toIdx >= 1
+			const fromIdx = MAX_CHILDREN_URIs_PAGE * (pageNumber - 1)
+			const toIdx = MAX_CHILDREN_URIs_PAGE * pageNumber - 1
+			const pageLinks = links.slice(fromIdx, toIdx + 1)
+			const hasNextPage = (links.length - 1) - toIdx >= 1
 
-		const locations = pageLinks.map(link => ({
-			uri: link.uri,
-			line: link.range.startLineNumber,
-			column: link.range.startColumn,
-		}))
-		return { result: { locations, hasNextPage } }
+			const locations = pageLinks.map(link => ({
+				uri: link.uri,
+				line: link.range.startLineNumber,
+				column: link.range.startColumn,
+			}))
+			return { result: { locations, hasNextPage } }
+		})
 	},
 
 	stringOfResult: (params, result, ctx) => {
-		return ctx.voidModelService.withModel(params.uri, () => {
-			if (result.locations.length === 0) {
-				return `No usages found for \`${params.symbolName}\` on ${params.uri.fsPath}:${params.line}. If you believe this is wrong, try \`search_for_files\` with \`${params.symbolName}\` as the query.`
-			}
-			const header = `Found ${result.locations.length} ${result.locations.length === 1 ? 'usage' : 'usages'} of \`${params.symbolName}\`${result.hasNextPage ? ' (more on next page)' : ''}:`
-			const lines = result.locations.map((loc, i) => {
-				const { model } = ctx.voidModelService.getModel(loc.uri)
-				const preview = model ? model.getLineContent(loc.line).trim() : '<preview unavailable>'
-				return `${i + 1}. ${loc.uri.fsPath}:${loc.line}:${loc.column}  ${preview}`
-			})
-			const footer = result.hasNextPage ? '\n\n(More usages available. Call again with `page_number` incremented by 1 to see them.)' : ''
-			return [header, ...lines].join('\n') + footer
+		if (result.locations.length === 0) {
+			return `No usages found for \`${params.symbolName}\` on ${params.uri.fsPath}:${params.line}. If you believe this is wrong, try \`search_for_files\` with \`${params.symbolName}\` as the query.`
+		}
+		const header = `Found ${result.locations.length} ${result.locations.length === 1 ? 'usage' : 'usages'} of \`${params.symbolName}\`${result.hasNextPage ? ' (more on next page)' : ''}:`
+		const lines = result.locations.map((loc, i) => {
+			const { model } = ctx.voidModelService.getModel(loc.uri)
+			const preview = model ? model.getLineContent(loc.line).trim() : '<preview unavailable>'
+			return `${i + 1}. ${loc.uri.fsPath}:${loc.line}:${loc.column}  ${preview}`
 		})
+		const footer = result.hasNextPage ? '\n\n(More usages available. Call again with `page_number` incremented by 1 to see them.)' : ''
+		return [header, ...lines].join('\n') + footer
 	},
 
 	title: { done: 'Found usages', proposed: 'Go to usages', running: 'Finding usages' },

@@ -3690,9 +3690,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const fsPathsSet = new Set<string>()
 		const uris: URI[] = []
 		const addURI = (uri: URI) => {
-			if (!fsPathsSet.has(uri.fsPath)) uris.push(uri)
-			fsPathsSet.add(uri.fsPath)
-			uris.push(uri)
+			if (!fsPathsSet.has(uri.fsPath)) {
+				fsPathsSet.add(uri.fsPath)
+				uris.push(uri)
+			}
 		}
 
 		for (const m of thread.messages) {
@@ -3799,88 +3800,90 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 			// check all prevUris for the target
 			for (const uri of prevUris) {
+				const { model } = await this._voidModelService.getModelSafe(uri)
+				try {
+					if (!model) continue
 
-				const modelRef = await this._voidModelService.getModelSafe(uri)
-				const { model } = modelRef
-				if (!model) continue
+					const matches = model.findMatches(
+						target,
+						false, // searchOnlyEditableRange
+						false, // isRegex
+						true,  // matchCase
+						null, //' ',   // wordSeparators
+						true   // captureMatches
+					);
 
-				const matches = model.findMatches(
-					target,
-					false, // searchOnlyEditableRange
-					false, // isRegex
-					true,  // matchCase
-					null, //' ',   // wordSeparators
-					true   // captureMatches
-				);
+					const firstThree = matches.slice(0, 3);
 
-				const firstThree = matches.slice(0, 3);
+					// take first 3 occurences, attempt to goto definition on them
+					for (const match of firstThree) {
+						const position = new Position(match.range.startLineNumber, match.range.startColumn);
+						const definitionProviders = this._languageFeaturesService.definitionProvider.ordered(model);
 
-				// take first 3 occurences, attempt to goto definition on them
-				for (const match of firstThree) {
-					const position = new Position(match.range.startLineNumber, match.range.startColumn);
-					const definitionProviders = this._languageFeaturesService.definitionProvider.ordered(model);
+						for (const provider of definitionProviders) {
 
-					for (const provider of definitionProviders) {
+							const _definitions = await provider.provideDefinition(model, position, CancellationToken.None);
 
-						const _definitions = await provider.provideDefinition(model, position, CancellationToken.None);
+							if (!_definitions) continue;
 
-						if (!_definitions) continue;
+							const definitions = Array.isArray(_definitions) ? _definitions : [_definitions];
 
-						const definitions = Array.isArray(_definitions) ? _definitions : [_definitions];
+							for (const definition of definitions) {
 
-						for (const definition of definitions) {
+								return {
+									uri: definition.uri,
+									selection: {
+										startLineNumber: definition.range.startLineNumber,
+										startColumn: definition.range.startColumn,
+										endLineNumber: definition.range.endLineNumber,
+										endColumn: definition.range.endColumn,
+									},
+									displayText: _codespanStr,
+								};
 
-							return {
-								uri: definition.uri,
-								selection: {
-									startLineNumber: definition.range.startLineNumber,
-									startColumn: definition.range.startColumn,
-									endLineNumber: definition.range.endLineNumber,
-									endColumn: definition.range.endColumn,
-								},
-								displayText: _codespanStr,
-							};
+								// const defModelRef = await this._textModelService.createModelReference(definition.uri);
+								// const defModel = defModelRef.object.textEditorModel;
 
-							// const defModelRef = await this._textModelService.createModelReference(definition.uri);
-							// const defModel = defModelRef.object.textEditorModel;
+								// try {
+								// 	const symbolProviders = this._languageFeaturesService.documentSymbolProvider.ordered(defModel);
 
-							// try {
-							// 	const symbolProviders = this._languageFeaturesService.documentSymbolProvider.ordered(defModel);
+								// 	for (const symbolProvider of symbolProviders) {
+								// 		const symbols = await symbolProvider.provideDocumentSymbols(
+								// 			defModel,
+								// 			CancellationToken.None
+								// 		);
 
-							// 	for (const symbolProvider of symbolProviders) {
-							// 		const symbols = await symbolProvider.provideDocumentSymbols(
-							// 			defModel,
-							// 			CancellationToken.None
-							// 		);
+								// 		if (symbols) {
+								// 			const symbol = symbols.find(s => {
+								// 				const symbolRange = s.range;
+								// 				return symbolRange.startLineNumber <= definition.range.startLineNumber &&
+								// 					symbolRange.endLineNumber >= definition.range.endLineNumber &&
+								// 					(symbolRange.startLineNumber !== definition.range.startLineNumber || symbolRange.startColumn <= definition.range.startColumn) &&
+								// 					(symbolRange.endLineNumber !== definition.range.endLineNumber || symbolRange.endColumn >= definition.range.endColumn);
+								// 			});
 
-							// 		if (symbols) {
-							// 			const symbol = symbols.find(s => {
-							// 				const symbolRange = s.range;
-							// 				return symbolRange.startLineNumber <= definition.range.startLineNumber &&
-							// 					symbolRange.endLineNumber >= definition.range.endLineNumber &&
-							// 					(symbolRange.startLineNumber !== definition.range.startLineNumber || symbolRange.startColumn <= definition.range.startColumn) &&
-							// 					(symbolRange.endLineNumber !== definition.range.endLineNumber || symbolRange.endColumn >= definition.range.endColumn);
-							// 			});
-
-							// 			// if we got to a class/function get the full range and return
-							// 			if (symbol?.kind === SymbolKind.Function || symbol?.kind === SymbolKind.Method || symbol?.kind === SymbolKind.Class) {
-							// 				return {
-							// 					uri: definition.uri,
-							// 					selection: {
-							// 						startLineNumber: definition.range.startLineNumber,
-							// 						startColumn: definition.range.startColumn,
-							// 						endLineNumber: definition.range.endLineNumber,
-							// 						endColumn: definition.range.endColumn,
-							// 					}
-							// 				};
-							// 			}
-							// 		}
-							// 	}
-							// } finally {
-							// 	defModelRef.dispose();
-							// }
+								// 			// if we got to a class/function get the full range and return
+								// 			if (symbol?.kind === SymbolKind.Function || symbol?.kind === SymbolKind.Method || symbol?.kind === SymbolKind.Class) {
+								// 				return {
+								// 					uri: definition.uri,
+								// 					selection: {
+								// 						startLineNumber: definition.range.startLineNumber,
+								// 						startColumn: definition.range.startColumn,
+								// 						endLineNumber: definition.range.endLineNumber,
+								// 						endColumn: definition.range.endColumn,
+								// 					}
+								// 				};
+								// 			}
+								// 		}
+								// 	}
+								// } finally {
+								// 	defModelRef.dispose();
+								// }
+							}
 						}
 					}
+				} finally {
+					this._voidModelService.releaseModel(uri)
 				}
 			}
 
@@ -4257,6 +4260,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._pendingImageBytesByThread.delete(threadId)
 		this._requestTelemetryService.forgetThread(threadId)
 		this._loadedMessageThreadIds.delete(threadId)
+
+		// Clean up stream state and throttle scheduler to prevent memory leaks
+		delete this.streamState[threadId]
+		const throttleEntry = this._streamTextThrottle.get(threadId)
+		if (throttleEntry) {
+			throttleEntry.scheduler.dispose()
+			this._streamTextThrottle.delete(threadId)
+		}
 
 		// Phase E — also clear any per-workspace last-active pointers to this
 		// thread so it doesn't get auto-pinned back via restore on next reload.

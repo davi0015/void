@@ -22,24 +22,24 @@ export const searchInFileToolCore: ToolDefinitionCore<'search_in_file'> = {
 	},
 
 	callTool: async ({ uri, query, isRegex }, ctx) => {
-		await ctx.voidModelService.initializeModel(uri)
-		const { model } = await ctx.voidModelService.getModelSafe(uri)
-		if (model === null) { throw new Error(`No contents; File does not exist.`) }
-		const contents = model.getValue(EndOfLinePreference.LF)
-		const contentOfLine = contents.split('\n')
-		const totalLines = contentOfLine.length
-		const regex = isRegex ? new RegExp(query) : null
-		const lines: number[] = []
-		const lineContentOfLineNumber: Record<number, string> = {}
-		for (let i = 0; i < totalLines; i++) {
-			const line = contentOfLine[i]
-			if ((isRegex && regex!.test(line)) || (!isRegex && line.includes(query))) {
-				const matchLine = i + 1
-				lines.push(matchLine)
-				lineContentOfLineNumber[matchLine] = line
+		return ctx.voidModelService.asyncWithModel(uri, async ({ model }) => {
+			if (model === null) { throw new Error(`No contents; File does not exist.`) }
+			const contents = model.getValue(EndOfLinePreference.LF)
+			const contentOfLine = contents.split('\n')
+			const totalLines = contentOfLine.length
+			const regex = isRegex ? new RegExp(query) : null
+			const lines: number[] = []
+			const lineContentOfLineNumber: Record<number, string> = {}
+			for (let i = 0; i < totalLines; i++) {
+				const line = contentOfLine[i]
+				if ((isRegex && regex!.test(line)) || (!isRegex && line.includes(query))) {
+					const matchLine = i + 1
+					lines.push(matchLine)
+					lineContentOfLineNumber[matchLine] = line
+				}
 			}
-		}
-		return { result: { lines, lineContentOfLineNumber } }
+			return { result: { lines, lineContentOfLineNumber } }
+		})
 	},
 
 	stringOfResult: (_params, result) => {

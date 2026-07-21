@@ -19,6 +19,7 @@ export interface IVoidModelService {
 	getModelFromFsPath(fsPath: string): VoidModelType;
 	getModelSafe(uri: URI): Promise<VoidModelType>;
 	withModel<T>(uri: URI, fn: (model: VoidModelType) => T): T;
+	asyncWithModel<T>(uri: URI, fn: (model: VoidModelType) => Promise<T>): Promise<T>;
 	saveModel(uri: URI): Promise<void>;
 
 }
@@ -105,6 +106,18 @@ class VoidModelService extends Disposable implements IVoidModelService {
 			return fn(result)
 		} finally {
 			this.releaseModel(uri)
+		}
+	}
+
+	// Use a model for an async read-only operation (e.g. LSP queries that
+	// await provider.provideDefinition). Like withModel, but awaits the
+	// callback before releasing the reference so async work completes first.
+	asyncWithModel = async <T>(uri: URI, fn: (model: VoidModelType) => Promise<T>): Promise<T> => {
+		if (!(uri.fsPath in this._modelRefOfURI)) await this.initializeModel(uri);
+		try {
+			return await fn(this.getModel(uri));
+		} finally {
+			this.releaseModel(uri);
 		}
 	}
 

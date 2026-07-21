@@ -25,47 +25,45 @@ export const goToDefinitionToolCore: ToolDefinitionCore<'go_to_definition'> = {
 	},
 
 	callTool: async ({ uri, symbolName, line }, ctx) => {
-		await ctx.voidModelService.initializeModel(uri)
-		const { model } = await ctx.voidModelService.getModelSafe(uri)
-		if (model === null) throw new Error(`File does not exist: ${uri.fsPath}.`)
+		return ctx.voidModelService.asyncWithModel(uri, async ({ model }) => {
+			if (model === null) throw new Error(`File does not exist: ${uri.fsPath}.`)
 
-		const position = resolveSymbolPosition(model, symbolName, line)
-		if (position === null) throw new Error(`Symbol \`${symbolName}\` not found anywhere in ${uri.fsPath}. Check the spelling of the symbol or the file path.`)
+			const position = resolveSymbolPosition(model, symbolName, line)
+			if (position === null) throw new Error(`Symbol \`${symbolName}\` not found anywhere in ${uri.fsPath}. Check the spelling of the symbol or the file path.`)
 
-		const providers = ctx.languageFeaturesService.definitionProvider.ordered(model)
-		if (providers.length === 0) throw new Error(`No LSP definition provider is registered for ${model.getLanguageId()} files. Use \`search_in_file\` or \`search_for_files\` with \`${symbolName}\` as the query instead.`)
+			const providers = ctx.languageFeaturesService.definitionProvider.ordered(model)
+			if (providers.length === 0) throw new Error(`No LSP definition provider is registered for ${model.getLanguageId()} files. Use \`search_in_file\` or \`search_for_files\` with \`${symbolName}\` as the query instead.`)
 
-		const links = await getDefinitionsAtPosition(
-			ctx.languageFeaturesService.definitionProvider,
-			model,
-			new Position(position.line, position.column),
-			false,
-			CancellationToken.None,
-		)
+			const links = await getDefinitionsAtPosition(
+				ctx.languageFeaturesService.definitionProvider,
+				model,
+				new Position(position.line, position.column),
+				false,
+				CancellationToken.None,
+			)
 
-		const locations = links.map(link => ({
-			uri: link.uri,
-			line: link.range.startLineNumber,
-			column: link.range.startColumn,
-		}))
-		return { result: { locations } }
+			const locations = links.map(link => ({
+				uri: link.uri,
+				line: link.range.startLineNumber,
+				column: link.range.startColumn,
+			}))
+			return { result: { locations } }
+		})
 	},
 
 	stringOfResult: (params, result, ctx) => {
-		return ctx.voidModelService.withModel(params.uri, () => {
-			if (result.locations.length === 0) {
-				return `No definition found for \`${params.symbolName}\` on ${params.uri.fsPath}:${params.line}. This can happen for built-in or primitive types. If you believe this is wrong, try \`search_in_file\` or \`search_for_files\` with \`${params.symbolName}\` as the query.`
-			}
-			const header = result.locations.length === 1
-				? `Found 1 definition of \`${params.symbolName}\`:`
-				: `Found ${result.locations.length} definitions of \`${params.symbolName}\`:`
-			const lines = result.locations.map((loc, i) => {
-				const { model } = ctx.voidModelService.getModel(loc.uri)
-				const preview = model ? model.getLineContent(loc.line).trim() : '<preview unavailable>'
-				return `${i + 1}. ${loc.uri.fsPath}:${loc.line}:${loc.column}  ${preview}`
-			})
-			return [header, ...lines].join('\n')
+		if (result.locations.length === 0) {
+			return `No definition found for \`${params.symbolName}\` on ${params.uri.fsPath}:${params.line}. This can happen for built-in or primitive types. If you believe this is wrong, try \`search_in_file\` or \`search_for_files\` with \`${params.symbolName}\` as the query.`
+		}
+		const header = result.locations.length === 1
+			? `Found 1 definition of \`${params.symbolName}\`:`
+			: `Found ${result.locations.length} definitions of \`${params.symbolName}\`:`
+		const lines = result.locations.map((loc, i) => {
+			const { model } = ctx.voidModelService.getModel(loc.uri)
+			const preview = model ? model.getLineContent(loc.line).trim() : '<preview unavailable>'
+			return `${i + 1}. ${loc.uri.fsPath}:${loc.line}:${loc.column}  ${preview}`
 		})
+		return [header, ...lines].join('\n')
 	},
 
 	title: { done: 'Found definition', proposed: 'Go to definition', running: 'Finding definition' },

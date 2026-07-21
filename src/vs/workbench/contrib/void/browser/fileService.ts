@@ -45,7 +45,7 @@ class FilePromptActionService extends Action2 {
 				m = await messageOfSelection({
 					type: 'File',
 					uri,
-					language: (await voidModelService.getModelSafe(uri)).model?.getLanguageId() || '',
+					language: await voidModelService.asyncWithModel(uri, async ({ model }) => model?.getLanguageId() || ''),
 					state: { wasAddedAsCurrentFile: false, },
 				}, {
 					folderOpts,
