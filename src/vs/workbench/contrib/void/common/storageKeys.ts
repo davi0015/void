@@ -68,3 +68,10 @@ export const PENDING_DIFFS_STORAGE_KEY = 'void.pendingDiffsI'
 // approval. The user adds entries by clicking "Always approve" on a terminal
 // tool request. Stored at WORKSPACE scope so it's project-specific.
 export const TERMINAL_AUTO_APPROVE_KEY = 'void.terminalAutoApproveI'
+
+// Per-workspace env var metadata (var names, variant labels, active variant
+// id). Plaintext — var names and labels are surfaced to the LLM via the
+// AVAILABLE_ENV_VARS volatile block, so they're not secret. The encrypted
+// values live separately in ISecretStorageService under a workspace-keyed
+// blob (see WorkspaceEnvVarService).
+export const WORKSPACE_ENV_VARS_KEY = 'void.workspaceEnvVarsI'
