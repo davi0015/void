@@ -4,7 +4,6 @@
  *--------------------------------------------------------------------------------------*/
 
 import { Disposable } from '../../../../base/common/lifecycle.js';
-import { generateUuid } from '../../../../base/common/uuid.js';
 import { hash } from '../../../../base/common/hash.js';
 import { basename as resourceBasename } from '../../../../base/common/resources.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
@@ -15,29 +14,23 @@ import { IWorkspaceContextService, toWorkspaceIdentifier } from '../../../../pla
 import { WORKSPACE_ENV_VARS_KEY } from '../common/storageKeys.js';
 
 
-// --- Types (also referenced by consumers: TerminalToolService,
-// ConvertToLLMMessageService, the management UI in sidebarActions.ts) ---
+// --- Types ---
 
-export type EnvVarVariantMeta = {
-	id: string       // stable uuid; key into the values blob
-	label: string    // human-readable, e.g. "prod" / "staging" / "personal"
-	createdAt: number
-}
-
+// Plaintext metadata for one env var. The actual values live in the encrypted
+// blob (EnvVarValuesBlob), indexed by position in the array.
 export type EnvVarEntry = {
-	variants: EnvVarVariantMeta[]   // insertion order; first is default-active on creation
-	activeVariantId: string         // points into variants[].id
+	activeIndex: number | null  // which value is active (injected into terminals), or null if none
 	// Whether to scrub this var's values from terminal output. Defaults to
 	// true (safer). Set to false for non-secret config like NODE_ENV=development
 	// where scrubbing would redact common words from legitimate output.
 	redact: boolean
 }
 
-// map keyed by VAR_NAME (e.g. "OPENAI_API_KEY")
+// Map keyed by VAR_NAME (e.g. "OPENAI_API_KEY")
 export type WorkspaceEnvVars = Record<string, EnvVarEntry>
 
-// The encrypted values blob: { VAR_NAME: { variantId: value } }
-type EnvVarValuesBlob = Record<string, Record<string, string>>
+// The encrypted values blob: { VAR_NAME: [value0, value1, ...] }
+type EnvVarValuesBlob = Record<string, string[]>
 
 
 // --- Interface ---
@@ -47,37 +40,48 @@ export interface IWorkspaceEnvVarService {
 
 	// Metadata (plaintext, workspace-scoped)
 	getVars(): WorkspaceEnvVars
-	addVar(name: string, firstVariantLabel: string, firstVariantValue: string, redact: boolean): Promise<void>
-	addVariant(name: string, label: string, value: string): Promise<void>
-	setActiveVariant(name: string, variantId: string): void
+	addVar(name: string, value: string, redact: boolean): Promise<void>
+	addValue(name: string, value: string): Promise<void>
+	setActive(name: string, index: number): void
 	setRedact(name: string, redact: boolean): void
 	removeVar(name: string): Promise<void>
-	removeVariant(name: string, variantId: string): Promise<void>
+	removeValue(name: string, index: number): Promise<void>
 
-	// Resolved env for terminal injection (active variants only,
+	// Read the encrypted values blob (for the management UI to display
+	// masked previews). One decrypt.
+	getValues(name: string): Promise<string[]>
+
+	// Resolved env for terminal injection (active values only,
 	// called by TerminalToolService._createTerminal). Reads the single
 	// encrypted values blob (one decrypt).
 	getActiveEnv(): Promise<Record<string, string>>  // VAR_NAME -> value
 
-	// All variant values (active + inactive) of vars where redact=true,
+	// All values (active + inactive) of vars where redact=true,
 	// name + value pairs. Called by the output scrubber in TerminalToolService
-	// so terminals created under a now-inactive variant still get scrubbed.
-	// Same single blob read as getActiveEnv, flattened to all variants,
-	// filtered to redact=true only.
+	// so terminals created under a now-inactive value still get scrubbed.
 	getScrubableEnvValues(): Promise<{ name: string, value: string }[]>
 
-	// Resolved names + active labels for LLM advertisement
-	// (called by ConvertToLLMMessageService — names only, no values)
-	getActiveVarDescriptors(): { name: string, activeLabel: string }[]
+	// Names of vars that have an active value (activeIndex !== null).
+	// Called by ConvertToLLMMessageService for LLM advertisement — names only.
+	getActiveVarNames(): string[]
 }
 
 export const IWorkspaceEnvVarService = createDecorator<IWorkspaceEnvVarService>('WorkspaceEnvVarService');
 
 
-// --- Implementation ---
+// --- Helpers ---
 
 const ENV_VAR_NAME_RE = /^[A-Z_][A-Z0-9_]*$/
 const SECRET_KEY_PREFIX = 'void.envVar.'
+
+// Mask a value for UI display: first 8 + ... + last 4.
+export const maskEnvValue = (v: string): string => {
+	if (v.length <= 12) return '••••'
+	return v.slice(0, 8) + '...' + v.slice(-4)
+}
+
+
+// --- Implementation ---
 
 class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarService {
 	readonly _serviceBrand: undefined;
@@ -92,10 +96,7 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 
 	// --- Workspace identity ---
 	// Mirrors ChatThreadService._getCurrentWorkspaceIdentity so env vars
-	// scope the same way threads do: single-folder → folder URI, saved
-	// .code-workspace → configPath, untitled multi-root → first folder URI
-	// (so adding/removing folders doesn't break identity). Returns '' for
-	// an empty window — env vars are a no-op in that case.
+	// scope the same way threads do.
 	private _workspaceKey(): string {
 		const workspace = this.workspaceContextService.getWorkspace()
 		const identifier = toWorkspaceIdentifier(workspace)
@@ -107,7 +108,6 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 			if (configName !== 'workspace.json' && configName.endsWith('.code-workspace')) {
 				return identifier.configPath.toString()
 			}
-			// Untitled workspace — fall through to first-folder identity.
 		}
 		if (workspace.folders.length > 0) {
 			return workspace.folders[0].uri.toString()
@@ -115,9 +115,6 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 		return ''
 	}
 
-	// Stable hash of the workspace URI for the secret-storage key. Not
-	// secret — just a compact partition key. Returns null for empty windows
-	// (no workspace), meaning env vars are disabled.
 	private _secretStorageKey(): string | null {
 		const wsKey = this._workspaceKey()
 		if (!wsKey) return null
@@ -134,7 +131,7 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 			if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {}
 			const vars = parsed as WorkspaceEnvVars
 			// Backward-compat: entries persisted before `redact` existed default
-			// to true (safer — scrub by default, user opts out for non-secrets).
+			// to true (safer — scrub by default).
 			for (const entry of Object.values(vars)) {
 				if (entry.redact === undefined) entry.redact = true
 			}
@@ -160,8 +157,6 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 			if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {}
 			return parsed as EnvVarValuesBlob
 		} catch {
-			// Corrupt blob — clear it so next read is clean. Matches the
-			// auto-delete-on-decrypt-failure behavior in secrets.ts.
 			await this.secretStorageService.delete(key).catch(() => { })
 			return {}
 		}
@@ -175,7 +170,7 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 
 	// --- CRUD ---
 
-	async addVar(name: string, firstVariantLabel: string, firstVariantValue: string, redact: boolean): Promise<void> {
+	async addVar(name: string, value: string, redact: boolean): Promise<void> {
 		if (!ENV_VAR_NAME_RE.test(name)) {
 			throw new Error(`Invalid env var name: ${name}. Must match /^[A-Z_][A-Z0-9_]*$/`)
 		}
@@ -183,50 +178,36 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 		if (name in vars) {
 			throw new Error(`Env var ${name} already exists`)
 		}
-		const variantId = generateUuid()
-		vars[name] = {
-			variants: [{ id: variantId, label: firstVariantLabel, createdAt: Date.now() }],
-			activeVariantId: variantId,
-			redact,
-		}
+		vars[name] = { activeIndex: 0, redact }
 		this._setVars(vars)
 
-		// Read-modify-write the values blob (writes are rare + serialized by
-		// ISecretStorageService's SequencerByKey).
 		const blob = await this._readValuesBlob()
-		if (!blob[name]) blob[name] = {}
-		blob[name][variantId] = firstVariantValue
+		blob[name] = [value]
 		await this._writeValuesBlob(blob)
 	}
 
-	async addVariant(name: string, label: string, value: string): Promise<void> {
+	async addValue(name: string, value: string): Promise<void> {
+		const vars = this.getVars()
+		if (!(name in vars)) {
+			throw new Error(`Env var ${name} does not exist`)
+		}
+		// Does NOT change activeIndex — user explicitly switches.
+		this._setVars(vars)
+
+		const blob = await this._readValuesBlob()
+		if (!blob[name]) blob[name] = []
+		blob[name].push(value)
+		await this._writeValuesBlob(blob)
+	}
+
+	setActive(name: string, index: number): void {
 		const vars = this.getVars()
 		const entry = vars[name]
 		if (!entry) {
 			throw new Error(`Env var ${name} does not exist`)
-		}
-		const variantId = generateUuid()
-		entry.variants.push({ id: variantId, label, createdAt: Date.now() })
-		// Does NOT change the active variant — user explicitly switches.
-		this._setVars(vars)
-
-		const blob = await this._readValuesBlob()
-		if (!blob[name]) blob[name] = {}
-		blob[name][variantId] = value
-		await this._writeValuesBlob(blob)
-	}
-
-	setActiveVariant(name: string, variantId: string): void {
-		const vars = this.getVars()
-		const entry = vars[name]
-		if (!entry) {
-			throw new Error(`Env var ${name} does not exist`)
-		}
-		if (!entry.variants.some(v => v.id === variantId)) {
-			throw new Error(`Variant ${variantId} does not exist on var ${name}`)
 		}
 		// Plaintext-metadata-only flip — zero secret bytes touched.
-		entry.activeVariantId = variantId
+		entry.activeIndex = index
 		this._setVars(vars)
 	}
 
@@ -236,7 +217,6 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 		if (!entry) {
 			throw new Error(`Env var ${name} does not exist`)
 		}
-		// Plaintext-metadata-only flip — zero secret bytes touched.
 		entry.redact = redact
 		this._setVars(vars)
 	}
@@ -247,9 +227,6 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 		delete vars[name]
 		this._setVars(vars)
 
-		// Best-effort: drop the var's values from the blob. If the blob
-		// decrypt fails, metadata is still updated and the dangling blob
-		// self-clears on next read via _readValuesBlob's catch.
 		const blob = await this._readValuesBlob()
 		if (blob[name]) {
 			delete blob[name]
@@ -257,43 +234,47 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 		}
 	}
 
-	async removeVariant(name: string, variantId: string): Promise<void> {
+	async removeValue(name: string, index: number): Promise<void> {
 		const vars = this.getVars()
 		const entry = vars[name]
 		if (!entry) return
 
-		const idx = entry.variants.findIndex(v => v.id === variantId)
-		if (idx === -1) return
+		const blob = await this._readValuesBlob()
+		const values = blob[name]
+		if (!values || index < 0 || index >= values.length) return
 
-		entry.variants.splice(idx, 1)
+		values.splice(index, 1)
 
-		// If we removed the active variant, fall back to the first remaining
-		// one (or remove the var entirely if no variants remain).
-		if (entry.variants.length === 0) {
+		// Adjust activeIndex: if we removed the active one, fall back to 0
+		// (or null if no values remain). If we removed before active, shift down.
+		if (values.length === 0) {
 			delete vars[name]
+			delete blob[name]
 		} else {
-			if (entry.activeVariantId === variantId) {
-				entry.activeVariantId = entry.variants[0].id
+			if (entry.activeIndex === index) {
+				entry.activeIndex = 0
+			} else if (entry.activeIndex !== null && index < entry.activeIndex) {
+				entry.activeIndex -= 1
 			}
 		}
 		this._setVars(vars)
-
-		const blob = await this._readValuesBlob()
-		if (blob[name]) {
-			delete blob[name][variantId]
-			if (Object.keys(blob[name]).length === 0) delete blob[name]
-			await this._writeValuesBlob(blob)
-		}
+		await this._writeValuesBlob(blob)
 	}
 
 	// --- Read paths for consumers ---
+
+	async getValues(name: string): Promise<string[]> {
+		const blob = await this._readValuesBlob()
+		return blob[name] ?? []
+	}
 
 	async getActiveEnv(): Promise<Record<string, string>> {
 		const vars = this.getVars()
 		const blob = await this._readValuesBlob()
 		const result: Record<string, string> = {}
 		for (const [name, entry] of Object.entries(vars)) {
-			const value = blob[name]?.[entry.activeVariantId]
+			if (entry.activeIndex === null) continue
+			const value = blob[name]?.[entry.activeIndex]
 			if (value !== undefined) result[name] = value
 		}
 		return result
@@ -305,24 +286,18 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 		const result: { name: string, value: string }[] = []
 		for (const [name, entry] of Object.entries(vars)) {
 			if (!entry.redact) continue
-			for (const variant of entry.variants) {
-				const value = blob[name]?.[variant.id]
-				if (value !== undefined) result.push({ name, value })
+			for (const value of blob[name] ?? []) {
+				if (value) result.push({ name, value })
 			}
 		}
 		return result
 	}
 
-	getActiveVarDescriptors(): { name: string, activeLabel: string }[] {
+	getActiveVarNames(): string[] {
 		const vars = this.getVars()
-		const result: { name: string, activeLabel: string }[] = []
-		for (const [name, entry] of Object.entries(vars)) {
-			const activeVariant = entry.variants.find(v => v.id === entry.activeVariantId)
-			if (activeVariant) {
-				result.push({ name, activeLabel: activeVariant.label })
-			}
-		}
-		return result
+		return Object.entries(vars)
+			.filter(([, entry]) => entry.activeIndex !== null)
+			.map(([name]) => name)
 	}
 }
 

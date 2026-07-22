@@ -228,7 +228,7 @@ export type ChatPromptContext = {
 	allTerminals: { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[]
 	chatMode: ChatMode
 	tools: InternalToolInfo[] | undefined
-	envVarDescriptors: { name: string, activeLabel: string }[]
+	activeEnvVarNames: string[]
 }
 
 
@@ -236,14 +236,14 @@ export type ChatPromptContext = {
 // should prepend this to the latest user message (Phase B caching layout) rather
 // than embed it in the system message — keeping it out of the system message lets
 // the stable prefix and the full conversation history be prefix-cached across turns.
-export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode: mode, includeDirectoryListing = true, directoryDiff, envVarDescriptors }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'allTerminals' | 'chatMode' | 'envVarDescriptors'> & { includeDirectoryListing?: boolean, directoryDiff?: string | null }) => {
+export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode: mode, includeDirectoryListing = true, directoryDiff, activeEnvVarNames }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'allTerminals' | 'chatMode' | 'activeEnvVarNames'> & { includeDirectoryListing?: boolean, directoryDiff?: string | null }) => {
 	const terminalBlock = mode === 'agent' && allTerminals.length > 0
 		? allTerminals.map(t => {
 			const cmd = t.lastCommand ? ` — ${t.lastCommand}` : ''
 			return `  - ${t.name}: ${t.status}${cmd}`
 		}).join('\n')
 		: null
-	const envVarsBlock = envVarDescriptors.length > 0 ? envVarDescriptors.map(v => `  - ${v.name} (active: ${v.activeLabel})`).join('\n') : null
+	const envVarsBlock = activeEnvVarNames.length > 0 ? activeEnvVarNames.map(n => `  - ${n}`).join('\n') : null
 
 const sysInfo = (`Here is the user's system information:
 <system_info>

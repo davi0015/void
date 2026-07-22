@@ -1318,8 +1318,8 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			directorySnapshot = currPaths
 		}
 
-		const envVarDescriptors = this.workspaceEnvVarService.getActiveVarDescriptors()
-		const volatile = chat_volatileContext({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode, includeDirectoryListing, directoryDiff, envVarDescriptors })
+		const activeEnvVarNames = this.workspaceEnvVarService.getActiveVarNames()
+		const volatile = chat_volatileContext({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode, includeDirectoryListing, directoryDiff, activeEnvVarNames })
 		return { volatile, directorySnapshot }
 	}
 
