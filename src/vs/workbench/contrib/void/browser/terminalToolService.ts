@@ -16,6 +16,7 @@ import { ITerminalService, ITerminalInstance, ICreateTerminalOptions } from '../
 import { MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_CHARS, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js';
 import { TerminalResolveReason } from '../common/toolsServiceTypes.js';
 import { TERMINAL_AUTO_APPROVE_KEY } from '../common/storageKeys.js';
+import { IWorkspaceEnvVarService } from './workspaceEnvVarService.js';
 import { timeout } from '../../../../base/common/async.js';
 
 
@@ -83,6 +84,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		@ITerminalService private readonly terminalService: ITerminalService,
 		@IWorkspaceContextService private readonly workspaceContextService: IWorkspaceContextService,
 		@IStorageService private readonly storageService: IStorageService,
+		@IWorkspaceEnvVarService private readonly workspaceEnvVarService: IWorkspaceEnvVarService,
 	) {
 		super();
 
@@ -199,6 +201,22 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 		const cwd: URI | string | undefined = (override_cwd ?? undefined) ?? this.workspaceContextService.getWorkspace().folders[0]?.uri;
 
+		// Inject workspace env vars (active variants only) into the terminal's
+		// environment. Only Void-spawned terminals get these — a terminal the
+		// user opens manually via the + button doesn't go through _createTerminal.
+		// Failure to read (e.g. Keychain locked) logs and skips; terminal
+		// creation must not fail because one secret is unreadable.
+		let workspaceEnv: Record<string, string> = {}
+		try {
+			workspaceEnv = await this.workspaceEnvVarService.getActiveEnv()
+		} catch (e) {
+			console.error('[workspaceEnvVars] Failed to read active env, skipping injection:', e)
+		}
+
+		// config is a union (IShellLaunchConfig | ITerminalProfile | IExtensionTerminalProfile);
+		// only IShellLaunchConfig has env, so narrow with 'env' in config.
+		const configEnv = config && 'env' in config ? config.env : undefined
+
 		const options: ICreateTerminalOptions = {
 			cwd,
 			location: hidden ? undefined : TerminalLocation.Panel,
@@ -208,6 +226,10 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 				hideFromUser: hidden ? true : undefined,
 				// Copy any other properties from the provided config
 				...config,
+				// Merge workspace env vars on top. These are referenced by the
+				// LLM as $VAR_NAME; the shell expands them at runtime so secret
+				// values never enter model context.
+				env: { ...configEnv, ...workspaceEnv },
 			},
 			// Skip profile check to ensure the terminal is created quickly
 			skipContributedProfileCheck: true,
