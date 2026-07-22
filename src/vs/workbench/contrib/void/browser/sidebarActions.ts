@@ -32,6 +32,7 @@ import { INotificationService, Severity } from '../../../../platform/notificatio
 import { StagingSelectionItem } from '../common/chatThreadServiceTypes.js';
 import { Codicon } from '../../../../base/common/codicons.js';
 import { ITerminalToolService } from './terminalToolService.js';
+import { IWorkspaceEnvVarService } from './workspaceEnvVarService.js';
 import { IQuickInputService } from '../../../../platform/quickinput/common/quickInput.js';
 
 // ---------- Register commands and keybindings ----------
@@ -274,6 +275,147 @@ registerAction2(class extends Action2 {
 })
 
 
+
+
+// Manage workspace env vars (soft-isolation secrets)
+// Top-level pick: lists vars + an "Add new var" entry. Selecting a var
+// drills into variant management (switch active, add variant, toggle
+// redact, remove var). Values are never displayed — only labels.
+registerAction2(class extends Action2 {
+	constructor() {
+		super({
+			id: 'void.workspaceEnvVars',
+			title: 'Manage Workspace Env Vars',
+			icon: Codicon.key,
+			menu: [{ id: MenuId.ViewTitle, group: 'navigation', when: ContextKeyExpr.equals('view', VOID_VIEW_ID), }]
+		});
+	}
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const envVarService = accessor.get(IWorkspaceEnvVarService)
+		const quickInputService = accessor.get(IQuickInputService)
+		const notificationService = accessor.get(INotificationService)
+
+		const promptForValue = async (title: string, placeholder: string, password: boolean): Promise<string | undefined> => {
+			return await quickInputService.input({
+				title,
+				placeHolder: placeholder,
+				password,
+				ignoreFocusLost: true,
+			})
+		}
+
+		const promptForName = async (): Promise<string | undefined> => {
+			return await quickInputService.input({
+				title: 'Add Env Var',
+				placeHolder: 'VAR_NAME (e.g. OPENAI_API_KEY)',
+				ignoreFocusLost: true,
+				validateInput: async (input) => {
+					if (!/^[A-Z_][A-Z0-9_]*$/.test(input)) return 'Must match /^[A-Z_][A-Z0-9_]*$/'
+					const vars = envVarService.getVars()
+					if (input in vars) return `${input} already exists`
+					return null
+				},
+			})
+		}
+
+		const addVarFlow = async () => {
+			const name = await promptForName()
+			if (!name) return
+			const label = await promptForValue('Variant Label', 'e.g. prod / staging / test', false)
+			if (!label) return
+			const value = await promptForValue(`${name} value`, `Value for ${name}`, true)
+			if (value === undefined) return
+			const redactPick = await quickInputService.pick(
+				[{ label: 'Yes (secret - scrub from output)', redact: true }, { label: 'No (config - visible in output)', redact: false }],
+				{ title: `Scrub ${name} from terminal output?`, placeHolder: 'Choose whether to redact this var from terminal tool results' }
+			)
+			if (!redactPick) return
+			try {
+				await envVarService.addVar(name, label, value, redactPick.redact)
+				notificationService.notify({ severity: Severity.Info, message: `Void: added ${name} (${label}).` })
+			} catch (e) {
+				notificationService.notify({ severity: Severity.Error, message: `Void: failed to add ${name}: ${e}` })
+			}
+		}
+
+		const addVariantFlow = async (name: string) => {
+			const label = await promptForValue(`New Variant for ${name}`, 'e.g. prod / staging / test', false)
+			if (!label) return
+			const value = await promptForValue(`${name} value`, `Value for ${name} (${label})`, true)
+			if (value === undefined) return
+			try {
+				await envVarService.addVariant(name, label, value)
+				notificationService.notify({ severity: Severity.Info, message: `Void: added variant ${label} to ${name}.` })
+			} catch (e) {
+				notificationService.notify({ severity: Severity.Error, message: `Void: failed to add variant: ${e}` })
+			}
+		}
+
+		const varDetailFlow = async (name: string) => {
+			const vars = envVarService.getVars()
+			const entry = vars[name]
+			if (!entry) return
+			const activeVariant = entry.variants.find(v => v.id === entry.activeVariantId)
+			const redactLabel = entry.redact ? 'Yes' : 'No'
+			type DetailItem = { label: string, action: 'switch' | 'addVariant' | 'toggleRedact' | 'remove' }
+			const items: DetailItem[] = [
+				{ label: `$(chevron-right) Switch active variant (current: ${activeVariant?.label ?? 'none'})`, action: 'switch' },
+				{ label: '$(add) Add variant', action: 'addVariant' },
+				{ label: `$(eye) Toggle redact (current: ${redactLabel})`, action: 'toggleRedact' },
+				{ label: '$(trash) Remove var', action: 'remove' },
+			]
+			const pick = await quickInputService.pick(items, { title: name, placeHolder: 'Select an action', ignoreFocusLost: true })
+			if (!pick) return
+			if (pick.action === 'switch') {
+				const variantItems = entry.variants.map(v => ({
+					label: `${v.label}${v.id === entry.activeVariantId ? ' (active)' : ''}`,
+					variantId: v.id,
+				}))
+				const chosen = await quickInputService.pick(variantItems, { title: `Switch active variant for ${name}`, placeHolder: 'Select a variant', ignoreFocusLost: true })
+				if (!chosen) return
+				try {
+					envVarService.setActiveVariant(name, chosen.variantId)
+				} catch (e) {
+					notificationService.notify({ severity: Severity.Error, message: `Void: failed to switch variant: ${e}` })
+				}
+			} else if (pick.action === 'addVariant') {
+				await addVariantFlow(name)
+			} else if (pick.action === 'toggleRedact') {
+				try {
+					envVarService.setRedact(name, !entry.redact)
+				} catch (e) {
+					notificationService.notify({ severity: Severity.Error, message: `Void: failed to toggle redact: ${e}` })
+				}
+			} else if (pick.action === 'remove') {
+				try {
+					await envVarService.removeVar(name)
+				} catch (e) {
+					notificationService.notify({ severity: Severity.Error, message: `Void: failed to remove ${name}: ${e}` })
+				}
+			}
+		}
+
+		const vars = envVarService.getVars()
+		type TopItem = { label: string, action: 'add' | 'detail', varName?: string }
+		const items: TopItem[] = Object.entries(vars).map(([name, entry]) => {
+			const active = entry.variants.find(v => v.id === entry.activeVariantId)
+			return { label: `${name} (active: ${active?.label ?? 'none'})`, action: 'detail', varName: name }
+		})
+		items.push({ label: '$(add) Add new env var', action: 'add' })
+
+		const pick = await quickInputService.pick(items, {
+			title: 'Workspace Env Vars',
+			placeHolder: Object.keys(vars).length === 0 ? 'No env vars yet - add one' : 'Select a var to manage, or add new',
+			ignoreFocusLost: true,
+		})
+		if (!pick) return
+		if (pick.action === 'add') {
+			await addVarFlow()
+		} else if (pick.action === 'detail' && pick.varName) {
+			await varDetailFlow(pick.varName)
+		}
+	}
+})
 
 
 // export class TabSwitchListener extends Disposable {
