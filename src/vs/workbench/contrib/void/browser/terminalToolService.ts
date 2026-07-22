@@ -353,7 +353,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 	private async _scrubSecrets(text: string): Promise<string> {
 		let envValues: { name: string, value: string }[]
 		try {
-			envValues = await this.workspaceEnvVarService.getAllEnvValues()
+			envValues = await this.workspaceEnvVarService.getScrubableEnvValues()
 		} catch (e) {
 			console.error('[workspaceEnvVars] Failed to read env values for scrubbing, returning unscrubbed output:', e)
 			return text

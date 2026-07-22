@@ -27,6 +27,10 @@ export type EnvVarVariantMeta = {
 export type EnvVarEntry = {
 	variants: EnvVarVariantMeta[]   // insertion order; first is default-active on creation
 	activeVariantId: string         // points into variants[].id
+	// Whether to scrub this var's values from terminal output. Defaults to
+	// true (safer). Set to false for non-secret config like NODE_ENV=development
+	// where scrubbing would redact common words from legitimate output.
+	redact: boolean
 }
 
 // map keyed by VAR_NAME (e.g. "OPENAI_API_KEY")
@@ -43,9 +47,10 @@ export interface IWorkspaceEnvVarService {
 
 	// Metadata (plaintext, workspace-scoped)
 	getVars(): WorkspaceEnvVars
-	addVar(name: string, firstVariantLabel: string, firstVariantValue: string): Promise<void>
+	addVar(name: string, firstVariantLabel: string, firstVariantValue: string, redact: boolean): Promise<void>
 	addVariant(name: string, label: string, value: string): Promise<void>
 	setActiveVariant(name: string, variantId: string): void
+	setRedact(name: string, redact: boolean): void
 	removeVar(name: string): Promise<void>
 	removeVariant(name: string, variantId: string): Promise<void>
 
@@ -54,11 +59,12 @@ export interface IWorkspaceEnvVarService {
 	// encrypted values blob (one decrypt).
 	getActiveEnv(): Promise<Record<string, string>>  // VAR_NAME -> value
 
-	// All variant values (active + inactive), name + value pairs.
-	// Called by the output scrubber in TerminalToolService so terminals
-	// created under a now-inactive variant still get scrubbed. Same single
-	// blob read as getActiveEnv, flattened to all variants.
-	getAllEnvValues(): Promise<{ name: string, value: string }[]>
+	// All variant values (active + inactive) of vars where redact=true,
+	// name + value pairs. Called by the output scrubber in TerminalToolService
+	// so terminals created under a now-inactive variant still get scrubbed.
+	// Same single blob read as getActiveEnv, flattened to all variants,
+	// filtered to redact=true only.
+	getScrubableEnvValues(): Promise<{ name: string, value: string }[]>
 
 	// Resolved names + active labels for LLM advertisement
 	// (called by ConvertToLLMMessageService — names only, no values)
@@ -126,7 +132,13 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 		try {
 			const parsed = JSON.parse(raw)
 			if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {}
-			return parsed as WorkspaceEnvVars
+			const vars = parsed as WorkspaceEnvVars
+			// Backward-compat: entries persisted before `redact` existed default
+			// to true (safer — scrub by default, user opts out for non-secrets).
+			for (const entry of Object.values(vars)) {
+				if (entry.redact === undefined) entry.redact = true
+			}
+			return vars
 		} catch {
 			return {}
 		}
@@ -163,7 +175,7 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 
 	// --- CRUD ---
 
-	async addVar(name: string, firstVariantLabel: string, firstVariantValue: string): Promise<void> {
+	async addVar(name: string, firstVariantLabel: string, firstVariantValue: string, redact: boolean): Promise<void> {
 		if (!ENV_VAR_NAME_RE.test(name)) {
 			throw new Error(`Invalid env var name: ${name}. Must match /^[A-Z_][A-Z0-9_]*$/`)
 		}
@@ -175,6 +187,7 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 		vars[name] = {
 			variants: [{ id: variantId, label: firstVariantLabel, createdAt: Date.now() }],
 			activeVariantId: variantId,
+			redact,
 		}
 		this._setVars(vars)
 
@@ -214,6 +227,17 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 		}
 		// Plaintext-metadata-only flip — zero secret bytes touched.
 		entry.activeVariantId = variantId
+		this._setVars(vars)
+	}
+
+	setRedact(name: string, redact: boolean): void {
+		const vars = this.getVars()
+		const entry = vars[name]
+		if (!entry) {
+			throw new Error(`Env var ${name} does not exist`)
+		}
+		// Plaintext-metadata-only flip — zero secret bytes touched.
+		entry.redact = redact
 		this._setVars(vars)
 	}
 
@@ -275,11 +299,12 @@ class WorkspaceEnvVarService extends Disposable implements IWorkspaceEnvVarServi
 		return result
 	}
 
-	async getAllEnvValues(): Promise<{ name: string, value: string }[]> {
+	async getScrubableEnvValues(): Promise<{ name: string, value: string }[]> {
 		const vars = this.getVars()
 		const blob = await this._readValuesBlob()
 		const result: { name: string, value: string }[] = []
 		for (const [name, entry] of Object.entries(vars)) {
+			if (!entry.redact) continue
 			for (const variant of entry.variants) {
 				const value = blob[name]?.[variant.id]
 				if (value !== undefined) result.push({ name, value })
