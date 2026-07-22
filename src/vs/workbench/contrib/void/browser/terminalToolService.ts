@@ -345,6 +345,27 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		return result;
 	};
 
+	// Replace every known secret value in the output with [REDACTED:VAR_NAME].
+	// Uses getAllEnvValues (all variants, not just active) so terminals created
+	// under a now-inactive variant still get scrubbed. Best-effort: if the
+	// secret read fails (e.g. Keychain locked), returns the text unscrubbed —
+	// the provider's input guardrail is the backstop.
+	private async _scrubSecrets(text: string): Promise<string> {
+		let envValues: { name: string, value: string }[]
+		try {
+			envValues = await this.workspaceEnvVarService.getAllEnvValues()
+		} catch (e) {
+			console.error('[workspaceEnvVars] Failed to read env values for scrubbing, returning unscrubbed output:', e)
+			return text
+		}
+		let scrubbed = text
+		for (const { name, value } of envValues) {
+			if (!value) continue // skip empty values (would cause infinite split)
+			scrubbed = scrubbed.split(value).join(`[REDACTED:${name}]`)
+		}
+		return scrubbed
+	}
+
 	readTerminal: ITerminalToolService['readTerminal'] = async (terminalId) => {
 		// Try persistent first, then temporary
 		const terminal = this.getPersistentTerminal(terminalId) ?? this.getTemporaryTerminal(terminalId);
@@ -370,7 +391,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 			result = result.slice(0, half) + '\n...\n' + result.slice(result.length - half);
 		}
 
-		return result
+		return this._scrubSecrets(result)
 	};
 
 	readTerminalByName: ITerminalToolService['readTerminalByName'] = async (terminalName, lastNCommands?) => {
@@ -414,7 +435,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 				exitCode: cmd.exitCode ?? null,
 				duration: cmd.duration,
 			}))
-			return { output, status, commands }
+			return { output: await this._scrubSecrets(output), status, commands }
 		}
 
 		// No filter — return full scrollback buffer
@@ -435,7 +456,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 			duration: cmd.duration,
 		}))
 
-		return { output, status, commands }
+		return { output: await this._scrubSecrets(output), status, commands }
 	}
 
 	private async _waitForCommandDetectionCapability(terminal: ITerminalInstance) {
@@ -601,7 +622,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 						+ result.slice(result.length - half, Infinity)
 				}
 
-				return { result, resolveReason }
+				return { result: await this._scrubSecrets(result), resolveReason }
 			} finally {
 				// Always dispose temporary terminals, even if an error was thrown
 				if (!isPersistent) {
