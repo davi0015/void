@@ -113,6 +113,7 @@ export class TerminalProcess extends Disposable implements ITerminalChildProcess
 	private _titleInterval: NodeJS.Timeout | null = null;
 	private _writeQueue: IWriteObject[] = [];
 	private _writeTimeout: NodeJS.Timeout | undefined;
+	private _isWriting: boolean = false;
 	private _delayedResizer: DelayedResizer | undefined;
 	private readonly _initialCwd: string;
 	private readonly _ptyOptions: IPtyForkOptions | IWindowsPtyForkOptions;
@@ -505,8 +506,8 @@ export class TerminalProcess extends Disposable implements ITerminalChildProcess
 	}
 
 	private _startWrite(): void {
-		// Don't write if it's already queued of is there is nothing to write
-		if (this._writeTimeout !== undefined || this._writeQueue.length === 0) {
+		// Don't write if it's already queued, if there is nothing to write, or if a write is in flight
+		if (this._writeTimeout !== undefined || this._writeQueue.length === 0 || this._isWriting) {
 			return;
 		}
 
@@ -528,6 +529,7 @@ export class TerminalProcess extends Disposable implements ITerminalChildProcess
 	private _doWrite(): void {
 		const object = this._writeQueue.shift()!;
 		this._logService.trace('node-pty.IPty#write', object.data);
+		this._isWriting = true;
 
 		// [VOID] On macOS, node-pty's net.Socket.write() can block the
 		// event loop when the kernel PTY input buffer is full (e.g. shell
@@ -552,6 +554,8 @@ export class TerminalProcess extends Disposable implements ITerminalChildProcess
 			? Buffer.from(object.data, 'binary')
 			: Buffer.from(object.data);
 		fs.write(fd, buffer, 0, buffer.length, null, (err) => {
+			this._isWriting = false;
+
 			// Resume node-pty's read socket after the write completes
 			if (socket && !socket.destroyed) {
 				socket.resume();
@@ -572,6 +576,16 @@ export class TerminalProcess extends Disposable implements ITerminalChildProcess
 				return;
 			}
 			this._childProcessMonitor?.handleInput();
+
+			// [VOID] Start the next queued write now that this one is done.
+			// Without this, writes stall when _writeTimeout was cleared (queue
+			// was empty after _doWrite returned) but more data arrived before
+			// fs.write completed. The _isWriting flag in _startWrite prevents
+			// concurrent fs.write calls on the same fd, which caused N-API
+			// exceptions that broke exit detection and leaked PTY processes.
+			if (!this._store.isDisposed && this._writeQueue.length > 0 && this._writeTimeout === undefined) {
+				this._startWrite();
+			}
 		});
 	}
 
