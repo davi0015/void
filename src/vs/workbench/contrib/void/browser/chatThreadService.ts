@@ -42,6 +42,7 @@ import { IWorkspaceContextService, toWorkspaceIdentifier } from '../../../../pla
 import { basename as resourceBasename, joinPath } from '../../../../base/common/resources.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
+import { IHostService } from '../../../services/host/browser/host.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
 import { buildTestMessages, runSimulatedStream } from './chatThreadDevTools.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
@@ -661,6 +662,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IEnvironmentService private readonly _environmentService: IEnvironmentService,
 		@ILifecycleService private readonly _lifecycleService: ILifecycleService,
 		@ITerminalToolService private readonly _terminalToolService: ITerminalToolService,
+		@IHostService private readonly _hostService: IHostService,
 	) {
 		super()
 		void this._editCodeService // checkpoint disabled — kept for DI, see checkpoint-storage-refactor.md
@@ -1568,8 +1570,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// must supersede any pending throttled stream-text update for this thread,
 		// otherwise the delayed flush could overwrite the new authoritative state.
 		this._cancelPendingStreamTextUpdate(threadId)
+
+		const prev = this.streamState[threadId]
 		this.streamState[threadId] = state
 		this._onDidChangeStreamState.fire({ threadId })
+
+		// Fire an approval notification when transitioning to 'awaiting_user',
+		// but only if the user is not currently viewing this thread or the
+		// window doesn't have focus (e.g. switched to another macOS desktop).
+		if (state?.isRunning === 'awaiting_user' && prev?.isRunning !== 'awaiting_user') {
+			if (threadId !== this.state.currentThreadId || !this._hostService.hasFocus) {
+				this._notifyAwaitingApproval(threadId)
+			}
+		}
 	}
 
 	// Per-thread coalescer for streaming-text updates. LLM chunks can arrive
@@ -3322,6 +3335,68 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// }
 
 
+	/**
+	 * Fire a notification when a tool requires user approval. Includes
+	 * Approve and Reject buttons so the user can act directly from the
+	 * notification without switching to the chat. Only fires when the user
+	 * is not currently viewing the thread.
+	 */
+	private _notifyAwaitingApproval(threadId: string) {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return
+		const pending = this._getPendingBatchTools(threadId)
+		if (pending.length === 0) return
+		const tool = pending[0]
+		const userMsg = findLast(thread.messages, m => m.role === 'user')
+		const messageContent = userMsg?.role === 'user' ? truncate(userMsg.displayContent, 50, '...') : ''
+
+		this._notificationService.notify({
+			severity: Severity.Info,
+			message: `Chat requires approval: ${tool.name}`,
+			source: messageContent,
+			sticky: true,
+			actions: {
+				primary: [
+					{
+						id: 'void.approveTool',
+						enabled: true,
+						label: 'Approve',
+						tooltip: '',
+						class: undefined,
+						run: () => {
+							this.switchToThread(threadId)
+							this.approveLatestToolRequest(threadId)
+						}
+					},
+					{
+						id: 'void.rejectTool',
+						enabled: true,
+						label: 'Reject',
+						tooltip: '',
+						class: undefined,
+						run: () => {
+							this.switchToThread(threadId)
+							this.rejectLatestToolRequest(threadId)
+						}
+					},
+				],
+				secondary: [{
+					id: 'void.goToChat',
+					enabled: true,
+					label: 'Jump to Chat',
+					tooltip: '',
+					class: undefined,
+					run: () => {
+						this.switchToThread(threadId)
+						this.state.allThreads[threadId]?.state.mountedInfo?.whenMounted.then(m => {
+							m.scrollToBottom()
+						})
+					}
+				}]
+			},
+		})
+	}
+
 	private _wrapRunAgentToNotify(p: Promise<void>, threadId: string) {
 		const notify = ({ error }: { error: string | null }) => {
 			const thread = this.state.allThreads[threadId]
@@ -3355,10 +3430,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			})
 		}
 
+		const shouldNotify = () => threadId !== this.state.currentThreadId || !this._hostService.hasFocus
+
 		p.then(() => {
-			if (threadId !== this.state.currentThreadId) notify({ error: null })
+			if (shouldNotify()) notify({ error: null })
 		}).catch((e) => {
-			if (threadId !== this.state.currentThreadId) notify({ error: getErrorMessage(e) })
+			if (shouldNotify()) notify({ error: getErrorMessage(e) })
 			throw e
 		})
 	}
