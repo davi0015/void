@@ -488,6 +488,9 @@ class Mangler {
             }
         };
         const appendRename = (newText, loc) => {
+            if (loc.fileName.includes('node_modules')) {
+                return;
+            }
             appendEdit(loc.fileName, {
                 newText: (loc.prefixText || '') + newText + (loc.suffixText || ''),
                 offset: loc.textSpan.start,

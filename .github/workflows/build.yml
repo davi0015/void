@@ -1,0 +1,296 @@
+name: Build Binaries
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build on Windows
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      # windows-latest now ships VS 2026 (v18); node-gyp >= 12.1.0 (npm >= 11.6.3) is required
+      GYP_MSVS_VERSION: '2026'
+      npm_config_msvs_version: '2026'
+      VCINSTALLDIR: 'C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC'
+      NODE_OPTIONS: --max-old-space-size=8192
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Upgrade npm for VS 2026 / node-gyp compatibility
+        # >= 11.6.3 bundles node-gyp with VS 2026 support; 11.6.3 crashes on overrides (npm/cli#8757)
+        run: npm install -g npm@11.6.4
+
+      - name: Install NPM dependencies
+        run: npm ci
+        env:
+          npm_config_foreground_scripts: 'true'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Void React bundles
+        run: npm run buildreact
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build Rust CLI
+        shell: pwsh
+        run: |
+          # Git for Windows ships a Unix `link.exe` that shadows MSVC's linker on PATH.
+          Remove-Item 'C:\Program Files\Git\usr\bin\link.exe' -Force -ErrorAction SilentlyContinue
+
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Import-Module "$vsPath\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments '-arch=amd64'
+
+          Set-Location cli
+          cargo build --release --bin code
+
+      - name: Package Void for Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path .build | Out-Null
+
+          # Use non-min build: mangling conflicts with Void's npm deps (e.g. google-auth-library)
+          npm run gulp vscode-win32-x64
+          npm run gulp vscode-win32-x64-inno-updater
+
+          $appDir = Join-Path (Split-Path $PWD -Parent) 'VSCode-win32-x64'
+          if (-not (Test-Path $appDir)) {
+            throw "Expected packaged app at $appDir"
+          }
+
+          $tunnelExe = Join-Path $appDir 'bin/void-tunnel.exe'
+          New-Item -ItemType Directory -Force -Path (Split-Path $tunnelExe -Parent) | Out-Null
+          Copy-Item 'cli/target/release/code.exe' $tunnelExe -Force
+
+          npm run gulp vscode-win32-x64-user-setup
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage release artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoParent = Split-Path $PWD -Parent
+          $appDir = Join-Path $repoParent 'VSCode-win32-x64'
+          $setupDir = '.build/win32-x64/user-setup'
+
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+
+          if (Test-Path "$setupDir/VSCodeSetup.exe") {
+            Copy-Item "$setupDir/VSCodeSetup.exe" 'artifacts/VoidSetup.exe'
+            Write-Host "Staged installer: artifacts/VoidSetup.exe"
+          } else {
+            Write-Error "Installer not found at $setupDir/VSCodeSetup.exe"
+          }
+
+          if (Test-Path $appDir) {
+            Compress-Archive -Path $appDir -DestinationPath 'artifacts/void-win32-x64-portable.zip' -Force
+            Write-Host "Staged portable build: artifacts/void-win32-x64-portable.zip"
+          } else {
+            Write-Error "Portable app folder not found at $appDir"
+          }
+
+      - name: Upload Artifacts
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: void-windows
+          path: artifacts/
+          retention-days: 90
+
+  build-linux:
+    name: Build on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      NODE_OPTIONS: --max-old-space-size=8192
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            g++ \
+            libx11-dev \
+            libxkbfile-dev \
+            libsecret-1-dev \
+            libkrb5-dev \
+            python-is-python3 \
+            pkg-config \
+            libgtk-3-0 \
+            libgbm1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install NPM dependencies
+        run: npm ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Void React bundles
+        run: npm run buildreact
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Rust CLI
+        run: |
+          set -euo pipefail
+          cd cli
+          cargo build --release --bin code
+
+      - name: Package Void for Linux
+        run: |
+          set -euo pipefail
+          mkdir -p .build
+
+          # Use non-min build: mangling conflicts with Void's npm deps (e.g. google-auth-library)
+          npm run gulp vscode-linux-x64
+
+          app_dir="$(cd .. && pwd)/VSCode-linux-x64"
+          if [ ! -d "$app_dir" ]; then
+            echo "Expected packaged app at $app_dir" >&2
+            exit 1
+          fi
+
+          mkdir -p "$app_dir/bin"
+          cp cli/target/release/code "$app_dir/bin/void-tunnel"
+          chmod +x "$app_dir/bin/void-tunnel"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage release artifacts
+        run: |
+          set -euo pipefail
+          app_dir="$(cd .. && pwd)/VSCode-linux-x64"
+
+          mkdir -p artifacts
+          tar -czf artifacts/void-linux-x64-portable.tar.gz -C .. VSCode-linux-x64
+          echo "Staged portable build: artifacts/void-linux-x64-portable.tar.gz"
+
+      - name: Upload Artifacts
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: void-linux
+          path: artifacts/
+          retention-days: 90
+
+  build-macos:
+    name: Build on macOS
+    # macos-14: stable Xcode 15 arm64 runner; macos-latest (Xcode 26) breaks native module builds
+    runs-on: macos-14
+    timeout-minutes: 120
+    env:
+      NODE_OPTIONS: --max-old-space-size=8192
+      GYP_DEFINES: kerberos_use_rtld=false
+      # Apple Clang 21+ (Xcode 26 on macos-latest) breaks bundled fmt in @vscode/spdlog
+      CXXFLAGS: -DFMT_CONSTEVAL=
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare macOS build environment
+        run: |
+          set -euo pipefail
+          python3 -m pip install setuptools
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+          # gulp packages darwin policy files from this folder; OSS builds skip policy generation
+          mkdir -p .build/policies/darwin
+          touch .build/policies/darwin/.keep
+
+      - name: Install NPM dependencies
+        run: npm ci
+        env:
+          npm_config_arch: arm64
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Void React bundles
+        run: npm run buildreact
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Rust CLI
+        run: |
+          set -euo pipefail
+          cd cli
+          cargo build --release --bin code
+
+      - name: Package Void for macOS
+        run: |
+          set -euo pipefail
+          mkdir -p .build
+
+          # Use non-min build: mangling conflicts with Void's npm deps (e.g. google-auth-library)
+          npm run gulp vscode-darwin-arm64
+
+          app_root="$(cd .. && pwd)/VSCode-darwin-arm64"
+          if [ ! -d "$app_root" ]; then
+            echo "Expected packaged app at $app_root" >&2
+            exit 1
+          fi
+
+          app_name="$(ls "$app_root" | head -n 1)"
+          app_path="$app_root/$app_name"
+          mkdir -p "$app_path/Contents/Resources/app/bin"
+          cp cli/target/release/code "$app_path/Contents/Resources/app/bin/void-tunnel"
+          chmod +x "$app_path/Contents/Resources/app/bin/void-tunnel"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage release artifacts
+        run: |
+          set -euo pipefail
+          app_root="$(cd .. && pwd)/VSCode-darwin-arm64"
+          app_name="$(ls "$app_root" | head -n 1)"
+
+          mkdir -p artifacts
+          (cd "$app_root" && ditto -c -k --sequesterRsrc --keepParent "$app_name" "$GITHUB_WORKSPACE/artifacts/void-darwin-arm64-portable.zip")
+          echo "Staged portable build: artifacts/void-darwin-arm64-portable.zip"
+
+      - name: Upload Artifacts
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: void-macos
+          path: artifacts/
+          retention-days: 90
