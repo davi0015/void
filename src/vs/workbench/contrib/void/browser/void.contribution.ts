@@ -24,6 +24,7 @@ import './autocompleteService.js'
 
 // settings pane
 import './voidSettingsPane.js'
+import './workspaceSettingsPane.js'
 
 // register css
 import './media/void.css'

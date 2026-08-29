@@ -56,6 +56,7 @@ import { IExtensionManagementService } from '../../../../../../../platform/exten
 import { IMCPService } from '../../../../common/mcpService.js';
 import { IStorageService, StorageScope } from '../../../../../../../platform/storage/common/storage.js'
 import { IQuickInputService } from '../../../../../../../platform/quickinput/common/quickInput.js'
+import { IWorkspaceEnvVarService } from '../../../workspaceEnvVarService.js'
 import { OPT_OUT_KEY } from '../../../../common/storageKeys.js'
 import { ISemanticIndexService, IndexStatus } from '../../../semanticIndexService.js'
 import { registerChatDevTools } from '../../../chatThreadDevTools.js'
@@ -271,6 +272,7 @@ const getReactAccessor = (accessor: ServicesAccessor) => {
 
 		IStorageService: accessor.get(IStorageService),
 		IQuickInputService: accessor.get(IQuickInputService),
+		IWorkspaceEnvVarService: accessor.get(IWorkspaceEnvVarService),
 		ISemanticIndexService: accessor.get(ISemanticIndexService),
 
 	} as const

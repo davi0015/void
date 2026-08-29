@@ -16,6 +16,7 @@ import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { ChatMode, FeatureName, ModelSelection, ProviderName } from '../common/voidSettingsTypes.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
 import { ITerminalToolService } from './terminalToolService.js';
+import { IWorkspaceEnvVarService } from './workspaceEnvVarService.js';
 import { IVoidModelService } from '../common/voidModelService.js';
 import { URI } from '../../../../base/common/uri.js';
 import { EndOfLinePreference } from '../../../../editor/common/model.js';
@@ -932,6 +933,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		@IEditorService private readonly editorService: IEditorService,
 		@IDirectoryStrService private readonly directoryStrService: IDirectoryStrService,
 		@ITerminalToolService private readonly terminalToolService: ITerminalToolService,
+		@IWorkspaceEnvVarService private readonly workspaceEnvVarService: IWorkspaceEnvVarService,
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
 		@IVoidModelService private readonly voidModelService: IVoidModelService,
 		@IMCPService private readonly mcpService: IMCPService,
@@ -1316,7 +1318,8 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			directorySnapshot = currPaths
 		}
 
-		const volatile = chat_volatileContext({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode, includeDirectoryListing, directoryDiff })
+		const activeEnvVarNames = this.workspaceEnvVarService.getActiveVarNames()
+		const volatile = chat_volatileContext({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode, includeDirectoryListing, directoryDiff, activeEnvVarNames })
 		return { volatile, directorySnapshot }
 	}
 

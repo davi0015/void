@@ -276,6 +276,11 @@ registerAction2(class extends Action2 {
 
 
 
+// Workspace env vars are managed in the Workspace Settings editor pane
+// (workspaceSettingsPane.ts), not via QuickPick. The key icon in the view
+// title opens that pane. See workspaceSettingsPane.ts for registration.
+
+
 // export class TabSwitchListener extends Disposable {
 
 // 	constructor(
