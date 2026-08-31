@@ -3367,8 +3367,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	/**
 	 * Show a native notification when a tool requires user approval.
-	 * Includes the user's question as context and the tool call details.
-	 * Approve/Reject buttons act without focusing; clicking the body = View.
+	 * The body shows the agent's last message (its reasoning for the tool call)
+	 * so the user can make an informed approve/reject decision without
+	 * switching to the Void window. Approve/Reject act without focusing;
+	 * clicking the body = View.
 	 */
 	private _notifyAwaitingApproval(threadId: string) {
 		const thread = this.state.allThreads[threadId]
@@ -3377,17 +3379,18 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (pending.length === 0) return
 		const tool = pending[0]
 
-		const userMsg = findLast(thread.messages, m => m.role === 'user')
-		const question = userMsg?.role === 'user' ? truncate(userMsg.displayContent, 80, '...') : ''
-
-		// Build a short description of the tool call from its params
 		const toolDesc = this._getToolDescription(tool)
+		const agentReasoning = this._getLastAssistantText(threadId)
+		const question = this._getLastUserQuestion(threadId)
+		// Prefer the agent's reasoning as the body; fall back to the user's
+		// question if there's no assistant text yet (e.g. first turn).
+		const body = agentReasoning || question
 
 		this._nativeHostService.showNotification({
 			id: `approval:${threadId}`,
-			title: 'Permission needed',
+			title: 'Void needs approval',
 			subtitle: toolDesc,
-			body: question,
+			body,
 			actions: [
 				{ label: 'Approve', actionId: `approve:${threadId}` },
 				{ label: 'Reject', actionId: `reject:${threadId}` },
@@ -3403,13 +3406,41 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const name = tool.name
 		if (name === 'run_command') {
 			const command = tool.rawParams?.command
-			return `run_command: ${truncate(typeof command === 'string' ? command : '', 60, '...')}`
+			return `$ ${truncate(typeof command === 'string' ? command : '', 60, '...')}`
 		}
 		if (name === 'edit_file' || name === 'file_replace') {
 			const fileUri = tool.rawParams?.fileUri
 			return `${name}: ${typeof fileUri === 'string' ? fileUri : ''}`
 		}
 		return name
+	}
+
+	/**
+	 * Get the last assistant message's display text, cleaned and truncated.
+	 * Used as notification body for done/approval notifications.
+	 */
+	private _getLastAssistantText(threadId: string): string {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return ''
+		const msg = findLast(thread.messages, m => m.role === 'assistant')
+		if (msg?.role !== 'assistant') return ''
+		// Strip markdown headers/list markers for cleaner notification display
+		const text = msg.displayContent
+			.replace(/^#+\s+/gm, '')
+			.replace(/^[-*]\s+/gm, '')
+			.replace(/```[\s\S]*?```/g, '[code]')
+			.trim()
+		return truncate(text, 150, '...')
+	}
+
+	/**
+	 * Get the user's last question, truncated for notification display.
+	 */
+	private _getLastUserQuestion(threadId: string): string {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return ''
+		const msg = findLast(thread.messages, m => m.role === 'user')
+		return msg?.role === 'user' ? truncate(msg.displayContent, 80, '...') : ''
 	}
 
 	private _wrapRunAgentToNotify(p: Promise<void>, threadId: string) {
@@ -3421,18 +3452,28 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const isAwaitingApproval = () => this.streamState[threadId]?.isRunning === 'awaiting_user'
 
 		const showDoneNotification = (error: string | null) => {
-			const thread = this.state.allThreads[threadId]
-			const userMsg = thread ? findLast(thread.messages, m => m.role === 'user') : undefined
-			const question = userMsg?.role === 'user' ? truncate(userMsg.displayContent, 80, '...') : ''
+			const question = this._getLastUserQuestion(threadId)
 
-			this._nativeHostService.showNotification({
-				id: error ? `error:${threadId}` : `done:${threadId}`,
-				title: error ? 'Chat error' : 'Chat result ready',
-				subtitle: question,
-				body: error ? truncate(error, 100, '...') : 'Click to view',
-				actions: [],
-				clickActionId: `view:${threadId}`,
-			})
+			if (error) {
+				this._nativeHostService.showNotification({
+					id: `error:${threadId}`,
+					title: 'Void hit an error',
+					subtitle: question,
+					body: truncate(error, 150, '...'),
+					actions: [],
+					clickActionId: `view:${threadId}`,
+				})
+			} else {
+				const answer = this._getLastAssistantText(threadId)
+				this._nativeHostService.showNotification({
+					id: `done:${threadId}`,
+					title: 'Void finished',
+					subtitle: question,
+					body: answer || 'Click to view',
+					actions: [],
+					clickActionId: `view:${threadId}`,
+				})
+			}
 		}
 
 		p.then(() => {
