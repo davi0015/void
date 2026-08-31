@@ -1002,7 +1002,7 @@ export class NativeHostMainService extends Disposable implements INativeHostMain
 	private readonly _onNotificationAction = this._register(new Emitter<string>());
 	readonly onNotificationAction: Event<string> = this._onNotificationAction.event;
 
-	async showNotification(windowId: number | undefined, notification: { id: string, title: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string }): Promise<void> {
+	async showNotification(windowId: number | undefined, notification: { id: string, title: string, subtitle?: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string }): Promise<void> {
 		if (!Notification.isSupported()) {
 			return;
 		}
@@ -1015,6 +1015,7 @@ export class NativeHostMainService extends Disposable implements INativeHostMain
 
 		const n = new Notification({
 			title: notification.title,
+			subtitle: notification.subtitle,
 			body: notification.body,
 			actions: notification.actions.map(a => ({ type: 'button', text: a.label })),
 			closeButtonText: 'Dismiss',

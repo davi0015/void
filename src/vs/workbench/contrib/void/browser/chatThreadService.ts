@@ -30,6 +30,7 @@ import { IVoidModelService } from '../common/voidModelService.js';
 import { IEditCodeService } from './editCodeServiceInterface.js';
 import { ITerminalToolService } from './terminalToolService.js';
 // import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js'; // checkpoint disabled — see checkpoint-storage-refactor.md
+import { findLast } from '../../../../base/common/arraysFind.js';
 import { truncate } from '../../../../base/common/strings.js';
 import { CHECKPOINT_KEY_PREFIX, LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, MESSAGE_KEY_PREFIX, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY, USAGE_KEY_PREFIX } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
@@ -3366,8 +3367,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	/**
 	 * Show a native notification when a tool requires user approval.
-	 * The notification has Approve and Reject action buttons; clicking
-	 * the notification body triggers View (focus + switch to thread).
+	 * Includes the user's question as context and the tool call details.
+	 * Approve/Reject buttons act without focusing; clicking the body = View.
 	 */
 	private _notifyAwaitingApproval(threadId: string) {
 		const thread = this.state.allThreads[threadId]
@@ -3376,16 +3377,39 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (pending.length === 0) return
 		const tool = pending[0]
 
+		const userMsg = findLast(thread.messages, m => m.role === 'user')
+		const question = userMsg?.role === 'user' ? truncate(userMsg.displayContent, 80, '...') : ''
+
+		// Build a short description of the tool call from its params
+		const toolDesc = this._getToolDescription(tool)
+
 		this._nativeHostService.showNotification({
 			id: `approval:${threadId}`,
-			title: `Approval required: ${tool.name}`,
-			body: 'Click Approve or Reject to continue',
+			title: 'Permission needed',
+			subtitle: toolDesc,
+			body: question,
 			actions: [
 				{ label: 'Approve', actionId: `approve:${threadId}` },
 				{ label: 'Reject', actionId: `reject:${threadId}` },
 			],
 			clickActionId: `view:${threadId}`,
 		})
+	}
+
+	/**
+	 * Build a human-readable description of a tool call for notifications.
+	 */
+	private _getToolDescription(tool: ToolMessage<ToolName>): string {
+		const name = tool.name
+		if (name === 'run_command') {
+			const command = tool.rawParams?.command
+			return `run_command: ${truncate(typeof command === 'string' ? command : '', 60, '...')}`
+		}
+		if (name === 'edit_file' || name === 'file_replace') {
+			const fileUri = tool.rawParams?.fileUri
+			return `${name}: ${typeof fileUri === 'string' ? fileUri : ''}`
+		}
+		return name
 	}
 
 	private _wrapRunAgentToNotify(p: Promise<void>, threadId: string) {
@@ -3397,9 +3421,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const isAwaitingApproval = () => this.streamState[threadId]?.isRunning === 'awaiting_user'
 
 		const showDoneNotification = (error: string | null) => {
+			const thread = this.state.allThreads[threadId]
+			const userMsg = thread ? findLast(thread.messages, m => m.role === 'user') : undefined
+			const question = userMsg?.role === 'user' ? truncate(userMsg.displayContent, 80, '...') : ''
+
 			this._nativeHostService.showNotification({
 				id: error ? `error:${threadId}` : `done:${threadId}`,
 				title: error ? 'Chat error' : 'Chat result ready',
+				subtitle: question,
 				body: error ? truncate(error, 100, '...') : 'Click to view',
 				actions: [],
 				clickActionId: `view:${threadId}`,

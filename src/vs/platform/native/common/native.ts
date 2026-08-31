@@ -200,7 +200,7 @@ export interface ICommonNativeHostService {
 
 	// Native notifications (macOS banner alerts with action buttons)
 	readonly onNotificationAction: Event<string>;
-	showNotification(notification: { id: string, title: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string }): Promise<void>;
+	showNotification(notification: { id: string, title: string, subtitle?: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string }): Promise<void>;
 	dismissNotification(id: string): Promise<void>;
 }
 
