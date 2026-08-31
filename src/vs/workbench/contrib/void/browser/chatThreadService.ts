@@ -31,7 +31,7 @@ import { findLast } from '../../../../base/common/arraysFind.js';
 import { IEditCodeService } from './editCodeServiceInterface.js';
 import { ITerminalToolService } from './terminalToolService.js';
 // import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js'; // checkpoint disabled — see checkpoint-storage-refactor.md
-import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
+import { INotificationService, INotificationHandle, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
 import { CHECKPOINT_KEY_PREFIX, LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, MESSAGE_KEY_PREFIX, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY, USAGE_KEY_PREFIX } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
@@ -43,6 +43,7 @@ import { basename as resourceBasename, joinPath } from '../../../../base/common/
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
 import { IHostService } from '../../../services/host/browser/host.js';
+import { INativeHostService } from '../../../../platform/native/common/native.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
 import { buildTestMessages, runSimulatedStream } from './chatThreadDevTools.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
@@ -628,6 +629,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// for approval, it consumes this flag and auto-approves instead of showing
 	// the button — so the user's click isn't swallowed.
 	private readonly _queuedApprovalOfThreadId = new Set<string>()
+	// Menu bar notification tracking: each entry is a pending notification
+	// in the macOS menu bar tray. Keyed by a unique actionId; removed when
+	// the user interacts with it or the notification is no longer relevant.
+	private readonly _menuBarNotifications: Map<string, { label: string, actionId: string, threadId: string, kind: 'approval' | 'done' | 'error' }> = new Map()
+	// In-app notification handles, keyed by threadId+kind, so they can be
+	// dismissed when the user acts from the menu bar tray instead.
+	private readonly _notificationHandleOfThreadKind: Map<string, INotificationHandle> = new Map()
 	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
@@ -663,6 +671,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@ILifecycleService private readonly _lifecycleService: ILifecycleService,
 		@ITerminalToolService private readonly _terminalToolService: ITerminalToolService,
 		@IHostService private readonly _hostService: IHostService,
+		@INativeHostService private readonly _nativeHostService: INativeHostService,
 	) {
 		super()
 		void this._editCodeService // checkpoint disabled — kept for DI, see checkpoint-storage-refactor.md
@@ -853,6 +862,82 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._flushPendingThreadWrites()
 		}))
 
+		// Listen for menu bar tray action clicks (from the macOS menu bar icon).
+		// The actionId encodes the type of action: approve, reject, jump, clear.
+		this._register(this._nativeHostService.onMenuBarNotificationAction(actionId => {
+			this._handleMenuBarAction(actionId)
+		}))
+
+	}
+
+	/**
+	 * Add a notification to the macOS menu bar tray. The actionId encodes
+	 * the action to take when the user clicks the menu item.
+	 */
+	private _addMenuBarNotification(actionId: string, label: string, threadId: string, kind: 'approval' | 'done' | 'error') {
+		// Dedup by kind+threadId, but only within the same action prefix
+		// (approve: and reject: are both 'approval' kind but different actions,
+		// so they should coexist).
+		const actionPrefix = actionId.split(':')[0]
+		for (const [existingId, entry] of this._menuBarNotifications) {
+			if (entry.threadId === threadId && entry.kind === kind && existingId.split(':')[0] === actionPrefix) {
+				this._menuBarNotifications.delete(existingId)
+			}
+		}
+		this._menuBarNotifications.set(actionId, { label, actionId, threadId, kind })
+		this._syncMenuBarNotifications()
+	}
+
+	private _removeMenuBarNotification(actionId: string) {
+		if (this._menuBarNotifications.delete(actionId)) {
+			this._syncMenuBarNotifications()
+		}
+	}
+
+	private _clearMenuBarNotifications() {
+		this._menuBarNotifications.clear()
+		this._syncMenuBarNotifications()
+	}
+
+	private _syncMenuBarNotifications() {
+		const items = Array.from(this._menuBarNotifications.values()).map(n => ({
+			label: n.label,
+			actionId: n.actionId,
+		}))
+		this._nativeHostService.updateMenuBarNotifications(items)
+	}
+
+	private _handleMenuBarAction(actionId: string) {
+		if (actionId === '__clear_all__') {
+			this._clearMenuBarNotifications()
+			return
+		}
+
+		const entry = this._menuBarNotifications.get(actionId)
+		if (!entry) return
+
+		// Focus the window and switch to the thread
+		this._hostService.focus({ force: false } as any).catch(() => { })
+		this.switchToThread(entry.threadId)
+
+		// Execute the action
+		if (entry.kind === 'approval') {
+			// Dismiss the in-app notification and the sibling menu bar entry
+			this._dismissInAppNotification(entry.threadId, 'approval')
+			this._removeMenuBarNotification(`approve:${entry.threadId}`)
+			this._removeMenuBarNotification(`reject:${entry.threadId}`)
+			// Extract approve/reject from the actionId (format: "approve:<threadId>" or "reject:<threadId>")
+			if (actionId.startsWith('approve:')) {
+				this.approveLatestToolRequest(entry.threadId)
+			} else if (actionId.startsWith('reject:')) {
+				this.rejectLatestToolRequest(entry.threadId)
+			}
+		} else {
+			// For 'done' and 'error', dismiss the in-app notification too
+			this._dismissInAppNotification(entry.threadId, entry.kind)
+		}
+
+		this._removeMenuBarNotification(actionId)
 	}
 
 	async focusCurrentChat() {
@@ -3350,7 +3435,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const userMsg = findLast(thread.messages, m => m.role === 'user')
 		const messageContent = userMsg?.role === 'user' ? truncate(userMsg.displayContent, 50, '...') : ''
 
-		this._notificationService.notify({
+		// Also add to the macOS menu bar tray so it's visible from any desktop.
+		// Two entries: one for approve, one for reject.
+		const approveActionId = `approve:${threadId}`
+		const rejectActionId = `reject:${threadId}`
+		this._addMenuBarNotification(approveActionId, `\u2713 Approve ${tool.name}`, threadId, 'approval')
+		this._addMenuBarNotification(rejectActionId, `\u2717 Reject ${tool.name}`, threadId, 'approval')
+
+		const handle = this._notificationService.notify({
 			severity: Severity.Info,
 			message: `Chat requires approval: ${tool.name}`,
 			source: messageContent,
@@ -3364,6 +3456,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						tooltip: '',
 						class: undefined,
 						run: () => {
+							this._removeMenuBarNotification(`approve:${threadId}`)
+							this._removeMenuBarNotification(`reject:${threadId}`)
+							this._dismissInAppNotification(threadId, 'approval')
 							this.switchToThread(threadId)
 							this.approveLatestToolRequest(threadId)
 						}
@@ -3375,6 +3470,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						tooltip: '',
 						class: undefined,
 						run: () => {
+							this._removeMenuBarNotification(`approve:${threadId}`)
+							this._removeMenuBarNotification(`reject:${threadId}`)
+							this._dismissInAppNotification(threadId, 'approval')
 							this.switchToThread(threadId)
 							this.rejectLatestToolRequest(threadId)
 						}
@@ -3395,6 +3493,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				}]
 			},
 		})
+		this._notificationHandleOfThreadKind.set(`${threadId}:approval`, handle)
+	}
+
+	private _dismissInAppNotification(threadId: string, kind: string) {
+		const key = `${threadId}:${kind}`
+		const handle = this._notificationHandleOfThreadKind.get(key)
+		if (handle) {
+			handle.close()
+			this._notificationHandleOfThreadKind.delete(key)
+		}
 	}
 
 	private _wrapRunAgentToNotify(p: Promise<void>, threadId: string) {
@@ -3406,7 +3514,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			if (userMsg.role !== 'user') return
 			const messageContent = truncate(userMsg.displayContent, 50, '...')
 
-			this._notificationService.notify({
+			const handle = this._notificationService.notify({
 				severity: error ? Severity.Warning : Severity.Info,
 				message: error ? `Error: ${error} ` : `A new Chat result is ready.`,
 				source: messageContent,
@@ -3428,14 +3536,28 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					}]
 				},
 			})
+			const kind = error ? 'error' : 'done'
+			this._notificationHandleOfThreadKind.set(`${threadId}:${kind}`, handle)
 		}
 
 		const shouldNotify = () => threadId !== this.state.currentThreadId || !this._hostService.hasFocus
+		// Don't fire "chat ready" when the agent paused for approval —
+		// the approval notification is already shown, and the agent
+		// hasn't actually finished.
+		const isAwaitingApproval = () => this.streamState[threadId]?.isRunning === 'awaiting_user'
+
+		const addMenuBarDone = (error: string | null) => {
+			const actionId = `done:${threadId}:${Date.now()}`
+			const label = error
+				? `\u26A0 Chat error: ${truncate(error, 40, '...')}`
+				: `\u2713 Chat result ready`
+			this._addMenuBarNotification(actionId, label, threadId, error ? 'error' : 'done')
+		}
 
 		p.then(() => {
-			if (shouldNotify()) notify({ error: null })
+			if (shouldNotify() && !isAwaitingApproval()) { notify({ error: null }); addMenuBarDone(null) }
 		}).catch((e) => {
-			if (shouldNotify()) notify({ error: getErrorMessage(e) })
+			if (shouldNotify()) { notify({ error: getErrorMessage(e) }); addMenuBarDone(getErrorMessage(e)) }
 			throw e
 		})
 	}
