@@ -5,7 +5,7 @@
 
 import * as fs from 'fs';
 import { exec } from 'child_process';
-import { app, BrowserWindow, clipboard, Display, Menu, MessageBoxOptions, MessageBoxReturnValue, nativeImage, OpenDevToolsOptions, OpenDialogOptions, OpenDialogReturnValue, powerMonitor, SaveDialogOptions, SaveDialogReturnValue, screen, shell, Tray, webContents } from 'electron';
+import { app, BrowserWindow, clipboard, Display, Menu, MessageBoxOptions, MessageBoxReturnValue, Notification, OpenDevToolsOptions, OpenDialogOptions, OpenDialogReturnValue, powerMonitor, SaveDialogOptions, SaveDialogReturnValue, screen, shell, webContents } from 'electron';
 import { arch, cpus, freemem, loadavg, platform, release, totalmem, type } from 'os';
 import { promisify } from 'util';
 import { memoize } from '../../../base/common/decorators.js';
@@ -995,50 +995,60 @@ export class NativeHostMainService extends Disposable implements INativeHostMain
 
 	//#endregion
 
-	//#region Menu Bar Notifications (macOS tray icon)
+	//#region Native Notifications
 
-	private _tray: Tray | undefined;
+	private readonly _activeNotifications = new Map<string, Notification>();
 
-	private readonly _onMenuBarNotificationAction = this._register(new Emitter<string>());
-	readonly onMenuBarNotificationAction: Event<string> = this._onMenuBarNotificationAction.event;
+	private readonly _onNotificationAction = this._register(new Emitter<string>());
+	readonly onNotificationAction: Event<string> = this._onNotificationAction.event;
 
-	async updateMenuBarNotifications(windowId: number | undefined, items: { label: string, actionId: string }[]): Promise<void> {
+	async showNotification(windowId: number | undefined, notification: { id: string, title: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string }): Promise<void> {
+		if (!Notification.isSupported()) {
+			return;
+		}
 
-		// Build the menu: one item per notification, each with a click handler
-		// that fires the action event back to the renderer.
-		const menuItems: Electron.MenuItemConstructorOptions[] = [];
+		// Close existing notification with same id (dedup)
+		const existing = this._activeNotifications.get(notification.id);
+		if (existing) {
+			existing.close();
+		}
 
-		if (items.length === 0) {
-			menuItems.push({ label: 'No notifications', enabled: false });
-		} else {
-			for (const item of items) {
-				menuItems.push({
-					label: item.label,
-					click: () => {
-						this._onMenuBarNotificationAction.fire(item.actionId);
-					},
-				});
+		const n = new Notification({
+			title: notification.title,
+			body: notification.body,
+			actions: notification.actions.map(a => ({ type: 'button', text: a.label })),
+			closeButtonText: 'Dismiss',
+		});
+
+		n.on('action', (event, index) => {
+			const action = notification.actions[index];
+			if (action) {
+				this._onNotificationAction.fire(action.actionId);
 			}
-			menuItems.push({ type: 'separator' });
-			menuItems.push({
-				label: 'Clear All',
-				click: () => {
-					this._onMenuBarNotificationAction.fire('__clear_all__');
-				},
+			n.close();
+		});
+
+		if (notification.clickActionId) {
+			n.on('click', () => {
+				this._onNotificationAction.fire(notification.clickActionId!);
+				n.close();
 			});
 		}
 
-		// Create the tray on first use
-		if (!this._tray) {
-			const icon = nativeImage.createEmpty();
-			this._tray = new Tray(icon);
-			this._register({ dispose: () => this._tray?.destroy() });
-		}
+		n.on('close', () => {
+			this._activeNotifications.delete(notification.id);
+		});
 
-		// Update badge text and menu
-		this._tray.setTitle(items.length > 0 ? `\u25CF${items.length}` : '');
-		this._tray.setContextMenu(Menu.buildFromTemplate(menuItems));
-		this._tray.setToolTip(items.length > 0 ? `Void: ${items.length} notification${items.length > 1 ? 's' : ''}` : 'Void');
+		this._activeNotifications.set(notification.id, n);
+		n.show();
+	}
+
+	async dismissNotification(windowId: number | undefined, id: string): Promise<void> {
+		const n = this._activeNotifications.get(id);
+		if (n) {
+			n.close();
+			this._activeNotifications.delete(id);
+		}
 	}
 
 	//#endregion

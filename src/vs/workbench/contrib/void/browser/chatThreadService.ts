@@ -27,11 +27,9 @@ import { Position } from '../../../../editor/common/core/position.js';
 import { IMetricsService } from '../common/metricsService.js';
 
 import { IVoidModelService } from '../common/voidModelService.js';
-import { findLast } from '../../../../base/common/arraysFind.js';
 import { IEditCodeService } from './editCodeServiceInterface.js';
 import { ITerminalToolService } from './terminalToolService.js';
 // import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js'; // checkpoint disabled — see checkpoint-storage-refactor.md
-import { INotificationService, INotificationHandle, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
 import { CHECKPOINT_KEY_PREFIX, LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, MESSAGE_KEY_PREFIX, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY, USAGE_KEY_PREFIX } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
@@ -629,13 +627,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// for approval, it consumes this flag and auto-approves instead of showing
 	// the button — so the user's click isn't swallowed.
 	private readonly _queuedApprovalOfThreadId = new Set<string>()
-	// Menu bar notification tracking: each entry is a pending notification
-	// in the macOS menu bar tray. Keyed by a unique actionId; removed when
-	// the user interacts with it or the notification is no longer relevant.
-	private readonly _menuBarNotifications: Map<string, { label: string, actionId: string, threadId: string, kind: 'approval' | 'done' | 'error' }> = new Map()
-	// In-app notification handles, keyed by threadId+kind, so they can be
-	// dismissed when the user acts from the menu bar tray instead.
-	private readonly _notificationHandleOfThreadKind: Map<string, INotificationHandle> = new Map()
+
 	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
@@ -660,7 +652,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// checkpoint disabled — _editCodeService only used by checkpoint methods
 		// kept in constructor for DI ordering; see checkpoint-storage-refactor.md
 		@IEditCodeService private readonly _editCodeService: IEditCodeService,
-		@INotificationService private readonly _notificationService: INotificationService,
 		@IConvertToLLMMessageService private readonly _convertToLLMMessagesService: IConvertToLLMMessageService,
 		@IWorkspaceContextService private readonly _workspaceContextService: IWorkspaceContextService,
 		@IDirectoryStrService private readonly _directoryStringService: IDirectoryStrService,
@@ -862,82 +853,33 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._flushPendingThreadWrites()
 		}))
 
-		// Listen for menu bar tray action clicks (from the macOS menu bar icon).
-		// The actionId encodes the type of action: approve, reject, jump, clear.
-		this._register(this._nativeHostService.onMenuBarNotificationAction(actionId => {
-			this._handleMenuBarAction(actionId)
+		// Listen for native notification action clicks (from macOS notification banners).
+		// The actionId encodes the type of action: approve, reject, view.
+		this._register(this._nativeHostService.onNotificationAction(actionId => {
+			this._handleNotificationAction(actionId)
 		}))
 
 	}
 
 	/**
-	 * Add a notification to the macOS menu bar tray. The actionId encodes
-	 * the action to take when the user clicks the menu item.
+	 * Handle a native notification action click. The actionId encodes
+	 * the action: approve:<threadId>, reject:<threadId>, or view:<threadId>.
 	 */
-	private _addMenuBarNotification(actionId: string, label: string, threadId: string, kind: 'approval' | 'done' | 'error') {
-		// Dedup by kind+threadId, but only within the same action prefix
-		// (approve: and reject: are both 'approval' kind but different actions,
-		// so they should coexist).
-		const actionPrefix = actionId.split(':')[0]
-		for (const [existingId, entry] of this._menuBarNotifications) {
-			if (entry.threadId === threadId && entry.kind === kind && existingId.split(':')[0] === actionPrefix) {
-				this._menuBarNotifications.delete(existingId)
-			}
+	private _handleNotificationAction(actionId: string) {
+		const parts = actionId.split(':')
+		const action = parts[0]
+		const threadId = parts[1]
+
+		if (action === 'approve') {
+			this._nativeHostService.dismissNotification(`approval:${threadId}`)
+			this.approveLatestToolRequest(threadId)
+		} else if (action === 'reject') {
+			this._nativeHostService.dismissNotification(`approval:${threadId}`)
+			this.rejectLatestToolRequest(threadId)
+		} else if (action === 'view') {
+			this._hostService.focus({ force: false } as any).catch(() => { })
+			this.switchToThread(threadId)
 		}
-		this._menuBarNotifications.set(actionId, { label, actionId, threadId, kind })
-		this._syncMenuBarNotifications()
-	}
-
-	private _removeMenuBarNotification(actionId: string) {
-		if (this._menuBarNotifications.delete(actionId)) {
-			this._syncMenuBarNotifications()
-		}
-	}
-
-	private _clearMenuBarNotifications() {
-		this._menuBarNotifications.clear()
-		this._syncMenuBarNotifications()
-	}
-
-	private _syncMenuBarNotifications() {
-		const items = Array.from(this._menuBarNotifications.values()).map(n => ({
-			label: n.label,
-			actionId: n.actionId,
-		}))
-		this._nativeHostService.updateMenuBarNotifications(items)
-	}
-
-	private _handleMenuBarAction(actionId: string) {
-		if (actionId === '__clear_all__') {
-			this._clearMenuBarNotifications()
-			return
-		}
-
-		const entry = this._menuBarNotifications.get(actionId)
-		if (!entry) return
-
-		// Focus the window and switch to the thread
-		this._hostService.focus({ force: false } as any).catch(() => { })
-		this.switchToThread(entry.threadId)
-
-		// Execute the action
-		if (entry.kind === 'approval') {
-			// Dismiss the in-app notification and the sibling menu bar entry
-			this._dismissInAppNotification(entry.threadId, 'approval')
-			this._removeMenuBarNotification(`approve:${entry.threadId}`)
-			this._removeMenuBarNotification(`reject:${entry.threadId}`)
-			// Extract approve/reject from the actionId (format: "approve:<threadId>" or "reject:<threadId>")
-			if (actionId.startsWith('approve:')) {
-				this.approveLatestToolRequest(entry.threadId)
-			} else if (actionId.startsWith('reject:')) {
-				this.rejectLatestToolRequest(entry.threadId)
-			}
-		} else {
-			// For 'done' and 'error', dismiss the in-app notification too
-			this._dismissInAppNotification(entry.threadId, entry.kind)
-		}
-
-		this._removeMenuBarNotification(actionId)
 	}
 
 	async focusCurrentChat() {
@@ -2163,6 +2105,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	approveLatestToolRequest(threadId: string) {
+		this._nativeHostService.dismissNotification(`approval:${threadId}`)
 		if (this._isThreadMutationBlocked(threadId, 'approveLatestToolRequest')) return
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
@@ -2209,6 +2152,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	 * `abortRunning` explicitly passes false.
 	 */
 	rejectLatestToolRequest(threadId: string, resumeAgent: boolean = true) {
+		this._nativeHostService.dismissNotification(`approval:${threadId}`)
 		// Phase E — block user-initiated rejects on read-only foreign threads.
 		// Skip the gate when called as part of `abortRunning` cleanup
 		// (`resumeAgent === false`): an abort is allowed to terminate any
@@ -3421,10 +3365,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 
 	/**
-	 * Fire a notification when a tool requires user approval. Includes
-	 * Approve and Reject buttons so the user can act directly from the
-	 * notification without switching to the chat. Only fires when the user
-	 * is not currently viewing the thread.
+	 * Show a native notification when a tool requires user approval.
+	 * The notification has Approve and Reject action buttons; clicking
+	 * the notification body triggers View (focus + switch to thread).
 	 */
 	private _notifyAwaitingApproval(threadId: string) {
 		const thread = this.state.allThreads[threadId]
@@ -3432,113 +3375,20 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const pending = this._getPendingBatchTools(threadId)
 		if (pending.length === 0) return
 		const tool = pending[0]
-		const userMsg = findLast(thread.messages, m => m.role === 'user')
-		const messageContent = userMsg?.role === 'user' ? truncate(userMsg.displayContent, 50, '...') : ''
 
-		// Also add to the macOS menu bar tray so it's visible from any desktop.
-		// Two entries: one for approve, one for reject.
-		const approveActionId = `approve:${threadId}`
-		const rejectActionId = `reject:${threadId}`
-		this._addMenuBarNotification(approveActionId, `\u2713 Approve ${tool.name}`, threadId, 'approval')
-		this._addMenuBarNotification(rejectActionId, `\u2717 Reject ${tool.name}`, threadId, 'approval')
-
-		const handle = this._notificationService.notify({
-			severity: Severity.Info,
-			message: `Chat requires approval: ${tool.name}`,
-			source: messageContent,
-			sticky: true,
-			actions: {
-				primary: [
-					{
-						id: 'void.approveTool',
-						enabled: true,
-						label: 'Approve',
-						tooltip: '',
-						class: undefined,
-						run: () => {
-							this._removeMenuBarNotification(`approve:${threadId}`)
-							this._removeMenuBarNotification(`reject:${threadId}`)
-							this._dismissInAppNotification(threadId, 'approval')
-							this.switchToThread(threadId)
-							this.approveLatestToolRequest(threadId)
-						}
-					},
-					{
-						id: 'void.rejectTool',
-						enabled: true,
-						label: 'Reject',
-						tooltip: '',
-						class: undefined,
-						run: () => {
-							this._removeMenuBarNotification(`approve:${threadId}`)
-							this._removeMenuBarNotification(`reject:${threadId}`)
-							this._dismissInAppNotification(threadId, 'approval')
-							this.switchToThread(threadId)
-							this.rejectLatestToolRequest(threadId)
-						}
-					},
-				],
-				secondary: [{
-					id: 'void.goToChat',
-					enabled: true,
-					label: 'Jump to Chat',
-					tooltip: '',
-					class: undefined,
-					run: () => {
-						this.switchToThread(threadId)
-						this.state.allThreads[threadId]?.state.mountedInfo?.whenMounted.then(m => {
-							m.scrollToBottom()
-						})
-					}
-				}]
-			},
+		this._nativeHostService.showNotification({
+			id: `approval:${threadId}`,
+			title: `Approval required: ${tool.name}`,
+			body: 'Click Approve or Reject to continue',
+			actions: [
+				{ label: 'Approve', actionId: `approve:${threadId}` },
+				{ label: 'Reject', actionId: `reject:${threadId}` },
+			],
+			clickActionId: `view:${threadId}`,
 		})
-		this._notificationHandleOfThreadKind.set(`${threadId}:approval`, handle)
-	}
-
-	private _dismissInAppNotification(threadId: string, kind: string) {
-		const key = `${threadId}:${kind}`
-		const handle = this._notificationHandleOfThreadKind.get(key)
-		if (handle) {
-			handle.close()
-			this._notificationHandleOfThreadKind.delete(key)
-		}
 	}
 
 	private _wrapRunAgentToNotify(p: Promise<void>, threadId: string) {
-		const notify = ({ error }: { error: string | null }) => {
-			const thread = this.state.allThreads[threadId]
-			if (!thread) return
-			const userMsg = findLast(thread.messages, m => m.role === 'user')
-			if (!userMsg) return
-			if (userMsg.role !== 'user') return
-			const messageContent = truncate(userMsg.displayContent, 50, '...')
-
-			const handle = this._notificationService.notify({
-				severity: error ? Severity.Warning : Severity.Info,
-				message: error ? `Error: ${error} ` : `A new Chat result is ready.`,
-				source: messageContent,
-				sticky: true,
-				actions: {
-					primary: [{
-						id: 'void.goToChat',
-						enabled: true,
-						label: `Jump to Chat`,
-						tooltip: '',
-						class: undefined,
-						run: () => {
-							this.switchToThread(threadId)
-							// scroll to bottom
-							this.state.allThreads[threadId]?.state.mountedInfo?.whenMounted.then(m => {
-								m.scrollToBottom()
-							})
-						}
-					}]
-				},
-			})
-			const kind = error ? 'error' : 'done'
-			this._notificationHandleOfThreadKind.set(`${threadId}:${kind}`, handle)
-		}
 
 		const shouldNotify = () => threadId !== this.state.currentThreadId || !this._hostService.hasFocus
 		// Don't fire "chat ready" when the agent paused for approval —
@@ -3546,18 +3396,20 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// hasn't actually finished.
 		const isAwaitingApproval = () => this.streamState[threadId]?.isRunning === 'awaiting_user'
 
-		const addMenuBarDone = (error: string | null) => {
-			const actionId = `done:${threadId}:${Date.now()}`
-			const label = error
-				? `\u26A0 Chat error: ${truncate(error, 40, '...')}`
-				: `\u2713 Chat result ready`
-			this._addMenuBarNotification(actionId, label, threadId, error ? 'error' : 'done')
+		const showDoneNotification = (error: string | null) => {
+			this._nativeHostService.showNotification({
+				id: error ? `error:${threadId}` : `done:${threadId}`,
+				title: error ? 'Chat error' : 'Chat result ready',
+				body: error ? truncate(error, 100, '...') : 'Click to view',
+				actions: [],
+				clickActionId: `view:${threadId}`,
+			})
 		}
 
 		p.then(() => {
-			if (shouldNotify() && !isAwaitingApproval()) { notify({ error: null }); addMenuBarDone(null) }
+			if (shouldNotify() && !isAwaitingApproval()) { showDoneNotification(null) }
 		}).catch((e) => {
-			if (shouldNotify()) { notify({ error: getErrorMessage(e) }); addMenuBarDone(getErrorMessage(e)) }
+			if (shouldNotify()) { showDoneNotification(getErrorMessage(e)) }
 			throw e
 		})
 	}

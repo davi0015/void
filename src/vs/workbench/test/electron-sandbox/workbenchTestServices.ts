@@ -163,8 +163,9 @@ export class TestNativeHostService implements INativeHostService {
 	async profileRenderer(): Promise<any> { throw new Error(); }
 	async getScreenshot(): Promise<ArrayBufferLike | undefined> { return undefined; }
 
-	onMenuBarNotificationAction: Event<string> = Event.None;
-	async updateMenuBarNotifications(): Promise<void> { }
+	onNotificationAction: Event<string> = Event.None;
+	async showNotification(): Promise<void> { }
+	async dismissNotification(): Promise<void> { }
 }
 
 export class TestExtensionTipsService extends AbstractNativeExtensionTipsService {

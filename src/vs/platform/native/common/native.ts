@@ -198,9 +198,10 @@ export interface ICommonNativeHostService {
 	// Registry (Windows only)
 	windowsGetStringRegKey(hive: 'HKEY_CURRENT_USER' | 'HKEY_LOCAL_MACHINE' | 'HKEY_CLASSES_ROOT' | 'HKEY_USERS' | 'HKEY_CURRENT_CONFIG', path: string, name: string): Promise<string | undefined>;
 
-	// Menu bar notifications (macOS menu bar item showing Void notifications)
-	readonly onMenuBarNotificationAction: Event<string>;
-	updateMenuBarNotifications(items: { label: string, actionId: string }[]): Promise<void>;
+	// Native notifications (macOS banner alerts with action buttons)
+	readonly onNotificationAction: Event<string>;
+	showNotification(notification: { id: string, title: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string }): Promise<void>;
+	dismissNotification(id: string): Promise<void>;
 }
 
 export const INativeHostService = createDecorator<INativeHostService>('nativeHostService');
