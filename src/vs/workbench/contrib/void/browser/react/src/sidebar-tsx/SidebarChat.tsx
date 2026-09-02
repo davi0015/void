@@ -23,12 +23,12 @@ import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
-import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning, Scissors, AlertTriangle } from 'lucide-react';
+import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning, Scissors, AlertTriangle, Brain } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { generateUuid } from '../../../../../../../base/common/uuid.js';
 import { VSBuffer } from '../../../../../../../base/common/buffer.js';
 import { joinPath } from '../../../../../../../base/common/resources.js';
-import { approvalTypeOfBuiltinToolName, type ToolName } from '../../../../common/toolsServiceTypes.js';
+import { approvalTypeOfBuiltinToolName, normalizeThreadPermissionMode, threadPermissionModes, ThreadPermissionMode, type ToolName } from '../../../../common/toolsServiceTypes.js';
 import { IconShell1, StatusIndicator } from '../markdown/ApplyBlockHoverButtons.js';
 import { IsRunningType, isThreadReadOnly, shouldShowOwnershipBanner } from '../../../chatThreadService.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
@@ -141,6 +141,11 @@ export { IconLoading } from './sidebarChatHelpers.js';
 // SLIDER ONLY:
 // When `threadOptions`/`onChangeThreadOptions` are provided, the slider
 // reads/writes per-thread reasoning state instead of the global settings.
+
+// Compact token count for the Thinking slider's value label — "16k" instead
+// of "16384 tokens" so the row stays narrow in a small chat sidebar.
+const compactTokens = (n: number): string => n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`
+
 const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptions }: {
 	featureName: FeatureName,
 	threadOptions?: ModelSelectionOptions,
@@ -173,8 +178,8 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 	}
 
 	if (canTurnOffReasoning && !reasoningBudgetSlider) { // if it's just a on/off toggle without a power slider
-		return <div className='flex items-center gap-x-2'>
-			<span className='text-void-fg-3 text-xs pointer-events-none inline-block w-10 pr-1'>Thinking</span>
+		return <div className='flex items-center gap-x-1'>
+			<Brain size={13} className='text-void-fg-3 pointer-events-none shrink-0' />
 			<VoidSwitch
 				size='xxs'
 				value={isReasoningEnabled}
@@ -197,8 +202,8 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 		const value = isReasoningEnabled ? modelSelectionOptions?.reasoningBudget ?? defaultVal
 			: valueIfOff
 
-		return <div className='flex items-center gap-x-2'>
-			<span className='text-void-fg-3 text-xs pointer-events-none inline-block w-10 pr-1'>Thinking</span>
+		return <div className='flex items-center gap-x-1'>
+			<Brain size={13} className='text-void-fg-3 pointer-events-none shrink-0' />
 			<VoidSlider
 				width={50}
 				size='xs'
@@ -211,7 +216,7 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 					setOptions({ reasoningEnabled: !isOff, reasoningBudget: newVal })
 				}}
 			/>
-			<span className='text-void-fg-3 text-xs pointer-events-none'>{isReasoningEnabled ? `${value} tokens` : 'Thinking disabled'}</span>
+			<span className='text-void-fg-3 text-xs pointer-events-none'>{isReasoningEnabled ? compactTokens(value) : 'Off'}</span>
 		</div>
 	}
 
@@ -228,8 +233,8 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 
 		const currentEffortCapitalized = currentEffort.charAt(0).toUpperCase() + currentEffort.slice(1, Infinity)
 
-		return <div className='flex items-center gap-x-2'>
-			<span className='text-void-fg-3 text-xs pointer-events-none inline-block w-10 pr-1'>Thinking</span>
+		return <div className='flex items-center gap-x-1'>
+			<Brain size={13} className='text-void-fg-3 pointer-events-none shrink-0' />
 			<VoidSlider
 				width={30}
 				size='xs'
@@ -242,7 +247,7 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 					setOptions({ reasoningEnabled: !isOff, reasoningEffort: values[newVal] ?? undefined })
 				}}
 			/>
-			<span className='text-void-fg-3 text-xs pointer-events-none'>{isReasoningEnabled ? `${currentEffortCapitalized}` : 'Thinking disabled'}</span>
+			<span className='text-void-fg-3 text-xs pointer-events-none'>{isReasoningEnabled ? `${currentEffortCapitalized}` : 'Off'}</span>
 		</div>
 	}
 
@@ -284,6 +289,55 @@ const ChatModeDropdown = ({ className }: { className: string }) => {
 		getOptionDisplayName={(val) => nameOfChatMode[val]}
 		getOptionDropdownName={(val) => nameOfChatMode[val]}
 		getOptionDropdownDetail={(val) => detailOfChatMode[val]}
+		getOptionsEqual={(a, b) => a === b}
+	/>
+
+}
+
+
+const nameOfPermissionMode: { [mode in ThreadPermissionMode]: string } = {
+	'read_only': 'Read Only',
+	'workspace_write': 'Workspace Write',
+	'full_access': 'Full Access',
+}
+
+const detailOfPermissionMode: { [mode in ThreadPermissionMode]: string } = {
+	'read_only': 'Always ask before edits',
+	'workspace_write': 'Auto-approve workspace file edits',
+	'full_access': 'Auto-approve all tools and commands',
+}
+
+// Per-chat permission selector (Read Only / Workspace Write / Full Access).
+// Lives in the chat input row next to the model dropdown. The mode is stored
+// on the thread and acts as an additional auto-approval source on top of the
+// global settings: the more permissive of config and this grant applies, so
+// raising a chat's level can skip approvals, but lowering it never restricts
+// below what your global settings already allow. Terminal commands remain
+// governed by your settings + the command allowlist until 'Full Access'.
+const ThreadPermissionDropdown = ({ className }: { className: string }) => {
+	const accessor = useAccessor()
+
+	const chatThreadsService = accessor.get('IChatThreadService')
+	const chatThreadsState = useChatThreadsState()
+
+	const currentThreadId = chatThreadsState.currentThreadId
+	const currentThread = chatThreadsState.allThreads[currentThreadId]
+	const permissionMode = normalizeThreadPermissionMode(currentThread?.permissionMode)
+
+	const options: ThreadPermissionMode[] = useMemo(() => threadPermissionModes, [])
+
+	const onChangeOption = useCallback((newVal: ThreadPermissionMode) => {
+		if (currentThreadId) chatThreadsService.setThreadPermissionMode(currentThreadId, newVal)
+	}, [chatThreadsService, currentThreadId])
+
+	return <VoidCustomDropdownBox
+		className={className}
+		options={options}
+		selectedOption={permissionMode}
+		onChangeOption={onChangeOption}
+		getOptionDisplayName={(val) => nameOfPermissionMode[val]}
+		getOptionDropdownName={(val) => nameOfPermissionMode[val]}
+		getOptionDropdownDetail={(val) => detailOfPermissionMode[val]}
 		getOptionsEqual={(a, b) => a === b}
 	/>
 
@@ -872,17 +926,30 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 			{/* Bottom row */}
 			<div className='flex flex-row justify-between items-end gap-1'>
 				{showModelDropdown && (
-					<div className='flex flex-col gap-y-1'>
-						<ReasoningOptionSlider featureName={featureName} threadOptions={threadReasoningOptions} onChangeThreadOptions={onChangeThreadReasoningOptions} />
-
-						<div className='flex items-center flex-wrap gap-x-2 gap-y-1 text-nowrap '>
-							{featureName === 'Chat' && <ChatModeDropdown className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-2 rounded py-0.5 px-1' />}
-							<ModelDropdown featureName={featureName} className='text-xs text-void-fg-3 bg-void-bg-1 rounded' />
+					// One wrapping row holding all input-row controls. Order is
+					// grouped semantically: behavior chips first (chat mode,
+					// permission), then the model pair (thinking level, model) —
+					// thinking is a property of the selected model, so they stay
+					// adjacent. The pair sits in its own nested flex container,
+					// so when the row is too narrow the pair moves to the next
+					// line TOGETHER (behavior chips stay on line 1) instead of
+					// the model drifting down alone. The pair has `flex-auto`
+					// and the model inside it `flex-auto min-w-0`, so the model
+					// still stretches to the row's right edge and ellipsizes
+					// long names (its dropdown menu still shows full names).
+					// `flex-1 min-w-0` on the row lets it shrink below its
+					// content instead of overflowing the chat area horizontally.
+					<div className='flex flex-wrap items-center gap-x-1.5 gap-y-1 flex-1 min-w-0 text-nowrap'>
+						{featureName === 'Chat' && <ChatModeDropdown className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-2 rounded py-0.5 px-1' />}
+						{featureName === 'Chat' && <ThreadPermissionDropdown className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-2 rounded py-0.5 px-1' />}
+						<div className='flex flex-wrap items-center gap-x-1.5 gap-y-1 flex-auto min-w-0'>
+							<ReasoningOptionSlider featureName={featureName} threadOptions={threadReasoningOptions} onChangeThreadOptions={onChangeThreadReasoningOptions} />
+							<ModelDropdown featureName={featureName} className='text-xs text-void-fg-3 bg-void-bg-1 rounded flex-auto min-w-0' />
 						</div>
 					</div>
 				)}
 
-				<div className="flex items-center gap-1.5">
+				<div className="flex items-center gap-1.5 shrink-0">
 
 					{isStreaming && loadingIcon}
 
