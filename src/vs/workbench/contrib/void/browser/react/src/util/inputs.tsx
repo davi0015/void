@@ -347,6 +347,11 @@ type InputBox2Props = {
 	placeholder: string;
 	multiline: boolean;
 	enableAtToMention?: boolean;
+	// Opt-in: keep the textarea at the height given by `className` (e.g.
+	// `h-[81px]`) instead of auto-growing with content. Long text scrolls
+	// inside the box (the textarea is `overflow-y-auto` by default). Used by
+	// the chat input so typing doesn't resize the chat area.
+	fixedHeight?: boolean;
 	fnsRef?: { current: null | TextAreaFns };
 	className?: string;
 	onChangeText?: (value: string) => void;
@@ -356,7 +361,7 @@ type InputBox2Props = {
 	onBlur?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
 	onChangeHeight?: (newHeight: number) => void;
 }
-export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(function X({ initValue, placeholder, multiline, enableAtToMention, fnsRef, className, onKeyDown, onPaste, onFocus, onBlur, onChangeText }, ref) {
+export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(function X({ initValue, placeholder, multiline, enableAtToMention, fixedHeight, fnsRef, className, onKeyDown, onPaste, onFocus, onBlur, onChangeText }, ref) {
 
 
 	// mirrors whatever is in ref
@@ -702,6 +707,10 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 	const adjustHeight = useCallback(() => {
 		const r = textAreaRef.current
 		if (!r) return
+		// Fixed-height mode: the caller pins the height via className (e.g.
+		// `h-[81px]`); never write an inline height, so overflowing text
+		// scrolls inside the box instead of growing it.
+		if (fixedHeight) return
 
 		r.style.height = 'auto' // set to auto to reset height, then set to new height
 
@@ -709,7 +718,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 		const h = r.scrollHeight
 		const newHeight = Math.min(h + 1, 500) // plus one to avoid scrollbar appearing when it shouldn't
 		r.style.height = `${newHeight}px`
-	}, []);
+	}, [fixedHeight]);
 
 
 

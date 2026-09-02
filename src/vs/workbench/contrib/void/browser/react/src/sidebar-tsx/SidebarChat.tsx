@@ -1606,7 +1606,8 @@ const UserMessageComponent = ({ chatMessage, messageIdx, /* isCheckpointGhost, *
 			<VoidInputBox2
 				enableAtToMention
 				ref={setTextAreaRef}
-				className='min-h-[81px] max-h-[500px] px-0.5'
+				fixedHeight
+				className='h-[81px] px-0.5'
 				placeholder="Edit your message..."
 				onChangeText={(text) => setIsDisabled(!text)}
 				onPaste={editImageUploadEnabled ? editImageAttach.onPaste : undefined}
@@ -3500,7 +3501,8 @@ export const SidebarChat = () => {
 			<VoidInputBox2
 				enableAtToMention
 				initValue={draftForCurrentThread || null}
-				className={`min-h-[81px] px-0.5 py-0.5`}
+				fixedHeight
+				className={`h-[81px] px-0.5 py-0.5`}
 				placeholder={`@ to mention, ${keybindingString ? `${keybindingString} to add a selection. ` : ''}Enter instructions...`}
 				onChangeText={onChangeText}
 				onKeyDown={onKeyDown}
