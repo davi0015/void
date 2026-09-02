@@ -468,6 +468,9 @@ export type GlobalSettings = {
 	autoRefreshModels: boolean;
 	aiInstructions: string;
 	enableAutocomplete: boolean;
+	notificationsEnabled: boolean;
+	notifyOnApproval: boolean;
+	notifyOnDone: boolean;
 	syncApplyToChat: boolean;
 	syncSCMToChat: boolean;
 	enableFastApply: boolean;
@@ -498,6 +501,9 @@ export const defaultGlobalSettings: GlobalSettings = {
 	autoRefreshModels: true,
 	aiInstructions: '',
 	enableAutocomplete: false,
+	notificationsEnabled: true,
+	notifyOnApproval: true,
+	notifyOnDone: true,
 	syncApplyToChat: true,
 	syncSCMToChat: true,
 	enableFastApply: true,
@@ -521,17 +527,6 @@ export const defaultGlobalSettings: GlobalSettings = {
 
 export type GlobalSettingName = keyof GlobalSettings
 export const globalSettingNames = Object.keys(defaultGlobalSettings) as GlobalSettingName[]
-
-
-
-
-
-
-
-
-
-
-
 
 export type ModelSelectionOptions = {
 	reasoningEnabled?: boolean;

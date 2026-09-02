@@ -1872,6 +1872,50 @@ export const Settings = () => {
 
 
 										<div className='w-full'>
+											<h4 className={`text-base`}>Notifications</h4>
+											<div className='text-sm text-void-fg-3 mt-1'>{`Floating notifications let you approve or view chats without switching to Void.`}</div>
+
+											<div className='my-2'>
+												{/* Notifications Switch */}
+												<ErrorBoundary>
+													<div className='flex items-center gap-x-2 my-2'>
+														<VoidSwitch
+															size='xs'
+															value={settingsState.globalSettings.notificationsEnabled}
+															onChange={(newVal) => voidSettingsService.setGlobalSetting('notificationsEnabled', newVal)}
+														/>
+														<span className='text-void-fg-3 text-xs pointer-events-none'>Chat notifications</span>
+													</div>
+												</ErrorBoundary>
+
+												{/* Per-type switches - only relevant when notifications are on */}
+												{settingsState.globalSettings.notificationsEnabled && <>
+													<ErrorBoundary>
+														<div className='flex items-center gap-x-2 my-2'>
+															<VoidSwitch
+																size='xs'
+																value={settingsState.globalSettings.notifyOnApproval}
+																onChange={(newVal) => voidSettingsService.setGlobalSetting('notifyOnApproval', newVal)}
+															/>
+															<span className='text-void-fg-3 text-xs pointer-events-none'>When a tool needs approval</span>
+														</div>
+													</ErrorBoundary>
+
+													<ErrorBoundary>
+														<div className='flex items-center gap-x-2 my-2'>
+															<VoidSwitch
+																size='xs'
+																value={settingsState.globalSettings.notifyOnDone}
+																onChange={(newVal) => voidSettingsService.setGlobalSetting('notifyOnDone', newVal)}
+															/>
+															<span className='text-void-fg-3 text-xs pointer-events-none'>When a chat finishes or errors</span>
+														</div>
+													</ErrorBoundary>
+												</>}
+											</div>
+										</div>
+
+										<div className='w-full'>
 											<h4 className={`text-base`}>Editor</h4>
 											<div className='text-sm text-void-fg-3 mt-1'>{`Settings that control the visibility of Void suggestions in the code editor.`}</div>
 

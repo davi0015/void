@@ -25,17 +25,19 @@ export type VoidNotification = {
  * elements stops the web-content focus chain from triggering macOS app
  * activation when clicking buttons.
  *
- * Global keyboard shortcuts (⌘⇧A / ⌘⇧R / ⌘⇧V) provide a zero-focus alternative.
+ * Global keyboard shortcuts (⌘⇧A / ⌘⇧R) provide a zero-focus alternative.
  */
 export class VoidNotificationService extends Disposable {
 
-	private readonly _notificationWindows = new Map<string, { window: BrowserWindow; timeout: NodeJS.Timeout | undefined; shortcuts: string[] }>();
+	private readonly _notificationWindows = new Map<string, { window: BrowserWindow; timeout: NodeJS.Timeout | undefined; shortcuts: string[]; height: number }>();
 
 	private readonly _onNotificationAction = this._register(new Emitter<string>());
 	readonly onNotificationAction: Event<string> = this._onNotificationAction.event;
 
 	private static readonly NOTIFICATION_WIDTH = 360;
-	private static readonly NOTIFICATION_HEIGHT = 180;
+	private static readonly NOTIFICATION_DEFAULT_HEIGHT = 180;
+	private static readonly NOTIFICATION_MIN_HEIGHT = 120;
+	private static readonly NOTIFICATION_MAX_HEIGHT = 260;
 	private static readonly NOTIFICATION_MARGIN = 20;
 	private static readonly NOTIFICATION_GAP = 10;
 	private static readonly NOTIFICATION_TIMEOUT_MS = 12000;
@@ -46,11 +48,14 @@ export class VoidNotificationService extends Disposable {
 
 		const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
 		const x = display.workArea.x + display.workArea.width - VoidNotificationService.NOTIFICATION_WIDTH - VoidNotificationService.NOTIFICATION_MARGIN;
-		const y = display.workArea.y + VoidNotificationService.NOTIFICATION_MARGIN + this._notificationWindows.size * (VoidNotificationService.NOTIFICATION_HEIGHT + VoidNotificationService.NOTIFICATION_GAP);
+		let y = display.workArea.y + VoidNotificationService.NOTIFICATION_MARGIN;
+		for (const [, entry] of this._notificationWindows) {
+			y += entry.height + VoidNotificationService.NOTIFICATION_GAP;
+		}
 
 		const win = new BrowserWindow({
 			width: VoidNotificationService.NOTIFICATION_WIDTH,
-			height: VoidNotificationService.NOTIFICATION_HEIGHT,
+			height: VoidNotificationService.NOTIFICATION_DEFAULT_HEIGHT,
 			x,
 			y,
 			frame: false,
@@ -73,7 +78,6 @@ export class VoidNotificationService extends Disposable {
 		});
 
 		win.setAlwaysOnTop(true, 'floating');
-		win.showInactive();
 
 		// Button/click actions use console.log — intercept via console-message.
 		win.webContents.on('console-message', (event, _level, message) => {
@@ -85,6 +89,28 @@ export class VoidNotificationService extends Disposable {
 				}
 				this.dismissNotification(notification.id);
 			}
+		});
+
+		// Size the window to its content (capped) so the buttons are always
+		// visible with long bodies, then show. The fallback timer covers a
+		// failed/slow measurement; isDestroyed guards a dismissal in between.
+		let shown = false;
+		const showNow = () => {
+			if (shown) return;
+			shown = true;
+			if (!win.isDestroyed()) win.showInactive();
+		};
+		const fallbackTimer = setTimeout(showNow, 1000);
+		win.webContents.once('did-finish-load', () => {
+			win.webContents.executeJavaScript('Math.ceil(document.body.scrollHeight)').then(measured => {
+				const contentHeight = typeof measured === 'number' && measured > 0 ? measured : VoidNotificationService.NOTIFICATION_DEFAULT_HEIGHT;
+				const height = Math.min(Math.max(contentHeight, VoidNotificationService.NOTIFICATION_MIN_HEIGHT), VoidNotificationService.NOTIFICATION_MAX_HEIGHT);
+				const entry = this._notificationWindows.get(notification.id);
+				if (entry) entry.height = height;
+				win.setContentSize(VoidNotificationService.NOTIFICATION_WIDTH, height);
+				showNow();
+				this._repositionNotifications();
+			}).catch(() => showNow()).finally(() => clearTimeout(fallbackTimer));
 		});
 
 		const html = this._buildNotificationHtml(notification);
@@ -101,7 +127,7 @@ export class VoidNotificationService extends Disposable {
 		// Register global keyboard shortcuts for action buttons
 		const shortcuts: string[] = [];
 		if (notification.actions.length > 0) {
-			const shortcutAccels = ['CmdOrCtrl+Shift+A', 'CmdOrCtrl+Shift+R', 'CmdOrCtrl+Shift+V'];
+			const shortcutAccels = ['CmdOrCtrl+Shift+A', 'CmdOrCtrl+Shift+R'];
 			notification.actions.forEach((action, i) => {
 				const accel = shortcutAccels[i];
 				if (accel && globalShortcut.register(accel, () => {
@@ -113,7 +139,7 @@ export class VoidNotificationService extends Disposable {
 			});
 		}
 
-		this._notificationWindows.set(notification.id, { window: win, timeout, shortcuts });
+		this._notificationWindows.set(notification.id, { window: win, timeout, shortcuts, height: VoidNotificationService.NOTIFICATION_DEFAULT_HEIGHT });
 	}
 
 	async dismissNotification(id: string): Promise<void> {
@@ -130,13 +156,13 @@ export class VoidNotificationService extends Disposable {
 
 	private _repositionNotifications(): void {
 		const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
-		let i = 0;
+		let y = display.workArea.y + VoidNotificationService.NOTIFICATION_MARGIN;
 		for (const [, entry] of this._notificationWindows) {
 			entry.window.setPosition(
 				display.workArea.x + display.workArea.width - VoidNotificationService.NOTIFICATION_WIDTH - VoidNotificationService.NOTIFICATION_MARGIN,
-				display.workArea.y + VoidNotificationService.NOTIFICATION_MARGIN + i * (VoidNotificationService.NOTIFICATION_HEIGHT + VoidNotificationService.NOTIFICATION_GAP)
+				y
 			);
-			i++;
+			y += entry.height + VoidNotificationService.NOTIFICATION_GAP;
 		}
 	}
 
@@ -181,14 +207,15 @@ body {
   box-shadow: 0 8px 32px rgba(0,0,0,0.4);
 }
 .container { cursor: pointer; }
-.title { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
-.subtitle { font-size: 13px; color: #8e8e93; margin-bottom: 6px; font-weight: 500; }
-.body { font-size: 13px; color: #aeaeb2; line-height: 1.4; margin-bottom: ${buttonsHtml ? '12px' : '0'}; white-space: pre-wrap; word-break: break-word; }
-.buttons { display: flex; gap: 8px; }
+.title { font-size: 14px; font-weight: 600; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.subtitle { font-size: 13px; color: #8e8e93; margin-bottom: 6px; font-weight: 500; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.body { font-size: 13px; color: #aeaeb2; line-height: 1.4; margin-bottom: ${buttonsHtml ? '12px' : '0'}; white-space: pre-wrap; word-break: break-word; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5; overflow: hidden; }
+.buttons { display: flex; gap: 6px; }
 .btn {
-  flex: 1; padding: 6px 12px; border: none; border-radius: 6px;
-  font-size: 13px; font-weight: 500; cursor: pointer; text-align: center;
+  flex: 1; padding: 6px 8px; border: none; border-radius: 6px;
+  font-size: 12px; font-weight: 500; cursor: pointer; text-align: center;
   display: flex; align-items: center; justify-content: center; gap: 6px;
+  white-space: nowrap;
 }
 .shortcut { font-size: 10px; opacity: 0.6; }
 .btn-approve { background: #30d158; color: #000; }
