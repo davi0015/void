@@ -3444,17 +3444,18 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	/**
 	 * Whether this pending tool would pause for approval: it is approval-gated
 	 * and not auto-approved by the user's auto-approve settings (including the
-	 * terminal allowlist). Mirrors the decision _runToolCall makes.
+	 * thread's permission mode and the terminal allowlist). Mirrors the decision
+	 * _runToolCall makes.
 	 */
-	private _toolWouldPauseForApproval(tool: ToolMessage<ToolName> & { type: 'tool_request' }): boolean {
+	private _toolWouldPauseForApproval(threadId: string, tool: ToolMessage<ToolName> & { type: 'tool_request' }): boolean {
 		if (!isABuiltinToolName(tool.name)) {
 			// MCP tools are always approval-gated; 'workspace' acts as 'all' for them
-			const mcpMode = normalizeAutoApproveMode(this._settingsService.state.globalSettings.autoApprove['MCP tools'])
+			const mcpMode = effectiveAutoApproveMode('MCP tools', this._settingsService.state.globalSettings.autoApprove['MCP tools'], this.state.allThreads[threadId]?.permissionMode)
 			return mcpMode === 'off'
 		}
 		const approvalType = approvalTypeOfBuiltinToolName[tool.name]
 		if (!approvalType) return false
-		const mode = normalizeAutoApproveMode(this._settingsService.state.globalSettings.autoApprove[approvalType])
+		const mode = effectiveAutoApproveMode(approvalType, this._settingsService.state.globalSettings.autoApprove[approvalType], this.state.allThreads[threadId]?.permissionMode)
 		let autoApprove = false
 		if (mode === 'all') {
 			autoApprove = true
@@ -3499,7 +3500,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					editFileUrisSeen.push(uri)
 				}
 			}
-			if (this._toolWouldPauseForApproval(tool)) count++
+			if (this._toolWouldPauseForApproval(threadId, tool)) count++
 		}
 		return count
 	}
