@@ -23,7 +23,7 @@ import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
-import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning, Scissors, AlertTriangle } from 'lucide-react';
+import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning, Scissors, AlertTriangle, Brain } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { generateUuid } from '../../../../../../../base/common/uuid.js';
 import { VSBuffer } from '../../../../../../../base/common/buffer.js';
@@ -178,8 +178,8 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 	}
 
 	if (canTurnOffReasoning && !reasoningBudgetSlider) { // if it's just a on/off toggle without a power slider
-		return <div className='flex items-center gap-x-2'>
-			<span className='text-void-fg-3 text-xs pointer-events-none shrink-0'>Thinking</span>
+		return <div className='flex items-center gap-x-1'>
+			<Brain size={13} className='text-void-fg-3 pointer-events-none shrink-0' />
 			<VoidSwitch
 				size='xxs'
 				value={isReasoningEnabled}
@@ -202,8 +202,8 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 		const value = isReasoningEnabled ? modelSelectionOptions?.reasoningBudget ?? defaultVal
 			: valueIfOff
 
-		return <div className='flex items-center gap-x-2'>
-			<span className='text-void-fg-3 text-xs pointer-events-none shrink-0'>Thinking</span>
+		return <div className='flex items-center gap-x-1'>
+			<Brain size={13} className='text-void-fg-3 pointer-events-none shrink-0' />
 			<VoidSlider
 				width={50}
 				size='xs'
@@ -233,8 +233,8 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 
 		const currentEffortCapitalized = currentEffort.charAt(0).toUpperCase() + currentEffort.slice(1, Infinity)
 
-		return <div className='flex items-center gap-x-2'>
-			<span className='text-void-fg-3 text-xs pointer-events-none shrink-0'>Thinking</span>
+		return <div className='flex items-center gap-x-1'>
+			<Brain size={13} className='text-void-fg-3 pointer-events-none shrink-0' />
 			<VoidSlider
 				width={30}
 				size='xs'
