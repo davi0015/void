@@ -48,6 +48,7 @@ import { IConfigurationService } from '../../configuration/common/configuration.
 import { IProxyAuthService } from './auth.js';
 import { AuthInfo, Credentials, IRequestService } from '../../request/common/request.js';
 import { randomPath } from '../../../base/common/extpath.js';
+import { VoidNotificationService } from '../../../workbench/contrib/void/electron-main/voidNotificationService.js';
 
 export interface INativeHostMainService extends AddFirstParameterToFunctions<ICommonNativeHostService, Promise<unknown> /* only methods, not events */, number | undefined /* window ID */> { }
 
@@ -991,6 +992,22 @@ export class NativeHostMainService extends Disposable implements INativeHostMain
 		} catch {
 			return undefined;
 		}
+	}
+
+	//#endregion
+
+	//#region Void Notifications (delegates to VoidNotificationService)
+
+	private readonly _voidNotificationService = this._register(new VoidNotificationService());
+
+	readonly onNotificationAction: Event<string> = this._voidNotificationService.onNotificationAction;
+
+	async showNotification(windowId: number | undefined, notification: { id: string, title: string, threadTitle?: string, subtitle?: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string, sound?: boolean }): Promise<void> {
+		await this._voidNotificationService.showNotification(notification);
+	}
+
+	async dismissNotification(windowId: number | undefined, id: string): Promise<void> {
+		await this._voidNotificationService.dismissNotification(id);
 	}
 
 	//#endregion

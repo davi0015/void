@@ -31,7 +31,6 @@ import { findLast } from '../../../../base/common/arraysFind.js';
 import { IEditCodeService } from './editCodeServiceInterface.js';
 import { ITerminalToolService } from './terminalToolService.js';
 // import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js'; // checkpoint disabled — see checkpoint-storage-refactor.md
-import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
 import { CHECKPOINT_KEY_PREFIX, LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, MESSAGE_KEY_PREFIX, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY, USAGE_KEY_PREFIX } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
@@ -42,6 +41,8 @@ import { IWorkspaceContextService, toWorkspaceIdentifier } from '../../../../pla
 import { basename as resourceBasename, joinPath } from '../../../../base/common/resources.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
+import { IHostService } from '../../../services/host/browser/host.js';
+import { INativeHostService } from '../../../../platform/native/common/native.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
 import { buildTestMessages, runSimulatedStream } from './chatThreadDevTools.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
@@ -648,6 +649,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// for approval, it consumes this flag and auto-approves instead of showing
 	// the button — so the user's click isn't swallowed.
 	private readonly _queuedApprovalOfThreadId = new Set<string>()
+	// "Approve all" (from the notification): auto-approve every remaining tool
+	// in the current batch of this thread. Cleared when the batch drains or is
+	// rejected/aborted — later turns still ask for approval individually.
+	private readonly _autoApproveRestOfBatchOfThreadId = new Set<string>()
 	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
@@ -672,7 +677,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// checkpoint disabled — _editCodeService only used by checkpoint methods
 		// kept in constructor for DI ordering; see checkpoint-storage-refactor.md
 		@IEditCodeService private readonly _editCodeService: IEditCodeService,
-		@INotificationService private readonly _notificationService: INotificationService,
 		@IConvertToLLMMessageService private readonly _convertToLLMMessagesService: IConvertToLLMMessageService,
 		@IWorkspaceContextService private readonly _workspaceContextService: IWorkspaceContextService,
 		@IDirectoryStrService private readonly _directoryStringService: IDirectoryStrService,
@@ -682,6 +686,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IEnvironmentService private readonly _environmentService: IEnvironmentService,
 		@ILifecycleService private readonly _lifecycleService: ILifecycleService,
 		@ITerminalToolService private readonly _terminalToolService: ITerminalToolService,
+		@IHostService private readonly _hostService: IHostService,
+		@INativeHostService private readonly _nativeHostService: INativeHostService,
 	) {
 		super()
 		void this._editCodeService // checkpoint disabled — kept for DI, see checkpoint-storage-refactor.md
@@ -872,6 +878,45 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._flushPendingThreadWrites()
 		}))
 
+		// Listen for notification action clicks (from the floating notification windows).
+		// The actionId encodes the type of action: approve, reject, view.
+		this._register(this._nativeHostService.onNotificationAction(actionId => {
+			this._handleNotificationAction(actionId)
+		}))
+
+	}
+
+	/**
+	 * Handle a notification action click. The actionId encodes
+	 * the action: approve:<threadId>, reject:<threadId>, or view:<threadId>.
+	 */
+	private _handleNotificationAction(actionId: string) {
+		const parts = actionId.split(':')
+		const action = parts[0]
+		const threadId = parts[1]
+
+		if (action === 'approve') {
+			this._nativeHostService.dismissNotification(`approval:${threadId}`)
+			this.approveLatestToolRequest(threadId)
+		} else if (action === 'approve_all') {
+			this._nativeHostService.dismissNotification(`approval:${threadId}`)
+			this.approveAllToolRequests(threadId)
+		} else if (action === 'reject') {
+			this._nativeHostService.dismissNotification(`approval:${threadId}`)
+			this.rejectLatestToolRequest(threadId)
+		} else if (action === 'view') {
+			this._hostService.focus({ force: false } as any).catch(() => { })
+			this.switchToThread(threadId)
+		} else if (action === 'reply') {
+			// reply:<threadId>:<encodeURIComponent'd text> — sent from the
+			// notification's reply input. addUserMessageAndStreamResponse wraps
+			// the agent run with _wrapRunAgentToNotify, so the next completion
+			// fires its own notification.
+			const replyText = decodeURIComponent(parts.slice(2).join(':')).trim()
+			if (!replyText || !threadId) return
+			this._nativeHostService.dismissNotification(`done:${threadId}`)
+			this.addUserMessageAndStreamResponse({ userMessage: replyText, threadId })
+		}
 	}
 
 	async focusCurrentChat() {
@@ -1589,8 +1634,20 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// must supersede any pending throttled stream-text update for this thread,
 		// otherwise the delayed flush could overwrite the new authoritative state.
 		this._cancelPendingStreamTextUpdate(threadId)
+
+		const prev = this.streamState[threadId]
 		this.streamState[threadId] = state
 		this._onDidChangeStreamState.fire({ threadId })
+
+		// Fire an approval notification when transitioning to 'awaiting_user',
+		// but only if the user is not currently viewing this thread or the
+		// window doesn't have focus. If they're on Void, they can see the
+		// approval button directly — no notification needed.
+		if (state?.isRunning === 'awaiting_user' && prev?.isRunning !== 'awaiting_user') {
+			if (threadId !== this.state.currentThreadId || !this._hostService.hasFocus) {
+				this._notifyAwaitingApproval(threadId)
+			}
+		}
 	}
 
 	// Per-thread coalescer for streaming-text updates. LLM chunks can arrive
@@ -1961,9 +2018,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// If the stream was cleared (e.g. by abortRunning) while a tool was
 			// finishing, stop processing — the caller must not continue the
 			// agent loop or it will overwrite the cleared state.
-			if (this.streamState[threadId] === undefined) return 'interrupted'
+			if (this.streamState[threadId] === undefined) {
+				this._autoApproveRestOfBatchOfThreadId.delete(threadId)
+				return 'interrupted'
+			}
 			const pending = this._getPendingBatchTools(threadId)
 			if (pending.length === 0) {
+				// Batch finished — clear the "Approve all" flag so later turns
+				// ask for approval individually.
+				this._autoApproveRestOfBatchOfThreadId.delete(threadId)
 				// No more pending tools — if concurrent terminal tools are still
 				// running, return 'awaiting_user' so the caller doesn't resume the
 				// agent prematurely. _checkAndContinueAfterConcurrentResolution
@@ -2048,8 +2111,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// If the user queued an approval while a previous tool was running,
 			// skip the approval pause and run directly. The validated params are
 			// already on the tool_request message (validated when the batch was
-			// pre-added), so we can pass them straight through.
-			if (this._queuedApprovalOfThreadId.has(threadId)) {
+			// pre-added), so we can pass them straight through. "Approve all"
+			// (from the notification) instead sets a flag that applies to every
+			// remaining tool in this batch — the flag is cleared when the batch
+			// finishes, so later turns still ask for approval.
+			const approveRestOfBatch = this._autoApproveRestOfBatchOfThreadId.has(threadId)
+			if (approveRestOfBatch || this._queuedApprovalOfThreadId.has(threadId)) {
 				this._queuedApprovalOfThreadId.delete(threadId)
 				const { interrupted: interruptedQ } = await this._runToolCall(
 					threadId, next.name, next.id, next.mcpServerName,
@@ -2061,7 +2128,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				if (!interruptedQ) {
 					this._recordMergedSiblingOutcomes(threadId, next.id)
 				}
-				if (interruptedQ) return 'interrupted'
+				if (interruptedQ) {
+					this._autoApproveRestOfBatchOfThreadId.delete(threadId)
+					return 'interrupted'
+				}
 				continue
 			}
 
@@ -2081,12 +2151,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				this._recordMergedSiblingOutcomes(threadId, next.id)
 			}
 
-			if (interrupted) return 'interrupted'
+			if (interrupted) {
+				this._autoApproveRestOfBatchOfThreadId.delete(threadId)
+				return 'interrupted'
+			}
+			// Keep the "Approve all" flag when pausing — remaining tools in this
+			// batch are still pending and should be auto-approved when the user
+			// approves the current one.
 			if (awaitingUserApproval) return 'awaiting_user'
 		}
 	}
 
 	approveLatestToolRequest(threadId: string) {
+		this._nativeHostService.dismissNotification(`approval:${threadId}`)
 		if (this._isThreadMutationBlocked(threadId, 'approveLatestToolRequest')) return
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
@@ -2118,6 +2195,20 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			, threadId
 		)
 	}
+
+	/**
+	 * Approve the current pending tool and auto-approve every remaining tool in
+	 * the same batch (notification "Approve all"). Later turns still ask for
+	 * approval individually — the flag is cleared when the batch drains.
+	 */
+	approveAllToolRequests(threadId: string) {
+		this._nativeHostService.dismissNotification(`approval:${threadId}`)
+		this._autoApproveRestOfBatchOfThreadId.add(threadId)
+		// approveLatestToolRequest handles the not-yet-awaiting case (queues the
+		// approval) and kicks off the agent with the first pending tool.
+		this.approveLatestToolRequest(threadId)
+	}
+
 	/**
 	 * Reject a pending tool request.
 	 *
@@ -2133,6 +2224,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	 * `abortRunning` explicitly passes false.
 	 */
 	rejectLatestToolRequest(threadId: string, resumeAgent: boolean = true) {
+		this._nativeHostService.dismissNotification(`approval:${threadId}`)
 		// Phase E — block user-initiated rejects on read-only foreign threads.
 		// Skip the gate when called as part of `abortRunning` cleanup
 		// (`resumeAgent === false`): an abort is allowed to terminate any
@@ -2145,6 +2237,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// Clear any queued approval — rejecting cancels the intent to approve.
 		this._queuedApprovalOfThreadId.delete(threadId)
+		this._autoApproveRestOfBatchOfThreadId.delete(threadId)
 
 		// Guard (user-initiated only): only allow rejection when the thread is
 		// awaiting user input. The abort path (resumeAgent: false) is exempt so
@@ -2382,6 +2475,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._concurrentRunningCountOfThreadId.delete(threadId)
 		this._concurrentResumeStartedOfThreadId.delete(threadId)
 		this._queuedApprovalOfThreadId.delete(threadId)
+		this._autoApproveRestOfBatchOfThreadId.delete(threadId)
 	}
 
 	private _computeMCPServerOfToolName = (toolName: string) => {
@@ -2394,6 +2488,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// Clear any queued approval on abort.
 		this._queuedApprovalOfThreadId.delete(threadId)
+		this._autoApproveRestOfBatchOfThreadId.delete(threadId)
 
 		// add assistant message
 		if (this.streamState[threadId]?.isRunning === 'LLM') {
@@ -3346,43 +3441,243 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// }
 
 
-	private _wrapRunAgentToNotify(p: Promise<void>, threadId: string) {
-		const notify = ({ error }: { error: string | null }) => {
-			const thread = this.state.allThreads[threadId]
-			if (!thread) return
-			const userMsg = findLast(thread.messages, m => m.role === 'user')
-			if (!userMsg) return
-			if (userMsg.role !== 'user') return
-			const messageContent = truncate(userMsg.displayContent, 50, '...')
+	/**
+	 * Whether this pending tool would pause for approval: it is approval-gated
+	 * and not auto-approved by the user's auto-approve settings (including the
+	 * terminal allowlist). Mirrors the decision _runToolCall makes.
+	 */
+	private _toolWouldPauseForApproval(tool: ToolMessage<ToolName> & { type: 'tool_request' }): boolean {
+		if (!isABuiltinToolName(tool.name)) {
+			// MCP tools are always approval-gated; 'workspace' acts as 'all' for them
+			const mcpMode = normalizeAutoApproveMode(this._settingsService.state.globalSettings.autoApprove['MCP tools'])
+			return mcpMode === 'off'
+		}
+		const approvalType = approvalTypeOfBuiltinToolName[tool.name]
+		if (!approvalType) return false
+		const mode = normalizeAutoApproveMode(this._settingsService.state.globalSettings.autoApprove[approvalType])
+		let autoApprove = false
+		if (mode === 'all') {
+			autoApprove = true
+		} else if (mode === 'workspace') {
+			if (approvalIsWorkspaceScoped(approvalType)) {
+				const toolParams = tool.params as { uri?: URI, sourceUri?: URI, targetUri?: URI } | undefined
+				const urisToCheck = [toolParams?.uri, toolParams?.sourceUri, toolParams?.targetUri].filter((u): u is URI => !!u)
+				autoApprove = urisToCheck.length > 0 && urisToCheck.every(u => this._workspaceContextService.isInsideWorkspace(u))
+			} else {
+				autoApprove = true
+			}
+		}
+		if (!autoApprove && approvalType === 'terminal') {
+			const terminalParams = tool.params as BuiltinToolCallParams['run_command'] | BuiltinToolCallParams['run_persistent_command'] | undefined
+			if (terminalParams && 'command' in terminalParams) {
+				const allowlist = this._terminalToolService.getAutoApproveAllowlist()
+				if (shouldAutoApprove(terminalParams.command, allowlist)) {
+					autoApprove = true
+				}
+			}
+		}
+		return !autoApprove
+	}
 
-			this._notificationService.notify({
-				severity: error ? Severity.Warning : Severity.Info,
-				message: error ? `Error: ${error} ` : `A new Chat result is ready.`,
-				source: messageContent,
-				sticky: true,
-				actions: {
-					primary: [{
-						id: 'void.goToChat',
-						enabled: true,
-						label: `Jump to Chat`,
-						tooltip: '',
-						class: undefined,
-						run: () => {
-							this.switchToThread(threadId)
-							// scroll to bottom
-							this.state.allThreads[threadId]?.state.mountedInfo?.whenMounted.then(m => {
-								m.scrollToBottom()
-							})
-						}
-					}]
-				},
-			})
+	/**
+	 * Count pending batch tools that would actually pause for approval. Used
+	 * to decide whether "Approve all" adds anything over "Approve" — remaining
+	 * tools that run without approval (not gated, auto-approved, or merged into
+	 * an earlier same-file edit_file) don't count.
+	 */
+	private _pendingApprovalCount(threadId: string): number {
+		const pending = this._getPendingBatchTools(threadId)
+		let count = 0
+		const editFileUrisSeen: string[] = []
+		for (const tool of pending) {
+			// Same-file edit_file siblings merge into the first call's run, so
+			// they never pause for their own approval.
+			if (tool.name === 'edit_file') {
+				const uri = tool.rawParams?.uri
+				if (typeof uri === 'string') {
+					if (editFileUrisSeen.includes(uri)) continue
+					editFileUrisSeen.push(uri)
+				}
+			}
+			if (this._toolWouldPauseForApproval(tool)) count++
+		}
+		return count
+	}
+
+	/**
+	 * Whether notifications of this kind are enabled in settings.
+	 */
+	private _shouldNotify(kind: 'approval' | 'done'): boolean {
+		const { notificationsEnabled, notifyOnApproval, notifyOnDone } = this._settingsService.state.globalSettings
+		if (!notificationsEnabled) return false
+		return kind === 'approval' ? notifyOnApproval : notifyOnDone
+	}
+
+	/**
+	 * Show a notification when a tool requires user approval.
+	 * The body shows the conversation context — the user's request and the
+	 * agent's reasoning — so the user can make an informed approve/reject
+	 * decision without switching to the Void window. Approve/Reject act
+	 * without focusing; clicking the body = View.
+	 */
+	private _notifyAwaitingApproval(threadId: string) {
+		if (!this._shouldNotify('approval')) return
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return
+		const pending = this._getPendingBatchTools(threadId)
+		if (pending.length === 0) return
+		const tool = pending[0]
+
+		const toolDesc = this._getToolDescription(tool)
+		const agentReasoning = this._getLastAssistantText(threadId)
+		const question = this._getLastUserQuestion(threadId)
+		// Conversation context: what the user asked for + the agent's reasoning
+		// for this tool call (empty when the model emitted no prose).
+		const bodyParts: string[] = []
+		if (question) bodyParts.push(`You: ${question}`)
+		if (agentReasoning) bodyParts.push(`Agent: ${agentReasoning}`)
+		const body = bodyParts.join('\n')
+
+		this._nativeHostService.showNotification({
+			id: `approval:${threadId}`,
+			title: 'Void needs approval',
+			threadTitle: this._getThreadTitle(threadId),
+			subtitle: toolDesc,
+			sound: this._settingsService.state.globalSettings.notificationSound,
+			body,
+			actions: [
+				{ label: 'Approve', actionId: `approve:${threadId}` },
+				{ label: 'Reject', actionId: `reject:${threadId}` },
+				// Only offer "Approve all" when more than one pending tool would
+				// actually pause for approval — otherwise it's identical to Approve.
+				...(this._pendingApprovalCount(threadId) > 1 ? [{ label: 'Approve all', actionId: `approve_all:${threadId}` }] : []),
+			],
+			clickActionId: `view:${threadId}`,
+		})
+	}
+
+	/**
+	 * Build a human-readable description of a tool call for notifications.
+	 * File tools show the file's name; terminal tools show the command.
+	 */
+	private _getToolDescription(tool: ToolMessage<ToolName>): string {
+		const name = tool.name
+		if (name === 'run_command' || name === 'run_persistent_command') {
+			const command = tool.rawParams?.command
+			return `$ ${truncate(typeof command === 'string' ? command : '', 60, '...')}`
+		}
+		if (name === 'edit_file' || name === 'rewrite_file' || name === 'create_file_or_folder' || name === 'delete_file_or_folder') {
+			const verb = name === 'edit_file' ? 'Edit' : name === 'rewrite_file' ? 'Rewrite' : name === 'create_file_or_folder' ? 'Create' : 'Delete'
+			return `${verb} ${this._fileNameOfPath(tool.rawParams?.uri)}`
+		}
+		if (name === 'rename_file_or_folder') {
+			return `Rename ${this._fileNameOfPath(tool.rawParams?.source_uri)} \u2192 ${this._fileNameOfPath(tool.rawParams?.target_uri)}`
+		}
+		return name
+	}
+
+	/**
+	 * File name (last path segment) of a tool's path param, for notifications.
+	 */
+	private _fileNameOfPath(p: string | undefined): string {
+		if (typeof p !== 'string' || !p) return 'file'
+		const parts = p.split('/')
+		return parts[parts.length - 1] || p
+	}
+
+	/**
+	 * Get the last assistant message's display text, cleaned and truncated.
+	 * Used as notification body for done/approval notifications.
+	 */
+	private _getLastAssistantText(threadId: string): string {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return ''
+		const msg = findLast(thread.messages, m => m.role === 'assistant')
+		if (msg?.role !== 'assistant') return ''
+		// Strip markdown headers/list markers for cleaner notification display
+		const text = msg.displayContent
+			.replace(/^#+\s+/gm, '')
+			.replace(/^[-*]\s+/gm, '')
+			.replace(/```[\s\S]*?```/g, '[code]')
+			.trim()
+		return truncate(text, 150, '...')
+	}
+
+	/**
+	 * The thread's display label, matching the sidebar's convention:
+	 * customTitle → first user message → ephemeral title → 'New Chat'.
+	 * Cleaned to a single line for the notification's identity row.
+	 */
+	private _getThreadTitle(threadId: string): string {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return ''
+		const clean = (s: string) => truncate(s.replace(/\s+/g, ' ').trim(), 60, '...')
+		const customTitle = thread.customTitle?.trim()
+		if (customTitle) return clean(customTitle)
+		const firstUser = thread.messages.find(m => m.role === 'user')
+		if (firstUser?.role === 'user' && firstUser.displayContent) return clean(firstUser.displayContent)
+		return thread.title ? clean(thread.title) : 'New Chat'
+	}
+
+	/**
+	 * Get the user's last question, truncated for notification display.
+	 */
+	private _getLastUserQuestion(threadId: string): string {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return ''
+		const msg = findLast(thread.messages, m => m.role === 'user')
+		return msg?.role === 'user' ? truncate(msg.displayContent, 80, '...') : ''
+	}
+
+	private _wrapRunAgentToNotify(p: Promise<void>, threadId: string) {
+
+		const shouldNotify = () => threadId !== this.state.currentThreadId || !this._hostService.hasFocus
+		// Don't fire "chat ready" when the agent paused for approval —
+		// the approval notification is already shown, and the agent
+		// hasn't actually finished.
+		const isAwaitingApproval = () => this.streamState[threadId]?.isRunning === 'awaiting_user'
+
+		const showDoneNotification = (error: string | null) => {
+			if (!this._shouldNotify('done')) return
+			const threadTitle = this._getThreadTitle(threadId)
+			// The identity line already shows the task for single-turn threads;
+			// only include the last question when there were multiple exchanges.
+			const thread = this.state.allThreads[threadId]
+			const isMultiTurn = !!thread && thread.messages.filter(m => m.role === 'user').length > 1
+			const question = isMultiTurn ? this._getLastUserQuestion(threadId) : undefined
+
+			if (error) {
+				this._nativeHostService.showNotification({
+					id: `error:${threadId}`,
+					title: 'Void hit an error',
+					threadTitle,
+					subtitle: question,
+					body: truncate(error, 150, '...'),
+					actions: [],
+					clickActionId: `view:${threadId}`,
+				})
+			} else {
+				const answer = this._getLastAssistantText(threadId)
+				this._nativeHostService.showNotification({
+					id: `done:${threadId}`,
+					title: 'Void finished',
+					threadTitle,
+					subtitle: question,
+					body: answer || 'Click to view',
+					actions: [
+						// Handled inside the notification window: reveals the reply
+						// input and makes the panel keyable so the user can type.
+						{ label: 'Reply', actionId: `reply-expand:${threadId}` },
+					],
+					clickActionId: `view:${threadId}`,
+				})
+			}
 		}
 
 		p.then(() => {
-			if (threadId !== this.state.currentThreadId) notify({ error: null })
+			if (shouldNotify() && !isAwaitingApproval()) { showDoneNotification(null) }
 		}).catch((e) => {
-			if (threadId !== this.state.currentThreadId) notify({ error: getErrorMessage(e) })
+			if (shouldNotify()) { showDoneNotification(getErrorMessage(e)) }
 			throw e
 		})
 	}
