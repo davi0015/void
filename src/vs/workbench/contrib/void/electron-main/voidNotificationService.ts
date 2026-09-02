@@ -37,7 +37,7 @@ export type VoidNotification = {
  */
 export class VoidNotificationService extends Disposable {
 
-	private readonly _notificationWindows = new Map<string, { window: BrowserWindow; timeout: NodeJS.Timeout | undefined; shortcuts: string[]; height: number }>();
+	private readonly _notificationWindows = new Map<string, { window: BrowserWindow; timeout: NodeJS.Timeout | undefined; shortcuts: string[]; height: number; informational: boolean; replyExpanded: boolean }>();
 
 	private readonly _onNotificationAction = this._register(new Emitter<string>());
 	readonly onNotificationAction: Event<string> = this._onNotificationAction.event;
@@ -49,10 +49,24 @@ export class VoidNotificationService extends Disposable {
 	private static readonly NOTIFICATION_MARGIN = 20;
 	private static readonly NOTIFICATION_GAP = 10;
 	private static readonly NOTIFICATION_TIMEOUT_MS = 20000;
+	private static readonly MAX_VISIBLE_NOTIFICATIONS = 5;
 
 	async showNotification(notification: VoidNotification): Promise<void> {
 		// Close existing notification with same id (dedup)
 		await this.dismissNotification(notification.id);
+
+		// Cap the visible stack (also keeps the stack on-screen). Evict the
+		// oldest informational notification (done/error) when full — approvals
+		// carry a pending decision and are never auto-dismissed, and neither
+		// is a notification whose reply input the user is typing in. If all
+		// visible notifications are protected, the stack is allowed to exceed
+		// the cap rather than hide a pending decision.
+		const informational = notification.actions.every(a => a.actionId.startsWith('reply-expand:'));
+		while (this._notificationWindows.size >= VoidNotificationService.MAX_VISIBLE_NOTIFICATIONS) {
+			const victim = [...this._notificationWindows.entries()].find(([, e]) => e.informational && !e.replyExpanded);
+			if (!victim) break;
+			await this.dismissNotification(victim[0]);
+		}
 
 		const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
 		const x = display.workArea.x + display.workArea.width - VoidNotificationService.NOTIFICATION_WIDTH - VoidNotificationService.NOTIFICATION_MARGIN;
@@ -100,6 +114,7 @@ export class VoidNotificationService extends Disposable {
 			if (actionId.startsWith('reply-expand:')) {
 				const entry = this._notificationWindows.get(notification.id);
 				if (entry?.timeout) { clearTimeout(entry.timeout); entry.timeout = undefined; }
+				if (entry) entry.replyExpanded = true;
 				win.setFocusable(true);
 				win.focus();
 				win.webContents.executeJavaScript('document.getElementById("void-reply-row").style.display = "flex"; document.getElementById("void-reply-input").focus();').catch(() => { });
@@ -107,6 +122,8 @@ export class VoidNotificationService extends Disposable {
 				return;
 			}
 			if (actionId === 'reply-collapse') {
+				const entry = this._notificationWindows.get(notification.id);
+				if (entry) entry.replyExpanded = false;
 				win.setFocusable(false);
 				this._resizeToContent(win, notification.id);
 				return;
@@ -167,7 +184,7 @@ export class VoidNotificationService extends Disposable {
 			}
 		}
 
-		this._notificationWindows.set(notification.id, { window: win, timeout, shortcuts, height: VoidNotificationService.NOTIFICATION_DEFAULT_HEIGHT });
+		this._notificationWindows.set(notification.id, { window: win, timeout, shortcuts, height: VoidNotificationService.NOTIFICATION_DEFAULT_HEIGHT, informational, replyExpanded: false });
 	}
 
 	async dismissNotification(id: string): Promise<void> {
