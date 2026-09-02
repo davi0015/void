@@ -471,6 +471,7 @@ export type GlobalSettings = {
 	notificationsEnabled: boolean;
 	notifyOnApproval: boolean;
 	notifyOnDone: boolean;
+	notificationSound: boolean;
 	syncApplyToChat: boolean;
 	syncSCMToChat: boolean;
 	enableFastApply: boolean;
@@ -504,6 +505,7 @@ export const defaultGlobalSettings: GlobalSettings = {
 	notificationsEnabled: true,
 	notifyOnApproval: true,
 	notifyOnDone: true,
+	notificationSound: true,
 	syncApplyToChat: true,
 	syncSCMToChat: true,
 	enableFastApply: true,

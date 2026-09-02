@@ -2,7 +2,7 @@
  *  Copyright (c) Void. All rights reserved.
  *--------------------------------------------------------------------------------------------*/
 
-import { BrowserWindow, globalShortcut, screen } from 'electron';
+import { BrowserWindow, screen } from 'electron';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 
@@ -13,6 +13,8 @@ export type VoidNotification = {
 	// tell parallel chats apart at a glance.
 	threadTitle?: string;
 	subtitle?: string;
+	// Play a soft chime when the notification appears (approval-needed).
+	sound?: boolean;
 	body: string;
 	actions: { label: string, actionId: string }[];
 	clickActionId?: string;
@@ -28,7 +30,9 @@ export type VoidNotification = {
  * elements stops the web-content focus chain from triggering macOS app
  * activation when clicking buttons.
  *
- * Global keyboard shortcuts (⌘⇧A / ⌘⇧R) provide a zero-focus alternative.
+ * Notifications are visible on all macOS Spaces so a persistent approval
+ * never gets stranded on a desktop the user has since left, and can play a
+ * soft chime (approval-needed) for awareness without looking.
  *
  * Reply: the Reply button (done notifications) temporarily makes the panel
  * keyable so the user can type a response without switching to Void — the
@@ -37,7 +41,7 @@ export type VoidNotification = {
  */
 export class VoidNotificationService extends Disposable {
 
-	private readonly _notificationWindows = new Map<string, { window: BrowserWindow; timeout: NodeJS.Timeout | undefined; shortcuts: string[]; height: number; informational: boolean; replyExpanded: boolean }>();
+	private readonly _notificationWindows = new Map<string, { window: BrowserWindow; timeout: NodeJS.Timeout | undefined; height: number; informational: boolean; replyExpanded: boolean }>();
 
 	private readonly _onNotificationAction = this._register(new Emitter<string>());
 	readonly onNotificationAction: Event<string> = this._onNotificationAction.event;
@@ -100,6 +104,9 @@ export class VoidNotificationService extends Disposable {
 		});
 
 		win.setAlwaysOnTop(true, 'floating');
+		// Visible on every Space — a persistent approval must follow the user
+		// across desktops instead of being stranded in the Space it was shown in.
+		win.setVisibleOnAllWorkspaces(true);
 
 		// Button/click actions use console.log — intercept via console-message.
 		win.webContents.on('console-message', (event, _level, message) => {
@@ -166,34 +173,13 @@ export class VoidNotificationService extends Disposable {
 			}, VoidNotificationService.NOTIFICATION_TIMEOUT_MS);
 		}
 
-		// Register global keyboard shortcuts for the actions that have one.
-		// Mapped by label so extra actions (Reply, Approve all) never pick up
-		// a shortcut meant for another button.
-		const shortcutAccelOfActionLabel: Record<string, string> = {
-			'Approve': 'CmdOrCtrl+Shift+A',
-			'Reject': 'CmdOrCtrl+Shift+R',
-		};
-		const shortcuts: string[] = [];
-		for (const action of notification.actions) {
-			const accel = shortcutAccelOfActionLabel[action.label];
-			if (accel && globalShortcut.register(accel, () => {
-				this._onNotificationAction.fire(action.actionId);
-				this.dismissNotification(notification.id);
-			})) {
-				shortcuts.push(accel);
-			}
-		}
-
-		this._notificationWindows.set(notification.id, { window: win, timeout, shortcuts, height: VoidNotificationService.NOTIFICATION_DEFAULT_HEIGHT, informational, replyExpanded: false });
+		this._notificationWindows.set(notification.id, { window: win, timeout, height: VoidNotificationService.NOTIFICATION_DEFAULT_HEIGHT, informational, replyExpanded: false });
 	}
 
 	async dismissNotification(id: string): Promise<void> {
 		const entry = this._notificationWindows.get(id);
 		if (!entry) return;
 		if (entry.timeout) { clearTimeout(entry.timeout); }
-		for (const accel of entry.shortcuts) {
-			globalShortcut.unregister(accel);
-		}
 		entry.window.close();
 		this._notificationWindows.delete(id);
 		this._repositionNotifications();
@@ -236,15 +222,10 @@ export class VoidNotificationService extends Disposable {
 		const subtitle = notification.subtitle ? this._escapeHtml(notification.subtitle) : '';
 		const body = this._escapeHtml(notification.body);
 
-		const shortcutLabelOfActionLabel: Record<string, string> = {
-			'Approve': '\u2318\u21e7A',
-			'Reject': '\u2318\u21e7R',
-		};
 		const allButtons = [...notification.actions, { label: 'Dismiss', actionId: 'close' }];
 		const buttonsHtml = `<div class="buttons">${allButtons.map(a => {
 			const cls = a.label.toLowerCase().includes('approve') ? 'btn-approve' : a.label.toLowerCase().includes('reject') ? 'btn-reject' : 'btn-default';
-			const hint = shortcutLabelOfActionLabel[a.label] ? `<span class="shortcut">${shortcutLabelOfActionLabel[a.label]}</span>` : '';
-			return `<button class="btn ${cls}" onmousedown="event.preventDefault()" onclick="event.preventDefault(); event.stopPropagation(); console.log('void-action:${this._escapeHtml(a.actionId)}')">${this._escapeHtml(a.label)}${hint}</button>`;
+			return `<button class="btn ${cls}" onmousedown="event.preventDefault()" onclick="event.preventDefault(); event.stopPropagation(); console.log('void-action:${this._escapeHtml(a.actionId)}')">${this._escapeHtml(a.label)}</button>`;
 		}).join('')}</div>`;
 
 		const subtitleHtml = subtitle ? `<div class="subtitle">${subtitle}</div>` : '';
@@ -270,6 +251,33 @@ function voidCollapseReply() {
 	document.getElementById('void-reply-row').style.display = 'none';
 	console.log('void-action:reply-collapse');
 }
+</script>` : '';
+
+		// Soft two-tone chime for approval-needed notifications. Synthesized
+		// with WebAudio inside the notification page — no bundled asset needed,
+		// and Electron's default autoplay policy allows it without a gesture.
+		const soundScript = notification.sound ? `
+<script>
+(function () {
+	try {
+		var ctx = new AudioContext();
+		var now = ctx.currentTime;
+		[880, 1174.66].forEach(function (freq, i) {
+			var t = now + i * 0.15;
+			var osc = ctx.createOscillator();
+			var g = ctx.createGain();
+			osc.type = 'sine';
+			osc.frequency.value = freq;
+			g.gain.setValueAtTime(0.0001, t);
+			g.gain.exponentialRampToValueAtTime(0.12, t + 0.02);
+			g.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
+			osc.connect(g);
+			g.connect(ctx.destination);
+			osc.start(t);
+			osc.stop(t + 0.65);
+		});
+	} catch (e) { }
+})();
 </script>` : '';
 
 		// Click the body text to view in Void (focuses the window + switches thread).
@@ -306,7 +314,6 @@ body {
   display: flex; align-items: center; justify-content: center; gap: 6px;
   white-space: nowrap;
 }
-.shortcut { font-size: 10px; opacity: 0.6; }
 .btn-approve { background: #30d158; color: #000; }
 .btn-approve:hover { background: #28b84c; }
 .btn-reject { background: #ff453a; color: #fff; }
@@ -332,6 +339,7 @@ body {
   ${replyRowHtml}
 </div>
 ${replyScript}
+${soundScript}
 </body>
 </html>`;
 	}

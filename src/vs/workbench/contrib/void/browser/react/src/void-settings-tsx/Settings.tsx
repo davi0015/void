@@ -1911,6 +1911,17 @@ export const Settings = () => {
 															<span className='text-void-fg-3 text-xs pointer-events-none'>When a chat finishes or errors</span>
 														</div>
 													</ErrorBoundary>
+
+													<ErrorBoundary>
+														<div className='flex items-center gap-x-2 my-2'>
+															<VoidSwitch
+																size='xs'
+																value={settingsState.globalSettings.notificationSound}
+																onChange={(newVal) => voidSettingsService.setGlobalSetting('notificationSound', newVal)}
+															/>
+															<span className='text-void-fg-3 text-xs pointer-events-none'>Play sound when approval is needed</span>
+														</div>
+													</ErrorBoundary>
 												</>}
 											</div>
 										</div>

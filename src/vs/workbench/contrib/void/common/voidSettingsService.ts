@@ -321,6 +321,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			if (readS.globalSettings.notificationsEnabled === undefined) readS.globalSettings.notificationsEnabled = true;
 			if (readS.globalSettings.notifyOnApproval === undefined) readS.globalSettings.notifyOnApproval = true;
 			if (readS.globalSettings.notifyOnDone === undefined) readS.globalSettings.notifyOnDone = true;
+			if (readS.globalSettings.notificationSound === undefined) readS.globalSettings.notificationSound = true;
 
 			// add SemanticSearch feature
 			if (readS.modelSelectionOfFeature && !readS.modelSelectionOfFeature['SemanticSearch']) {

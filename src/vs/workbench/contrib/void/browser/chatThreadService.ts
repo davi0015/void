@@ -3519,6 +3519,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			title: 'Void needs approval',
 			threadTitle: this._getThreadTitle(threadId),
 			subtitle: toolDesc,
+			sound: this._settingsService.state.globalSettings.notificationSound,
 			body,
 			actions: [
 				{ label: 'Approve', actionId: `approve:${threadId}` },
