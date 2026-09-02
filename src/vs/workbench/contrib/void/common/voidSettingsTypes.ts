@@ -4,6 +4,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
+import { isMacintosh } from '../../../../base/common/platform.js';
 import { defaultModelsOfProvider, defaultProviderSettings, ModelOverrides } from './modelCapabilities.js';
 import { AutoApproveMode, ToolApprovalType } from './toolsServiceTypes.js';
 import { VoidSettingsState } from './voidSettingsService.js'
@@ -468,6 +469,9 @@ export type GlobalSettings = {
 	autoRefreshModels: boolean;
 	aiInstructions: string;
 	enableAutocomplete: boolean;
+	// macOS is the tested platform — the floating notification windows rely
+	// on macOS-only behaviors (non-activating panels, all-Spaces visibility),
+	// so notifications default to off elsewhere until verified there.
 	notificationsEnabled: boolean;
 	notifyOnApproval: boolean;
 	notifyOnDone: boolean;
@@ -502,7 +506,7 @@ export const defaultGlobalSettings: GlobalSettings = {
 	autoRefreshModels: true,
 	aiInstructions: '',
 	enableAutocomplete: false,
-	notificationsEnabled: true,
+	notificationsEnabled: isMacintosh,
 	notifyOnApproval: true,
 	notifyOnDone: true,
 	notificationSound: true,

@@ -11,6 +11,7 @@ import { registerSingleton, InstantiationType } from '../../../../platform/insta
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { IMetricsService } from './metricsService.js';
+import { isMacintosh } from '../../../../base/common/platform.js';
 import { defaultProviderSettings, getModelCapabilities, ModelOverrides } from './modelCapabilities.js';
 import { VOID_SETTINGS_STORAGE_KEY } from './storageKeys.js';
 import { defaultSettingsOfProvider, FeatureName, ProviderName, ModelSelectionOfFeature, SettingsOfProvider, SettingName, providerNames, ModelSelection, modelSelectionsEqual, featureNames, VoidStatefulModelInfo, GlobalSettings, GlobalSettingName, defaultGlobalSettings, ModelSelectionOptions, OptionsOfModelSelection, ChatMode, OverridesOfModel, defaultOverridesOfModel, MCPUserStateOfName as MCPUserStateOfName, MCPUserState, BackendId, BackendProtocol, BackendProviderSettings, isBackendId, registerBackendDisplayNames, displayInfoOfProviderName } from './voidSettingsTypes.js';
@@ -318,7 +319,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			if (readS.globalSettings.rulesPaths === undefined) readS.globalSettings.rulesPaths = '';
 
 			// add notification settings
-			if (readS.globalSettings.notificationsEnabled === undefined) readS.globalSettings.notificationsEnabled = true;
+			if (readS.globalSettings.notificationsEnabled === undefined) readS.globalSettings.notificationsEnabled = isMacintosh;
 			if (readS.globalSettings.notifyOnApproval === undefined) readS.globalSettings.notifyOnApproval = true;
 			if (readS.globalSettings.notifyOnDone === undefined) readS.globalSettings.notifyOnDone = true;
 			if (readS.globalSettings.notificationSound === undefined) readS.globalSettings.notificationSound = true;
