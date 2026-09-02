@@ -325,23 +325,16 @@ const ThreadPermissionDropdown = ({ className }: { className: string }) => {
 		if (currentThreadId) chatThreadsService.setThreadPermissionMode(currentThreadId, newVal)
 	}, [chatThreadsService, currentThreadId])
 
-	return <div
-		className='inline-block'
-		data-tooltip-id='void-tooltip'
-		data-tooltip-content='Per-chat permission. Adds to your global auto-approve settings — whichever allows more applies here.'
-		data-tooltip-place='top'
-	>
-		<VoidCustomDropdownBox
-			className={className}
-			options={options}
-			selectedOption={permissionMode}
-			onChangeOption={onChangeOption}
-			getOptionDisplayName={(val) => nameOfPermissionMode[val]}
-			getOptionDropdownName={(val) => nameOfPermissionMode[val]}
-			getOptionDropdownDetail={(val) => detailOfPermissionMode[val]}
-			getOptionsEqual={(a, b) => a === b}
-		/>
-	</div>
+	return <VoidCustomDropdownBox
+		className={className}
+		options={options}
+		selectedOption={permissionMode}
+		onChangeOption={onChangeOption}
+		getOptionDisplayName={(val) => nameOfPermissionMode[val]}
+		getOptionDropdownName={(val) => nameOfPermissionMode[val]}
+		getOptionDropdownDetail={(val) => detailOfPermissionMode[val]}
+		getOptionsEqual={(a, b) => a === b}
+	/>
 
 }
 
