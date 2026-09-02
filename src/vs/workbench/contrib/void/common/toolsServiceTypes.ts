@@ -78,6 +78,64 @@ export const normalizeAutoApproveMode = (raw: AutoApproveMode | boolean | undefi
 }
 
 
+// ===== Per-chat (per-thread) permission modes =====
+//
+// A coarse, user-facing permission level selectable per chat thread from the
+// chat input box (same row as model selection). It acts as an *additional*
+// source of auto-approval on top of the global per-tier `autoApprove` config:
+// the effective mode per tier is whichever of the two allows more ("union"
+// semantics — a chat can grant more than config, never less).
+//   - 'read_only'      → grants nothing. Approval is governed by config +
+//                        the per-workspace terminal allowlist, exactly like
+//                        threads created before this feature existed.
+//   - 'workspace_write'→ auto-approves workspace-scoped file edits and
+//                        deletes (tier modes 'workspace'). Terminal and MCP
+//                        tools are NOT granted — commands stay governed by
+//                        config + allowlist; pick 'full_access' for those.
+//   - 'full_access'    → auto-approves every tier ('all').
+export type ThreadPermissionMode = 'read_only' | 'workspace_write' | 'full_access'
+
+export const threadPermissionModes: ThreadPermissionMode[] = ['read_only', 'workspace_write', 'full_access']
+
+// Per-tier auto-approve mode granted by each thread permission mode. Keys are
+// ordered exactly like `toolApprovalTypes`' members; the 'terminal' and
+// 'MCP tools' entries for 'workspace_write' are deliberately 'off' (see above).
+export const threadModeToTierAutoApprove: { [mode in ThreadPermissionMode]: { [approvalType in ToolApprovalType]: AutoApproveMode } } = {
+	'read_only': { 'edits': 'off', 'delete': 'off', 'terminal': 'off', 'MCP tools': 'off' },
+	'workspace_write': { 'edits': 'workspace', 'delete': 'workspace', 'terminal': 'off', 'MCP tools': 'off' },
+	'full_access': { 'edits': 'all', 'delete': 'all', 'terminal': 'all', 'MCP tools': 'all' },
+}
+
+// Normalizes a persisted thread permission mode. Anything unknown (including
+// `undefined` — threads persisted before this feature existed) maps to
+// 'read_only', which grants nothing and therefore preserves pre-feature
+// behavior exactly.
+export const normalizeThreadPermissionMode = (raw: ThreadPermissionMode | undefined): ThreadPermissionMode => {
+	if (raw === 'workspace_write' || raw === 'full_access') return raw
+	return 'read_only'
+}
+
+// Returns the more permissive of two auto-approve modes. Used to combine the
+// global config mode with the per-thread grant: "whichever allows access".
+const _autoApproveModeRank: { [mode in AutoApproveMode]: number } = { 'off': 0, 'workspace': 1, 'all': 2 }
+export const combineAutoApproveModes = (a: AutoApproveMode, b: AutoApproveMode): AutoApproveMode =>
+	_autoApproveModeRank[a] >= _autoApproveModeRank[b] ? a : b
+
+// Effective per-tier auto-approve mode for a tool call on a thread: the more
+// permissive of the global config mode and the thread's permission-mode grant.
+// Single place where the union semantics live, shared by the approval gate in
+// `chatThreadService` and the UI that pre-hides buttons for auto-approved tools.
+export const effectiveAutoApproveMode = (
+	approvalType: ToolApprovalType,
+	configMode: AutoApproveMode | boolean | undefined,
+	threadMode: ThreadPermissionMode | undefined,
+): AutoApproveMode => {
+	const config = normalizeAutoApproveMode(configMode)
+	const grant = threadModeToTierAutoApprove[normalizeThreadPermissionMode(threadMode)][approvalType]
+	return combineAutoApproveModes(config, grant)
+}
+
+
 
 
 // PARAMS OF TOOL CALL

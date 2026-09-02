@@ -28,7 +28,7 @@ import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, Too
 import { generateUuid } from '../../../../../../../base/common/uuid.js';
 import { VSBuffer } from '../../../../../../../base/common/buffer.js';
 import { joinPath } from '../../../../../../../base/common/resources.js';
-import { approvalTypeOfBuiltinToolName, type ToolName } from '../../../../common/toolsServiceTypes.js';
+import { approvalTypeOfBuiltinToolName, normalizeThreadPermissionMode, threadPermissionModes, ThreadPermissionMode, type ToolName } from '../../../../common/toolsServiceTypes.js';
 import { IconShell1, StatusIndicator } from '../markdown/ApplyBlockHoverButtons.js';
 import { IsRunningType, isThreadReadOnly, shouldShowOwnershipBanner } from '../../../chatThreadService.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
@@ -286,6 +286,62 @@ const ChatModeDropdown = ({ className }: { className: string }) => {
 		getOptionDropdownDetail={(val) => detailOfChatMode[val]}
 		getOptionsEqual={(a, b) => a === b}
 	/>
+
+}
+
+
+const nameOfPermissionMode: { [mode in ThreadPermissionMode]: string } = {
+	'read_only': 'Read Only',
+	'workspace_write': 'Workspace Write',
+	'full_access': 'Full Access',
+}
+
+const detailOfPermissionMode: { [mode in ThreadPermissionMode]: string } = {
+	'read_only': 'Always ask before edits',
+	'workspace_write': 'Auto-approve workspace file edits',
+	'full_access': 'Auto-approve all tools and commands',
+}
+
+// Per-chat permission selector (Read Only / Workspace Write / Full Access).
+// Lives in the chat input row next to the model dropdown. The mode is stored
+// on the thread and acts as an additional auto-approval source on top of the
+// global settings: the more permissive of config and this grant applies, so
+// raising a chat's level can skip approvals, but lowering it never restricts
+// below what your global settings already allow. Terminal commands remain
+// governed by your settings + the command allowlist until 'Full Access'.
+const ThreadPermissionDropdown = ({ className }: { className: string }) => {
+	const accessor = useAccessor()
+
+	const chatThreadsService = accessor.get('IChatThreadService')
+	const chatThreadsState = useChatThreadsState()
+
+	const currentThreadId = chatThreadsState.currentThreadId
+	const currentThread = chatThreadsState.allThreads[currentThreadId]
+	const permissionMode = normalizeThreadPermissionMode(currentThread?.permissionMode)
+
+	const options: ThreadPermissionMode[] = useMemo(() => threadPermissionModes, [])
+
+	const onChangeOption = useCallback((newVal: ThreadPermissionMode) => {
+		if (currentThreadId) chatThreadsService.setThreadPermissionMode(currentThreadId, newVal)
+	}, [chatThreadsService, currentThreadId])
+
+	return <div
+		className='inline-block'
+		data-tooltip-id='void-tooltip'
+		data-tooltip-content='Per-chat permission. Adds to your global auto-approve settings — whichever allows more applies here.'
+		data-tooltip-place='top'
+	>
+		<VoidCustomDropdownBox
+			className={className}
+			options={options}
+			selectedOption={permissionMode}
+			onChangeOption={onChangeOption}
+			getOptionDisplayName={(val) => nameOfPermissionMode[val]}
+			getOptionDropdownName={(val) => nameOfPermissionMode[val]}
+			getOptionDropdownDetail={(val) => detailOfPermissionMode[val]}
+			getOptionsEqual={(a, b) => a === b}
+		/>
+	</div>
 
 }
 
@@ -877,6 +933,7 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 
 						<div className='flex items-center flex-wrap gap-x-2 gap-y-1 text-nowrap '>
 							{featureName === 'Chat' && <ChatModeDropdown className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-2 rounded py-0.5 px-1' />}
+							{featureName === 'Chat' && <ThreadPermissionDropdown className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-2 rounded py-0.5 px-1' />}
 							<ModelDropdown featureName={featureName} className='text-xs text-void-fg-3 bg-void-bg-1 rounded' />
 						</div>
 					</div>

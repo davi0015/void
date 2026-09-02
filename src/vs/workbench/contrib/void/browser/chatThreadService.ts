@@ -18,7 +18,7 @@ import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, Raw
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
-import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, normalizeAutoApproveMode, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
+import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, effectiveAutoApproveMode, normalizeThreadPermissionMode, ThreadPermissionMode, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { IToolsService } from './toolsService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
@@ -253,6 +253,17 @@ export type ThreadType = {
 	// Persisted as part of the thread blob — no separate storage key.
 	customTitle?: string;
 
+	// Per-chat permission mode ('read_only' | 'workspace_write' | 'full_access'),
+	// selected from the chat input box (same row as model selection). Acts as
+	// an additional auto-approval source on top of the global per-tier
+	// `autoApprove` config — the effective mode per tier is the more
+	// permissive of config and this grant ("whichever allows access"), see
+	// `effectiveAutoApproveMode` in toolsServiceTypes. 'read_only' grants
+	// nothing; undefined (threads persisted before this field existed)
+	// normalizes to 'read_only' so legacy behavior is unchanged.
+	// Persisted as part of the thread blob.
+	permissionMode?: ThreadPermissionMode;
+
 	// Ephemeral (not persisted) — computed during metadata-only reads by
 	// reading the first few message keys. Used by the UI as a label fallback
 	// when messages aren't loaded (lazy loading). Skipped in _splitThreadForStorage.
@@ -442,6 +453,9 @@ const newThreadObject = (workspace?: { uri?: string, label?: string }) => {
 		// checkpoints: [], // checkpoint disabled
 		workspaceUri: workspace?.uri,
 		workspaceLabel: workspace?.label,
+		// grants nothing on top of global config — out-of-the-box behavior is
+		// identical to threads created before this field existed.
+		permissionMode: 'read_only',
 		state: {
 			// currCheckpointIdx: null, // checkpoint disabled
 			stagingSelections: [],
@@ -508,6 +522,13 @@ export interface IChatThreadService {
 	// `_isThreadMutationBlocked` — read-only foreign threads cannot be
 	// renamed from this window (consistent with the rest of Phase E).
 	setThreadCustomTitle(threadId: string, title: string | undefined): void;
+
+	// Per-chat permission mode — the coarse Read Only / Workspace Write /
+	// Full Access selector on the chat input box. Persists on the thread and
+	// feeds `effectiveAutoApproveMode` so tool calls on this thread can be
+	// auto-approved by config OR this grant, whichever allows more. Gated by
+	// `_isThreadMutationBlocked` like the other thread mutations.
+	setThreadPermissionMode(threadId: string, mode: ThreadPermissionMode): void;
 
 	// Phase E commit 4 — claim a foreign thread into the current workspace.
 	// Both auto-pin to this workspace's tab strip on completion.
@@ -2000,9 +2021,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			if (isABuiltinToolName(next.name)) {
 				const nextApprovalType = approvalTypeOfBuiltinToolName[next.name]
 				if (nextApprovalType === 'terminal') {
-					const mode = normalizeAutoApproveMode(this._settingsService.state.globalSettings.autoApprove.terminal)
-					// Terminal tools are NOT workspace-scoped, so 'workspace' === 'all'
-					// Also check the per-workspace command allowlist
+					// Effective mode = global config OR this thread's permission-mode
+					// grant, whichever allows more. Terminal tools are NOT workspace-
+					// scoped, so 'workspace' === 'all' here.
+					const mode = effectiveAutoApproveMode('terminal', this._settingsService.state.globalSettings.autoApprove.terminal, this.state.allThreads[threadId]?.permissionMode)
 					let isAutoApproved = mode === 'all' || mode === 'workspace'
 					if (!isAutoApproved) {
 						const terminalParams = next.params as BuiltinToolCallParams['run_command'] | BuiltinToolCallParams['run_persistent_command'] | undefined
@@ -2544,7 +2566,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 			const approvalType = isBuiltInTool ? approvalTypeOfBuiltinToolName[toolName] : 'MCP tools'
 			if (approvalType) {
-				const mode = normalizeAutoApproveMode(this._settingsService.state.globalSettings.autoApprove[approvalType])
+				// Effective mode = global config OR this thread's permission-mode grant,
+				// whichever allows more (per-chat selector in the chat input box).
 				// Tri-state resolution:
 				//   'off'       → always prompt
 				//   'all'       → skip prompt
@@ -2553,6 +2576,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				//                 'workspace' is semantically equivalent to 'all' — commands/MCPs
 				//                 don't have a single target URI to scope against and can
 				//                 legitimately operate outside the workspace.
+				const mode = effectiveAutoApproveMode(approvalType, this._settingsService.state.globalSettings.autoApprove[approvalType], this.state.allThreads[threadId]?.permissionMode)
 				let autoApprove = false
 				if (mode === 'all') {
 					autoApprove = true
@@ -4524,6 +4548,23 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const newThreads = { ...allThreads, [threadId]: newThread }
 		this._storeThread(threadId, newThread)
 		this._setState({ allThreads: newThreads })
+	}
+
+	setThreadPermissionMode(threadId: string, mode: ThreadPermissionMode): void {
+		if (this._isThreadMutationBlocked(threadId, 'setThreadPermissionMode')) return
+		const { allThreads } = this.state
+		const oldThread = allThreads[threadId]
+		if (!oldThread) return
+
+		const next = normalizeThreadPermissionMode(mode)
+		if (oldThread.permissionMode === next) return
+
+		const newThread: ThreadType = { ...oldThread, permissionMode: next, lastModified: new Date().toISOString() }
+		const newThreads = { ...allThreads, [threadId]: newThread }
+		this._storeThread(threadId, newThread)
+		this._setState({ allThreads: newThreads })
+
+		this._metricsService.capture('Chat Permission Mode Change', { mode: next })
 	}
 
 	private _addMessageToThread(threadId: string, message: ChatMessage) {

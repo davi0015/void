@@ -5,7 +5,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { useAccessor, useChatThreadsStreamState, useSettingsState } from '../util/services.js';
+import { useAccessor, useChatThread, useChatThreadsStreamState, useSettingsState } from '../util/services.js';
 
 import { ChatMarkdownRender, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
 import { URI } from '../../../../../../../base/common/uri.js';
@@ -13,7 +13,7 @@ import { VoidDiffEditor } from '../util/inputs.js';
 import { extractSearchReplaceBlocks } from '../../../../common/helpers/extractCodeFromResult.js';
 import { AlertTriangle, Ban, ChevronRight, CircleEllipsis } from 'lucide-react';
 import { ChatMessage, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
-import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, LintErrorItem, normalizeAutoApproveMode, ToolCallParams, ToolName } from '../../../../common/toolsServiceTypes.js';
+import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, effectiveAutoApproveMode, LintErrorItem, ToolCallParams, ToolName } from '../../../../common/toolsServiceTypes.js';
 import { Edit } from '../../../../common/editCodeServiceTypes.js';
 import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE } from '../../../../common/prompt/prompts.js';
 import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
@@ -585,20 +585,37 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 	const approvalType = isABuiltinToolName(toolName) ? approvalTypeOfBuiltinToolName[toolName] : 'MCP tools'
 	const isTerminal = approvalType === 'terminal'
 
+	// The thread this tool request belongs to — needed for the per-chat
+	// permission mode (Read Only / Workspace Write / Full Access), which
+	// combines with the global config in `effectiveAutoApproveMode` below.
+	const thread = useChatThread(threadId)
+
 	// Don't render the button if this tool will be auto-approved anyway.
 	// This prevents a race condition where the button flashes for tools that
-	// will run immediately when the batch processor reaches them.
-	if (approvalType) {
-		const mode = normalizeAutoApproveMode(voidSettingsState.globalSettings.autoApprove[approvalType])
-		if (mode === 'all') return null
-		if (mode === 'workspace' && approvalIsWorkspaceScoped(approvalType) && params) {
-			const p = params as { uri?: URI, sourceUri?: URI, targetUri?: URI }
-			const uris = [p.uri, p.sourceUri, p.targetUri].filter((u): u is URI => !!u)
-			if (uris.length > 0 && uris.every(u => workspaceContextService.isInsideWorkspace(u))) return null
-		}
+	// will run immediately when the batch processor reaches them. The
+	// effective mode is the more permissive of the global config and this
+	// thread's permission-mode grant (whichever allows access).
+	//
+	// Computed here but only *returned* after all hooks below have run —
+	// returning early would change the hook count between renders when the
+	// user flips a permission/auto-approve setting while buttons are mounted.
+	const effectiveMode = approvalType
+		? effectiveAutoApproveMode(approvalType, voidSettingsState.globalSettings.autoApprove[approvalType], thread?.permissionMode)
+		: undefined
+	const hideBecauseAutoApproved = !!approvalType && (
+		effectiveMode === 'all'
+		|| (
+			effectiveMode === 'workspace'
+			&& approvalIsWorkspaceScoped(approvalType)
+			&& (() => {
+				const p = params as { uri?: URI, sourceUri?: URI, targetUri?: URI } | undefined
+				const uris = [p?.uri, p?.sourceUri, p?.targetUri].filter((u): u is URI => !!u)
+				return uris.length > 0 && uris.every(u => workspaceContextService.isInsideWorkspace(u))
+			})()
+		)
 		// 'workspace' for non-workspace-scoped tiers (terminal, MCP) === 'all'
-		if (mode === 'workspace' && !approvalIsWorkspaceScoped(approvalType)) return null
-	}
+		|| (effectiveMode === 'workspace' && !approvalIsWorkspaceScoped(approvalType))
+	)
 
 	const onAccept = useCallback(() => {
 		try {
@@ -675,6 +692,9 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 			metricsService.capture('Tool Request Added To Allowlist', {})
 		} catch (e) { console.error('Error while allowing message in chat:', e) }
 	}, [commandStatuses, terminalToolService, chatThreadsService, metricsService, toolId])
+
+	// Return AFTER all hooks have run (see comment on hideBecauseAutoApproved)
+	if (hideBecauseAutoApproved) return null
 
 	const approveButton = (
 		<button
