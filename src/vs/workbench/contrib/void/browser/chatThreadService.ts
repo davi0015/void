@@ -886,6 +886,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		} else if (action === 'view') {
 			this._hostService.focus({ force: false } as any).catch(() => { })
 			this.switchToThread(threadId)
+		} else if (action === 'reply') {
+			// reply:<threadId>:<encodeURIComponent'd text> — sent from the
+			// notification's reply input. addUserMessageAndStreamResponse wraps
+			// the agent run with _wrapRunAgentToNotify, so the next completion
+			// fires its own notification.
+			const replyText = decodeURIComponent(parts.slice(2).join(':')).trim()
+			if (!replyText || !threadId) return
+			this._nativeHostService.dismissNotification(`done:${threadId}`)
+			this.addUserMessageAndStreamResponse({ userMessage: replyText, threadId })
 		}
 	}
 
@@ -3482,10 +3491,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	/**
 	 * Show a notification when a tool requires user approval.
-	 * The body shows the agent's last message (its reasoning for the tool call)
-	 * so the user can make an informed approve/reject decision without
-	 * switching to the Void window. Approve/Reject act without focusing;
-	 * clicking the body = View.
+	 * The body shows the conversation context — the user's request and the
+	 * agent's reasoning — so the user can make an informed approve/reject
+	 * decision without switching to the Void window. Approve/Reject act
+	 * without focusing; clicking the body = View.
 	 */
 	private _notifyAwaitingApproval(threadId: string) {
 		if (!this._shouldNotify('approval')) return
@@ -3498,9 +3507,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const toolDesc = this._getToolDescription(tool)
 		const agentReasoning = this._getLastAssistantText(threadId)
 		const question = this._getLastUserQuestion(threadId)
-		// Prefer the agent's reasoning as the body; fall back to the user's
-		// question if there's no assistant text yet (e.g. first turn).
-		const body = agentReasoning || question
+		// Conversation context: what the user asked for + the agent's reasoning
+		// for this tool call (empty when the model emitted no prose).
+		const bodyParts: string[] = []
+		if (question) bodyParts.push(`You: ${question}`)
+		if (agentReasoning) bodyParts.push(`Agent: ${agentReasoning}`)
+		const body = bodyParts.join('\n')
 
 		this._nativeHostService.showNotification({
 			id: `approval:${threadId}`,
@@ -3520,18 +3532,31 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	/**
 	 * Build a human-readable description of a tool call for notifications.
+	 * File tools show the file's name; terminal tools show the command.
 	 */
 	private _getToolDescription(tool: ToolMessage<ToolName>): string {
 		const name = tool.name
-		if (name === 'run_command') {
+		if (name === 'run_command' || name === 'run_persistent_command') {
 			const command = tool.rawParams?.command
 			return `$ ${truncate(typeof command === 'string' ? command : '', 60, '...')}`
 		}
-		if (name === 'edit_file' || name === 'file_replace') {
-			const fileUri = tool.rawParams?.fileUri
-			return `${name}: ${typeof fileUri === 'string' ? fileUri : ''}`
+		if (name === 'edit_file' || name === 'rewrite_file' || name === 'create_file_or_folder' || name === 'delete_file_or_folder') {
+			const verb = name === 'edit_file' ? 'Edit' : name === 'rewrite_file' ? 'Rewrite' : name === 'create_file_or_folder' ? 'Create' : 'Delete'
+			return `${verb} ${this._fileNameOfPath(tool.rawParams?.uri)}`
+		}
+		if (name === 'rename_file_or_folder') {
+			return `Rename ${this._fileNameOfPath(tool.rawParams?.source_uri)} \u2192 ${this._fileNameOfPath(tool.rawParams?.target_uri)}`
 		}
 		return name
+	}
+
+	/**
+	 * File name (last path segment) of a tool's path param, for notifications.
+	 */
+	private _fileNameOfPath(p: string | undefined): string {
+		if (typeof p !== 'string' || !p) return 'file'
+		const parts = p.split('/')
+		return parts[parts.length - 1] || p
 	}
 
 	/**
@@ -3590,7 +3615,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					title: 'Void finished',
 					subtitle: question,
 					body: answer || 'Click to view',
-					actions: [],
+					actions: [
+						// Handled inside the notification window: reveals the reply
+						// input and makes the panel keyable so the user can type.
+						{ label: 'Reply', actionId: `reply-expand:${threadId}` },
+					],
 					clickActionId: `view:${threadId}`,
 				})
 			}
