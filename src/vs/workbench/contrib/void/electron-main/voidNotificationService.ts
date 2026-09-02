@@ -191,7 +191,7 @@ export class VoidNotificationService extends Disposable {
 	 */
 	private _resizeToContent(win: BrowserWindow, id: string): Promise<void> {
 		if (win.isDestroyed()) return Promise.resolve();
-		return win.webContents.executeJavaScript('Math.ceil(document.body.scrollHeight)').then(measured => {
+		return win.webContents.executeJavaScript('Math.ceil(document.body.offsetHeight)').then(measured => {
 			const contentHeight = typeof measured === 'number' && measured > 0 ? measured : VoidNotificationService.NOTIFICATION_DEFAULT_HEIGHT;
 			const height = Math.min(Math.max(contentHeight, VoidNotificationService.NOTIFICATION_MIN_HEIGHT), VoidNotificationService.NOTIFICATION_MAX_HEIGHT);
 			const entry = this._notificationWindows.get(id);
@@ -224,7 +224,7 @@ export class VoidNotificationService extends Disposable {
 
 		const allButtons = [...notification.actions, { label: 'Dismiss', actionId: 'close' }];
 		const buttonsHtml = `<div class="buttons">${allButtons.map(a => {
-			const cls = a.label.toLowerCase().includes('approve') ? 'btn-approve' : a.label.toLowerCase().includes('reject') ? 'btn-reject' : 'btn-default';
+			const cls = a.label === 'Approve' ? 'btn-approve' : a.label === 'Approve all' ? 'btn-approve-all' : a.label === 'Reject' ? 'btn-reject' : 'btn-default';
 			return `<button class="btn ${cls}" onmousedown="event.preventDefault()" onclick="event.preventDefault(); event.stopPropagation(); console.log('void-action:${this._escapeHtml(a.actionId)}')">${this._escapeHtml(a.label)}</button>`;
 		}).join('')}</div>`;
 
@@ -280,6 +280,12 @@ function voidCollapseReply() {
 })();
 </script>` : '';
 
+		// Accent color by kind, inferred from the action set: approvals are
+		// attention-colored, done is calm, errors are red.
+		const accentColor = notification.actions.some(a => a.actionId.startsWith('approve')) ? '#d29922'
+			: notification.actions.some(a => a.actionId.startsWith('reply-expand:')) ? '#3fb950'
+			: '#f85149';
+
 		// Click the body text to view in Void (focuses the window + switches thread).
 		// Buttons stopPropagation so they don't trigger this.
 		const clickAction = notification.clickActionId ? this._escapeHtml(notification.clickActionId) : '';
@@ -292,7 +298,9 @@ function voidCollapseReply() {
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
-  background: rgba(30, 30, 30, 0.92);
+  background: rgba(22, 22, 26, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-left: 3px solid ${accentColor};
   border-radius: 12px;
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
   color: #fff;
@@ -300,33 +308,37 @@ body {
   overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  box-shadow: 0 16px 48px rgba(0,0,0,0.55), 0 2px 8px rgba(0,0,0,0.4);
 }
 .container { cursor: pointer; }
-.title { font-size: 14px; font-weight: 600; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.title { font-size: 14px; font-weight: 600; color: #f4f4f5; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .thread-title { font-size: 12px; color: #d1d1d6; font-weight: 500; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .subtitle { font-size: 13px; color: #8e8e93; margin-bottom: 6px; font-weight: 500; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
 .body { font-size: 13px; color: #aeaeb2; line-height: 1.4; margin-bottom: ${buttonsHtml ? '12px' : '0'}; white-space: pre-wrap; word-break: break-word; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 6; overflow: hidden; }
 .buttons { display: flex; gap: 6px; }
 .btn {
-  flex: 1; padding: 6px 8px; border: none; border-radius: 6px;
+  flex: 1; padding: 6px 8px; border: 1px solid transparent; border-radius: 6px;
   font-size: 12px; font-weight: 500; cursor: pointer; text-align: center;
   display: flex; align-items: center; justify-content: center; gap: 6px;
   white-space: nowrap;
 }
-.btn-approve { background: #30d158; color: #000; }
-.btn-approve:hover { background: #28b84c; }
-.btn-reject { background: #ff453a; color: #fff; }
-.btn-reject:hover { background: #d63a30; }
-.btn-default { background: rgba(255,255,255,0.15); color: #fff; }
+.btn-approve { background: #238636; color: #fff; border-color: rgba(255,255,255,0.12); }
+.btn-approve:hover { background: #2ea043; }
+.btn-approve-all { background: transparent; color: #3fb950; border-color: rgba(63,185,80,0.5); }
+.btn-approve-all:hover { background: rgba(63,185,80,0.12); }
+.btn-reject { background: transparent; color: #f85149; border-color: rgba(248,81,73,0.5); }
+.btn-reject:hover { background: rgba(248,81,73,0.12); }
+.btn-default { background: rgba(255,255,255,0.08); color: #c9d1d9; border-color: rgba(255,255,255,0.14); }
+.btn-default:hover { background: rgba(255,255,255,0.14); }
 .reply-row { margin-top: 8px; display: flex; }
 .reply-row input {
-  width: 100%; padding: 6px 10px; border: none; border-radius: 6px;
-  background: rgba(255,255,255,0.12); color: #fff; font-size: 13px;
+  width: 100%; padding: 6px 10px; border: 1px solid rgba(255,255,255,0.14); border-radius: 6px;
+  background: rgba(255,255,255,0.08); color: #f4f4f5; font-size: 13px;
   outline: none; font-family: inherit; cursor: text;
   user-select: text; -webkit-user-select: text;
 }
-.reply-row input::placeholder { color: #636366; }
+.reply-row input:focus { border-color: rgba(255,255,255,0.32); }
+.reply-row input::placeholder { color: #6e7681; }
 </style>
 </head>
 <body>
