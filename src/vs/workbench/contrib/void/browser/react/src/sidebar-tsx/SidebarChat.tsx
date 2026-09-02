@@ -930,19 +930,22 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 					// grouped semantically: behavior chips first (chat mode,
 					// permission), then the model pair (thinking level, model) —
 					// thinking is a property of the selected model, so they stay
-					// adjacent. flex-wrap drops controls to the next line as the
-					// sidebar narrows, and `flex-1 min-w-0` lets the row shrink
-					// below its content (without min-w-0 the flex item would
-					// refuse to shrink and overflow the chat area horizontally).
-					// The model dropdown takes the leftover width
-					// (`flex-auto min-w-0`) so it stretches to the row's right
-					// edge and ellipsizes long model names instead of forcing a
-					// wrap or overflowing; its menu still shows full names.
+					// adjacent. The pair sits in its own nested flex container,
+					// so when the row is too narrow the pair moves to the next
+					// line TOGETHER (behavior chips stay on line 1) instead of
+					// the model drifting down alone. The pair has `flex-auto`
+					// and the model inside it `flex-auto min-w-0`, so the model
+					// still stretches to the row's right edge and ellipsizes
+					// long names (its dropdown menu still shows full names).
+					// `flex-1 min-w-0` on the row lets it shrink below its
+					// content instead of overflowing the chat area horizontally.
 					<div className='flex flex-wrap items-center gap-x-1.5 gap-y-1 flex-1 min-w-0 text-nowrap'>
 						{featureName === 'Chat' && <ChatModeDropdown className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-2 rounded py-0.5 px-1' />}
 						{featureName === 'Chat' && <ThreadPermissionDropdown className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-2 rounded py-0.5 px-1' />}
-						<ReasoningOptionSlider featureName={featureName} threadOptions={threadReasoningOptions} onChangeThreadOptions={onChangeThreadReasoningOptions} />
-						<ModelDropdown featureName={featureName} className='text-xs text-void-fg-3 bg-void-bg-1 rounded flex-auto min-w-0' />
+						<div className='flex flex-wrap items-center gap-x-1.5 gap-y-1 flex-auto min-w-0'>
+							<ReasoningOptionSlider featureName={featureName} threadOptions={threadReasoningOptions} onChangeThreadOptions={onChangeThreadReasoningOptions} />
+							<ModelDropdown featureName={featureName} className='text-xs text-void-fg-3 bg-void-bg-1 rounded flex-auto min-w-0' />
+						</div>
 					</div>
 				)}
 
