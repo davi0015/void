@@ -141,6 +141,11 @@ export { IconLoading } from './sidebarChatHelpers.js';
 // SLIDER ONLY:
 // When `threadOptions`/`onChangeThreadOptions` are provided, the slider
 // reads/writes per-thread reasoning state instead of the global settings.
+
+// Compact token count for the Thinking slider's value label — "16k" instead
+// of "16384 tokens" so the row stays narrow in a small chat sidebar.
+const compactTokens = (n: number): string => n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`
+
 const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptions }: {
 	featureName: FeatureName,
 	threadOptions?: ModelSelectionOptions,
@@ -174,7 +179,7 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 
 	if (canTurnOffReasoning && !reasoningBudgetSlider) { // if it's just a on/off toggle without a power slider
 		return <div className='flex items-center gap-x-2'>
-			<span className='text-void-fg-3 text-xs pointer-events-none inline-block w-10 pr-1'>Thinking</span>
+			<span className='text-void-fg-3 text-xs pointer-events-none shrink-0'>Thinking</span>
 			<VoidSwitch
 				size='xxs'
 				value={isReasoningEnabled}
@@ -198,7 +203,7 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 			: valueIfOff
 
 		return <div className='flex items-center gap-x-2'>
-			<span className='text-void-fg-3 text-xs pointer-events-none inline-block w-10 pr-1'>Thinking</span>
+			<span className='text-void-fg-3 text-xs pointer-events-none shrink-0'>Thinking</span>
 			<VoidSlider
 				width={50}
 				size='xs'
@@ -211,7 +216,7 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 					setOptions({ reasoningEnabled: !isOff, reasoningBudget: newVal })
 				}}
 			/>
-			<span className='text-void-fg-3 text-xs pointer-events-none'>{isReasoningEnabled ? `${value} tokens` : 'Thinking disabled'}</span>
+			<span className='text-void-fg-3 text-xs pointer-events-none'>{isReasoningEnabled ? compactTokens(value) : 'Off'}</span>
 		</div>
 	}
 
@@ -229,7 +234,7 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 		const currentEffortCapitalized = currentEffort.charAt(0).toUpperCase() + currentEffort.slice(1, Infinity)
 
 		return <div className='flex items-center gap-x-2'>
-			<span className='text-void-fg-3 text-xs pointer-events-none inline-block w-10 pr-1'>Thinking</span>
+			<span className='text-void-fg-3 text-xs pointer-events-none shrink-0'>Thinking</span>
 			<VoidSlider
 				width={30}
 				size='xs'
@@ -242,7 +247,7 @@ const ReasoningOptionSlider = ({ featureName, threadOptions, onChangeThreadOptio
 					setOptions({ reasoningEnabled: !isOff, reasoningEffort: values[newVal] ?? undefined })
 				}}
 			/>
-			<span className='text-void-fg-3 text-xs pointer-events-none'>{isReasoningEnabled ? `${currentEffortCapitalized}` : 'Thinking disabled'}</span>
+			<span className='text-void-fg-3 text-xs pointer-events-none'>{isReasoningEnabled ? `${currentEffortCapitalized}` : 'Off'}</span>
 		</div>
 	}
 
@@ -921,18 +926,24 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 			{/* Bottom row */}
 			<div className='flex flex-row justify-between items-end gap-1'>
 				{showModelDropdown && (
-					<div className='flex flex-col gap-y-1'>
+					// One wrapping row holding all input-row controls (Thinking
+					// slider, chat mode, permission, model). flex-wrap drops
+					// controls to the next line as the sidebar narrows, and
+					// `flex-1 min-w-0` lets the row shrink below its content
+					// (without min-w-0 the flex item would refuse to shrink and
+					// overflow the chat area horizontally). The model dropdown
+					// takes the leftover width (`flex-auto min-w-0`) so long
+					// model names ellipsize instead of forcing a wrap or
+					// overflowing; every other control keeps its natural size.
+					<div className='flex flex-wrap items-center gap-x-1.5 gap-y-1 flex-1 min-w-0 text-nowrap'>
 						<ReasoningOptionSlider featureName={featureName} threadOptions={threadReasoningOptions} onChangeThreadOptions={onChangeThreadReasoningOptions} />
-
-						<div className='flex items-center flex-wrap gap-x-2 gap-y-1 text-nowrap '>
-							{featureName === 'Chat' && <ChatModeDropdown className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-2 rounded py-0.5 px-1' />}
-							{featureName === 'Chat' && <ThreadPermissionDropdown className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-2 rounded py-0.5 px-1' />}
-							<ModelDropdown featureName={featureName} className='text-xs text-void-fg-3 bg-void-bg-1 rounded' />
-						</div>
+						{featureName === 'Chat' && <ChatModeDropdown className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-2 rounded py-0.5 px-1' />}
+						{featureName === 'Chat' && <ThreadPermissionDropdown className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-2 rounded py-0.5 px-1' />}
+						<ModelDropdown featureName={featureName} className='text-xs text-void-fg-3 bg-void-bg-1 rounded flex-auto min-w-0' />
 					</div>
 				)}
 
-				<div className="flex items-center gap-1.5">
+				<div className="flex items-center gap-1.5 shrink-0">
 
 					{isStreaming && loadingIcon}
 
