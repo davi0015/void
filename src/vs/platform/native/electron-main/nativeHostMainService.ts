@@ -5,7 +5,7 @@
 
 import * as fs from 'fs';
 import { exec } from 'child_process';
-import { app, BrowserWindow, clipboard, Display, Menu, MessageBoxOptions, MessageBoxReturnValue, Notification, OpenDevToolsOptions, OpenDialogOptions, OpenDialogReturnValue, powerMonitor, SaveDialogOptions, SaveDialogReturnValue, screen, shell, webContents } from 'electron';
+import { app, BrowserWindow, clipboard, Display, Menu, MessageBoxOptions, MessageBoxReturnValue, OpenDevToolsOptions, OpenDialogOptions, OpenDialogReturnValue, powerMonitor, SaveDialogOptions, SaveDialogReturnValue, screen, shell, webContents } from 'electron';
 import { arch, cpus, freemem, loadavg, platform, release, totalmem, type } from 'os';
 import { promisify } from 'util';
 import { memoize } from '../../../base/common/decorators.js';
@@ -48,6 +48,7 @@ import { IConfigurationService } from '../../configuration/common/configuration.
 import { IProxyAuthService } from './auth.js';
 import { AuthInfo, Credentials, IRequestService } from '../../request/common/request.js';
 import { randomPath } from '../../../base/common/extpath.js';
+import { VoidNotificationService } from '../../../workbench/contrib/void/electron-main/voidNotificationService.js';
 
 export interface INativeHostMainService extends AddFirstParameterToFunctions<ICommonNativeHostService, Promise<unknown> /* only methods, not events */, number | undefined /* window ID */> { }
 
@@ -995,61 +996,18 @@ export class NativeHostMainService extends Disposable implements INativeHostMain
 
 	//#endregion
 
-	//#region Native Notifications
+	//#region Void Notifications (delegates to VoidNotificationService)
 
-	private readonly _activeNotifications = new Map<string, Notification>();
+	private readonly _voidNotificationService = this._register(new VoidNotificationService());
 
-	private readonly _onNotificationAction = this._register(new Emitter<string>());
-	readonly onNotificationAction: Event<string> = this._onNotificationAction.event;
+	readonly onNotificationAction: Event<string> = this._voidNotificationService.onNotificationAction;
 
 	async showNotification(windowId: number | undefined, notification: { id: string, title: string, subtitle?: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string }): Promise<void> {
-		if (!Notification.isSupported()) {
-			return;
-		}
-
-		// Close existing notification with same id (dedup)
-		const existing = this._activeNotifications.get(notification.id);
-		if (existing) {
-			existing.close();
-		}
-
-		const n = new Notification({
-			title: notification.title,
-			subtitle: notification.subtitle,
-			body: notification.body,
-			actions: notification.actions.map(a => ({ type: 'button', text: a.label })),
-			closeButtonText: 'Dismiss',
-		});
-
-		n.on('action', (event, index) => {
-			const action = notification.actions[index];
-			if (action) {
-				this._onNotificationAction.fire(action.actionId);
-			}
-			n.close();
-		});
-
-		if (notification.clickActionId) {
-			n.on('click', () => {
-				this._onNotificationAction.fire(notification.clickActionId!);
-				n.close();
-			});
-		}
-
-		n.on('close', () => {
-			this._activeNotifications.delete(notification.id);
-		});
-
-		this._activeNotifications.set(notification.id, n);
-		n.show();
+		await this._voidNotificationService.showNotification(notification);
 	}
 
 	async dismissNotification(windowId: number | undefined, id: string): Promise<void> {
-		const n = this._activeNotifications.get(id);
-		if (n) {
-			n.close();
-			this._activeNotifications.delete(id);
-		}
+		await this._voidNotificationService.dismissNotification(id);
 	}
 
 	//#endregion

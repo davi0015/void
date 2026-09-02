@@ -198,7 +198,7 @@ export interface ICommonNativeHostService {
 	// Registry (Windows only)
 	windowsGetStringRegKey(hive: 'HKEY_CURRENT_USER' | 'HKEY_LOCAL_MACHINE' | 'HKEY_CLASSES_ROOT' | 'HKEY_USERS' | 'HKEY_CURRENT_CONFIG', path: string, name: string): Promise<string | undefined>;
 
-	// Native notifications (macOS banner alerts with action buttons)
+	// Floating notification windows (custom BrowserWindows with action buttons)
 	readonly onNotificationAction: Event<string>;
 	showNotification(notification: { id: string, title: string, subtitle?: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string }): Promise<void>;
 	dismissNotification(id: string): Promise<void>;

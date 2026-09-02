@@ -27,10 +27,10 @@ import { Position } from '../../../../editor/common/core/position.js';
 import { IMetricsService } from '../common/metricsService.js';
 
 import { IVoidModelService } from '../common/voidModelService.js';
+import { findLast } from '../../../../base/common/arraysFind.js';
 import { IEditCodeService } from './editCodeServiceInterface.js';
 import { ITerminalToolService } from './terminalToolService.js';
 // import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js'; // checkpoint disabled — see checkpoint-storage-refactor.md
-import { findLast } from '../../../../base/common/arraysFind.js';
 import { truncate } from '../../../../base/common/strings.js';
 import { CHECKPOINT_KEY_PREFIX, LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, MESSAGE_KEY_PREFIX, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY, USAGE_KEY_PREFIX } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
@@ -628,7 +628,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// for approval, it consumes this flag and auto-approves instead of showing
 	// the button — so the user's click isn't swallowed.
 	private readonly _queuedApprovalOfThreadId = new Set<string>()
-
 	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
@@ -854,7 +853,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._flushPendingThreadWrites()
 		}))
 
-		// Listen for native notification action clicks (from macOS notification banners).
+		// Listen for notification action clicks (from the floating notification windows).
 		// The actionId encodes the type of action: approve, reject, view.
 		this._register(this._nativeHostService.onNotificationAction(actionId => {
 			this._handleNotificationAction(actionId)
@@ -863,7 +862,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	/**
-	 * Handle a native notification action click. The actionId encodes
+	 * Handle a notification action click. The actionId encodes
 	 * the action: approve:<threadId>, reject:<threadId>, or view:<threadId>.
 	 */
 	private _handleNotificationAction(actionId: string) {
@@ -1605,7 +1604,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// Fire an approval notification when transitioning to 'awaiting_user',
 		// but only if the user is not currently viewing this thread or the
-		// window doesn't have focus (e.g. switched to another macOS desktop).
+		// window doesn't have focus. If they're on Void, they can see the
+		// approval button directly — no notification needed.
 		if (state?.isRunning === 'awaiting_user' && prev?.isRunning !== 'awaiting_user') {
 			if (threadId !== this.state.currentThreadId || !this._hostService.hasFocus) {
 				this._notifyAwaitingApproval(threadId)
@@ -3366,7 +3366,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 
 	/**
-	 * Show a native notification when a tool requires user approval.
+	 * Show a notification when a tool requires user approval.
 	 * The body shows the agent's last message (its reasoning for the tool call)
 	 * so the user can make an informed approve/reject decision without
 	 * switching to the Void window. Approve/Reject act without focusing;
