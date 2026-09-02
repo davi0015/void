@@ -3517,6 +3517,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._nativeHostService.showNotification({
 			id: `approval:${threadId}`,
 			title: 'Void needs approval',
+			threadTitle: this._getThreadTitle(threadId),
 			subtitle: toolDesc,
 			body,
 			actions: [
@@ -3578,6 +3579,22 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	/**
+	 * The thread's display label, matching the sidebar's convention:
+	 * customTitle → first user message → ephemeral title → 'New Chat'.
+	 * Cleaned to a single line for the notification's identity row.
+	 */
+	private _getThreadTitle(threadId: string): string {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return ''
+		const clean = (s: string) => truncate(s.replace(/\s+/g, ' ').trim(), 60, '...')
+		const customTitle = thread.customTitle?.trim()
+		if (customTitle) return clean(customTitle)
+		const firstUser = thread.messages.find(m => m.role === 'user')
+		if (firstUser?.role === 'user' && firstUser.displayContent) return clean(firstUser.displayContent)
+		return thread.title ? clean(thread.title) : 'New Chat'
+	}
+
+	/**
 	 * Get the user's last question, truncated for notification display.
 	 */
 	private _getLastUserQuestion(threadId: string): string {
@@ -3597,12 +3614,18 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		const showDoneNotification = (error: string | null) => {
 			if (!this._shouldNotify('done')) return
-			const question = this._getLastUserQuestion(threadId)
+			const threadTitle = this._getThreadTitle(threadId)
+			// The identity line already shows the task for single-turn threads;
+			// only include the last question when there were multiple exchanges.
+			const thread = this.state.allThreads[threadId]
+			const isMultiTurn = !!thread && thread.messages.filter(m => m.role === 'user').length > 1
+			const question = isMultiTurn ? this._getLastUserQuestion(threadId) : undefined
 
 			if (error) {
 				this._nativeHostService.showNotification({
 					id: `error:${threadId}`,
 					title: 'Void hit an error',
+					threadTitle,
 					subtitle: question,
 					body: truncate(error, 150, '...'),
 					actions: [],
@@ -3613,6 +3636,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				this._nativeHostService.showNotification({
 					id: `done:${threadId}`,
 					title: 'Void finished',
+					threadTitle,
 					subtitle: question,
 					body: answer || 'Click to view',
 					actions: [

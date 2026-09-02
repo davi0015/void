@@ -9,6 +9,9 @@ import { Disposable } from '../../../../base/common/lifecycle.js';
 export type VoidNotification = {
 	id: string;
 	title: string;
+	// Thread identity (custom title or first user message) — lets the user
+	// tell parallel chats apart at a glance.
+	threadTitle?: string;
 	subtitle?: string;
 	body: string;
 	actions: { label: string, actionId: string }[];
@@ -228,6 +231,7 @@ export class VoidNotificationService extends Disposable {
 		}).join('')}</div>`;
 
 		const subtitleHtml = subtitle ? `<div class="subtitle">${subtitle}</div>` : '';
+		const threadTitleHtml = notification.threadTitle ? `<div class="thread-title">${this._escapeHtml(notification.threadTitle)}</div>` : '';
 
 		// Reply input — revealed by the main process when Reply is clicked (it
 		// makes the window keyable first so the input can take focus). Esc
@@ -275,6 +279,7 @@ body {
 }
 .container { cursor: pointer; }
 .title { font-size: 14px; font-weight: 600; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.thread-title { font-size: 12px; color: #d1d1d6; font-weight: 500; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .subtitle { font-size: 13px; color: #8e8e93; margin-bottom: 6px; font-weight: 500; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
 .body { font-size: 13px; color: #aeaeb2; line-height: 1.4; margin-bottom: ${buttonsHtml ? '12px' : '0'}; white-space: pre-wrap; word-break: break-word; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 6; overflow: hidden; }
 .buttons { display: flex; gap: 6px; }
@@ -303,6 +308,7 @@ body {
 <body>
 <div class="container" ${clickHandler}>
   <div class="title">${title}</div>
+  ${threadTitleHtml}
   ${subtitleHtml}
   <div class="body">${body}</div>
   ${buttonsHtml}
