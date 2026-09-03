@@ -854,6 +854,26 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			}
 		}))
 
+		// Resume threads paused awaiting approval when the effective
+		// auto-approval level rises via the GLOBAL settings — the
+		// ToolApprovalTypeSwitch rendered next to the approval buttons can
+		// be flipped while a tool is pending. Same reasoning as
+		// setThreadPermissionMode: the UI hides the approval buttons for
+		// tools that are now auto-approved, so without resuming, the thread
+		// would be stuck with no way to continue except Stop. The event
+		// fires for every settings mutation, so snapshot-compare the
+		// autoApprove reference and only run the (cheap) resume check when
+		// it was actually replaced.
+		let lastSeenAutoApprove = this._settingsService.state.globalSettings.autoApprove
+		this._register(this._settingsService.onDidChangeState(() => {
+			const current = this._settingsService.state.globalSettings.autoApprove
+			if (current === lastSeenAutoApprove) return
+			lastSeenAutoApprove = current
+			for (const threadId of Object.keys(this.streamState)) {
+				this._resumeAwaitingApprovalIfAutoApproved(threadId)
+			}
+		}))
+
 
 		// keep track of user-modified files
 		// const disposablesOfModelId: { [modelId: string]: IDisposable[] } = {}
@@ -2661,45 +2681,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 			const approvalType = isBuiltInTool ? approvalTypeOfBuiltinToolName[toolName] : 'MCP tools'
 			if (approvalType) {
-				// Effective mode = global config OR this thread's permission-mode grant,
-				// whichever allows more (per-chat selector in the chat input box).
-				// Tri-state resolution:
-				//   'off'       → always prompt
-				//   'all'       → skip prompt
-				//   'workspace' → skip prompt iff target URI is inside an open workspace folder.
-				//                 For non-workspace-scoped tiers ('terminal', 'MCP tools'),
-				//                 'workspace' is semantically equivalent to 'all' — commands/MCPs
-				//                 don't have a single target URI to scope against and can
-				//                 legitimately operate outside the workspace.
-				const mode = effectiveAutoApproveMode(approvalType, this._settingsService.state.globalSettings.autoApprove[approvalType], this.state.allThreads[threadId]?.permissionMode)
-				let autoApprove = false
-				if (mode === 'all') {
-					autoApprove = true
-				} else if (mode === 'workspace') {
-					if (approvalIsWorkspaceScoped(approvalType) && isBuiltInTool) {
-						const targetUri = (toolParams as { uri?: URI } | undefined)?.uri
-						const sourceUri = (toolParams as { sourceUri?: URI } | undefined)?.sourceUri
-						const targetUri2 = (toolParams as { targetUri?: URI } | undefined)?.targetUri
-						const urisToCheck = [targetUri, sourceUri, targetUri2].filter((u): u is URI => !!u)
-						autoApprove = urisToCheck.length > 0 && urisToCheck.every(u => this._workspaceContextService.isInsideWorkspace(u))
-					} else {
-						autoApprove = true
-					}
-				}
-
-				// Terminal command allowlist — check if the command matches a prefix
-				// in the per-workspace allowlist (added via "Always approve" button).
-				if (!autoApprove && approvalType === 'terminal' && isBuiltInTool) {
-					const terminalParams = toolParams as BuiltinToolCallParams['run_command'] | BuiltinToolCallParams['run_persistent_command']
-					if (terminalParams && 'command' in terminalParams) {
-						const allowlist = this._terminalToolService.getAutoApproveAllowlist()
-						if (shouldAutoApprove(terminalParams.command, allowlist)) {
-							autoApprove = true
-						}
-					}
-				}
-
-				if (!autoApprove) {
+				if (!this._isToolAutoApproved(threadId, toolName, toolParams)) {
 					// Transition (or create) the tool_request row. _updateLatestTool finds the
 					// row by id: for solo tool calls there's no pre-added row and it appends one
 					// (same as the old behavior). For batched tool calls, the batch processor
@@ -4861,6 +4843,88 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._setState({ allThreads: newThreads })
 
 		this._metricsService.capture('Chat Permission Mode Change', { mode: next })
+
+		// If this thread is paused awaiting approval and the raised level would
+		// now auto-approve the pending tool, resume it — the approval buttons
+		// already disappear for auto-approved tools, so without this the
+		// thread would be stuck with no way to continue except Stop.
+		this._resumeAwaitingApprovalIfAutoApproved(threadId)
+	}
+
+	// The full auto-approval decision for a tool call on a thread: the
+	// effective mode (global config OR the thread's permission-mode grant,
+	// whichever allows more), the workspace-scoping URI check, and the
+	// per-workspace terminal command allowlist. Single source of truth shared
+	// by the approval gate in `_runToolCall` and by
+	// `_resumeAwaitingApprovalIfAutoApproved` so both always agree — the UI
+	// hides approval buttons based on the same effective mode.
+	private _isToolAutoApproved(threadId: string, toolName: ToolName, toolParams: ToolCallParams<ToolName> | undefined): boolean {
+		const isBuiltInTool = isABuiltinToolName(toolName)
+		const approvalType = isBuiltInTool ? approvalTypeOfBuiltinToolName[toolName] : 'MCP tools'
+		if (!approvalType) return false
+
+		// Tri-state resolution:
+		//   'off'       → always prompt
+		//   'all'       → skip prompt
+		//   'workspace' → skip prompt iff target URI is inside an open workspace folder.
+		//                 For non-workspace-scoped tiers ('terminal', 'MCP tools'),
+		//                 'workspace' is semantically equivalent to 'all' — commands/MCPs
+		//                 don't have a single target URI to scope against and can
+		//                 legitimately operate outside the workspace.
+		const mode = effectiveAutoApproveMode(approvalType, this._settingsService.state.globalSettings.autoApprove[approvalType], this.state.allThreads[threadId]?.permissionMode)
+		let autoApprove = false
+		if (mode === 'all') {
+			autoApprove = true
+		} else if (mode === 'workspace') {
+			if (approvalIsWorkspaceScoped(approvalType) && isBuiltInTool) {
+				const targetUri = (toolParams as { uri?: URI } | undefined)?.uri
+				const sourceUri = (toolParams as { sourceUri?: URI } | undefined)?.sourceUri
+				const targetUri2 = (toolParams as { targetUri?: URI } | undefined)?.targetUri
+				const urisToCheck = [targetUri, sourceUri, targetUri2].filter((u): u is URI => !!u)
+				autoApprove = urisToCheck.length > 0 && urisToCheck.every(u => this._workspaceContextService.isInsideWorkspace(u))
+			} else {
+				autoApprove = true
+			}
+		}
+
+		// Terminal command allowlist — check if the command matches a prefix
+		// in the per-workspace allowlist (added via "Always approve" button).
+		if (!autoApprove && approvalType === 'terminal' && isBuiltInTool) {
+			const terminalParams = toolParams as BuiltinToolCallParams['run_command'] | BuiltinToolCallParams['run_persistent_command']
+			if (terminalParams && 'command' in terminalParams) {
+				const allowlist = this._terminalToolService.getAutoApproveAllowlist()
+				if (shouldAutoApprove(terminalParams.command, allowlist)) {
+					autoApprove = true
+				}
+			}
+		}
+
+		return autoApprove
+	}
+
+	// If the thread is paused awaiting user approval and the FIRST pending
+	// tool would now be auto-approved (effective level rose — permission mode
+	// raised or global auto-approve turned on), approve it programmatically:
+	// terminal tools fire their concurrent path, everything else restarts the
+	// agent with that tool — exactly what the user's button click would do.
+	// Any remaining pending tools are then handled by the normal batch drain,
+	// which auto-approves them through the same raised level. Without this,
+	// the UI hides the (now dead) approval buttons and the thread is stuck
+	// until the user presses Stop.
+	private _resumeAwaitingApprovalIfAutoApproved(threadId: string) {
+		if (this.streamState[threadId]?.isRunning !== 'awaiting_user') return
+		const pending = this._getPendingBatchTools(threadId)
+		if (pending.length === 0) return
+
+		const first = pending[0]
+		if (!this._isToolAutoApproved(threadId, first.name, first.params)) return
+
+		const name = first.name
+		if (isABuiltinToolName(name) && approvalTypeOfBuiltinToolName[name] === 'terminal') {
+			this.approveToolRequest(threadId, first.id)
+		} else {
+			this.approveLatestToolRequest(threadId)
+		}
 	}
 
 	private _addMessageToThread(threadId: string, message: ChatMessage) {
