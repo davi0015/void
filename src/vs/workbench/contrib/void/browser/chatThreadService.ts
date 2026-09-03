@@ -3544,12 +3544,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (agentReasoning) bodyParts.push(`Agent: ${agentReasoning}`)
 		const body = bodyParts.join('\n')
 
+		// Stored volume is 0-100; the notification takes 0-1 (0/undefined = silent).
+		const { notificationSound, notificationSoundVolume } = this._settingsService.state.globalSettings
+
 		this._nativeHostService.showNotification({
 			id: `approval:${threadId}`,
 			title: 'Void needs approval',
 			threadTitle: this._getThreadTitle(threadId),
 			subtitle: toolDesc,
-			sound: this._settingsService.state.globalSettings.notificationSound,
+			sound: notificationSound ? (notificationSoundVolume ?? 100) / 100 : undefined,
 			body,
 			actions: [
 				{ label: 'Approve', actionId: `approve:${threadId}` },
@@ -3645,6 +3648,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		const showDoneNotification = (error: string | null) => {
 			if (!this._shouldNotify('done')) return
+			// Chime on completion only (not errors) — same toggle/volume as approvals.
+			const { notificationSound, notificationSoundVolume } = this._settingsService.state.globalSettings
 			const threadTitle = this._getThreadTitle(threadId)
 			// The identity line already shows the task for single-turn threads;
 			// only include the last question when there were multiple exchanges.
@@ -3669,6 +3674,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					title: 'Void finished',
 					threadTitle,
 					subtitle: question,
+					sound: notificationSound ? (notificationSoundVolume ?? 100) / 100 : undefined,
 					body: answer || 'Click to view',
 					actions: [
 						// Handled inside the notification window: reveals the reply

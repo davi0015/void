@@ -476,6 +476,8 @@ export type GlobalSettings = {
 	notifyOnApproval: boolean;
 	notifyOnDone: boolean;
 	notificationSound: boolean;
+	// Notification chime volume, 0-100 (0 = silent, same as notificationSound off).
+	notificationSoundVolume: number;
 	syncApplyToChat: boolean;
 	syncSCMToChat: boolean;
 	enableFastApply: boolean;
@@ -510,6 +512,7 @@ export const defaultGlobalSettings: GlobalSettings = {
 	notifyOnApproval: true,
 	notifyOnDone: true,
 	notificationSound: true,
+	notificationSoundVolume: 100,
 	syncApplyToChat: true,
 	syncSCMToChat: true,
 	enableFastApply: true,

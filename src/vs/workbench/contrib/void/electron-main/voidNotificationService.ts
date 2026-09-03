@@ -13,8 +13,9 @@ export type VoidNotification = {
 	// tell parallel chats apart at a glance.
 	threadTitle?: string;
 	subtitle?: string;
-	// Play a soft chime when the notification appears (approval-needed).
-	sound?: boolean;
+	// Play a soft chime when the notification appears (approvals and
+	// chat-complete). Value is the volume 0-1; 0 or undefined means no sound.
+	sound?: number;
 	body: string;
 	actions: { label: string, actionId: string }[];
 	clickActionId?: string;
@@ -253,23 +254,35 @@ function voidCollapseReply() {
 }
 </script>` : '';
 
-		// Soft two-tone chime for approval-needed notifications. Synthesized
-		// with WebAudio inside the notification page — no bundled asset needed,
-		// and Electron's default autoplay policy allows it without a gesture.
-		const soundScript = notification.sound ? `
+		// Soft two-tone chime for notifications. Synthesized with WebAudio
+		// inside the notification page — no bundled asset needed, and Electron's
+		// default autoplay policy allows it without a gesture. Approvals chime
+		// ascending (attention); chat-complete chimes descending (resolution) —
+		// mirroring the accent-color inference, so the user can tell "needs me"
+		// from "finished" without looking.
+		// The requested volume (0-1, clamped) scales the chime's peak gain on a
+		// quadratic curve — perceived loudness is logarithmic, so a linear mapping
+		// would spend most of the slider range below the audible-difference
+		// threshold. 100% = 0.7 peak gain (~6x the original 0.12 loudness).
+		const soundVolume = Math.min(Math.max(notification.sound ?? 0, 0), 1);
+		const peakGain = 0.7 * soundVolume * soundVolume;
+		const chimeFrequencies = notification.actions.some(a => a.actionId.startsWith('approve')) ? [880, 1174.66] : [1174.66, 880];
+		const soundScript = peakGain > 0 ? `
 <script>
 (function () {
 	try {
 		var ctx = new AudioContext();
 		var now = ctx.currentTime;
-		[880, 1174.66].forEach(function (freq, i) {
+		var peak = ${peakGain.toFixed(4)};
+		var freqs = ${JSON.stringify(chimeFrequencies)};
+		freqs.forEach(function (freq, i) {
 			var t = now + i * 0.15;
 			var osc = ctx.createOscillator();
 			var g = ctx.createGain();
 			osc.type = 'sine';
 			osc.frequency.value = freq;
 			g.gain.setValueAtTime(0.0001, t);
-			g.gain.exponentialRampToValueAtTime(0.12, t + 0.02);
+			g.gain.exponentialRampToValueAtTime(peak, t + 0.02);
 			g.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
 			osc.connect(g);
 			g.connect(ctx.destination);

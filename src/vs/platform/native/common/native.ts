@@ -200,7 +200,7 @@ export interface ICommonNativeHostService {
 
 	// Floating notification windows (custom BrowserWindows with action buttons)
 	readonly onNotificationAction: Event<{ windowId: number | undefined; actionId: string }>;
-	showNotification(notification: { id: string, title: string, threadTitle?: string, subtitle?: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string, sound?: boolean }): Promise<void>;
+	showNotification(notification: { id: string, title: string, threadTitle?: string, subtitle?: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string, sound?: number }): Promise<void>;
 	dismissNotification(id: string): Promise<void>;
 }
 
