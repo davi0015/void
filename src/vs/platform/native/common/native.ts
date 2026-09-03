@@ -199,8 +199,8 @@ export interface ICommonNativeHostService {
 	windowsGetStringRegKey(hive: 'HKEY_CURRENT_USER' | 'HKEY_LOCAL_MACHINE' | 'HKEY_CLASSES_ROOT' | 'HKEY_USERS' | 'HKEY_CURRENT_CONFIG', path: string, name: string): Promise<string | undefined>;
 
 	// Floating notification windows (custom BrowserWindows with action buttons)
-	readonly onNotificationAction: Event<string>;
-	showNotification(notification: { id: string, title: string, threadTitle?: string, subtitle?: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string, sound?: boolean }): Promise<void>;
+	readonly onNotificationAction: Event<{ windowId: number | undefined; actionId: string }>;
+	showNotification(notification: { id: string, title: string, threadTitle?: string, subtitle?: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string, sound?: number, soundKind?: string }): Promise<void>;
 	dismissNotification(id: string): Promise<void>;
 }
 

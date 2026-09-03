@@ -899,8 +899,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}))
 
 		// Listen for notification action clicks (from the floating notification windows).
-		// The actionId encodes the type of action: approve, reject, view.
-		this._register(this._nativeHostService.onNotificationAction(actionId => {
+		// The actionId encodes the type of action: approve, reject, view. Each
+		// notification is tagged with the window that showed it — only that
+		// window handles the action, so multiple Void windows don't all react
+		// to the same click. Actions without a windowId (undefined) are handled
+		// by every window, preserving the old broadcast behavior.
+		this._register(this._nativeHostService.onNotificationAction(({ windowId, actionId }) => {
+			if (windowId !== undefined && windowId !== this._nativeHostService.windowId) return
 			this._handleNotificationAction(actionId)
 		}))
 
@@ -3521,12 +3526,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (agentReasoning) bodyParts.push(`Agent: ${agentReasoning}`)
 		const body = bodyParts.join('\n')
 
+		// Stored volume is 0-100; the notification takes 0-1 (0/undefined = silent).
+		const { notificationSound, notificationSoundVolume, notificationSoundKind } = this._settingsService.state.globalSettings
+
 		this._nativeHostService.showNotification({
 			id: `approval:${threadId}`,
 			title: 'Void needs approval',
 			threadTitle: this._getThreadTitle(threadId),
 			subtitle: toolDesc,
-			sound: this._settingsService.state.globalSettings.notificationSound,
+			sound: notificationSound ? (notificationSoundVolume ?? 100) / 100 : undefined,
+			soundKind: notificationSound ? (notificationSoundKind ?? 'pop') : undefined,
 			body,
 			actions: [
 				{ label: 'Approve', actionId: `approve:${threadId}` },
@@ -3622,6 +3631,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		const showDoneNotification = (error: string | null) => {
 			if (!this._shouldNotify('done')) return
+			// Chime on completion only (not errors) — same toggle/volume as approvals.
+			const { notificationSound, notificationSoundVolume, notificationSoundKind } = this._settingsService.state.globalSettings
 			const threadTitle = this._getThreadTitle(threadId)
 			// The identity line already shows the task for single-turn threads;
 			// only include the last question when there were multiple exchanges.
@@ -3646,6 +3657,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					title: 'Void finished',
 					threadTitle,
 					subtitle: question,
+					sound: notificationSound ? (notificationSoundVolume ?? 100) / 100 : undefined,
+					soundKind: notificationSound ? (notificationSoundKind ?? 'pop') : undefined,
 					body: answer || 'Click to view',
 					actions: [
 						// Handled inside the notification window: reveals the reply
