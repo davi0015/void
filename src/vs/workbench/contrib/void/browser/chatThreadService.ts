@@ -879,8 +879,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}))
 
 		// Listen for notification action clicks (from the floating notification windows).
-		// The actionId encodes the type of action: approve, reject, view.
-		this._register(this._nativeHostService.onNotificationAction(actionId => {
+		// The actionId encodes the type of action: approve, reject, view. Each
+		// notification is tagged with the window that showed it — only that
+		// window handles the action, so multiple Void windows don't all react
+		// to the same click. Actions without a windowId (undefined) are handled
+		// by every window, preserving the old broadcast behavior.
+		this._register(this._nativeHostService.onNotificationAction(({ windowId, actionId }) => {
+			if (windowId !== undefined && windowId !== this._nativeHostService.windowId) return
 			this._handleNotificationAction(actionId)
 		}))
 

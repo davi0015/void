@@ -163,7 +163,7 @@ export class TestNativeHostService implements INativeHostService {
 	async profileRenderer(): Promise<any> { throw new Error(); }
 	async getScreenshot(): Promise<ArrayBufferLike | undefined> { return undefined; }
 
-	onNotificationAction: Event<string> = Event.None;
+	onNotificationAction: Event<{ windowId: number | undefined; actionId: string }> = Event.None;
 	async showNotification(): Promise<void> { }
 	async dismissNotification(): Promise<void> { }
 }

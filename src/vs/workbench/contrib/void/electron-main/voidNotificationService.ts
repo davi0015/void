@@ -41,10 +41,10 @@ export type VoidNotification = {
  */
 export class VoidNotificationService extends Disposable {
 
-	private readonly _notificationWindows = new Map<string, { window: BrowserWindow; timeout: NodeJS.Timeout | undefined; height: number; informational: boolean; replyExpanded: boolean }>();
+	private readonly _notificationWindows = new Map<string, { window: BrowserWindow; windowId: number | undefined; timeout: NodeJS.Timeout | undefined; height: number; informational: boolean; replyExpanded: boolean }>();
 
-	private readonly _onNotificationAction = this._register(new Emitter<string>());
-	readonly onNotificationAction: Event<string> = this._onNotificationAction.event;
+	private readonly _onNotificationAction = this._register(new Emitter<{ windowId: number | undefined; actionId: string }>());
+	readonly onNotificationAction: Event<{ windowId: number | undefined; actionId: string }> = this._onNotificationAction.event;
 
 	private static readonly NOTIFICATION_WIDTH = 360;
 	private static readonly NOTIFICATION_DEFAULT_HEIGHT = 180;
@@ -55,7 +55,7 @@ export class VoidNotificationService extends Disposable {
 	private static readonly NOTIFICATION_TIMEOUT_MS = 20000;
 	private static readonly MAX_VISIBLE_NOTIFICATIONS = 5;
 
-	async showNotification(notification: VoidNotification): Promise<void> {
+	async showNotification(windowId: number | undefined, notification: VoidNotification): Promise<void> {
 		// Close existing notification with same id (dedup)
 		await this.dismissNotification(notification.id);
 
@@ -137,7 +137,7 @@ export class VoidNotificationService extends Disposable {
 			}
 
 			if (actionId !== 'close') {
-				this._onNotificationAction.fire(actionId);
+				this._onNotificationAction.fire({ windowId, actionId });
 			}
 			this.dismissNotification(notification.id);
 		});
@@ -173,7 +173,7 @@ export class VoidNotificationService extends Disposable {
 			}, VoidNotificationService.NOTIFICATION_TIMEOUT_MS);
 		}
 
-		this._notificationWindows.set(notification.id, { window: win, timeout, height: VoidNotificationService.NOTIFICATION_DEFAULT_HEIGHT, informational, replyExpanded: false });
+		this._notificationWindows.set(notification.id, { window: win, windowId, timeout, height: VoidNotificationService.NOTIFICATION_DEFAULT_HEIGHT, informational, replyExpanded: false });
 	}
 
 	async dismissNotification(id: string): Promise<void> {
