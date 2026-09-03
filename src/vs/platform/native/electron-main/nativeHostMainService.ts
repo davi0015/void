@@ -1002,7 +1002,7 @@ export class NativeHostMainService extends Disposable implements INativeHostMain
 
 	readonly onNotificationAction: Event<{ windowId: number | undefined; actionId: string }> = this._voidNotificationService.onNotificationAction;
 
-	async showNotification(windowId: number | undefined, notification: { id: string, title: string, threadTitle?: string, subtitle?: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string, sound?: number }): Promise<void> {
+	async showNotification(windowId: number | undefined, notification: { id: string, title: string, threadTitle?: string, subtitle?: string, body: string, actions: { label: string, actionId: string }[], clickActionId?: string, sound?: number, soundKind?: string }): Promise<void> {
 		await this._voidNotificationService.showNotification(windowId, notification);
 	}
 

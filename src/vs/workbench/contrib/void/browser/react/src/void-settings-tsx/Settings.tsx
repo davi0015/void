@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
-import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName, BackendId, BackendProtocol, BackendProviderSettings } from '../../../../common/voidSettingsTypes.js'
+import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName, BackendId, BackendProtocol, BackendProviderSettings, notificationSoundKinds, displayNameOfNotificationSoundKind } from '../../../../common/voidSettingsTypes.js'
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js'
 import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSegmentedControl, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js'
 import { useAccessor, useIsDark, useIsOptedOut, useRefreshModelListener, useRefreshModelState, useSettingsState, useSemanticIndexState } from '../util/services.js'
@@ -1939,8 +1939,24 @@ export const Settings = () => {
 														</div>
 													</ErrorBoundary>
 
-													{/* Sound volume — only relevant when the sound is on */}
+													{/* Sound kind + volume — only relevant when the sound is on */}
 													{settingsState.globalSettings.notificationSound && <>
+														<ErrorBoundary>
+															<div className='flex items-center gap-x-2 my-2'>
+																<span className='text-void-fg-3 text-xs pointer-events-none'>Sound</span>
+																<VoidCustomDropdownBox
+																	options={[...notificationSoundKinds]}
+																	selectedOption={settingsState.globalSettings.notificationSoundKind ?? 'pop'}
+																	onChangeOption={(k) => voidSettingsService.setGlobalSetting('notificationSoundKind', k)}
+																	getOptionDisplayName={(k) => displayNameOfNotificationSoundKind[k]}
+																	getOptionDropdownName={(k) => displayNameOfNotificationSoundKind[k]}
+																	getOptionsEqual={(a, b) => a === b}
+																	className='max-w-40 text-xs bg-void-bg-1 border border-void-border-2 rounded px-1'
+																	arrowTouchesText={false}
+																/>
+															</div>
+														</ErrorBoundary>
+
 														<ErrorBoundary>
 															<div className='flex items-center gap-x-2 my-2'>
 																<span className='text-void-fg-3 text-xs pointer-events-none'>Sound volume</span>

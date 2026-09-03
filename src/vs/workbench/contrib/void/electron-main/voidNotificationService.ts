@@ -16,6 +16,10 @@ export type VoidNotification = {
 	// Play a soft chime when the notification appears (approvals and
 	// chat-complete). Value is the volume 0-1; 0 or undefined means no sound.
 	sound?: number;
+	// The chime timbre — one of the notificationSoundKinds from
+	// voidSettingsTypes ('pop', 'glass', 'marimba', ...). Unknown values fall
+	// back to 'pop' in the generated sound script.
+	soundKind?: string;
 	body: string;
 	actions: { label: string, actionId: string }[];
 	clickActionId?: string;
@@ -222,9 +226,17 @@ export class VoidNotificationService extends Disposable {
 		const title = this._escapeHtml(notification.title);
 		const subtitle = notification.subtitle ? this._escapeHtml(notification.subtitle) : '';
 		const body = this._escapeHtml(notification.body);
+		// Shown in the header meta row — static at build time, which is when
+		// the notification appears.
+		const timestamp = new Date().toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
 
 		const allButtons = [...notification.actions, { label: 'Dismiss', actionId: 'close' }];
 		const buttonsHtml = `<div class="buttons">${allButtons.map(a => {
+			// The close button renders as a compact × instead of a text
+			// button — less visual noise next to the primary actions.
+			if (a.actionId === 'close') {
+				return `<button class="btn btn-close" title="Dismiss" onmousedown="event.preventDefault()" onclick="event.preventDefault(); event.stopPropagation(); console.log('void-action:close')">&times;</button>`;
+			}
 			const cls = a.label === 'Approve' ? 'btn-approve' : a.label === 'Approve all' ? 'btn-approve-all' : a.label === 'Reject' ? 'btn-reject' : 'btn-default';
 			return `<button class="btn ${cls}" onmousedown="event.preventDefault()" onclick="event.preventDefault(); event.stopPropagation(); console.log('void-action:${this._escapeHtml(a.actionId)}')">${this._escapeHtml(a.label)}</button>`;
 		}).join('')}</div>`;
@@ -254,16 +266,19 @@ function voidCollapseReply() {
 }
 </script>` : '';
 
-		// Soft two-tone chime for notifications. Synthesized with WebAudio
-		// inside the notification page — no bundled asset needed, and Electron's
-		// default autoplay policy allows it without a gesture. Approvals chime
-		// ascending (attention); chat-complete chimes descending (resolution) —
+		// Notification chime, synthesized with WebAudio inside the notification
+		// page — no bundled asset needed, and Electron's default autoplay policy
+		// allows it without a gesture. The timbre (soundKind) selects one of the
+		// players below ('pop', 'glass', 'marimba', ... — see notificationSoundKinds
+		// in voidSettingsTypes); unknown kinds fall back to 'pop'. Approvals chime
+		// ascending (attention); chat-complete chimes descending (resolution),
 		// mirroring the accent-color inference, so the user can tell "needs me"
 		// from "finished" without looking.
-		// The requested volume (0-1, clamped) scales the chime's peak gain on a
-		// quadratic curve — perceived loudness is logarithmic, so a linear mapping
-		// would spend most of the slider range below the audible-difference
-		// threshold. 100% = 0.7 peak gain (~6x the original 0.12 loudness).
+		// The requested volume (0-1, clamped) scales every player's peak gain on
+		// a quadratic curve — perceived loudness is logarithmic, so a linear
+		// mapping would spend most of the slider range below the audible-
+		// difference threshold. Layer gains sum to 1, so `peak` stays the true
+		// peak amplitude. 100% = 0.7 (~6x the original 0.12 loudness).
 		const soundVolume = Math.min(Math.max(notification.sound ?? 0, 0), 1);
 		const peakGain = 0.7 * soundVolume * soundVolume;
 		const chimeFrequencies = notification.actions.some(a => a.actionId.startsWith('approve')) ? [880, 1174.66] : [1174.66, 880];
@@ -272,23 +287,171 @@ function voidCollapseReply() {
 (function () {
 	try {
 		var ctx = new AudioContext();
+		var dest = ctx.destination;
 		var now = ctx.currentTime;
 		var peak = ${peakGain.toFixed(4)};
 		var freqs = ${JSON.stringify(chimeFrequencies)};
-		freqs.forEach(function (freq, i) {
-			var t = now + i * 0.15;
-			var osc = ctx.createOscillator();
-			var g = ctx.createGain();
-			osc.type = 'sine';
-			osc.frequency.value = freq;
-			g.gain.setValueAtTime(0.0001, t);
-			g.gain.exponentialRampToValueAtTime(peak, t + 0.02);
-			g.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
-			osc.connect(g);
-			g.connect(ctx.destination);
-			osc.start(t);
-			osc.stop(t + 0.65);
-		});
+		var panOf = function (i) { return i === 0 ? -0.15 : 0.15; };
+		var noteGainOf = function (i) { return i === 0 ? 1 : 0.75; };
+		// Schedule a note made of sine layers. layers = [frequency ratio, gain,
+		// decay seconds]. opts: attack seconds, glide multiplier (e.g. 0.94 =
+		// starts 6% below pitch), glideTime seconds.
+		function layeredSine(freq, nt, i, layers, opts) {
+			var pan = ctx.createStereoPanner();
+			pan.pan.value = panOf(i);
+			pan.connect(dest);
+			layers.forEach(function (l) {
+				var osc = ctx.createOscillator();
+				var g = ctx.createGain();
+				osc.type = 'sine';
+				if (opts.glide) {
+					osc.frequency.setValueAtTime(freq * l[0] * opts.glide, nt);
+					osc.frequency.exponentialRampToValueAtTime(freq * l[0], nt + (opts.glideTime || 0.06));
+				} else {
+					osc.frequency.value = freq * l[0];
+				}
+				g.gain.setValueAtTime(0.0001, nt);
+				g.gain.linearRampToValueAtTime(peak * l[1] * noteGainOf(i), nt + opts.attack);
+				g.gain.exponentialRampToValueAtTime(0.0001, nt + l[2]);
+					osc.connect(g);
+					g.connect(pan);
+					osc.start(nt);
+					osc.stop(nt + l[2] + 0.05);
+			});
+		}
+		var PLAYERS = {
+			pop: function (t) {
+				freqs.forEach(function (freq, i) {
+					layeredSine(freq, t + i * 0.13, i, [[1, 0.87, 0.3], [2, 0.13, 0.3]], { attack: 0.015, glide: 0.94 });
+				});
+			},
+			glass: function (t) {
+					freqs.forEach(function (freq, i) {
+						var nt = t + i * 0.13;
+						var pan = ctx.createStereoPanner();
+						pan.pan.value = panOf(i);
+						pan.connect(dest);
+						var carrier = ctx.createOscillator();
+						carrier.type = 'sine';
+						carrier.frequency.value = freq;
+						var mod = ctx.createOscillator();
+						mod.type = 'sine';
+						mod.frequency.value = freq * 3.5;
+						var modGain = ctx.createGain();
+						modGain.gain.setValueAtTime(freq * 1.8 * noteGainOf(i), nt);
+						modGain.gain.exponentialRampToValueAtTime(freq * 0.01, nt + 0.25);
+						mod.connect(modGain);
+						modGain.connect(carrier.frequency);
+						var g = ctx.createGain();
+						g.gain.setValueAtTime(0.0001, nt);
+						g.gain.linearRampToValueAtTime(peak * noteGainOf(i), nt + 0.005);
+						g.gain.exponentialRampToValueAtTime(0.0001, nt + 0.4);
+						carrier.connect(g);
+						g.connect(pan);
+						carrier.start(nt);
+						mod.start(nt);
+						carrier.stop(nt + 0.45);
+						mod.stop(nt + 0.45);
+					});
+			},
+			marimba: function (t) {
+				freqs.forEach(function (freq, i) {
+					layeredSine(freq, t + i * 0.13, i, [[1, 0.74, 0.4], [3.9, 0.19, 0.12], [9.2, 0.07, 0.06]], { attack: 0.008 });
+				});
+			},
+			warmSynth: function (t) {
+				freqs.forEach(function (freq, i) {
+					var nt = t + i * 0.13;
+					var pan = ctx.createStereoPanner();
+					pan.pan.value = panOf(i);
+					pan.connect(dest);
+					[{ type: 'triangle', ratio: 1, gain: 0.8 }, { type: 'sine', ratio: 2, gain: 0.2 }].forEach(function (l) {
+						var osc = ctx.createOscillator();
+						var g = ctx.createGain();
+						osc.type = l.type;
+						osc.frequency.value = freq * l.ratio;
+						g.gain.setValueAtTime(0.0001, nt);
+						g.gain.linearRampToValueAtTime(peak * l.gain * noteGainOf(i), nt + 0.02);
+						g.gain.exponentialRampToValueAtTime(0.0001, nt + 0.35);
+						osc.connect(g);
+						g.connect(pan);
+						osc.start(nt);
+						osc.stop(nt + 0.4);
+					});
+				});
+			},
+			epiano: function (t) {
+				freqs.forEach(function (freq, i) {
+					layeredSine(freq, t + i * 0.14, i, [[0.997, 0.4, 0.45], [1.003, 0.4, 0.45], [2, 0.2, 0.45]], { attack: 0.02 });
+				});
+			},
+			sparkle: function (t) {
+				var asc = freqs[0] < freqs[1];
+				var notes = asc ? [freqs[0], freqs[1], freqs[1] * 1.5] : [freqs[0] * 1.5, freqs[0], freqs[1]];
+				notes.forEach(function (freq, i) {
+					var nt = t + i * 0.09;
+					var pan = ctx.createStereoPanner();
+					pan.pan.value = [-0.2, 0, 0.2][i];
+					pan.connect(dest);
+					var osc = ctx.createOscillator();
+					var g = ctx.createGain();
+						osc.type = 'sine';
+						osc.frequency.value = freq;
+						g.gain.setValueAtTime(0.0001, nt);
+						g.gain.linearRampToValueAtTime(peak * [1, 0.85, 0.7][i], nt + 0.01);
+						g.gain.exponentialRampToValueAtTime(0.0001, nt + 0.25);
+						osc.connect(g);
+						g.connect(pan);
+						osc.start(nt);
+						osc.stop(nt + 0.3);
+					});
+			},
+			kalimba: function (t) {
+				freqs.forEach(function (freq, i) {
+					layeredSine(freq, t + i * 0.13, i, [[1, 0.9, 0.2], [2.76, 0.1, 0.08]], { attack: 0.008 });
+				});
+			},
+			woodblock: function (t) {
+				freqs.forEach(function (freq, i) {
+					layeredSine(freq * 1.5, t + i * 0.15, i, [[1, 0.85, 0.06], [2.5, 0.15, 0.04]], { attack: 0.003 });
+				});
+			},
+			waterdrop: function (t) {
+				freqs.forEach(function (freq, i) {
+					layeredSine(freq, t + i * 0.14, i, [[1, 1, 0.25]], { attack: 0.006, glide: 1.3, glideTime: 0.045 });
+				});
+			},
+			sonar: function (t) {
+				layeredSine(freqs[1], t, 0, [[1, 1, 0.5]], { attack: 0.005 });
+				layeredSine(freqs[1], t + 0.35, 1, [[1, 0.55, 0.5]], { attack: 0.005 });
+			},
+			bell: function (t) {
+				freqs.forEach(function (freq, i) {
+					layeredSine(freq * 2, t + i * 0.13, i, [[1, 0.6, 0.6], [2.71, 0.25, 0.25], [5.15, 0.15, 0.1]], { attack: 0.005 });
+				});
+			},
+			terminal: function (t) {
+				freqs.forEach(function (freq, i) {
+					var nt = t + i * 0.15;
+					var pan = ctx.createStereoPanner();
+					pan.pan.value = panOf(i);
+					pan.connect(dest);
+					var osc = ctx.createOscillator();
+					var g = ctx.createGain();
+						osc.type = 'square';
+						osc.frequency.value = freq / 2;
+						g.gain.setValueAtTime(0.0001, nt);
+						g.gain.linearRampToValueAtTime(peak * 0.3 * noteGainOf(i), nt + 0.002);
+						g.gain.exponentialRampToValueAtTime(0.0001, nt + 0.12);
+						osc.connect(g);
+						g.connect(pan);
+						osc.start(nt);
+						osc.stop(nt + 0.16);
+				});
+			},
+		};
+		var kind = ${JSON.stringify(notification.soundKind)};
+		(PLAYERS[kind] || PLAYERS.pop)(now);
 	} catch (e) { }
 })();
 </script>` : '';
@@ -311,27 +474,37 @@ function voidCollapseReply() {
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
-  background: rgba(22, 22, 26, 0.95);
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(24, 24, 28, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-left: 3px solid ${accentColor};
-  border-radius: 12px;
+  border-radius: 10px;
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
   color: #fff;
-  padding: 14px 16px;
+  padding: 12px 14px;
   overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
   box-shadow: 0 16px 48px rgba(0,0,0,0.55), 0 2px 8px rgba(0,0,0,0.4);
 }
 .container { cursor: pointer; }
-.title { font-size: 14px; font-weight: 600; color: #f4f4f5; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.thread-title { font-size: 12px; color: #d1d1d6; font-weight: 500; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.subtitle { font-size: 13px; color: #8e8e93; margin-bottom: 6px; font-weight: 500; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
-.body { font-size: 13px; color: #aeaeb2; line-height: 1.4; margin-bottom: ${buttonsHtml ? '12px' : '0'}; white-space: pre-wrap; word-break: break-word; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 6; overflow: hidden; }
+.header { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
+.status-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: ${accentColor}; box-shadow: 0 0 6px ${accentColor}; }
+.title { flex: 1; font-size: 13px; font-weight: 600; color: #f4f4f5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meta { flex: none; font-size: 10px; font-weight: 600; color: #7d7d83; letter-spacing: 0.5px; text-transform: uppercase; white-space: nowrap; }
+.thread-title { font-size: 12px; color: #d1d1d6; font-weight: 500; margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.subtitle {
+  font-family: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px; font-weight: 500; color: #e8e8ec;
+  background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08); border-radius: 5px;
+  padding: 3px 8px; margin-bottom: 7px;
+  width: fit-content; max-width: 100%;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.body { font-size: 12.5px; color: #aeaeb2; line-height: 1.45; margin-bottom: ${buttonsHtml ? '12px' : '0'}; white-space: pre-wrap; word-break: break-word; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 6; overflow: hidden; }
 .buttons { display: flex; gap: 6px; }
 .btn {
-  flex: 1; padding: 6px 8px; border: 1px solid transparent; border-radius: 6px;
-  font-size: 12px; font-weight: 500; cursor: pointer; text-align: center;
+  flex: 1; padding: 5px 8px; border: 1px solid transparent; border-radius: 6px;
+  font-size: 11.5px; font-weight: 500; cursor: pointer; text-align: center;
   display: flex; align-items: center; justify-content: center; gap: 6px;
   white-space: nowrap;
 }
@@ -343,6 +516,12 @@ body {
 .btn-reject:hover { background: rgba(248,81,73,0.12); }
 .btn-default { background: rgba(255,255,255,0.08); color: #c9d1d9; border-color: rgba(255,255,255,0.14); }
 .btn-default:hover { background: rgba(255,255,255,0.14); }
+.btn-close {
+  flex: none; width: 28px; margin-left: auto; padding: 0;
+  background: transparent; color: #8e8e93; border-color: rgba(255,255,255,0.12);
+  font-size: 14px; line-height: 1;
+}
+.btn-close:hover { background: rgba(255,255,255,0.12); color: #fff; }
 .reply-row { margin-top: 8px; display: flex; }
 .reply-row input {
   width: 100%; padding: 6px 10px; border: 1px solid rgba(255,255,255,0.14); border-radius: 6px;
@@ -356,7 +535,11 @@ body {
 </head>
 <body>
 <div class="container" ${clickHandler}>
-  <div class="title">${title}</div>
+  <div class="header">
+    <span class="status-dot"></span>
+    <span class="title">${title}</span>
+    <span class="meta">Void &middot; ${this._escapeHtml(timestamp)}</span>
+  </div>
   ${threadTitleHtml}
   ${subtitleHtml}
   <div class="body">${body}</div>
