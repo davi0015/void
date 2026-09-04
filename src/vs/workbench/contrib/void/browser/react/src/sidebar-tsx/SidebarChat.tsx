@@ -32,7 +32,7 @@ import { approvalTypeOfBuiltinToolName, normalizeThreadPermissionMode, threadPer
 import { IconShell1, StatusIndicator } from '../markdown/ApplyBlockHoverButtons.js';
 import { IsRunningType, isThreadReadOnly, shouldShowOwnershipBanner } from '../../../chatThreadService.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
-import { isABuiltinToolName, MAX_TERMINAL_INACTIVE_TIME } from '../../../../common/prompt/prompts.js';
+import { isABuiltinToolName } from '../../../../common/prompt/prompts.js';
 import { getBasename, getFolderName, getRelative, voidOpenFileFn, IconLoading, SmallProseWrapper } from './sidebarChatHelpers.js';
 import { toolDefinitionOfToolName } from '../../../tools/toolRegistry.js';
 import { type LLMUsage, RawToolCallObj } from '../../../../common/sendLLMMessageTypes.js';
