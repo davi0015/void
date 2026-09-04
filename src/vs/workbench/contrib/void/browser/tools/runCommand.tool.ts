@@ -2,7 +2,7 @@ import { generateUuid } from '../../../../../base/common/uuid.js'
 import { DEFAULT_TERMINAL_TIMEOUT_SECONDS, MAX_TERMINAL_TIMEOUT_SECONDS } from '../../common/prompt/prompts.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
-import { validateStr, validateOptionalStr, validateNumber } from './toolHelpers.js'
+import { validateStr, validateOptionalStr, validateTimeoutSeconds } from './toolHelpers.js'
 
 const terminalDescHelper =
 	'Shell commands not covered by dedicated tools (e.g. `npm install`, `git status`, `pytest`).' +
@@ -16,21 +16,6 @@ const timeoutHelper =
 	`Optional. Inactivity timeout in whole seconds — the command is killed after this long with no new output. Defaults to ${DEFAULT_TERMINAL_TIMEOUT_SECONDS}. ` +
 	`Raise it (up to ${MAX_TERMINAL_TIMEOUT_SECONDS}) only for commands that legitimately run long with sparse output (installs, builds, test suites). ` +
 	`Do not raise it when a command seems stuck: silence usually means it is waiting for input, and it will still be killed at the timeout.`
-
-// Validates the LLM-provided `timeout_seconds`: accepts a number or a
-// numeric string (all tool params reach us as strings), falls back to the
-// default when omitted or unparseable, and rejects non-positive or
-// beyond-cap values with a clear error the LLM can act on.
-const validateTimeoutSeconds = (timeoutSecondsUnknown: unknown): number => {
-	const timeoutSeconds = validateNumber(timeoutSecondsUnknown, { default: DEFAULT_TERMINAL_TIMEOUT_SECONDS }) ?? DEFAULT_TERMINAL_TIMEOUT_SECONDS
-	if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1) {
-		throw new Error(`Invalid LLM output format: timeout_seconds must be a positive integer number of seconds, got "${timeoutSecondsUnknown}".`)
-	}
-	if (timeoutSeconds > MAX_TERMINAL_TIMEOUT_SECONDS) {
-		throw new Error(`Invalid LLM output format: timeout_seconds must be at most ${MAX_TERMINAL_TIMEOUT_SECONDS} seconds, got "${timeoutSecondsUnknown}".`)
-	}
-	return timeoutSeconds
-}
 
 export const runCommandToolCore: ToolDefinitionCore<'run_command'> = {
 	name: 'run_command',
@@ -46,7 +31,7 @@ export const runCommandToolCore: ToolDefinitionCore<'run_command'> = {
 		const { command: commandUnknown, cwd: cwdUnknown, timeout_seconds: timeoutSecondsUnknown } = raw
 		const command = validateStr('command', commandUnknown)
 		const cwd = validateOptionalStr('cwd', cwdUnknown)
-		const timeoutSeconds = validateTimeoutSeconds(timeoutSecondsUnknown)
+		const timeoutSeconds = validateTimeoutSeconds(timeoutSecondsUnknown, DEFAULT_TERMINAL_TIMEOUT_SECONDS)
 		const terminalId = generateUuid()
 		return { command, cwd, terminalId, timeoutSeconds }
 	},

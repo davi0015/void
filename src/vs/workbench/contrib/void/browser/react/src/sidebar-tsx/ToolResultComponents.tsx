@@ -15,7 +15,7 @@ import { AlertTriangle, Ban, ChevronRight, CircleEllipsis } from 'lucide-react';
 import { ChatMessage, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, effectiveAutoApproveMode, LintErrorItem, ToolCallParams, ToolName } from '../../../../common/toolsServiceTypes.js';
 import { Edit } from '../../../../common/editCodeServiceTypes.js';
-import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE, DEFAULT_TERMINAL_TIMEOUT_SECONDS } from '../../../../common/prompt/prompts.js';
+import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE, DEFAULT_TERMINAL_TIMEOUT_SECONDS, MAX_TERMINAL_BG_COMMAND_TIME } from '../../../../common/prompt/prompts.js';
 import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
 import { persistentTerminalNameOfId } from '../../../terminalToolService.js';
@@ -490,6 +490,7 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 			const toolParams = _toolParams as BuiltinToolCallParams['run_persistent_command']
 			return {
 				desc1: `"${toolParams.command}"`,
+				desc1Info: toolParams.timeoutSeconds !== MAX_TERMINAL_BG_COMMAND_TIME ? `${toolParams.timeoutSeconds}s timeout` : undefined,
 			}
 		},
 		'open_persistent_terminal': () => {
