@@ -156,7 +156,7 @@ export type BuiltinToolCallParams = {
 	'delete_file_or_folder': { uri: URI, isRecursive: boolean, isFolder: boolean },
 	'rename_file_or_folder': { sourceUri: URI, targetUri: URI, overwrite: boolean },
 	// ---
-	'run_command': { command: string; cwd: string | null, terminalId: string },
+	'run_command': { command: string; cwd: string | null, terminalId: string, timeoutSeconds: number },
 	'open_persistent_terminal': { cwd: string | null },
 	'run_persistent_command': { command: string; persistentTerminalId: string },
 	'kill_persistent_terminal': { persistentTerminalId: string },

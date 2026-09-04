@@ -28,7 +28,12 @@ export const AUTO_OUTLINE_THRESHOLD = 30_000 // chars; files larger than this ge
 
 // terminal tool info
 export const MAX_TERMINAL_CHARS = 100_000
-export const MAX_TERMINAL_INACTIVE_TIME = 8 // seconds
+// Default inactivity timeout for `run_command` (seconds of no output before
+// the command is killed). The LLM can raise it per call via `timeout_seconds`.
+export const DEFAULT_TERMINAL_TIMEOUT_SECONDS = 60
+// Hard ceiling for the LLM-provided `timeout_seconds` — bounds how long one
+// command can block the agent loop.
+export const MAX_TERMINAL_TIMEOUT_SECONDS = 600
 export const MAX_TERMINAL_BG_COMMAND_TIME = 5
 
 

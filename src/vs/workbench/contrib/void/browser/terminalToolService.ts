@@ -13,7 +13,7 @@ import { TerminalLocation } from '../../../../platform/terminal/common/terminal.
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { ITerminalService, ITerminalInstance, ICreateTerminalOptions } from '../../../../workbench/contrib/terminal/browser/terminal.js';
-import { MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_CHARS, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js';
+import { MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_CHARS } from '../common/prompt/prompts.js';
 import { TerminalResolveReason } from '../common/toolsServiceTypes.js';
 import { TERMINAL_AUTO_APPROVE_KEY } from '../common/storageKeys.js';
 import { timeout } from '../../../../base/common/async.js';
@@ -26,7 +26,7 @@ export interface ITerminalToolService {
 	listAllTerminals(): { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[];
 	runCommand(command: string, opts:
 		| { type: 'persistent', persistentTerminalId: string }
-		| { type: 'temporary', cwd: string | null, terminalId: string }
+		| { type: 'temporary', cwd: string | null, terminalId: string, timeoutSeconds: number }
 		// | { type: 'apply', terminalId: string }
 	): Promise<{ interrupt: () => void; resPromise: Promise<{ result: string, resolveReason: TerminalResolveReason }> }>;
 
@@ -446,6 +446,11 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		let terminal: ITerminalInstance
 		const disposables: IDisposable[] = []
 
+		// Inactivity timeout (seconds of no output before the command resolves
+		// as timed-out). Persistent terminals keep their fixed constant; the
+		// LLM provides it per call for temporary terminals via timeout_seconds.
+		const timeoutSeconds = isPersistent ? MAX_TERMINAL_BG_COMMAND_TIME : params.timeoutSeconds
+
 		if (isPersistent) { // BG process
 			const { persistentTerminalId } = params
 			terminal = this.persistentTerminalInstanceOfId[persistentTerminalId];
@@ -519,7 +524,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 					new Promise<void>(res => {
 						let inactivityTimeoutId: ReturnType<typeof setTimeout>;
 						let backstopTimeoutId: ReturnType<typeof setTimeout>;
-						const inactivityMs = (isPersistent ? MAX_TERMINAL_BG_COMMAND_TIME : MAX_TERMINAL_INACTIVE_TIME) * 1000;
+						const inactivityMs = timeoutSeconds * 1000;
 						const backstopMs = isPersistent ? MAX_TERMINAL_BG_COMMAND_TIME * 1000 * 2 : Infinity;
 
 						const fire = (timeoutReason: 'inactivity' | 'backstop') => {
