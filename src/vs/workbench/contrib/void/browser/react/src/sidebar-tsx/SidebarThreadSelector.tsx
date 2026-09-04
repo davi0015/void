@@ -362,12 +362,16 @@ const PastThreadElement = ({ pastThread, idx, hoveredIdx, setHoveredIdx, isRunni
 	// />
 
 	// Same label cascade as the tab strip: user-set custom title beats the
-	// auto-derived first-user-message text. Keeps the two surfaces in sync
-	// when the user renames a tab — the history entry follows.
+	// LLM-generated autoTitle, which beats the auto-derived
+	// first-user-message text. Keeps the two surfaces in sync when the user
+	// renames a tab — the history entry follows.
 	let firstMsg = null;
 	const customTitle = pastThread.customTitle?.trim();
+	const autoTitle = pastThread.autoTitle?.trim();
 	if (customTitle) {
 		firstMsg = customTitle;
+	} else if (autoTitle) {
+		firstMsg = autoTitle;
 	} else {
 		const firstUserMsgIdx = pastThread.messages.findIndex((msg) => msg.role === 'user');
 		if (firstUserMsgIdx !== -1) {
@@ -869,7 +873,8 @@ export const SidebarThreadTabs = React.memo(() => {
 						? 'Not tied to a workspace yet. Sending a message will claim it for this workspace.'
 						: ''
 
-					// Label cascade: user-set custom title (trimmed, non-empty) wins;
+					// Label cascade: user-set custom title (trimmed, non-empty) wins,
+					// then the LLM-generated autoTitle;
 					// otherwise fall back to first user message's displayContent;
 					// otherwise the ephemeral `title` field (set during metadata-only
 					// reads when messages aren't loaded — lazy loading);
@@ -877,11 +882,12 @@ export const SidebarThreadTabs = React.memo(() => {
 					// custom title is editable via double-click or right-click →
 					// Rename. Whitespace-only customTitle resets to default.
 					const customTitle = t.customTitle?.trim()
+					const autoTitle = t.autoTitle?.trim()
 					const firstUser = t.messages.find(m => m.role === 'user')
 					const firstMsgLabel = firstUser && firstUser.role === 'user' && firstUser.displayContent
 						? firstUser.displayContent
 						: (t.title || 'New Chat')
-					const label = customTitle || firstMsgLabel
+					const label = customTitle || autoTitle || firstMsgLabel
 					const isEditingThis = editingThreadId === id
 
 					// Truncate the tooltip body. The visible tab label is already clipped
@@ -1203,9 +1209,10 @@ export const SidebarThreadTabs = React.memo(() => {
 				const t = allThreads[dragSource]
 				if (!t) return null
 				const customTitle = t.customTitle?.trim()
+				const autoTitle = t.autoTitle?.trim()
 				const firstUser = t.messages.find(m => m.role === 'user')
 				const firstMsgLabel = firstUser && firstUser.role === 'user' && firstUser.displayContent ? firstUser.displayContent : (t.title || 'New Chat')
-				const ghostLabel = customTitle || firstMsgLabel
+				const ghostLabel = customTitle || autoTitle || firstMsgLabel
 				return (
 					<div
 						ref={ghostElRef}

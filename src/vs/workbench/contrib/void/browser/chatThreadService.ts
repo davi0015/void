@@ -254,6 +254,14 @@ export type ThreadType = {
 	// Persisted as part of the thread blob — no separate storage key.
 	customTitle?: string;
 
+	// LLM-generated short label for the thread, produced once after the
+	// first turn using the thread's Chat model. Displayed in the tab strip,
+	// history list, and notifications when the user hasn't set a `customTitle`
+	// (manual rename always wins). Older threads without this field fall back
+	// to the first user message, so behavior there is unchanged.
+	// Persisted as part of the thread blob — no separate storage key.
+	autoTitle?: string;
+
 	// Per-chat permission mode ('read_only' | 'workspace_write' | 'full_access'),
 	// selected from the chat input box (same row as model selection). Acts as
 	// an additional auto-approval source on top of the global per-tier
@@ -653,6 +661,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// in the current batch of this thread. Cleared when the batch drains or is
 	// rejected/aborted — later turns still ask for approval individually.
 	private readonly _autoApproveRestOfBatchOfThreadId = new Set<string>()
+	// Title generation in flight: prevents firing a second LLM title call for
+	// a thread while one is already pending (e.g. a loop that ends awaiting
+	// approval, then ends again after resume). Cleared on settle so a failed
+	// attempt retries on the next turn.
+	private readonly _titleGenInFlightOfThreadId = new Set<string>()
 	readonly latestUsageOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisTurnOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
 	readonly cumulativeUsageThisThreadOfThreadId: { [threadId: string]: LLMUsage | undefined } = {}
@@ -3224,6 +3237,78 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// capture number of messages sent
 		this._metricsService.capture('Agent Loop Done', { nMessagesSent, chatMode })
+
+		// Fire-and-forget: brand new threads get an LLM-generated tab label
+		// once the first turn has produced an assistant reply. Never blocks
+		// the loop, never touches stream state or usage stats — failures
+		// silently keep the first-message fallback.
+		this._maybeGenerateThreadTitle(threadId, modelSelection, modelSelectionOptions)
+	}
+
+	/**
+	 * Fire-and-forget LLM title for a new thread. Runs once per thread: the
+	 * first time an agent loop ends with at least one user message and one
+	 * assistant reply on a thread that has neither `customTitle` nor
+	 * `autoTitle`. Uses the thread's own Chat model via the lightweight
+	 * simple-messages path (no tools, no stream state, no usage-stat writes)
+	 * so the main loop is never disturbed. An in-flight guard prevents
+	 * duplicate calls across rapid loop endings; failures (no model, provider
+	 * error, thread deleted meanwhile) are silent and retry on the next
+	 * turn — the first-message fallback label stays in place until then.
+	 */
+	private _maybeGenerateThreadTitle(threadId: string, modelSelection: ModelSelection | null, modelSelectionOptions: ModelSelectionOptions | undefined): void {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return
+		if (!modelSelection) return
+		if (thread.customTitle?.trim() || thread.autoTitle?.trim()) return
+		if (this._titleGenInFlightOfThreadId.has(threadId)) return
+		const firstUser = thread.messages.find(m => m.role === 'user')
+		const firstAssistant = thread.messages.find(m => m.role === 'assistant')
+		if (!firstUser || firstUser.role !== 'user' || !firstUser.displayContent?.trim()) return
+		if (!firstAssistant || firstAssistant.role !== 'assistant' || !firstAssistant.displayContent?.trim()) return
+
+		const userExcerpt = truncate(firstUser.displayContent.replace(/\s+/g, ' ').trim(), 500, '...')
+		const assistantExcerpt = truncate(firstAssistant.displayContent.replace(/\s+/g, ' ').trim(), 1000, '...')
+		const { overridesOfModel } = this._settingsService.state
+		const { messages, separateSystemMessage } = this._convertToLLMMessagesService.prepareLLMSimpleMessages({
+			simpleMessages: [{
+				role: 'user' as const,
+				content: `Generate a short title (max 8 words, plain text, no quotes) for a chat thread that started like this:\n\nUser: ${userExcerpt}\n\nAssistant: ${assistantExcerpt}\n\nReply with ONLY the title.`,
+			}],
+			systemMessage: 'You generate short, descriptive chat thread titles. Reply with only the title text.',
+			modelSelection,
+			featureName: 'Chat',
+		})
+
+		this._titleGenInFlightOfThreadId.add(threadId)
+		this._llmMessageService.sendLLMMessage({
+			messagesType: 'chatMessages',
+			messages,
+			separateSystemMessage,
+			chatMode: null,
+			modelSelection,
+			modelSelectionOptions,
+			overridesOfModel,
+			onText: () => { },
+			onFinalMessage: ({ fullText }) => {
+				this._titleGenInFlightOfThreadId.delete(threadId)
+				// Thread may have been deleted/renamed while we waited.
+				const latest = this.state.allThreads[threadId]
+				if (!latest || latest.autoTitle?.trim()) return
+				const cleaned = truncate(
+					fullText.replace(/\s+/g, ' ').trim().replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim(),
+					60, '...'
+				)
+				if (!cleaned) return
+				const updatedThread: ThreadType = { ...latest, autoTitle: cleaned, lastModified: new Date().toISOString() }
+				const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
+				this._storeThread(threadId, updatedThread)
+				this._setState({ allThreads: newThreads })
+			},
+			onError: () => { this._titleGenInFlightOfThreadId.delete(threadId) },
+			onAbort: () => { this._titleGenInFlightOfThreadId.delete(threadId) },
+			logging: { loggingName: 'Thread Title Generation', loggingExtras: { threadId } },
+		})
 	}
 
 
@@ -3597,7 +3682,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	/**
 	 * The thread's display label, matching the sidebar's convention:
-	 * customTitle → first user message → ephemeral title → 'New Chat'.
+	 * customTitle → LLM-generated autoTitle → first user message →
+	 * ephemeral title → 'New Chat'.
 	 * Cleaned to a single line for the notification's identity row.
 	 */
 	private _getThreadTitle(threadId: string): string {
@@ -3606,6 +3692,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const clean = (s: string) => truncate(s.replace(/\s+/g, ' ').trim(), 60, '...')
 		const customTitle = thread.customTitle?.trim()
 		if (customTitle) return clean(customTitle)
+		const autoTitle = thread.autoTitle?.trim()
+		if (autoTitle) return clean(autoTitle)
 		const firstUser = thread.messages.find(m => m.role === 'user')
 		if (firstUser?.role === 'user' && firstUser.displayContent) return clean(firstUser.displayContent)
 		return thread.title ? clean(thread.title) : 'New Chat'
