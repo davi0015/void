@@ -44,11 +44,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Single source of truth for artifact filenames (e.g. 1.99.3).
+      # Version source of truth: the tag name on tag builds
+      # (v1.0.0-rc.1 → 1.0.0-rc.1, so filenames match the release),
+      # package.json on manual dispatches.
       - name: Read version
         id: version
         shell: bash
-        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -96,11 +105,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Single source of truth for artifact filenames (e.g. 1.99.3).
+      # Version source of truth: the tag name on tag builds
+      # (v1.0.0-rc.1 → 1.0.0-rc.1, so filenames match the release),
+      # package.json on manual dispatches.
       - name: Read version
         id: version
         shell: bash
-        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -158,11 +176,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Single source of truth for artifact filenames (e.g. 1.99.3).
+      # Version source of truth: the tag name on tag builds
+      # (v1.0.0-rc.1 → 1.0.0-rc.1, so filenames match the release),
+      # package.json on manual dispatches.
       - name: Read version
         id: version
         shell: bash
-        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node
         uses: actions/setup-node@v4
