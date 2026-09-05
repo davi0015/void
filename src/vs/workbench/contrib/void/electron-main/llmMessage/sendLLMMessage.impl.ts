@@ -14,7 +14,7 @@ import { Tool as GeminiTool, FunctionDeclaration, GoogleGenAI, ThinkingConfig, S
 import { GoogleAuth } from 'google-auth-library'
 /* eslint-enable */
 
-import { AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, type LLMUsage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js';
+import { AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, type LLMUsage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj, ResponsesReasoningRef } from '../../common/sendLLMMessageTypes.js';
 import type { ToolName } from '../../common/toolsServiceTypes.js';
 import { BackendProviderSettings, displayInfoOfProviderName, isBackendId, ModelSelectionOptions, OverridesOfModel, ProviderName, SettingsOfProvider } from '../../common/voidSettingsTypes.js';
 import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, defaultProviderSettings, getReservedOutputTokenSpace } from '../../common/modelCapabilities.js';
@@ -531,6 +531,19 @@ const responsesInputOfLLMMessages = (messages: LLMChatMessage[], separateSystemM
 			continue
 		}
 		if (msg.role === 'assistant') {
+			// Replay the opaque reasoning payload captured last turn, ahead
+			// of the message (generation order). `encrypted_content` is
+			// absent from this SDK version's types — cast. Skipped when
+			// there's nothing worth replaying.
+			const prevReasoning = 'responsesReasoning' in msg ? msg.responsesReasoning : undefined
+			if (prevReasoning?.id && (prevReasoning.encrypted_content || prevReasoning.summaryText)) {
+				input.push({
+					type: 'reasoning',
+					id: prevReasoning.id,
+					summary: prevReasoning.summaryText ? [{ type: 'summary_text', text: prevReasoning.summaryText }] : [],
+					...(prevReasoning.encrypted_content ? { encrypted_content: prevReasoning.encrypted_content } : {}),
+				} as OpenAI.Responses.ResponseInputItem)
+			}
 			if (typeof msg.content === 'string') {
 				if (msg.content) input.push({ role: 'assistant', content: msg.content })
 			}
@@ -616,6 +629,11 @@ export const sendOpenAIResponsesChat = async ({ messages, onText, onFinalMessage
 		// reasoning output items below). Costs a few output tokens; placed
 		// before the spreads so model extras can override it.
 		reasoning: { summary: 'auto' },
+		// Also receive the opaque encrypted chain-of-thought so it can be
+		// persisted and replayed next turn (tier-3 reasoning retention).
+		// Not in this SDK version's types — cast. Backends that don't
+		// understand it should ignore unknown fields, same as the rest.
+		include: ['reasoning.encrypted_content'] as unknown as OpenAI.Responses.ResponseIncludable[],
 		...(responsesTools ? { tools: responsesTools } : {}),
 		...additionalOpenAIPayload,
 	} as OpenAI.Responses.ResponseCreateParamsStreaming
@@ -707,6 +725,11 @@ export const sendOpenAIResponsesChat = async ({ messages, onText, onFinalMessage
 			// Streamed buffers fill gaps for backends that end the stream
 			// without a completed object.
 			const authoritativeCalls: { call_id: string; name: string; argsStr: string }[] = []
+			// Opaque reasoning payload for next-turn replay. At most one
+			// reasoning item is expected; if several appear, the first id
+			// wins and any encrypted blob wins (last one sticks).
+			let capturedReasoningId: string | undefined = undefined
+			let capturedEncrypted: string | undefined = undefined
 			if (finalResponse) {
 				const texts: string[] = []
 				const reasoningTexts: string[] = []
@@ -723,6 +746,10 @@ export const sendOpenAIResponsesChat = async ({ messages, onText, onFinalMessage
 						for (const s of item.summary ?? []) {
 							if (s.type === 'summary_text' && s.text) reasoningTexts.push(s.text)
 						}
+						if (!capturedReasoningId && item.id) capturedReasoningId = item.id
+						// Absent from this SDK version's types — read loosely.
+						const encrypted = (item as { encrypted_content?: unknown }).encrypted_content
+						if (typeof encrypted === 'string' && encrypted) capturedEncrypted = encrypted
 					}
 				}
 				if (texts.length > 0) fullTextSoFar = texts.join('')
@@ -750,6 +777,19 @@ export const sendOpenAIResponsesChat = async ({ messages, onText, onFinalMessage
 				.map(c => rawToolCallObjOfParamsStr(c.name, c.argsStr, c.call_id))
 				.filter((t): t is RawToolCallObj => t !== null)
 
+			// Persistable reasoning payload for next-turn replay. Stored
+			// only when there's something worth replaying (an id plus a
+			// blob or summary text); otherwise left undefined so the
+			// thread blob stays minimal.
+			let responsesReasoning: ResponsesReasoningRef | undefined = undefined
+			if (capturedReasoningId && (capturedEncrypted || fullReasoningSoFar)) {
+				responsesReasoning = {
+					id: capturedReasoningId,
+					...(capturedEncrypted ? { encrypted_content: capturedEncrypted } : {}),
+					...(fullReasoningSoFar ? { summaryText: fullReasoningSoFar } : {}),
+				}
+			}
+
 			if (!fullTextSoFar && !fullReasoningSoFar && finalToolCalls.length === 0) {
 				onError({ message: 'Void: Response from model was empty.', fullError: null })
 			}
@@ -761,6 +801,7 @@ export const sendOpenAIResponsesChat = async ({ messages, onText, onFinalMessage
 					usage: latestUsage,
 					finishReason: incompleteReason ?? 'stop',
 					toolCalls: finalToolCalls.length > 0 ? finalToolCalls : undefined,
+					responsesReasoning,
 				});
 			}
 		})
