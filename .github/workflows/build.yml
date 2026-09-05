@@ -131,11 +131,19 @@ jobs:
       - name: Build user installer
         run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js vscode-win32-x64-user-setup
 
+      # Inno names it VSCodeSetup.exe by default (code.iss); rename to the
+      # versioned scheme matching the other platforms.
+      - name: Rename installer
+        shell: bash
+        run: |
+          EXE=$(ls .build/win32-x64/user-setup/*.exe | head -1)
+          mv "$EXE" ".build/win32-x64/user-setup/Void-win-x64-setup-${{ steps.version.outputs.version }}.exe"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Void-win-x64-setup-${{ steps.version.outputs.version }}
-          path: .build/win32-x64/user-setup/*.exe
+          path: .build/win32-x64/user-setup/Void-win-x64-setup-${{ steps.version.outputs.version }}.exe
           retention-days: 90
 
   build-linux-x64:
