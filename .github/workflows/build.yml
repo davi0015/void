@@ -33,6 +33,11 @@ jobs:
     # macos-14 is Apple Silicon — required for a darwin-arm64 build.
     runs-on: macos-14
     timeout-minutes: 120
+    # Authenticates api.github.com calls made by postinstall downloaders
+    # (@vscode/ripgrep etc.) — anonymous requests from shared runner IPs
+    # hit rate limits (403) otherwise.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -76,6 +81,9 @@ jobs:
     # longer provides in a detectable form.
     runs-on: windows-2022
     timeout-minutes: 120
+    # Same api.github.com rate-limit fix as the mac job.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
