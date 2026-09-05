@@ -1273,14 +1273,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		const metadataParsed = JSON.parse(metadataRaw, ChatThreadService._storageReviver) as any
 
-		// One-time migration: early iterations of LLM thread titles stored
-		// the generated label in a separate `autoTitle` field. Fold it into
-		// `customTitle` (the single persisted title field) so those threads
-		// keep their labels, then drop the orphan key so it isn't
-		// re-persisted. A user rename always takes precedence.
-		if (metadataParsed.autoTitle && !metadataParsed.customTitle) metadataParsed.customTitle = metadataParsed.autoTitle
-		delete metadataParsed.autoTitle
-
 		// @deprecated Migration 1: very old format has messages array inline in metadata.
 		// Split into per-message keys, discarding old checkpoint data.
 		// Safe to remove once all users have migrated (check: no threads with
