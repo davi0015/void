@@ -44,6 +44,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Single source of truth for artifact filenames (e.g. 1.99.3).
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -67,13 +73,13 @@ jobs:
         run: |
           APP=$(ls -d ../VSCode-darwin-arm64/*.app | head -1)
           echo "Zipping $APP"
-          ditto -c -k --sequesterRsrc --keepParent "$APP" Void-mac-arm64.zip
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "Void-mac-arm64-${{ steps.version.outputs.version }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Void-mac-arm64
-          path: Void-mac-arm64.zip
+          name: Void-mac-arm64-${{ steps.version.outputs.version }}
+          path: Void-mac-arm64-${{ steps.version.outputs.version }}.zip
           retention-days: 90
 
   build-win-x64:
@@ -89,6 +95,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Single source of truth for artifact filenames (e.g. 1.99.3).
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -122,7 +134,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Void-win-x64-setup
+          name: Void-win-x64-setup-${{ steps.version.outputs.version }}
           path: .build/win32-x64/user-setup/*.exe
           retention-days: 90
 
@@ -137,6 +149,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Single source of truth for artifact filenames (e.g. 1.99.3).
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -164,13 +182,13 @@ jobs:
         run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js vscode-linux-x64
 
       - name: Tarball app
-        run: tar -czf Void-linux-x64.tar.gz -C .. VSCode-linux-x64
+        run: tar -czf "Void-linux-x64-${{ steps.version.outputs.version }}.tar.gz" -C .. VSCode-linux-x64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Void-linux-x64
-          path: Void-linux-x64.tar.gz
+          name: Void-linux-x64-${{ steps.version.outputs.version }}
+          path: Void-linux-x64-${{ steps.version.outputs.version }}.tar.gz
           retention-days: 90
 
   # Tag releases only: pushing e.g. `git tag v1.99.3 && git push origin v1.99.3`
