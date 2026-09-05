@@ -71,7 +71,10 @@ jobs:
 
   build-win-x64:
     name: Windows x64
-    runs-on: windows-latest
+    # Pinned to 2022: node-gyp (native modules in `npm ci`) needs a full
+    # Visual Studio install, which the windows-latest (2025) image no
+    # longer provides in a detectable form.
+    runs-on: windows-2022
     timeout-minutes: 120
     steps:
       - name: Checkout
