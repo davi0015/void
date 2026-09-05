@@ -1,13 +1,11 @@
 # Build Void distributables for macOS (arm64) and Windows (x64).
 #
-# COST — this repo is private, so runs bill against the account's Actions
-# quota (2,000 min/month on the Free plan, 500 MB artifact storage):
-#   macOS runners bill at 10x, Windows at 2x (Linux is 1x).
-# A full distro build is ~20-40 min wall-clock per platform, i.e. roughly
-# 200-400 billed minutes (mac) + 40-80 (win) per run. That is why this
-# workflow has NO push/pull_request trigger — it runs only when you start
-# it by hand (Actions tab → Run workflow) or push a version tag (v*).
-# Artifacts auto-expire after 14 days to stay inside the storage quota.
+# COST — this repo is public, so GitHub-hosted runners are free and
+# unlimited (minutes and artifact storage). Even so, this workflow has NO
+# push/pull_request trigger — a full distro build is ~20-40 min
+# wall-clock per platform, so it runs only when you start it by hand
+# (Actions tab → Run workflow) or push a version tag (v*).
+# Artifacts auto-expire after 14 days to keep storage tidy.
 #
 # Signing: builds are UNSIGNED (no Apple cert / Windows cert in CI).
 # macOS Gatekeeper will block the app on first launch — right-click → Open,
