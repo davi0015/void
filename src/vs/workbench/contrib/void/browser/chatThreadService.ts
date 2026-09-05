@@ -3263,7 +3263,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (thread.customTitle?.trim() || thread.autoTitle?.trim()) return
 		if (this._titleGenInFlightOfThreadId.has(threadId)) return
 		const firstUser = thread.messages.find(m => m.role === 'user')
-		const firstAssistant = thread.messages.find(m => m.role === 'assistant')
+		// First assistant message *with text* — a tool-only first turn has
+		// empty displayContent, which must not block titles forever (a plain
+		// find would keep returning that same empty message on later turns).
+		const firstAssistant = thread.messages.find(m => m.role === 'assistant' && m.displayContent?.trim())
 		if (!firstUser || firstUser.role !== 'user' || !firstUser.displayContent?.trim()) return
 		if (!firstAssistant || firstAssistant.role !== 'assistant' || !firstAssistant.displayContent?.trim()) return
 
