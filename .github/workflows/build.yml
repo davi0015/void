@@ -1,0 +1,111 @@
+# Build Void distributables for macOS (arm64) and Windows (x64).
+#
+# COST — this repo is private, so runs bill against the account's Actions
+# quota (2,000 min/month on the Free plan, 500 MB artifact storage):
+#   macOS runners bill at 10x, Windows at 2x (Linux is 1x).
+# A full distro build is ~20-40 min wall-clock per platform, i.e. roughly
+# 200-400 billed minutes (mac) + 40-80 (win) per run. That is why this
+# workflow has NO push/pull_request trigger — it runs only when you start
+# it by hand (Actions tab → Run workflow) or push a version tag (v*).
+# Artifacts auto-expire after 14 days to stay inside the storage quota.
+#
+# Signing: builds are UNSIGNED (no Apple cert / Windows cert in CI).
+# macOS Gatekeeper will block the app on first launch — right-click → Open,
+# or `xattr -cr Void.app`. The Windows user-setup installer works as-is
+# (SmartScreen will show an "unknown publisher" prompt).
+
+name: Build distributables
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-mac-arm64:
+    name: macOS arm64
+    # macos-14 is Apple Silicon — required for a darwin-arm64 build.
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Void-specific: the chat UI bundle is gitignored and must be built
+      # before the workbench compile picks it up.
+      - name: Build React bundles
+        run: npm run buildreact
+
+      # Compiles the client + extensions and packages Void.app into
+      # ../VSCode-darwin-arm64 (sibling of the checkout, per build scripts).
+      - name: Package macOS app
+        run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js vscode-darwin-arm64
+
+      - name: Zip app
+        run: |
+          APP=$(ls -d ../VSCode-darwin-arm64/*.app | head -1)
+          echo "Zipping $APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" Void-mac-arm64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Void-mac-arm64
+          path: Void-mac-arm64.zip
+          retention-days: 14
+
+  build-win-x64:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Void-specific: see mac job.
+      - name: Build React bundles
+        run: npm run buildreact
+
+      # Compiles the client + extensions and stages the app into
+      # ../VSCode-win32-x64 (sibling of the checkout, per build scripts).
+      - name: Package Windows app
+        run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js vscode-win32-x64
+
+      # Builds the per-user Setup exe via Inno Setup into
+      # .build/win32-x64/user-setup (no code signing — expect a
+      # SmartScreen "unknown publisher" prompt on install).
+      - name: Build user installer
+        run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js vscode-win32-x64-user-setup
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Void-win-x64-setup
+          path: .build/win32-x64/user-setup/*.exe
+          retention-days: 14
