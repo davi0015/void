@@ -6,7 +6,7 @@
 import { SendLLMMessageParams, OnText, OnFinalMessage, OnError } from '../../common/sendLLMMessageTypes.js';
 import { IMetricsService } from '../../common/metricsService.js';
 import { BackendProviderSettings, BuiltInProviderName, isBackendId, displayInfoOfProviderName, registerBackendDisplayNames } from '../../common/voidSettingsTypes.js';
-import { sendLLMMessageToProviderImplementation } from './sendLLMMessage.impl.js';
+import { sendLLMMessageToProviderImplementation, sendOpenAIResponsesChat } from './sendLLMMessage.impl.js';
 
 export const sendLLMMessage = async ({
 	messagesType,
@@ -125,10 +125,21 @@ export const sendLLMMessage = async ({
 
 
 	try {
+		// Backends on the Responses API protocol bypass the implementation
+		// registry for chat — they get a dedicated Responses send path
+		// below. FIM has no Responses equivalent, so those requests fall
+		// through to the plain OpenAI-compatible implementation instead.
+		if (isBackendId(providerName)) {
+			const backendSettings = settingsOfProvider[providerName] as BackendProviderSettings
+			if (backendSettings.protocol === 'openAIResponses' && messagesType === 'chatMessages') {
+				await sendOpenAIResponsesChat({ messages: messages_, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName, _setAborter, providerName, separateSystemMessage, tools })
+				return
+			}
+		}
 		let implKey: BuiltInProviderName
 		if (isBackendId(providerName)) {
 			const backendSettings = settingsOfProvider[providerName] as BackendProviderSettings
-			implKey = backendSettings.protocol
+			implKey = backendSettings.protocol === 'openAIResponses' ? 'openAI' : backendSettings.protocol
 		} else {
 			implKey = providerName as BuiltInProviderName
 		}

@@ -15,7 +15,7 @@ type UnionOfKeys<T> = T extends T ? keyof T : never;
 
 
 export type BackendId = `backend_${string}`
-export type BackendProtocol = 'openAI' | 'anthropic' | 'gemini'
+export type BackendProtocol = 'openAI' | 'anthropic' | 'gemini' | 'openAIResponses'
 export type BuiltInProviderName = keyof typeof defaultProviderSettings
 export type ProviderName = BuiltInProviderName | BackendId
 export const providerNames = Object.keys(defaultProviderSettings) as BuiltInProviderName[]

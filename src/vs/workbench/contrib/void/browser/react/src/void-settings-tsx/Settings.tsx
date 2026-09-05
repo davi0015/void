@@ -1017,7 +1017,7 @@ const BackendSettingsEntry = ({ backendId }: { backendId: BackendId }) => {
 			</button>
 		</div>
 
-		<div className='text-xs text-void-fg-3'>Protocol: {settings.protocol}</div>
+		<div className='text-xs text-void-fg-3'>Protocol: {settings.protocol === 'openAIResponses' ? 'OpenAI Responses' : settings.protocol}</div>
 
 		<VoidSimpleInputBox
 			placeholder='Display Name'
@@ -1083,11 +1083,11 @@ const BackendSettings = () => {
 					compact
 				/>
 				<VoidCustomDropdownBox
-					options={['openAI', 'anthropic', 'gemini'] as BackendProtocol[]}
+					options={['openAI', 'openAIResponses', 'anthropic', 'gemini'] as BackendProtocol[]}
 					selectedOption={newProtocol}
 					onChangeOption={(p) => setNewProtocol(p)}
-					getOptionDisplayName={(p) => p}
-					getOptionDropdownName={(p) => p}
+					getOptionDisplayName={(p) => p === 'openAIResponses' ? 'OpenAI Responses' : p}
+					getOptionDropdownName={(p) => p === 'openAIResponses' ? 'OpenAI Responses' : p}
 					getOptionsEqual={(a, b) => a === b}
 					className='w-full resize-none bg-void-bg-1 text-void-fg-1 placeholder:text-void-fg-3 border border-void-border-2 focus:border-void-border-1 py-1 px-2 rounded'
 					arrowTouchesText={false}
