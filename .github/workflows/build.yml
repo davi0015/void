@@ -1,0 +1,256 @@
+# Build Void distributables for macOS (arm64), Windows (x64), Linux (x64).
+#
+# COST — this repo is public, so GitHub-hosted runners are free and
+# unlimited (minutes and artifact storage). Even so, this workflow has NO
+# push/pull_request trigger — a full distro build is ~20-40 min
+# wall-clock per platform, so it runs only when you start it by hand
+# (Actions tab → Run workflow) or push a version tag (v*). Tag pushes go
+# one step further: both artifacts are attached to that tag's GitHub
+# Release permanently.
+# Artifacts auto-expire after 90 days (the maximum) to keep storage tidy.
+#
+# Signing: builds are UNSIGNED (no Apple cert / Windows cert in CI).
+# macOS Gatekeeper will block the app on first launch — right-click → Open,
+# or `xattr -cr Void.app`. The Windows user-setup installer works as-is
+# (SmartScreen will show an "unknown publisher" prompt).
+
+name: Build distributables
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-mac-arm64:
+    name: macOS arm64
+    # macos-14 is Apple Silicon — required for a darwin-arm64 build.
+    runs-on: macos-14
+    timeout-minutes: 120
+    # Authenticates api.github.com calls made by postinstall downloaders
+    # (@vscode/ripgrep etc.) — anonymous requests from shared runner IPs
+    # hit rate limits (403) otherwise.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Version source of truth: the tag name on tag builds
+      # (v1.0.0-rc.1 → 1.0.0-rc.1, so filenames match the release),
+      # package.json on manual dispatches.
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Void-specific: the chat UI bundle is gitignored and must be built
+      # before the workbench compile picks it up.
+      - name: Build React bundles
+        run: npm run buildreact
+
+      # Compiles the client + extensions and packages Void.app into
+      # ../VSCode-darwin-arm64 (sibling of the checkout, per build scripts).
+      - name: Package macOS app
+        run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js vscode-darwin-arm64
+
+      - name: Zip app
+        run: |
+          APP=$(ls -d ../VSCode-darwin-arm64/*.app | head -1)
+          echo "Zipping $APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "Void-mac-arm64-${{ steps.version.outputs.version }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Void-mac-arm64-${{ steps.version.outputs.version }}
+          path: Void-mac-arm64-${{ steps.version.outputs.version }}.zip
+          retention-days: 90
+
+  build-win-x64:
+    name: Windows x64
+    # Pinned to 2022: node-gyp (native modules in `npm ci`) needs a full
+    # Visual Studio install, which the windows-latest (2025) image no
+    # longer provides in a detectable form.
+    runs-on: windows-2022
+    timeout-minutes: 120
+    # Same api.github.com rate-limit fix as the mac job.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Version source of truth: the tag name on tag builds
+      # (v1.0.0-rc.1 → 1.0.0-rc.1, so filenames match the release),
+      # package.json on manual dispatches.
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Void-specific: see mac job.
+      - name: Build React bundles
+        run: npm run buildreact
+
+      # Compiles the client + extensions and stages the app into
+      # ../VSCode-win32-x64 (sibling of the checkout, per build scripts).
+      - name: Package Windows app
+        run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js vscode-win32-x64
+
+      # Stages inno_updater.exe + vcruntime into VSCode-win32-x64/tools —
+      # required by code.iss, but not part of the package task itself.
+      - name: Stage updater tools
+        run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js vscode-win32-x64-inno-updater
+
+      # Builds the per-user Setup exe via Inno Setup into
+      # .build/win32-x64/user-setup (no code signing — expect a
+      # SmartScreen "unknown publisher" prompt on install).
+      - name: Build user installer
+        run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js vscode-win32-x64-user-setup
+
+      # Inno names it VSCodeSetup.exe by default (code.iss); rename to the
+      # versioned scheme matching the other platforms.
+      - name: Rename installer
+        shell: bash
+        run: |
+          EXE=$(ls .build/win32-x64/user-setup/*.exe | head -1)
+          mv "$EXE" ".build/win32-x64/user-setup/Void-win-x64-setup-${{ steps.version.outputs.version }}.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Void-win-x64-setup-${{ steps.version.outputs.version }}
+          path: .build/win32-x64/user-setup/Void-win-x64-setup-${{ steps.version.outputs.version }}.exe
+          retention-days: 90
+
+  build-linux-x64:
+    name: Linux x64
+    # 22.04 (older glibc) so the binary runs on 22.04 and newer distros.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    # Same api.github.com rate-limit fix as the other jobs.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Version source of truth: the tag name on tag builds
+      # (v1.0.0-rc.1 → 1.0.0-rc.1, so filenames match the release),
+      # package.json on manual dispatches.
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      # Native modules need these headers (kerberos → libkrb5-dev,
+      # native-keymap → libxkbfile-dev, libsecret); build-essential/
+      # python3/git are preinstalled on the image.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbfile-dev libsecret-1-dev libkrb5-dev pkg-config
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Void-specific: see mac job.
+      - name: Build React bundles
+        run: npm run buildreact
+
+      # Compiles the client + extensions and stages the app into
+      # ../VSCode-linux-x64 (sibling of the checkout, per build scripts).
+      # Proven identical locally in a clean Debian container.
+      - name: Package Linux app
+        run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js vscode-linux-x64
+
+      - name: Tarball app
+        run: tar -czf "Void-linux-x64-${{ steps.version.outputs.version }}.tar.gz" -C .. VSCode-linux-x64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Void-linux-x64-${{ steps.version.outputs.version }}
+          path: Void-linux-x64-${{ steps.version.outputs.version }}.tar.gz
+          retention-days: 90
+
+  # Tag releases only: pushing e.g. `git tag v1.99.3 && git push origin v1.99.3`
+  # builds all three platforms (above) and attaches the files to that tag's
+  # GitHub Release permanently. Manual dispatches stop at the 90-day
+  # artifacts and never touch releases.
+  release:
+    name: Attach to release
+    needs: [build-mac-arm64, build-win-x64, build-linux-x64]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          # Tag pushes (e.g. from CLI) land here as drafts: review the
+          # assets, write the notes, then publish by hand. Releases
+          # published via the GitHub UI already exist, so this only
+          # attaches files to them.
+          draft: true
