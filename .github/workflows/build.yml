@@ -214,3 +214,8 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          # Tag pushes (e.g. from CLI) land here as drafts: review the
+          # assets, write the notes, then publish by hand. Releases
+          # published via the GitHub UI already exist, so this only
+          # attaches files to them.
+          draft: true
