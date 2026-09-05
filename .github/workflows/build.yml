@@ -5,7 +5,7 @@
 # push/pull_request trigger — a full distro build is ~20-40 min
 # wall-clock per platform, so it runs only when you start it by hand
 # (Actions tab → Run workflow) or push a version tag (v*).
-# Artifacts auto-expire after 14 days to keep storage tidy.
+# Artifacts auto-expire after 90 days (the maximum) to keep storage tidy.
 #
 # Signing: builds are UNSIGNED (no Apple cert / Windows cert in CI).
 # macOS Gatekeeper will block the app on first launch — right-click → Open,
@@ -72,7 +72,7 @@ jobs:
         with:
           name: Void-mac-arm64
           path: Void-mac-arm64.zip
-          retention-days: 14
+          retention-days: 90
 
   build-win-x64:
     name: Windows x64
@@ -122,4 +122,4 @@ jobs:
         with:
           name: Void-win-x64-setup
           path: .build/win32-x64/user-setup/*.exe
-          retention-days: 14
+          retention-days: 90
