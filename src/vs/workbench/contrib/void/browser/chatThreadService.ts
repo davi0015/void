@@ -246,21 +246,15 @@ export type ThreadType = {
 	// repeating the full directory tree. Persisted so it survives reload.
 	directorySnapshot?: string[];
 
-	// User-provided override of the auto-derived tab / history label. When
-	// non-empty, used as the display label everywhere; when undefined or
-	// whitespace-only, the UI falls back to the first user message's
-	// `displayContent` (and finally to "New Chat" for empty threads). Lets
-	// users curate their tab strip without editing message content.
+	// Display label for the tab strip / history / notifications. When
+	// non-empty, used everywhere; when undefined or whitespace-only, the UI
+	// falls back to the first user message's `displayContent` (and finally
+	// to "New Chat" for empty threads). Written two ways: by the user via
+	// rename, and once by the LLM after the first turn when still empty (a
+	// later manual rename simply overwrites the generated label, and
+	// resetting the rename falls back to the first user message).
 	// Persisted as part of the thread blob — no separate storage key.
 	customTitle?: string;
-
-	// LLM-generated short label for the thread, produced once after the
-	// first turn using the thread's Chat model. Displayed in the tab strip,
-	// history list, and notifications when the user hasn't set a `customTitle`
-	// (manual rename always wins). Older threads without this field fall back
-	// to the first user message, so behavior there is unchanged.
-	// Persisted as part of the thread blob — no separate storage key.
-	autoTitle?: string;
 
 	// Per-chat permission mode ('read_only' | 'workspace_write' | 'full_access'),
 	// selected from the chat input box (same row as model selection). Acts as
@@ -1278,6 +1272,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (!metadataRaw) return undefined
 
 		const metadataParsed = JSON.parse(metadataRaw, ChatThreadService._storageReviver) as any
+
+		// One-time migration: early iterations of LLM thread titles stored
+		// the generated label in a separate `autoTitle` field. Fold it into
+		// `customTitle` (the single persisted title field) so those threads
+		// keep their labels, then drop the orphan key so it isn't
+		// re-persisted. A user rename always takes precedence.
+		if (metadataParsed.autoTitle && !metadataParsed.customTitle) metadataParsed.customTitle = metadataParsed.autoTitle
+		delete metadataParsed.autoTitle
 
 		// @deprecated Migration 1: very old format has messages array inline in metadata.
 		// Split into per-message keys, discarding old checkpoint data.
@@ -3248,19 +3250,22 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	/**
 	 * Fire-and-forget LLM title for a new thread. Runs once per thread: the
 	 * first time an agent loop ends with at least one user message and one
-	 * assistant reply on a thread that has neither `customTitle` nor
-	 * `autoTitle`. Uses the thread's own Chat model via the lightweight
-	 * simple-messages path (no tools, no stream state, no usage-stat writes)
-	 * so the main loop is never disturbed. An in-flight guard prevents
-	 * duplicate calls across rapid loop endings; failures (no model, provider
-	 * error, thread deleted meanwhile) are silent and retry on the next
-	 * turn — the first-message fallback label stays in place until then.
+	 * assistant reply on a thread whose `customTitle` is still empty. The
+	 * generated label is stored in `customTitle` itself (the single
+	 * persisted title field) — a later manual rename overwrites it, and a
+	 * rename that lands mid-flight suppresses the write. Uses the thread's
+	 * own Chat model via the lightweight simple-messages path (no tools, no
+	 * stream state, no usage-stat writes) so the main loop is never
+	 * disturbed. An in-flight guard prevents duplicate calls across rapid
+	 * loop endings; failures (no model, provider error, thread deleted
+	 * meanwhile) are silent and retry on the next turn — the first-message
+	 * fallback label stays in place until then.
 	 */
 	private _maybeGenerateThreadTitle(threadId: string, modelSelection: ModelSelection | null, modelSelectionOptions: ModelSelectionOptions | undefined): void {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
 		if (!modelSelection) return
-		if (thread.customTitle?.trim() || thread.autoTitle?.trim()) return
+		if (thread.customTitle?.trim()) return
 		if (this._titleGenInFlightOfThreadId.has(threadId)) return
 		const firstUser = thread.messages.find(m => m.role === 'user')
 		// First assistant message *with text* — a tool-only first turn has
@@ -3295,15 +3300,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			onText: () => { },
 			onFinalMessage: ({ fullText }) => {
 				this._titleGenInFlightOfThreadId.delete(threadId)
-				// Thread may have been deleted/renamed while we waited.
+				// The user may have renamed (or a title already landed) while
+				// we waited — only fill the still-empty field, never overwrite.
 				const latest = this.state.allThreads[threadId]
-				if (!latest || latest.autoTitle?.trim()) return
+				if (!latest || latest.customTitle?.trim()) return
 				const cleaned = truncate(
 					fullText.replace(/\s+/g, ' ').trim().replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim(),
 					60, '...'
 				)
 				if (!cleaned) return
-				const updatedThread: ThreadType = { ...latest, autoTitle: cleaned, lastModified: new Date().toISOString() }
+				const updatedThread: ThreadType = { ...latest, customTitle: cleaned, lastModified: new Date().toISOString() }
 				const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 				this._storeThread(threadId, updatedThread)
 				this._setState({ allThreads: newThreads })
@@ -3685,8 +3691,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	/**
 	 * The thread's display label, matching the sidebar's convention:
-	 * customTitle → LLM-generated autoTitle → first user message →
-	 * ephemeral title → 'New Chat'.
+	 * customTitle → first user message → ephemeral title → 'New Chat'.
 	 * Cleaned to a single line for the notification's identity row.
 	 */
 	private _getThreadTitle(threadId: string): string {
@@ -3695,8 +3700,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const clean = (s: string) => truncate(s.replace(/\s+/g, ' ').trim(), 60, '...')
 		const customTitle = thread.customTitle?.trim()
 		if (customTitle) return clean(customTitle)
-		const autoTitle = thread.autoTitle?.trim()
-		if (autoTitle) return clean(autoTitle)
 		const firstUser = thread.messages.find(m => m.role === 'user')
 		if (firstUser?.role === 'user' && firstUser.displayContent) return clean(firstUser.displayContent)
 		return thread.title ? clean(thread.title) : 'New Chat'
