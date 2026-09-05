@@ -611,6 +611,11 @@ export const sendOpenAIResponsesChat = async ({ messages, onText, onFinalMessage
 		// Stateless per request — Void replays full history every turn, so
 		// nothing should be retained server-side.
 		store: false,
+		// Ask for reasoning summaries so thinking models have something to
+		// show in the UI (streamed as summary deltas + returned on the
+		// reasoning output items below). Costs a few output tokens; placed
+		// before the spreads so model extras can override it.
+		reasoning: { summary: 'auto' },
 		...(responsesTools ? { tools: responsesTools } : {}),
 		...additionalOpenAIPayload,
 	} as OpenAI.Responses.ResponseCreateParamsStreaming
@@ -648,9 +653,9 @@ export const sendOpenAIResponsesChat = async ({ messages, onText, onFinalMessage
 				if (event.type === 'response.output_text.delta') {
 					fullTextSoFar += event.delta
 				}
-				// Best-effort reasoning capture — only present when the
-				// backend emits summaries (not requested by default, since
-				// they cost output tokens).
+				// Reasoning summary streaming (requested via `reasoning.summary`
+				// above) — feeds the thinking UI live; the final output's
+				// reasoning items overwrite authoritatively below.
 				else if (event.type === 'response.reasoning_summary_text.delta') {
 					fullReasoningSoFar += event.delta
 				}
@@ -704,6 +709,7 @@ export const sendOpenAIResponsesChat = async ({ messages, onText, onFinalMessage
 			const authoritativeCalls: { call_id: string; name: string; argsStr: string }[] = []
 			if (finalResponse) {
 				const texts: string[] = []
+				const reasoningTexts: string[] = []
 				for (const item of finalResponse.output ?? []) {
 					if (item.type === 'message') {
 						for (const c of item.content) {
@@ -713,8 +719,14 @@ export const sendOpenAIResponsesChat = async ({ messages, onText, onFinalMessage
 					else if (item.type === 'function_call') {
 						authoritativeCalls.push({ call_id: item.call_id, name: item.name, argsStr: item.arguments })
 					}
+					else if (item.type === 'reasoning') {
+						for (const s of item.summary ?? []) {
+							if (s.type === 'summary_text' && s.text) reasoningTexts.push(s.text)
+						}
+					}
 				}
 				if (texts.length > 0) fullTextSoFar = texts.join('')
+				if (reasoningTexts.length > 0) fullReasoningSoFar = reasoningTexts.join('\n')
 				if (finalResponse.usage) {
 					latestUsage = {
 						inputTokens: finalResponse.usage.input_tokens,
