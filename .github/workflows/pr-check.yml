@@ -46,7 +46,9 @@ jobs:
 
       - name: Typecheck
         # Full-project tsc needs more than node's ~4GB default heap.
-        run: npx tsc -p src/tsconfig.json --noEmit
+        # --skipLibCheck silences pre-existing errors in third-party
+        # .d.ts files (e.g. linkedom); src/ is still fully checked.
+        run: npx tsc -p src/tsconfig.json --noEmit --skipLibCheck
         env:
           NODE_OPTIONS: --max-old-space-size=8192
 
