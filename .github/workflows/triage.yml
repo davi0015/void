@@ -1,9 +1,12 @@
 name: Issue Triage to Wiki
 
 on:
+  # Scheduled runs disabled: the 6-hourly cron only generated failure
+  # emails (missing wiki secrets). Manual dispatch still available if the
+  # triage is ever wanted back — re-add the schedule below to resume.
   workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'    # every 6 hrs (UTC)
+  # schedule:
+  #   - cron: '0 */6 * * *'    # every 6 hrs (UTC)
 
 jobs:
   roadmap:
