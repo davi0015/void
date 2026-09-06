@@ -14,7 +14,7 @@ import { Tool as GeminiTool, FunctionDeclaration, GoogleGenAI, ThinkingConfig, S
 import { GoogleAuth } from 'google-auth-library'
 /* eslint-enable */
 
-import { AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, type LLMUsage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js';
+import { AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, type LLMUsage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj, ResponsesReasoningRef } from '../../common/sendLLMMessageTypes.js';
 import type { ToolName } from '../../common/toolsServiceTypes.js';
 import { BackendProviderSettings, displayInfoOfProviderName, isBackendId, ModelSelectionOptions, OverridesOfModel, ProviderName, SettingsOfProvider } from '../../common/voidSettingsTypes.js';
 import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, defaultProviderSettings, getReservedOutputTokenSpace } from '../../common/modelCapabilities.js';
@@ -494,6 +494,330 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 			if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: authErrorMessage(providerName, error), fullError: error }); }
 			else { onError({ message: error + '', fullError: error }); }
 		})
+}
+
+
+// ------------ OPENAI RESPONSES (backends only) ------------
+
+// Translate the browser layer's LLM chat messages (+ separate system
+// message) into Responses API `instructions` + `input`. Backends on the
+// responses protocol always produce OpenAI-style messages (openai-style is
+// the default tool format for unrecognized providers), so only those
+// shapes are translated — anything else is skipped, never fatal.
+const responsesInputOfLLMMessages = (messages: LLMChatMessage[], separateSystemMessage: string | undefined): { instructions: string | undefined, input: OpenAI.Responses.ResponseInput } => {
+	const instructionParts: string[] = []
+	if (separateSystemMessage) instructionParts.push(separateSystemMessage)
+	const input: OpenAI.Responses.ResponseInput = []
+	for (const msg of messages) {
+		if (msg.role === 'system' || msg.role === 'developer') {
+			if (typeof msg.content === 'string' && msg.content) instructionParts.push(msg.content)
+			continue
+		}
+		if (msg.role === 'user') {
+			// Gemini-shaped messages carry `parts` instead of `content` —
+			// they never occur on this protocol; skip them.
+			if (!('content' in msg)) continue
+			if (typeof msg.content === 'string') {
+				input.push({ role: 'user', content: msg.content })
+				continue
+			}
+			// content parts — text + images only; anything else skipped
+			const content: OpenAI.Responses.ResponseInputContent[] = []
+			for (const part of msg.content) {
+				if (part.type === 'text') content.push({ type: 'input_text', text: part.text })
+				else if (part.type === 'image_url') content.push({ type: 'input_image', image_url: part.image_url.url, detail: 'auto' })
+			}
+			if (content.length > 0) input.push({ role: 'user', content })
+			continue
+		}
+		if (msg.role === 'assistant') {
+			// Replay the opaque reasoning payload captured last turn, ahead
+			// of the message (generation order). `encrypted_content` is
+			// absent from this SDK version's types — cast. Skipped when
+			// there's nothing worth replaying.
+			const prevReasoning = 'responsesReasoning' in msg ? msg.responsesReasoning : undefined
+			if (prevReasoning?.id && (prevReasoning.encrypted_content || prevReasoning.summaryText)) {
+				input.push({
+					type: 'reasoning',
+					id: prevReasoning.id,
+					summary: prevReasoning.summaryText ? [{ type: 'summary_text', text: prevReasoning.summaryText }] : [],
+					...(prevReasoning.encrypted_content ? { encrypted_content: prevReasoning.encrypted_content } : {}),
+				} as OpenAI.Responses.ResponseInputItem)
+			}
+			if (typeof msg.content === 'string') {
+				if (msg.content) input.push({ role: 'assistant', content: msg.content })
+			}
+			else {
+				// array content is unusual here, but carry any text parts
+				const texts: string[] = []
+				for (const part of msg.content) {
+					if (part.type === 'text' && 'text' in part && typeof part.text === 'string') texts.push(part.text)
+				}
+				if (texts.length > 0) input.push({ role: 'assistant', content: texts.join('\n') })
+			}
+			// prior tool calls replay as function_call items so the next
+			// turn's outputs can match them by call_id (see below)
+			if ('tool_calls' in msg && msg.tool_calls) {
+				for (const tc of msg.tool_calls) {
+					input.push({ type: 'function_call', call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments })
+				}
+			}
+			continue
+		}
+		if (msg.role === 'tool') {
+			// `tool_call_id` is the Responses call_id from the previous
+			// turn (stored as the tool's id) — echo it back verbatim so
+			// the backend can pair output with call.
+			input.push({ type: 'function_call_output', call_id: msg.tool_call_id, output: msg.content })
+			continue
+		}
+	}
+	const instructions = instructionParts.length > 0 ? instructionParts.join('\n\n') : undefined
+	return { instructions, input }
+}
+
+
+export const sendOpenAIResponsesChat = async ({ messages, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, modelName: modelName_, _setAborter, providerName, tools, separateSystemMessage, overridesOfModel }: SendChatParams_Internal) => {
+	const {
+		modelName,
+		additionalOpenAIPayload,
+		reasoningCapabilities,
+	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
+
+	// reasoning — same think-tag handling as the chat path; the text-level
+	// wrapper works unchanged on streamed responses text.
+	const { openSourceThinkTags } = reasoningCapabilities || {}
+
+	// NOTE: providerReasoningIOSettings.input.includeInPayload is deliberately
+	// NOT applied here. Those fields (e.g. reasoning_effort) are shaped for
+	// Chat Completions; the Responses API takes reasoning config under
+	// `reasoning: {...}` instead. additionalOpenAIPayload (model-specific
+	// extras) still applies below.
+	const { instructions, input } = responsesInputOfLLMMessages(messages, separateSystemMessage)
+
+	// tools — same function schemas as the chat path; only the envelope
+	// differs (Responses FunctionTool instead of ChatCompletionTool).
+	// `strict` stays off: our schemas have no `required` list (same reason
+	// it's commented out in toOpenAICompatibleTool).
+	const chatTools = openAITools(tools)
+	const responsesTools: OpenAI.Responses.FunctionTool[] | undefined = chatTools?.map(t => ({
+		type: 'function' as const,
+		name: t.function.name,
+		description: t.function.description,
+		parameters: t.function.parameters as Record<string, unknown>,
+		strict: false,
+	}))
+
+	// open-source models - manually parse think tokens (same as chat path)
+	if (openSourceThinkTags) {
+		const { newOnText, newOnFinalMessage } = extractReasoningWrapper(onText, onFinalMessage, openSourceThinkTags)
+		onText = newOnText
+		onFinalMessage = newOnFinalMessage
+	}
+
+	const openai: OpenAI = await newOpenAICompatibleSDK({ providerName, settingsOfProvider })
+	const options = {
+		model: modelName,
+		instructions,
+		input,
+		stream: true,
+		// Stateless per request — Void replays full history every turn, so
+		// nothing should be retained server-side.
+		store: false,
+		// Ask for reasoning summaries so thinking models have something to
+		// show in the UI (streamed as summary deltas + returned on the
+		// reasoning output items below). Costs a few output tokens; placed
+		// before the spreads so model extras can override it.
+		reasoning: { summary: 'auto' },
+		// Also receive the opaque encrypted chain-of-thought so it can be
+		// persisted and replayed next turn (tier-3 reasoning retention).
+		// Not in this SDK version's types — cast. Backends that don't
+		// understand it should ignore unknown fields, same as the rest.
+		include: ['reasoning.encrypted_content'] as unknown as OpenAI.Responses.ResponseIncludable[],
+		...(responsesTools ? { tools: responsesTools } : {}),
+		...additionalOpenAIPayload,
+	} as OpenAI.Responses.ResponseCreateParamsStreaming
+
+	let fullTextSoFar = ''
+	let fullReasoningSoFar = ''
+
+	// Tool-call buffers keyed by the stream's output_index (present on both
+	// `output_item.added` and `function_call_arguments.delta` for the same
+	// call). The authoritative call list comes from the final response
+	// object; buffers drive the in-progress UI snapshot and cover backends
+	// that end the stream without one.
+	const toolBuffers = new Map<number, { call_id: string; name: string; argsStr: string }>()
+	const getOrCreateToolBuffer = (index: number) => {
+		let buf = toolBuffers.get(index)
+		if (!buf) { buf = { call_id: '', name: '', argsStr: '' }; toolBuffers.set(index, buf) }
+		return buf
+	}
+
+	// Usage only arrives on the final response object (nothing mid-stream).
+	let latestUsage: LLMUsage | undefined = undefined
+
+	// Truncation signal for the UI warning (mirrors the chat path's
+	// finish_reason handling: only non-clean endings are reported).
+	let incompleteReason: string | undefined = undefined
+
+	let finalResponse: OpenAI.Responses.Response | undefined = undefined
+
+	openai.responses
+		.create(options)
+		.then(async response => {
+			_setAborter(() => response.controller.abort())
+
+			for await (const event of response) {
+				if (event.type === 'response.output_text.delta') {
+					fullTextSoFar += event.delta
+				}
+				// Reasoning summary streaming (requested via `reasoning.summary`
+				// above) — feeds the thinking UI live; the final output's
+				// reasoning items overwrite authoritatively below.
+				else if (event.type === 'response.reasoning_summary_text.delta') {
+					fullReasoningSoFar += event.delta
+				}
+				else if (event.type === 'response.output_item.added') {
+					if (event.item.type === 'function_call') {
+						const buf = getOrCreateToolBuffer(event.output_index)
+						if (event.item.call_id) buf.call_id = event.item.call_id
+						if (event.item.name) buf.name = event.item.name
+					}
+				}
+				else if (event.type === 'response.function_call_arguments.delta') {
+					getOrCreateToolBuffer(event.output_index).argsStr += event.delta
+				}
+				else if (event.type === 'response.completed' || event.type === 'response.incomplete') {
+					finalResponse = event.response
+					const reason = event.response.incomplete_details?.reason
+					// Map to the chat path's finish_reason vocabulary so the
+					// UI's truncation warning fires identically.
+					if (reason === 'max_output_tokens') incompleteReason = 'length'
+					else if (reason) incompleteReason = reason
+				}
+				else if (event.type === 'response.failed') {
+					const errMsg = (failedMsgOfResponseError(event.response.error)) ?? 'The model failed to produce a response.'
+					onError({ message: errMsg, fullError: null })
+					return
+				}
+				else if (event.type === 'error') {
+					onError({ message: event.message || 'Responses stream error.', fullError: null })
+					return
+				}
+
+				// In-progress tool snapshot for UI streaming (same contract
+				// as the chat path: only named calls, provider order).
+				const inProgressToolCalls: RawToolCallObj[] = Array.from(toolBuffers.entries())
+					.filter(([_i, buf]) => !!buf.name)
+					.sort(([a], [b]) => a - b)
+					.map(([_i, buf]) => ({ name: buf.name as ToolName, rawParams: {}, isDone: false, doneParams: [], id: buf.call_id }))
+
+				onText({
+					fullText: fullTextSoFar,
+					fullReasoning: fullReasoningSoFar,
+					toolCalls: inProgressToolCalls.length > 0 ? inProgressToolCalls : undefined,
+					usage: latestUsage,
+				})
+			}
+
+			// Authoritative pass over the final response object when present.
+			// Deltas and the completed object should agree; the object wins.
+			// Streamed buffers fill gaps for backends that end the stream
+			// without a completed object.
+			const authoritativeCalls: { call_id: string; name: string; argsStr: string }[] = []
+			// Opaque reasoning payload for next-turn replay. At most one
+			// reasoning item is expected; if several appear, the first id
+			// wins and any encrypted blob wins (last one sticks).
+			let capturedReasoningId: string | undefined = undefined
+			let capturedEncrypted: string | undefined = undefined
+			if (finalResponse) {
+				const texts: string[] = []
+				const reasoningTexts: string[] = []
+				for (const item of finalResponse.output ?? []) {
+					if (item.type === 'message') {
+						for (const c of item.content) {
+							if (c.type === 'output_text') texts.push(c.text)
+						}
+					}
+					else if (item.type === 'function_call') {
+						authoritativeCalls.push({ call_id: item.call_id, name: item.name, argsStr: item.arguments })
+					}
+					else if (item.type === 'reasoning') {
+						for (const s of item.summary ?? []) {
+							if (s.type === 'summary_text' && s.text) reasoningTexts.push(s.text)
+						}
+						if (!capturedReasoningId && item.id) capturedReasoningId = item.id
+						// Absent from this SDK version's types — read loosely.
+						const encrypted = (item as { encrypted_content?: unknown }).encrypted_content
+						if (typeof encrypted === 'string' && encrypted) capturedEncrypted = encrypted
+					}
+				}
+				if (texts.length > 0) fullTextSoFar = texts.join('')
+				if (reasoningTexts.length > 0) fullReasoningSoFar = reasoningTexts.join('\n')
+				if (finalResponse.usage) {
+					latestUsage = {
+						inputTokens: finalResponse.usage.input_tokens,
+						outputTokens: finalResponse.usage.output_tokens,
+						totalTokens: finalResponse.usage.total_tokens,
+						reasoningTokens: finalResponse.usage.output_tokens_details?.reasoning_tokens,
+						cachedInputTokens: finalResponse.usage.input_tokens_details?.cached_tokens,
+					}
+				}
+			}
+			const seenCallIds = new Set(authoritativeCalls.map(c => c.call_id))
+			for (const [_i, buf] of toolBuffers) {
+				if (buf.name && !seenCallIds.has(buf.call_id)) {
+					authoritativeCalls.push({ call_id: buf.call_id, name: buf.name, argsStr: buf.argsStr })
+					seenCallIds.add(buf.call_id)
+				}
+			}
+			// Parse each completed call; malformed JSON is skipped (same as
+			// the chat path) rather than failing the whole turn.
+			const finalToolCalls: RawToolCallObj[] = authoritativeCalls
+				.map(c => rawToolCallObjOfParamsStr(c.name, c.argsStr, c.call_id))
+				.filter((t): t is RawToolCallObj => t !== null)
+
+			// Persistable reasoning payload for next-turn replay. Stored
+			// only when there's something worth replaying (an id plus a
+			// blob or summary text); otherwise left undefined so the
+			// thread blob stays minimal.
+			let responsesReasoning: ResponsesReasoningRef | undefined = undefined
+			if (capturedReasoningId && (capturedEncrypted || fullReasoningSoFar)) {
+				responsesReasoning = {
+					id: capturedReasoningId,
+					...(capturedEncrypted ? { encrypted_content: capturedEncrypted } : {}),
+					...(fullReasoningSoFar ? { summaryText: fullReasoningSoFar } : {}),
+				}
+			}
+
+			if (!fullTextSoFar && !fullReasoningSoFar && finalToolCalls.length === 0) {
+				onError({ message: 'Void: Response from model was empty.', fullError: null })
+			}
+			else {
+				onFinalMessage({
+					fullText: fullTextSoFar,
+					fullReasoning: fullReasoningSoFar,
+					anthropicReasoning: null,
+					usage: latestUsage,
+					finishReason: incompleteReason ?? 'stop',
+					toolCalls: finalToolCalls.length > 0 ? finalToolCalls : undefined,
+					responsesReasoning,
+				});
+			}
+		})
+		// when error/fail - this catches errors of both .create() and .then(for await)
+		.catch(error => {
+			if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: authErrorMessage(providerName, error), fullError: error }); }
+			else { onError({ message: error + '', fullError: error }); }
+		})
+}
+
+// Safely extract a message from a failed response's error payload, which
+// varies by backend. Returns null when there's nothing readable.
+const failedMsgOfResponseError = (error: OpenAI.Responses.Response['error']): string | null => {
+	if (!error || typeof error !== 'object') return null
+	const message = (error as { message?: unknown }).message
+	return typeof message === 'string' && message ? message : null
 }
 
 

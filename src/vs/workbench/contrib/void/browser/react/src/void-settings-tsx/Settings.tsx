@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
-import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName, BackendId, BackendProtocol, BackendProviderSettings, notificationSoundKinds, displayNameOfNotificationSoundKind } from '../../../../common/voidSettingsTypes.js'
+import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName, BackendId, BackendProtocol, BackendProviderSettings, displayNameOfBackendProtocol, notificationSoundKinds, displayNameOfNotificationSoundKind } from '../../../../common/voidSettingsTypes.js'
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js'
 import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSegmentedControl, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js'
 import { useAccessor, useIsDark, useIsOptedOut, useRefreshModelListener, useRefreshModelState, useSettingsState, useSemanticIndexState } from '../util/services.js'
@@ -1017,7 +1017,7 @@ const BackendSettingsEntry = ({ backendId }: { backendId: BackendId }) => {
 			</button>
 		</div>
 
-		<div className='text-xs text-void-fg-3'>Protocol: {settings.protocol}</div>
+		<div className='text-xs text-void-fg-3'>Protocol: {displayNameOfBackendProtocol(settings.protocol)}</div>
 
 		<VoidSimpleInputBox
 			placeholder='Display Name'
@@ -1083,11 +1083,11 @@ const BackendSettings = () => {
 					compact
 				/>
 				<VoidCustomDropdownBox
-					options={['openAI', 'anthropic', 'gemini'] as BackendProtocol[]}
+					options={['openAI', 'openAIResponses', 'anthropic', 'gemini'] as BackendProtocol[]}
 					selectedOption={newProtocol}
 					onChangeOption={(p) => setNewProtocol(p)}
-					getOptionDisplayName={(p) => p}
-					getOptionDropdownName={(p) => p}
+					getOptionDisplayName={(p) => displayNameOfBackendProtocol(p)}
+					getOptionDropdownName={(p) => displayNameOfBackendProtocol(p)}
 					getOptionsEqual={(a, b) => a === b}
 					className='w-full resize-none bg-void-bg-1 text-void-fg-1 placeholder:text-void-fg-3 border border-void-border-2 focus:border-void-border-1 py-1 px-2 rounded'
 					arrowTouchesText={false}

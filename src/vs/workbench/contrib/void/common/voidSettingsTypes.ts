@@ -15,7 +15,14 @@ type UnionOfKeys<T> = T extends T ? keyof T : never;
 
 
 export type BackendId = `backend_${string}`
-export type BackendProtocol = 'openAI' | 'anthropic' | 'gemini'
+export type BackendProtocol = 'openAI' | 'anthropic' | 'gemini' | 'openAIResponses'
+
+// Human-readable label for a backend protocol id. Centralized so the
+// add-backend picker and the saved-card label can't drift apart.
+export const displayNameOfBackendProtocol = (protocol: BackendProtocol): string => {
+	if (protocol === 'openAIResponses') return 'OpenAI Responses'
+	return protocol
+}
 export type BuiltInProviderName = keyof typeof defaultProviderSettings
 export type ProviderName = BuiltInProviderName | BackendId
 export const providerNames = Object.keys(defaultProviderSettings) as BuiltInProviderName[]
