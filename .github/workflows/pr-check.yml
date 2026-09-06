@@ -1,0 +1,59 @@
+# Fast correctness gate for pull requests: clean install, typecheck,
+# workbench compile, and hygiene on Linux. Catches breakage before merge
+# instead of after. Runs only on PRs (and manually) — never on pushes to
+# main, and it produces no artifacts.
+
+name: PR check
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-linux:
+    name: Compile + hygiene (Linux)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      # Same native-module headers the distro Linux job needs.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbfile-dev libsecret-1-dev libkrb5-dev pkg-config
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build React bundles
+        run: npm run buildreact
+
+      - name: Typecheck
+        # Full-project tsc needs more than node's ~4GB default heap.
+        # --skipLibCheck silences pre-existing errors in third-party
+        # .d.ts files (e.g. linkedom); src/ is still fully checked.
+        run: npx tsc -p src/tsconfig.json --noEmit --skipLibCheck
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+
+      - name: Compile workbench
+        run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js compile
+
+      - name: Hygiene
+        run: node build/hygiene.js
