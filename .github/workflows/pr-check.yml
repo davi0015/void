@@ -45,7 +45,10 @@ jobs:
         run: npm run buildreact
 
       - name: Typecheck
+        # Full-project tsc needs more than node's ~4GB default heap.
         run: npx tsc -p src/tsconfig.json --noEmit
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
 
       - name: Compile workbench
         run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js compile
