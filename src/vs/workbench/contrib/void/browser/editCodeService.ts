@@ -49,6 +49,7 @@ import { DiffArea, Diff, CtrlKZone, VoidFileSnapshot, DiffAreaSnapshotEntry, dif
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { PENDING_DIFFS_STORAGE_KEY } from '../common/storageKeys.js';
+import { IFileService, FileChangeType } from '../../../../platform/files/common/files.js';
 // import { isMacintosh } from '../../../../base/common/platform.js';
 // import { VOID_OPEN_SETTINGS_ACTION_ID } from './voidSettingsPane.js';
 
@@ -217,7 +218,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		@INotificationService private readonly _notificationService: INotificationService,
 		// @ICommandService private readonly _commandService: ICommandService,
 		@IVoidSettingsService private readonly _settingsService: IVoidSettingsService,
-		// @IFileService private readonly _fileService: IFileService,
+		@IFileService private readonly _fileService: IFileService,
 		@IVoidModelService private readonly _voidModelService: IVoidModelService,
 		@IConvertToLLMMessageService private readonly _convertToLLMMessageService: IConvertToLLMMessageService,
 		@IStorageService private readonly _storageService: IStorageService,
@@ -257,8 +258,29 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		// initialize all existing models + initialize when a new model mounts
 		for (let model of this._modelService.getModels()) { initializeModel(model) }
 		this._register(this._modelService.onModelAdded(model => { initializeModel(model) }));
-		// clean up when a model is removed so it can be re-initialized later
-		this._register(this._modelService.onModelRemoved(model => { registeredModelURIs.delete(model.uri.fsPath) }));
+		// clean up when a model is removed so it can be re-initialized later.
+		// Also drop any pending diffs for it, otherwise the Accept/Reject UI
+		// lingers after the file is deleted/closed (stale diff-after-delete).
+		this._register(this._modelService.onModelRemoved(model => {
+			registeredModelURIs.delete(model.uri.fsPath)
+			if (this.diffAreasOfURI[model.uri.fsPath]?.size) {
+				this.acceptOrRejectAllDiffAreas({ uri: model.uri, removeCtrlKs: true, behavior: 'accept', _addToHistory: false })
+			}
+		}));
+		// Manual deletes (Explorer, git checkout, external tools) bypass the
+		// agent's delete_file_or_folder cleanup, so watch the filesystem too.
+		// `contains(..., DELETED)` also matches when a parent folder is deleted.
+		this._register(this._fileService.onDidFilesChange(e => {
+			if (!e.gotDeleted()) return
+			for (const trackedPath of Object.keys(this.diffAreasOfURI)) {
+				if (!this.diffAreasOfURI[trackedPath]?.size) continue
+				const trackedUri = URI.file(trackedPath)
+				if (e.contains(trackedUri, FileChangeType.DELETED)) {
+					this.interruptURIStreaming({ uri: trackedUri })
+					this.acceptOrRejectAllDiffAreas({ uri: trackedUri, removeCtrlKs: true, behavior: 'accept', _addToHistory: false })
+				}
+			}
+		}));
 
 
 		// this function adds listeners to refresh styles when editor changes tab
@@ -927,14 +949,17 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 
 	private _deleteAllDiffAreas(uri: URI) {
-		const diffAreas = this.diffAreasOfURI[uri.fsPath]
-		diffAreas?.forEach(diffareaid => {
+		const diffAreas = [...(this.diffAreasOfURI[uri.fsPath] ?? [])]
+		for (const diffareaid of diffAreas) {
 			const diffArea = this.diffAreaOfId[diffareaid]
+			if (!diffArea) continue
 			if (diffArea.type === 'DiffZone')
 				this._deleteDiffZone(diffArea)
 			else if (diffArea.type === 'CtrlKZone')
 				this._deleteCtrlKZone(diffArea)
-		})
+			else
+				this._deleteTrackingZone(diffArea)
+		}
 		this.diffAreasOfURI[uri.fsPath]?.clear()
 	}
 
