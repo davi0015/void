@@ -1,4 +1,5 @@
 import { generateUuid } from '../../../../../base/common/uuid.js'
+import { URI } from '../../../../../base/common/uri.js'
 import { DEFAULT_TERMINAL_TIMEOUT_SECONDS, MAX_TERMINAL_TIMEOUT_SECONDS } from '../../common/prompt/prompts.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
@@ -38,6 +39,24 @@ export const runCommandToolCore: ToolDefinitionCore<'run_command'> = {
 
 	callTool: async ({ command, cwd, terminalId, timeoutSeconds }, ctx) => {
 		const { resPromise, interrupt } = await ctx.terminalToolService.runCommand(command, { type: 'temporary', cwd, terminalId, timeoutSeconds })
+		// Shell commands bypass IFileService, so `rm`/`mv` leaves ghost diffs
+		// until the file watcher fires (75ms native, up to 5s polling).
+		// Sweep tracked diff URIs once the command settles — fire-and-forget
+		// so the tool result isn't delayed. Only stats files with live diffs.
+		const sweepDeletedDiffs = async () => {
+			const trackedPaths = Object.keys(ctx.editCodeService.diffAreasOfURI)
+			if (trackedPaths.length === 0) return
+			for (const trackedPath of trackedPaths) {
+				if (!ctx.editCodeService.diffAreasOfURI[trackedPath]?.size) continue
+				let exists = true
+				try { exists = await ctx.fileService.exists(URI.file(trackedPath)) }
+				catch { continue } // on error, leave diffs alone
+				if (!exists) {
+					ctx.editCodeService.acceptOrRejectAllDiffAreas({ uri: URI.file(trackedPath), removeCtrlKs: true, behavior: 'accept', _addToHistory: false })
+				}
+			}
+		}
+		void resPromise.then(sweepDeletedDiffs, sweepDeletedDiffs)
 		return { result: resPromise, interruptTool: interrupt }
 	},
 
