@@ -29,6 +29,7 @@ import { KeyMod } from '../../../../editor/common/services/editorBaseApi.js';
 import { KeyCode } from '../../../../base/common/keyCodes.js';
 import { ScrollType } from '../../../../editor/common/editorCommon.js';
 import { IVoidModelService } from '../common/voidModelService.js';
+import { IFileService, FileChangeType } from '../../../../platform/files/common/files.js';
 
 
 
@@ -102,6 +103,7 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 		@IModelService private readonly _modelService: IModelService,
 		@IEditCodeService private readonly _editCodeService: IEditCodeService,
 		@IVoidModelService private readonly _voidModelService: IVoidModelService,
+		@IFileService private readonly _fileService: IFileService,
 	) {
 		super();
 
@@ -121,6 +123,33 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 		this._register(this._modelService.onModelRemoved(model => {
 			registeredModelURIs.delete(model.uri.fsPath)
 			this._listenToTheseURIs.delete(model.uri)
+			// Drop command-bar state for removed models so the Accept/Reject
+			// widget doesn't linger after delete (editCodeService cleanup
+			// fires onDidAddOrDeleteDiffZones too, but don't rely on ordering).
+			if (this.stateOfURI[model.uri.fsPath]) {
+				this._deleteURIEntryFromState(model.uri)
+				this._onDidChangeState.fire({ uri: model.uri })
+			}
+			if (this.activeURI?.fsPath === model.uri.fsPath) {
+				this.activeURI = null
+				this._onDidChangeActiveURI.fire({ uri: null })
+			}
+		}));
+		// Belt-and-suspenders for manual deletes: clear state for any tracked
+		// URI whose file (or parent folder) was deleted, even if the model
+		// event was missed or reordered.
+		this._register(this._fileService.onDidFilesChange(e => {
+			if (!e.gotDeleted()) return
+			for (const uri of [...this.sortedURIs]) {
+				if (e.contains(uri, FileChangeType.DELETED)) {
+					this._deleteURIEntryFromState(uri)
+					this._onDidChangeState.fire({ uri })
+					if (this.activeURI?.fsPath === uri.fsPath) {
+						this.activeURI = null
+						this._onDidChangeActiveURI.fire({ uri: null })
+					}
+				}
+			}
 		}));
 
 
