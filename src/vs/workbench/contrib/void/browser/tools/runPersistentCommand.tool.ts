@@ -5,7 +5,7 @@ import { validateStr, validateProposedTerminalId, validateTimeoutSeconds } from 
 
 const terminalDescHelper =
 	'Shell commands not covered by dedicated tools (e.g. `npm install`, `git status`, `pytest`).' +
-	' Do NOT use for: reading files, listing directories, finding files, searching text, or editing files.' +
+	' Do NOT use for: reading files, listing directories, finding files, searching text, editing files, or moving/renaming/deleting files or folders — use the dedicated tools instead (pending diffs and review UI only follow file-service moves, not shell `mv`/`rm`).' +
 	' Avoid interactive commands that wait for input (pagers, editors, REPLs, y/n prompts).' +
 	' Pipe pagers to `cat` (e.g. `git diff | cat`). If a command hangs, it may be waiting for input.'
 

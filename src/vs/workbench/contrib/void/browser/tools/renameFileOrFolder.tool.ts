@@ -1,11 +1,10 @@
-import { URI } from '../../../../../base/common/uri.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
 import { validateBoolean } from './toolHelpers.js'
 
 export const renameFileOrFolderToolCore: ToolDefinitionCore<'rename_file_or_folder'> = {
 	name: 'rename_file_or_folder',
-	description: `Rename or move a file or folder from one path to another.`,
+	description: `Rename or move a file or folder from one path to another. Prefer this over shell \`mv\`: pending diffs and review UI follow the move.`,
 	params: {
 		source_uri: { description: `Path of the existing file or folder to rename/move. Can be absolute or relative to the workspace root.` },
 		target_uri: { description: `New path for the file or folder. Can be absolute or relative to the workspace root.` },
@@ -22,14 +21,9 @@ export const renameFileOrFolderToolCore: ToolDefinitionCore<'rename_file_or_fold
 	},
 
 	callTool: async ({ sourceUri, targetUri, overwrite }, ctx) => {
-		// Clean up any pending diffs for the source before moving
-		const sourcePath = sourceUri.fsPath
-		for (const trackedPath of Object.keys(ctx.editCodeService.diffAreasOfURI)) {
-			if (trackedPath === sourcePath || trackedPath.startsWith(sourcePath + '/')) {
-				const trackedUri = URI.file(trackedPath)
-				ctx.editCodeService.acceptOrRejectAllDiffAreas({ uri: trackedUri, removeCtrlKs: true, behavior: 'accept', _addToHistory: false })
-			}
-		}
+		// Pending diffs follow the move: EditCodeService listens for the
+		// file-service MOVE operation and remaps tracked diffs (and the
+		// command bar follows suit), so review UI tracks the new location.
 		await ctx.fileService.move(sourceUri, targetUri, overwrite)
 		return { result: {} }
 	},

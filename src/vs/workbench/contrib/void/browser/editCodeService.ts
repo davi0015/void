@@ -49,7 +49,7 @@ import { DiffArea, Diff, CtrlKZone, VoidFileSnapshot, DiffAreaSnapshotEntry, dif
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { PENDING_DIFFS_STORAGE_KEY } from '../common/storageKeys.js';
-import { IFileService, FileChangeType } from '../../../../platform/files/common/files.js';
+import { IFileService, FileChangeType, FileOperation } from '../../../../platform/files/common/files.js';
 // import { isMacintosh } from '../../../../base/common/platform.js';
 // import { VOID_OPEN_SETTINGS_ACTION_ID } from './voidSettingsPane.js';
 
@@ -280,6 +280,14 @@ class EditCodeService extends Disposable implements IEditCodeService {
 					this.acceptOrRejectAllDiffAreas({ uri: trackedUri, removeCtrlKs: true, behavior: 'accept', _addToHistory: false })
 				}
 			}
+		}));
+		// Follow renames/moves (Explorer, agent rename tool — both go through
+		// IFileService.move): remap pending diffs to the new location so the
+		// review UI tracks the file instead of haunting the old path.
+		// Terminal `mv` bypasses the file service and is NOT covered here.
+		this._register(this._fileService.onDidRunOperation(e => {
+			if (!e.isOperation(FileOperation.MOVE)) return
+			this.transferDiffAreas({ from: e.resource, to: e.target.resource })
 		}));
 
 
@@ -2331,6 +2339,76 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		this._refreshStylesAndDiffsInURI(uri)
 		onFinishEdit()
 	}
+
+
+	// Move pending diffs to a new location on rename/move (see onDidRunOperation
+	// listener). DiffZones and TrackingZones are repointed so review UI follows
+	// the file; editor-anchored CtrlK zones are dropped. Only refreshes styles
+	// when the new model already exists — otherwise diffs stay in memory until
+	// the new model mounts (initializeModel refreshes then).
+	public transferDiffAreas: IEditCodeService['transferDiffAreas'] = ({ from, to }) => {
+		const fromPath = from.fsPath
+		const toPath = to.fsPath
+		if (fromPath === toPath) return
+
+		const affectedPaths = Object.keys(this.diffAreasOfURI).filter(p =>
+			p === fromPath || p.startsWith(fromPath + '/')
+		)
+		if (affectedPaths.length === 0) return
+
+		for (const oldPath of affectedPaths) {
+			const newPath = oldPath === fromPath ? toPath : toPath + oldPath.slice(fromPath.length)
+			const oldUri = URI.file(oldPath)
+			const newUri = URI.file(newPath)
+			const ids = this.diffAreasOfURI[oldPath]
+			if (!ids || ids.size === 0) {
+				delete this.diffAreasOfURI[oldPath]
+				continue
+			}
+
+			// Stop any live stream without touching undo history or file content.
+			for (const id of [...ids]) {
+				const da = this.diffAreaOfId[id]
+				if (da?.type === 'DiffZone' && da._streamState.isStreaming) this._stopIfStreaming(da)
+			}
+
+			// Drop editor-anchored CtrlK zones surgically (their mount belongs
+			// to the old editor). Unlike _deleteCtrlKZone, this must NOT clear
+			// sibling DiffZones' diffs.
+			for (const id of [...ids]) {
+				const da = this.diffAreaOfId[id]
+				if (!da) { ids.delete(id); continue }
+				if (da.type === 'CtrlKZone') {
+					da._mountInfo?.dispose()
+					delete this.diffAreaOfId[id]
+					ids.delete(id)
+				}
+			}
+			if (ids.size === 0) {
+				delete this.diffAreasOfURI[oldPath]
+				this._voidModelService.releaseModel(oldUri)
+				this._onDidAddOrDeleteDiffZones.fire({ uri: oldUri })
+				continue
+			}
+
+			// Repoint remaining areas at the new location, preserving diffs.
+			for (const id of ids) {
+				const da = this.diffAreaOfId[id]
+				if (da) da._URI = newUri
+			}
+			const existing = this.diffAreasOfURI[newPath]
+			if (existing) for (const id of ids) existing.add(id)
+			else this.diffAreasOfURI[newPath] = ids
+			delete this.diffAreasOfURI[oldPath]
+			this._voidModelService.releaseModel(oldUri)
+
+			// Recompute decorations on the new model only if it exists —
+			// otherwise the in-memory diffs are picked up on mount.
+			if (this._modelService.getModel(newUri)) this._refreshStylesAndDiffsInURI(newUri)
+			this._onDidAddOrDeleteDiffZones.fire({ uri: oldUri })
+			this._onDidAddOrDeleteDiffZones.fire({ uri: newUri })
+		}
+	};
 
 
 
