@@ -4,7 +4,7 @@ import { validateBoolean } from './toolHelpers.js'
 
 export const renameFileOrFolderToolCore: ToolDefinitionCore<'rename_file_or_folder'> = {
 	name: 'rename_file_or_folder',
-	description: `Rename or move a file or folder from one path to another.`,
+	description: `Rename or move a file or folder from one path to another. Prefer this over shell \`mv\`: pending diffs and review UI follow the move.`,
 	params: {
 		source_uri: { description: `Path of the existing file or folder to rename/move. Can be absolute or relative to the workspace root.` },
 		target_uri: { description: `New path for the file or folder. Can be absolute or relative to the workspace root.` },
