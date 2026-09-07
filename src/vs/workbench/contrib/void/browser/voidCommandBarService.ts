@@ -29,7 +29,7 @@ import { KeyMod } from '../../../../editor/common/services/editorBaseApi.js';
 import { KeyCode } from '../../../../base/common/keyCodes.js';
 import { ScrollType } from '../../../../editor/common/editorCommon.js';
 import { IVoidModelService } from '../common/voidModelService.js';
-import { IFileService, FileChangeType } from '../../../../platform/files/common/files.js';
+import { IFileService, FileChangeType, FileOperation } from '../../../../platform/files/common/files.js';
 
 
 
@@ -149,6 +149,52 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 						this._onDidChangeActiveURI.fire({ uri: null })
 					}
 				}
+			}
+		}));
+		// Follow renames/moves with the edit service: shift command-bar state
+		// to the new location (covers files + folders). Runs alongside the
+		// edit service's own transfer; the reconcile loop below makes the two
+		// order-independent (zone events may fire before/after this).
+		this._register(this._fileService.onDidRunOperation(e => {
+			if (!e.isOperation(FileOperation.MOVE)) return
+			const fromPath = e.resource.fsPath
+			const toPath = e.target.resource.fsPath
+			if (fromPath === toPath) return
+			for (const uri of [...this._listenToTheseURIs]) {
+				if (uri.fsPath !== fromPath && !uri.fsPath.startsWith(fromPath + '/')) continue
+				const newPath = uri.fsPath === fromPath ? toPath : toPath + uri.fsPath.slice(fromPath.length)
+				const newUri = URI.file(newPath)
+				this._listenToTheseURIs.delete(uri)
+				this._listenToTheseURIs.add(newUri)
+				const state = this.stateOfURI[uri.fsPath]
+				if (state) {
+					this.stateOfURI[newPath] = state
+					delete this.stateOfURI[uri.fsPath]
+				}
+				const i = this.sortedURIs.findIndex(u => u.fsPath === uri.fsPath)
+				if (i !== -1) this.sortedURIs[i] = newUri
+				if (this.activeURI?.fsPath === uri.fsPath) {
+					this.activeURI = newUri
+					this._onDidChangeActiveURI.fire({ uri: newUri })
+				}
+				this._onDidChangeState.fire({ uri: newUri })
+			}
+			// Reconcile: if the edit service transferred diffs to a URI we
+			// weren't listening to yet (new model not mounted at event time),
+			// create its state entry now instead of waiting for the next event.
+			for (const uri of this._listenToTheseURIs) {
+				if (this.stateOfURI[uri.fsPath]) continue
+				const zones = this._editCodeService.diffAreasOfURI[uri.fsPath]
+				if (!zones || zones.size === 0) continue
+				this._addURIEntryToState(uri)
+				const ids = [...zones]
+				this._setState(uri, {
+					sortedDiffZoneIds: ids,
+					sortedDiffIds: this._computeSortedDiffs(ids),
+					isStreaming: this._isAnyDiffZoneStreaming(ids),
+					diffIdx: null,
+				})
+				this._onDidChangeState.fire({ uri })
 			}
 		}));
 
