@@ -8,7 +8,7 @@ import { flushSync } from 'react-dom';
 
 
 
-import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction, useAnyThreadRunning, useSemanticIndexState } from '../util/services.js';
+import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction, useAnyThreadRunning, useSemanticIndexState, useQueuedMessage } from '../util/services.js';
 
 import { ChatMarkdownRender, ChatMessageLocation } from '../markdown/ChatMarkdownRender.js';
 import { URI } from '../../../../../../../base/common/uri.js';
@@ -23,7 +23,7 @@ import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
-import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning, Scissors, AlertTriangle, Brain } from 'lucide-react';
+import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning, Scissors, AlertTriangle, Brain, Clock } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { generateUuid } from '../../../../../../../base/common/uuid.js';
 import { VSBuffer } from '../../../../../../../base/common/buffer.js';
@@ -820,6 +820,10 @@ interface VoidChatAreaProps {
 	// Form controls
 	onSubmit: () => void;
 	onAbort: () => void;
+	// Queue a message for when the run finishes (shown only while streaming).
+	onQueue?: () => void;
+	// Tooltip for the submit arrow while streaming (undefined = none).
+	submitTooltip?: string;
 	isStreaming: boolean;
 	isDisabled?: boolean;
 	divRef?: React.RefObject<HTMLDivElement | null>;
@@ -855,6 +859,8 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 	children,
 	onSubmit,
 	onAbort,
+	onQueue,
+	submitTooltip,
 	onClose,
 	onClickAnywhere,
 	divRef,
@@ -982,9 +988,14 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 					)}
 
 					{(() => {
+						const queueBtn = onQueue && isStreaming
+							? <QueueButton onClick={onQueue} disabled={isDisabled} />
+							: null
+						const submitBtn = <ButtonSubmit onClick={onSubmit} disabled={isDisabled}
+							{...(submitTooltip && isStreaming ? { 'data-tooltip-id': 'void-tooltip', 'data-tooltip-content': submitTooltip, 'data-tooltip-place': 'top' } : {})} />
 						const button = isStreaming
-							? <ButtonStop onClick={onAbort} />
-							: <ButtonSubmit onClick={onSubmit} disabled={isDisabled} />
+							? <>{queueBtn}{submitBtn}<ButtonStop onClick={onAbort} /></>
+							: submitBtn
 						if (!threadIdForUsageRing) return button
 						return (
 							<SubmitButtonWithUsageRing threadId={threadIdForUsageRing} featureName={featureName}>
@@ -1018,6 +1029,23 @@ export const ButtonSubmit = ({ className, disabled, ...props }: ButtonProps & Re
 		{...props}
 	>
 		<IconArrowUp size={DEFAULT_BUTTON_SIZE} className="stroke-[2] p-[2px]" />
+	</button>
+}
+
+export const QueueButton = ({ className, disabled, ...props }: ButtonProps & Required<Pick<ButtonProps, 'disabled'>>) => {
+	return <button
+		type='button'
+		className={`rounded-full flex-shrink-0 flex-grow-0 flex items-center justify-center
+			${disabled ? 'opacity-40 cursor-default' : 'cursor-pointer text-void-fg-3 hover:text-void-fg-1 hover:bg-void-bg-2'}
+			${className}
+		`}
+		data-tooltip-id='void-tooltip'
+		data-tooltip-content='Queue message for when the run finishes'
+		data-tooltip-place='top'
+		disabled={disabled}
+		{...props}
+	>
+		<Clock size={DEFAULT_BUTTON_SIZE} className="p-[4px]" />
 	</button>
 }
 
@@ -3334,6 +3362,10 @@ export const SidebarChat = () => {
 	// active view without knowing about the LRU cache.
 	const scrollContainerRef = getScrollContainerRef(currentThread.id)
 
+	// While parked for approval, Enter queues instead of interrupting —
+	// implicitly discarding a pending approval would be data loss.
+	const isAwaitingApproval = isRunning === 'awaiting_user'
+
 	// Synchronous reentrancy guard. The React-state-derived `isRunning`
 	// check below is necessary but NOT sufficient to prevent duplicate
 	// submissions when the user spams Enter while the renderer is busy:
@@ -3343,21 +3375,12 @@ export const SidebarChat = () => {
 	// deterministically.
 	const isSubmittingRef = useRef(false)
 
-	const onSubmit = useCallback(async (_forceSubmit?: string) => {
-
-		if (isSubmittingRef.current) return
-		// Phase E commit 4 — read-only foreign thread short-circuit. Belt
-		// to commit 3's service guard's suspenders: `isDisabled` already
-		// covers the keyboard-Enter path via the textarea, but
-		// `_forceSubmit` (landing-page suggested prompts) bypasses
-		// `isDisabled`. Foreign threads can't land on the landing page in
-		// practice (they always have messages, and the partition filter
-		// drops empty ones), so this is purely defensive — but it costs
-		// one branch and removes any "what if" worry.
-		if (isCurrentThreadReadOnly) return
-		if (isDisabled && !_forceSubmit) return
-		if (isRunning) return
-
+	// Snapshot text + selections + image bytes, clearing the input
+	// synchronously (queued Enter keydowns flushed while the main thread is
+	// busy must see an empty textarea — see note in onSubmit). Shared by the
+	// send path and the queue path. Returns null when disabled.
+	const captureInputPayload = useCallback((_forceSubmit?: string) => {
+		if (isDisabled && !_forceSubmit) return null
 		// Snapshot the user's text + clear the textarea SYNCHRONOUSLY
 		// before any await. The earlier ordering cleared after the await,
 		// which meant queued Enter keypresses (delivered while the prior
@@ -3370,8 +3393,6 @@ export const SidebarChat = () => {
 		setSelections([]) // clear staging
 		textAreaFnsRef.current?.setValue('')
 		draftsRef.current.delete(chatThreadsService.state.currentThreadId)
-
-		isSubmittingRef.current = true
 
 		// Extract in-memory bytes for the service layer (reads from memory,
 		// flushes to disk after persist). Release the raw bytes to free memory
@@ -3388,6 +3409,45 @@ export const SidebarChat = () => {
 
 		const threadId = chatThreadsService.state.currentThreadId
 		const modelSelectionOptionsOverride = reasoningByThread[threadId]
+		return { userMessage, _chatSelections, _pendingImageBytes, modelSelectionOptionsOverride, threadId }
+	}, [chatThreadsService, isDisabled, textAreaRef, textAreaFnsRef, setSelections, settingsState, reasoningByThread])
+
+	// Queue the input as the next turn instead of sending now. Single slot —
+	// queuing again replaces. Auto-sent by the service when the run ends.
+	const onQueue = useCallback(() => {
+		if (isCurrentThreadReadOnly) return
+		const payload = captureInputPayload()
+		if (!payload) return
+		chatThreadsService.queueUserMessage(payload.threadId, {
+			userMessage: payload.userMessage,
+			chatSelections: payload._chatSelections,
+			pendingImageBytes: payload._pendingImageBytes,
+			modelSelectionOptionsOverride: payload.modelSelectionOptionsOverride,
+		})
+		textAreaRef.current?.focus() // focus input after queueing
+	}, [captureInputPayload, chatThreadsService, isCurrentThreadReadOnly, textAreaRef])
+
+	const onSubmit = useCallback(async (_forceSubmit?: string) => {
+
+		if (isSubmittingRef.current) return
+		// Phase E commit 4 — read-only foreign thread short-circuit. Belt
+		// to commit 3's service guard's suspenders: `isDisabled` already
+		// covers the keyboard-Enter path via the textarea, but
+		// `_forceSubmit` (landing-page suggested prompts) bypasses
+		// `isDisabled`. Foreign threads can't land on the landing page in
+		// practice (they always have messages, and the partition filter
+		// drops empty ones), so this is purely defensive — but it costs
+		// one branch and removes any "what if" worry.
+		if (isCurrentThreadReadOnly) return
+		if (isDisabled && !_forceSubmit) return
+		if (isAwaitingApproval && !_forceSubmit) { onQueue(); return }
+
+		const payload = captureInputPayload(_forceSubmit)
+		if (!payload) return
+		const { userMessage, _chatSelections, _pendingImageBytes, modelSelectionOptionsOverride, threadId } = payload
+
+		isSubmittingRef.current = true
+
 		try {
 			await chatThreadsService.addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes, modelSelectionOptionsOverride })
 		} catch (e) {
@@ -3398,7 +3458,7 @@ export const SidebarChat = () => {
 
 		textAreaRef.current?.focus() // focus input after submit
 
-	}, [chatThreadsService, isDisabled, isRunning, textAreaRef, textAreaFnsRef, setSelections, settingsState, isCurrentThreadReadOnly, reasoningByThread])
+	}, [captureInputPayload, chatThreadsService, isAwaitingApproval, onQueue, isCurrentThreadReadOnly, textAreaRef])
 
 	const onAbort = async () => {
 		const threadId = currentThread.id
@@ -3408,6 +3468,7 @@ export const SidebarChat = () => {
 	const keybindingString = accessor.get('IKeybindingService').lookupKeybinding(VOID_CTRL_L_ACTION_ID)?.getLabel()
 
 	const threadId = currentThread.id
+	const queuedMessage = useQueuedMessage(currentThread.id)
 	// checkpoint disabled — see checkpoint-storage-refactor.md
 	// const currCheckpointIdx = chatThreadsState.allThreads[threadId]?.state?.currCheckpointIdx ?? undefined
 
@@ -3481,11 +3542,36 @@ export const SidebarChat = () => {
 	// dropdown, etc. Keyboard `Enter` is independently blocked via
 	// `isDisabled` above. The banner above the messages explains why
 	// it's grayed out and offers Copy/Move.
+	const queuedChipHTML = queuedMessage ? (
+		<div className='flex items-center gap-2 px-2 py-1 mb-1 rounded border border-void-border-2 bg-void-bg-1 text-xs text-void-fg-3'>
+			<Clock size={12} className='shrink-0' />
+			<span className='flex-1 truncate'
+				data-tooltip-id='void-tooltip'
+				data-tooltip-content={queuedMessage.userMessage || '(attachments)'}
+				data-tooltip-place='top'
+			>
+				Queued for after this run: {queuedMessage.userMessage || '(attachments)'}
+			</span>
+			<button type='button'
+				className='shrink-0 cursor-pointer hover:text-void-fg-1'
+				data-tooltip-id='void-tooltip'
+				data-tooltip-content='Discard queued message'
+				data-tooltip-place='top'
+				onClick={() => chatThreadsService.clearQueuedMessage(currentThread.id)}
+			>
+				<X size={12} />
+			</button>
+		</div>
+	) : null
+
 	const inputChatArea = <div className={isCurrentThreadReadOnly ? 'pointer-events-none opacity-60' : ''}>
+		{queuedChipHTML}
 		<VoidChatArea
 			featureName='Chat'
 			onSubmit={() => onSubmit()}
 			onAbort={onAbort}
+			onQueue={isRunning ? onQueue : undefined}
+			submitTooltip={isAwaitingApproval ? 'Queue message (approval pending)' : isRunning ? 'Stop current run and send' : undefined}
 			isStreaming={!!isRunning}
 			isDisabled={isDisabled}
 			showSelections={true}

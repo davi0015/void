@@ -387,6 +387,17 @@ export type IsRunningType =
 	| 'idle' // nothing is running now, but the chat should still appear like it's going (used in-between calls)
 	| undefined
 
+// A follow-up message typed while a run was streaming. Single slot per
+// thread (new replaces old); captured with the same snapshot the send
+// path builds (text + selections + image bytes + model override) and
+// auto-sent as the next turn when the run ends naturally.
+export type QueuedMessage = {
+	userMessage: string;
+	chatSelections: StagingSelectionItem[];
+	pendingImageBytes: Map<string, Uint8Array>;
+	modelSelectionOptionsOverride?: ModelSelectionOptions;
+}
+
 export type ThreadStreamState = {
 	[threadId: string]: undefined | {
 		isRunning: undefined;
@@ -511,6 +522,10 @@ export interface IChatThreadService {
 	onDidChangeUnreadThreads: Event<void>;
 	getUnreadThreadIds(): string[];
 	markThreadRead(threadId: string): void;
+	onDidChangeQueuedMessage: Event<{ threadId: string }>;
+	getQueuedMessage(threadId: string): QueuedMessage | undefined;
+	queueUserMessage(threadId: string, msg: QueuedMessage): void;
+	clearQueuedMessage(threadId: string): void;
 
 	getCurrentThread(): ThreadType;
 	openNewThread(): void;
@@ -641,6 +656,27 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	markThreadRead(threadId: string): void {
 		if (this._unreadThreadIds.delete(threadId))
 			this._onDidChangeUnreadThreads.fire()
+	}
+
+	// Follow-up typed while a run was streaming. Single slot per thread —
+	// queuing again replaces. Auto-sent as the next turn when the run ends
+	// naturally (not on approval-parked ends). Kept on abort: stopping
+	// deliberately preserves the queued message for a manual send.
+	// In-memory only, dropped with the thread.
+	private readonly _queuedMessageOfThreadId = new Map<string, QueuedMessage>();
+	private readonly _onDidChangeQueuedMessage = new Emitter<{ threadId: string }>();
+	readonly onDidChangeQueuedMessage: Event<{ threadId: string }> = this._onDidChangeQueuedMessage.event;
+	getQueuedMessage(threadId: string): QueuedMessage | undefined {
+		return this._queuedMessageOfThreadId.get(threadId)
+	}
+	queueUserMessage(threadId: string, msg: QueuedMessage): void {
+		if (!this.state.allThreads[threadId]) return
+		this._queuedMessageOfThreadId.set(threadId, msg)
+		this._onDidChangeQueuedMessage.fire({ threadId })
+	}
+	clearQueuedMessage(threadId: string): void {
+		if (this._queuedMessageOfThreadId.delete(threadId))
+			this._onDidChangeQueuedMessage.fire({ threadId })
 	}
 
 	readonly streamState: ThreadStreamState = {}
@@ -3292,6 +3328,26 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._onDidChangeUnreadThreads.fire()
 		}
 
+		// A message queued mid-run goes out as the next turn now (even on a
+		// background thread — dots/notifications cover it). Only on fully-idle
+		// ends: approval-parked ends keep the queue for after the resume.
+		// Fire-and-forget so this run's completion (notification, unread)
+		// isn't held back by the follow-up turn.
+		if (isRunningWhenEnd === undefined) {
+			const queued = this._queuedMessageOfThreadId.get(threadId)
+			if (queued) {
+				this._queuedMessageOfThreadId.delete(threadId)
+				this._onDidChangeQueuedMessage.fire({ threadId })
+				this.addUserMessageAndStreamResponse({
+					userMessage: queued.userMessage,
+					_chatSelections: queued.chatSelections,
+					threadId,
+					_pendingImageBytes: queued.pendingImageBytes,
+					modelSelectionOptionsOverride: queued.modelSelectionOptionsOverride,
+				}).catch(e => { console.error('Error while sending queued message:', e) })
+			}
+		}
+
 		// checkpoint disabled — see checkpoint-storage-refactor.md
 		// if (!isRunningWhenEnd) this._addUserCheckpoint({ threadId })
 
@@ -4698,6 +4754,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const deletedThread = currentThreads[threadId]
 
 		this.markThreadRead(threadId)
+		this.clearQueuedMessage(threadId)
 
 		// Clean up image files owned by this thread.
 		// Load messages first so image paths are available for cleanup.
