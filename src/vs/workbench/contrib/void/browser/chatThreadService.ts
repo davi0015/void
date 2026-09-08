@@ -2367,6 +2367,23 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (!tool) return
 
 		this._fireConcurrentTerminal(threadId, tool)
+		this._refreshApprovalOrParkedState(threadId, tool.id)
+	}
+
+	// After a per-tool approve/reject while concurrent tools run, the
+	// 'awaiting_user' state may be stale: the approved/rejected tool is no
+	// longer pending, and if nothing else needs approval the orange dot
+	// would stick until the terminals finish. Recompute — genuine pending
+	// approvals keep 'awaiting_user', otherwise park as 'waiting_tools'.
+	// `excludeId` covers the just-approved tool: firing is fire-and-forget,
+	// so its message still reads as pending synchronously after the call.
+	private _refreshApprovalOrParkedState(threadId: string, excludeId?: string) {
+		if (this.streamState[threadId]?.isRunning !== 'awaiting_user') return
+		const stillPending = this._getPendingBatchTools(threadId)
+			.filter(t => t.id !== excludeId)
+		if (stillPending.length > 0) return
+		if ((this._concurrentRunningCountOfThreadId.get(threadId) ?? 0) === 0) return
+		this._setStreamState(threadId, { isRunning: 'waiting_tools' })
 	}
 
 	/**
@@ -2403,6 +2420,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			mcpServerName: tool.mcpServerName,
 		})
 
+		this._refreshApprovalOrParkedState(threadId)
 		this._checkAndContinueAfterConcurrentResolution(threadId)
 	}
 
