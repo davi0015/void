@@ -5,14 +5,34 @@
 
 import React, { startTransition, useEffect, useLayoutEffect, useMemo, useRef, useState, KeyboardEvent } from 'react';
 import { CopyButton, IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
-import { useAccessor, useChatThreadsState, useRunningThreadIds, useSettingsState } from '../util/services.js';
+import { useAccessor, useChatThreadsState, useRunningThreadIds, useSettingsState, useUnreadThreadIds } from '../util/services.js';
 import { IconX } from './SidebarChat.js';
-import { Check, ChevronDown, ChevronRight, Copy, Globe, Icon, LoaderCircle, Lock, MessageCircleQuestion, Plus, Trash2, UserCheck, X } from 'lucide-react';
+import { StatusIndicator } from '../markdown/ApplyBlockHoverButtons.js';
+import { Check, ChevronDown, ChevronRight, Copy, Globe, Icon, LoaderCircle, Lock, Plus, Trash2, UserCheck, X } from 'lucide-react';
 import { isThreadReadOnly, IsRunningType, ThreadType } from '../../../chatThreadService.js';
 import { Separator } from '../../../../../../../base/common/actions.js';
 
 
 const numInitialThreads = 3
+
+// Per-thread status dot shared by the tab strip and history rows.
+// Priority: in-progress spinner > awaiting-approval orange > unread green.
+// Provenance icons (Lock/Globe) render only when this returns null.
+//   spinner — LLM streaming, tool running, or parked on background tools
+//   orange  — genuinely awaiting approval (an actionable tool_request;
+//             the parked 'waiting_tools' state never shows this)
+//   green   — run finished while the user was elsewhere (unread)
+const threadStatusDot = (isRunning: IsRunningType | undefined, isUnread: boolean) => {
+	if (isRunning === 'LLM' || isRunning === 'tool' || isRunning === 'waiting_tools' || isRunning === 'idle')
+		return <LoaderCircle className='animate-spin shrink-0' size={10} />
+	if (isRunning === 'awaiting_user')
+		return <StatusIndicator indicatorColor='orange' className='shrink-0'
+			data-tooltip-id='void-tooltip' data-tooltip-content='Waiting for approval' data-tooltip-place='bottom' />
+	if (isUnread)
+		return <StatusIndicator indicatorColor='green' className='shrink-0'
+			data-tooltip-id='void-tooltip' data-tooltip-content='Finished — unread' data-tooltip-place='bottom' />
+	return null
+}
 
 // Synthetic group label for unscoped (legacy / pre-Phase-E) threads —
 // they live under "Other workspaces" alongside foreign threads. Internal
@@ -335,6 +355,7 @@ const PastThreadElement = ({ pastThread, idx, hoveredIdx, setHoveredIdx, isRunni
 
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
+	const unreadThreadIds = useUnreadThreadIds()
 
 	// const settingsState = useSettingsState()
 	// const convertService = accessor.get('IConvertToLLMMessageService')
@@ -418,12 +439,7 @@ const PastThreadElement = ({ pastThread, idx, hoveredIdx, setHoveredIdx, isRunni
 	>
 		<div className="flex items-center justify-between gap-1">
 			<span className="flex items-center gap-2 min-w-0 overflow-hidden">
-				{/* spinner */}
-				{isRunning === 'LLM' || isRunning === 'tool' || isRunning === 'idle' ? <LoaderCircle className="animate-spin bg-void-stroke-1 flex-shrink-0 flex-grow-0" size={14} />
-					:
-					isRunning === 'awaiting_user' ? <MessageCircleQuestion className="bg-void-stroke-1 flex-shrink-0 flex-grow-0" size={14} />
-						:
-						null}
+				{threadStatusDot(isRunning, unreadThreadIds.includes(pastThread.id))}
 				{/* name */}
 				<span className="truncate overflow-hidden text-ellipsis"
 					data-tooltip-id='void-tooltip'
@@ -466,6 +482,7 @@ export const SidebarThreadTabs = React.memo(() => {
 
 	const threadsState = useChatThreadsState()
 	const runningThreadIds = useRunningThreadIds()
+	const unreadThreadIds = useUnreadThreadIds()
 
 	const { allThreads, currentThreadId, pinnedThreadIds, currentWorkspaceUri } = threadsState
 
@@ -1116,12 +1133,8 @@ export const SidebarThreadTabs = React.memo(() => {
 							data-tooltip-content={isEditingThis ? '' : tooltipLabel}
 							data-tooltip-place='bottom'
 						>
-							{isRunning === 'LLM' || isRunning === 'tool' || isRunning === 'idle'
-								? <LoaderCircle className='animate-spin shrink-0' size={10} />
-								: isRunning === 'awaiting_user'
-									? <MessageCircleQuestion className='shrink-0' size={10} />
-									: tabIsForeign
-										? <span
+							{threadStatusDot(isRunning, unreadThreadIds.includes(id)) ?? (tabIsForeign
+								? <span
 											className='shrink-0 inline-flex items-center'
 											data-tooltip-id='void-tooltip'
 											data-tooltip-content={foreignTooltip}
@@ -1138,7 +1151,7 @@ export const SidebarThreadTabs = React.memo(() => {
 											>
 												<Globe size={10} />
 											</span>
-											: null}
+										: null)}
 							{isEditingThis ? (
 								<input
 									type='text'

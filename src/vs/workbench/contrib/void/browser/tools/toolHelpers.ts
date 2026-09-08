@@ -7,7 +7,7 @@ import { IMarkerService, MarkerSeverity } from '../../../../../platform/markers/
 
 import { LintErrorItem } from '../../common/toolsServiceTypes.js'
 import { Edit } from '../../common/editCodeServiceTypes.js'
-import { MAX_FILE_CHARS_PAGE } from '../../common/prompt/prompts.js'
+import { MAX_FILE_CHARS_PAGE, MAX_TERMINAL_TIMEOUT_SECONDS } from '../../common/prompt/prompts.js'
 
 
 export const isFalsy = (u: unknown) => {
@@ -115,6 +115,21 @@ export const validateNumber = (numStr: unknown, opts: { default: number | null }
 	}
 
 	return opts.default
+}
+
+// Validates an LLM-provided `timeout_seconds`: accepts a number or a numeric
+// string (all tool params reach us as strings), falls back to
+// `defaultSeconds` when omitted or unparseable, and rejects non-positive or
+// beyond-cap values with a clear error the LLM can act on.
+export const validateTimeoutSeconds = (timeoutSecondsUnknown: unknown, defaultSeconds: number): number => {
+	const timeoutSeconds = validateNumber(timeoutSecondsUnknown, { default: defaultSeconds }) ?? defaultSeconds
+	if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1) {
+		throw new Error(`Invalid LLM output format: timeout_seconds must be a positive integer number of seconds, got "${timeoutSecondsUnknown}".`)
+	}
+	if (timeoutSeconds > MAX_TERMINAL_TIMEOUT_SECONDS) {
+		throw new Error(`Invalid LLM output format: timeout_seconds must be at most ${MAX_TERMINAL_TIMEOUT_SECONDS} seconds, got "${timeoutSecondsUnknown}".`)
+	}
+	return timeoutSeconds
 }
 
 export const validateProposedTerminalId = (terminalIdUnknown: unknown) => {

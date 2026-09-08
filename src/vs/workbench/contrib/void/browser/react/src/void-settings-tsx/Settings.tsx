@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
-import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName, BackendId, BackendProtocol, BackendProviderSettings } from '../../../../common/voidSettingsTypes.js'
+import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName, BackendId, BackendProtocol, BackendProviderSettings, displayNameOfBackendProtocol, notificationSoundKinds, displayNameOfNotificationSoundKind } from '../../../../common/voidSettingsTypes.js'
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js'
 import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSegmentedControl, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js'
 import { useAccessor, useIsDark, useIsOptedOut, useRefreshModelListener, useRefreshModelState, useSettingsState, useSemanticIndexState } from '../util/services.js'
@@ -1017,7 +1017,7 @@ const BackendSettingsEntry = ({ backendId }: { backendId: BackendId }) => {
 			</button>
 		</div>
 
-		<div className='text-xs text-void-fg-3'>Protocol: {settings.protocol}</div>
+		<div className='text-xs text-void-fg-3'>Protocol: {displayNameOfBackendProtocol(settings.protocol)}</div>
 
 		<VoidSimpleInputBox
 			placeholder='Display Name'
@@ -1083,11 +1083,11 @@ const BackendSettings = () => {
 					compact
 				/>
 				<VoidCustomDropdownBox
-					options={['openAI', 'anthropic', 'gemini'] as BackendProtocol[]}
+					options={['openAI', 'openAIResponses', 'anthropic', 'gemini'] as BackendProtocol[]}
 					selectedOption={newProtocol}
 					onChangeOption={(p) => setNewProtocol(p)}
-					getOptionDisplayName={(p) => p}
-					getOptionDropdownName={(p) => p}
+					getOptionDisplayName={(p) => displayNameOfBackendProtocol(p)}
+					getOptionDropdownName={(p) => displayNameOfBackendProtocol(p)}
 					getOptionsEqual={(a, b) => a === b}
 					className='w-full resize-none bg-void-bg-1 text-void-fg-1 placeholder:text-void-fg-3 border border-void-border-2 focus:border-void-border-1 py-1 px-2 rounded'
 					arrowTouchesText={false}
@@ -1599,6 +1599,22 @@ export const Settings = () => {
 	const fileInputSettingsRef = useRef<HTMLInputElement>(null)
 	const fileInputChatsRef = useRef<HTMLInputElement>(null)
 
+	// Notification sound volume (0-100). The slider mirrors local state so
+	// dragging is smooth — persisting via setGlobalSetting awaits an encrypt
+	// IPC round trip before the change event fires, so a directly-controlled
+	// slider would snap back mid-drag. The persist is debounced so one drag
+	// writes the setting once.
+	const [soundVolume, setSoundVolume] = useState(settingsState.globalSettings.notificationSoundVolume ?? 100)
+	const soundVolumePersistTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+	useEffect(() => {
+		setSoundVolume(settingsState.globalSettings.notificationSoundVolume ?? 100)
+	}, [settingsState.globalSettings.notificationSoundVolume])
+	const onSoundVolumeChange = (newVolume: number) => {
+		setSoundVolume(newVolume)
+		if (soundVolumePersistTimer.current !== undefined) clearTimeout(soundVolumePersistTimer.current)
+		soundVolumePersistTimer.current = setTimeout(() => voidSettingsService.setGlobalSetting('notificationSoundVolume', newVolume), 300)
+	}
+
 	const [s, ss] = useState(0)
 
 	const handleUpload = (t: 'Chats' | 'Settings') => (e: React.ChangeEvent<HTMLInputElement>,) => {
@@ -1870,6 +1886,96 @@ export const Settings = () => {
 										</div>
 
 
+
+										<div className='w-full'>
+											<h4 className={`text-base`}>Notifications</h4>
+											<div className='text-sm text-void-fg-3 mt-1'>{`Floating notifications let you approve or view chats without switching to Void.`}</div>
+
+											<div className='my-2'>
+												{/* Notifications Switch */}
+												<ErrorBoundary>
+													<div className='flex items-center gap-x-2 my-2'>
+														<VoidSwitch
+															size='xs'
+															value={settingsState.globalSettings.notificationsEnabled}
+															onChange={(newVal) => voidSettingsService.setGlobalSetting('notificationsEnabled', newVal)}
+														/>
+														<span className='text-void-fg-3 text-xs pointer-events-none'>Chat notifications</span>
+													</div>
+												</ErrorBoundary>
+
+												{/* Per-type switches - only relevant when notifications are on */}
+												{settingsState.globalSettings.notificationsEnabled && <>
+													<ErrorBoundary>
+														<div className='flex items-center gap-x-2 my-2'>
+															<VoidSwitch
+																size='xs'
+																value={settingsState.globalSettings.notifyOnApproval}
+																onChange={(newVal) => voidSettingsService.setGlobalSetting('notifyOnApproval', newVal)}
+															/>
+															<span className='text-void-fg-3 text-xs pointer-events-none'>When a tool needs approval</span>
+														</div>
+													</ErrorBoundary>
+
+													<ErrorBoundary>
+														<div className='flex items-center gap-x-2 my-2'>
+															<VoidSwitch
+																size='xs'
+																value={settingsState.globalSettings.notifyOnDone}
+																onChange={(newVal) => voidSettingsService.setGlobalSetting('notifyOnDone', newVal)}
+															/>
+															<span className='text-void-fg-3 text-xs pointer-events-none'>When a chat finishes or errors</span>
+														</div>
+													</ErrorBoundary>
+
+													<ErrorBoundary>
+														<div className='flex items-center gap-x-2 my-2'>
+															<VoidSwitch
+																size='xs'
+																value={settingsState.globalSettings.notificationSound}
+																onChange={(newVal) => voidSettingsService.setGlobalSetting('notificationSound', newVal)}
+															/>
+															<span className='text-void-fg-3 text-xs pointer-events-none'>Play sound on notifications</span>
+														</div>
+													</ErrorBoundary>
+
+													{/* Sound kind + volume — only relevant when the sound is on */}
+													{settingsState.globalSettings.notificationSound && <>
+														<ErrorBoundary>
+															<div className='flex items-center gap-x-2 my-2'>
+																<span className='text-void-fg-3 text-xs pointer-events-none'>Sound</span>
+																<VoidCustomDropdownBox
+																	options={[...notificationSoundKinds]}
+																	selectedOption={settingsState.globalSettings.notificationSoundKind ?? 'pop'}
+																	onChangeOption={(k) => voidSettingsService.setGlobalSetting('notificationSoundKind', k)}
+																	getOptionDisplayName={(k) => displayNameOfNotificationSoundKind[k]}
+																	getOptionDropdownName={(k) => displayNameOfNotificationSoundKind[k]}
+																	getOptionsEqual={(a, b) => a === b}
+																	className='max-w-40 text-xs bg-void-bg-1 border border-void-border-2 rounded px-1'
+																	arrowTouchesText={false}
+																/>
+															</div>
+														</ErrorBoundary>
+
+														<ErrorBoundary>
+															<div className='flex items-center gap-x-2 my-2'>
+																<span className='text-void-fg-3 text-xs pointer-events-none'>Sound volume</span>
+																<input
+																	type='range'
+																	min={0}
+																	max={100}
+																	value={soundVolume}
+																	onChange={(e) => onSoundVolumeChange(parseInt(e.target.value))}
+																	className='w-32 cursor-pointer'
+																	style={{ accentColor: 'var(--void-fg-2)' }}
+																/>
+																<span className='text-void-fg-3 text-xs pointer-events-none'>{soundVolume}%</span>
+															</div>
+														</ErrorBoundary>
+													</>}
+												</>}
+											</div>
+										</div>
 
 										<div className='w-full'>
 											<h4 className={`text-base`}>Editor</h4>

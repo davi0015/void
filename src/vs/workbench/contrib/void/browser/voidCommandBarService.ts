@@ -29,6 +29,7 @@ import { KeyMod } from '../../../../editor/common/services/editorBaseApi.js';
 import { KeyCode } from '../../../../base/common/keyCodes.js';
 import { ScrollType } from '../../../../editor/common/editorCommon.js';
 import { IVoidModelService } from '../common/voidModelService.js';
+import { IFileService, FileChangeType, FileOperation } from '../../../../platform/files/common/files.js';
 
 
 
@@ -43,9 +44,16 @@ export interface IVoidCommandBarService {
 
 	getStreamState: (uri: URI) => 'streaming' | 'idle-has-changes' | 'idle-no-changes';
 	setDiffIdx(uri: URI, newIdx: number | null): void;
+	getActionURI(): URI | null;
 
 	getNextDiffIdx(step: 1 | -1): number | null;
 	getNextUriIdx(step: 1 | -1): number | null;
+	// URI-scoped navigation: relative to the file the widget is showing,
+	// not the (possibly stale) activeURI. Used by the bottom bar, which
+	// exists once per editor and knows its own URI.
+	getNextDiffIdxForUri(uri: URI, step: 1 | -1): number | null;
+	getNextUriIdxFromUri(uri: URI | null, fallbackIdx: number | null, step: 1 | -1): number | null;
+	goToDiffIdxInUri(uri: URI, idx: number | null): void;
 	goToDiffIdx(idx: number | null): void;
 	goToURIIdx(idx: number | null): Promise<void>;
 
@@ -84,7 +92,6 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 	// depends on uri -> diffZone -> {streaming, diffs}
 	public stateOfURI: { [uri: string]: CommandBarStateType } = {}
 	public sortedURIs: URI[] = [] // keys of state (depends on diffZones in the uri)
-	private readonly _listenToTheseURIs = new Set<URI>() // uriFsPaths
 
 	// Emits when a URI's stream state changes between idle, streaming, and acceptRejectAll
 	private readonly _onDidChangeState = new Emitter<{ uri: URI }>();
@@ -102,25 +109,93 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 		@IModelService private readonly _modelService: IModelService,
 		@IEditCodeService private readonly _editCodeService: IEditCodeService,
 		@IVoidModelService private readonly _voidModelService: IVoidModelService,
+		@IFileService private readonly _fileService: IFileService,
 	) {
 		super();
 
 
-		const registeredModelURIs = new Set<string>()
 		const initializeModel = async (model: ITextModel) => {
 			// Skip non-workspace models (chat code blocks are inmemory:// + isForSimpleWidget)
 			if (model.uri.scheme === Schemas.inMemory || model.isForSimpleWidget) return
-			// do not add listeners to the same model twice - important, or will see duplicates
-			if (registeredModelURIs.has(model.uri.fsPath)) return
-			registeredModelURIs.add(model.uri.fsPath)
-			this._listenToTheseURIs.add(model.uri)
+			// Review state is driven by diff-zone events, not open models —
+			// just reconcile in case edits landed before the model mounted.
+			this._ensureStateForUri(model.uri)
 		}
 		// initialize all existing models + initialize when a new model mounts
 		this._modelService.getModels().forEach(model => { initializeModel(model) })
-		this._register(this._modelService.onModelAdded(model => { initializeModel(model) }));
+		this._register(this._modelService.onModelAdded(model => {
+			initializeModel(model)
+			// A file may have been edited in the background before its model
+			// existed (agent edits a closed file). The add/delete + streaming
+			// events fired before we listened, so reconcile state now instead
+			// of leaving the bottom bar empty until the next accept/reject.
+			this._ensureStateForUri(model.uri)
+		}));
 		this._register(this._modelService.onModelRemoved(model => {
-			registeredModelURIs.delete(model.uri.fsPath)
-			this._listenToTheseURIs.delete(model.uri)
+			// Drop command-bar state for removed models only when no diffs
+			// remain (e.g. file deleted — editCodeService cleanup fires
+			// onDidAddOrDeleteDiffZones too, but don't rely on ordering).
+			// A closed tab with pending diffs keeps its entry so the bar
+			// (and Next navigation) survives on other editors.
+			const zonesRemain = (this._editCodeService.diffAreasOfURI[model.uri.fsPath]?.size ?? 0) > 0
+			if (this.stateOfURI[model.uri.fsPath] && !zonesRemain) {
+				this._deleteURIEntryFromState(model.uri)
+				this._onDidChangeState.fire({ uri: model.uri })
+			}
+			if (this.activeURI?.fsPath === model.uri.fsPath) {
+				this.activeURI = null
+				this._onDidChangeActiveURI.fire({ uri: null })
+			}
+		}));
+		// Belt-and-suspenders for manual deletes: clear state for any tracked
+		// URI whose file (or parent folder) was deleted, even if the model
+		// event was missed or reordered.
+		this._register(this._fileService.onDidFilesChange(e => {
+			if (!e.gotDeleted()) return
+			for (const uri of [...this.sortedURIs]) {
+				if (e.contains(uri, FileChangeType.DELETED)) {
+					this._deleteURIEntryFromState(uri)
+					this._onDidChangeState.fire({ uri })
+					if (this.activeURI?.fsPath === uri.fsPath) {
+						this.activeURI = null
+						this._onDidChangeActiveURI.fire({ uri: null })
+					}
+				}
+			}
+		}));
+		// Follow renames/moves with the edit service: shift command-bar state
+		// to the new location (covers files + folders). Runs alongside the
+		// edit service's own transfer; the reconcile loop below makes the two
+		// order-independent (zone events may fire before/after this).
+		this._register(this._fileService.onDidRunOperation(e => {
+			if (!e.isOperation(FileOperation.MOVE)) return
+			const fromPath = e.resource.fsPath
+			const toPath = e.target.resource.fsPath
+			if (fromPath === toPath) return
+			for (const uri of [...this.sortedURIs]) {
+				if (uri.fsPath !== fromPath && !uri.fsPath.startsWith(fromPath + '/')) continue
+				const newPath = uri.fsPath === fromPath ? toPath : toPath + uri.fsPath.slice(fromPath.length)
+				const newUri = URI.file(newPath)
+				const state = this.stateOfURI[uri.fsPath]
+				if (state) {
+					this.stateOfURI[newPath] = state
+					delete this.stateOfURI[uri.fsPath]
+				}
+				const i = this.sortedURIs.findIndex(u => u.fsPath === uri.fsPath)
+				if (i !== -1) this.sortedURIs[i] = newUri
+				if (this.activeURI?.fsPath === uri.fsPath) {
+					this.activeURI = newUri
+					this._onDidChangeActiveURI.fire({ uri: newUri })
+				}
+				this._onDidChangeState.fire({ uri: newUri })
+			}
+			// Reconcile: if the edit service transferred diffs to a URI with
+			// no state entry yet (e.g. no open model at event time), create
+			// it now instead of waiting for the next event.
+			for (const fsPath of Object.keys(this._editCodeService.diffAreasOfURI)) {
+				if (this.stateOfURI[fsPath]) continue
+				this._ensureStateForUri(URI.file(fsPath))
+			}
 		}));
 
 
@@ -157,8 +232,8 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 
 		// state updaters
 		this._register(this._editCodeService.onDidAddOrDeleteDiffZones(e => {
-			for (const uri of this._listenToTheseURIs) {
-				if (e.uri.fsPath !== uri.fsPath) continue
+			for (const uri of [e.uri]) {
+				if (uri.scheme !== Schemas.file) continue
 				// --- sortedURIs: delete if empty, add if not in state yet
 				const diffZones = this._getDiffZonesOnURI(uri)
 				if (diffZones.length === 0) {
@@ -173,6 +248,7 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 				const currState = this.stateOfURI[uri.fsPath]
 				if (!currState) continue // should never happen
 				// update state of the diffZones on this URI
+				const prevDiffIdx = currState.diffIdx
 				const oldDiffZones = currState.sortedDiffZoneIds
 				const currentDiffZones = this._editCodeService.diffAreasOfURI[uri.fsPath] || [] // a Set
 				const { addedDiffZones, deletedDiffZones } = this._getDiffZoneChanges(oldDiffZones, currentDiffZones || [])
@@ -187,8 +263,11 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 				const newSortedDiffIds = this._computeSortedDiffs(newSortedDiffZoneIds)
 				const isStreaming = this._isAnyDiffZoneStreaming(currentDiffZones)
 
-				// When diffZones are added/removed, reset the diffIdx to 0 if we have diffs
-				const newDiffIdx = newSortedDiffIds.length > 0 ? 0 : null;
+				// New zones start review at the first diff; pure deletions (accept/reject) keep the reviewer's position, clamped.
+				const newDiffIdx = newSortedDiffIds.length === 0 ? null
+					: addedDiffZones.size > 0 ? 0
+					: prevDiffIdx === null ? 0
+					: Math.min(prevDiffIdx, newSortedDiffIds.length - 1);
 
 				this._setState(uri, {
 					sortedDiffZoneIds: newSortedDiffZoneIds,
@@ -201,13 +280,14 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 
 		}))
 		this._register(this._editCodeService.onDidChangeDiffsInDiffZoneNotStreaming(e => {
-			for (const uri of this._listenToTheseURIs) {
-				if (e.uri.fsPath !== uri.fsPath) continue
+			for (const uri of [e.uri]) {
+				if (uri.scheme !== Schemas.file) continue
 				// --- sortedURIs: no change
 				// --- state:
 				// sortedDiffIds gets a change to it, so gets recomputed
 				const currState = this.stateOfURI[uri.fsPath]
-				if (!currState) continue // should never happen
+				?? this._ensureStateForUri(uri)
+				if (!currState) continue // no diff zones on this URI
 				const { sortedDiffZoneIds } = currState
 				const oldSortedDiffIds = currState.sortedDiffIds;
 				const newSortedDiffIds = this._computeSortedDiffs(sortedDiffZoneIds)
@@ -234,12 +314,13 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 			}
 		}))
 		this._register(this._editCodeService.onDidChangeStreamingInDiffZone(e => {
-			for (const uri of this._listenToTheseURIs) {
-				if (e.uri.fsPath !== uri.fsPath) continue
+			for (const uri of [e.uri]) {
+				if (uri.scheme !== Schemas.file) continue
 				// --- sortedURIs: no change
 				// --- state:
 				const currState = this.stateOfURI[uri.fsPath]
-				if (!currState) continue // should never happen
+				?? this._ensureStateForUri(uri)
+				if (!currState) continue // no diff zones on this URI
 				const { sortedDiffZoneIds } = currState
 				this._setState(uri, {
 					isStreaming: this._isAnyDiffZoneStreaming(sortedDiffZoneIds),
@@ -339,10 +420,10 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 			...opts
 		}
 
-		// make sure diffIdx is always correct
-		if (newState.diffIdx !== null && newState.diffIdx > newState.sortedDiffIds.length) {
-			newState.diffIdx = newState.sortedDiffIds.length
-			if (newState.diffIdx <= 0) newState.diffIdx = null
+		// make sure diffIdx is always a valid index
+		if (newState.diffIdx !== null && newState.diffIdx >= newState.sortedDiffIds.length) {
+			newState.diffIdx = newState.sortedDiffIds.length - 1
+			if (newState.diffIdx < 0) newState.diffIdx = null
 		}
 
 		this.stateOfURI = {
@@ -373,6 +454,40 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 		]
 		// delete from state
 		delete this.stateOfURI[uri.fsPath]
+		// Don't leave activeURI dangling on the removed file (e.g. the file
+		// just approved): park it on the predecessor (wrapping) so a
+		// relative Next (+1, keybindings) lands on the successor that slid
+		// into the removed slot — the same file the tab bar navigates to
+		// directly — instead of jumping back to index 0.
+		if (this.activeURI?.fsPath === uri.fsPath) {
+			const parked = this.sortedURIs.length === 0 ? null
+				: this.sortedURIs[(i - 1 + this.sortedURIs.length) % this.sortedURIs.length]
+			this.activeURI = parked
+			this._onDidChangeActiveURI.fire({ uri: parked })
+		}
+	}
+
+	// Create command-bar state for a URI that already has diff zones but no
+	// entry (e.g. edited while its model was closed, or before this service
+	// listened to it). Returns the state, or null when there is nothing to
+	// track. Fire-and-forget: callers fire onDidChangeState themselves.
+	private _ensureStateForUri(uri: URI): CommandBarStateType {
+		if (this.stateOfURI[uri.fsPath]) return this.stateOfURI[uri.fsPath]
+		const zones = this._editCodeService.diffAreasOfURI[uri.fsPath]
+		if (!zones || zones.size === 0) return null as unknown as CommandBarStateType
+		const ids = [...zones]
+		const sortedDiffIds = this._computeSortedDiffs(ids)
+		this._addURIEntryToState(uri)
+		const isStreaming = this._isAnyDiffZoneStreaming(ids)
+		const state: NonNullable<CommandBarStateType> = {
+			sortedDiffZoneIds: ids,
+			sortedDiffIds,
+			isStreaming,
+			diffIdx: sortedDiffIds.length > 0 ? 0 : null,
+		}
+		this.stateOfURI[uri.fsPath] = state
+		this._onDidChangeState.fire({ uri })
+		return this.stateOfURI[uri.fsPath]
 	}
 
 
@@ -389,11 +504,8 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 		return this.sortedURIs.some(uri => this.getStreamState(uri) === 'streaming')
 	}
 
-	getNextDiffIdx(step: 1 | -1): number | null {
-		// If no active URI, return null
-		if (!this.activeURI) return null;
-
-		const state = this.stateOfURI[this.activeURI.fsPath];
+	getNextDiffIdxForUri(uri: URI, step: 1 | -1): number | null {
+		const state = this.stateOfURI[uri.fsPath] ?? this._ensureStateForUri(uri);
 		if (!state) return null;
 
 		const { diffIdx, sortedDiffIds } = state;
@@ -406,34 +518,55 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 		return nextIdx;
 	}
 
-	getNextUriIdx(step: 1 | -1): number | null {
+	getNextDiffIdx(step: 1 | -1): number | null {
+		const uri = this.getActionURI();
+		if (!uri) return null;
+		return this.getNextDiffIdxForUri(uri, step);
+	}
+
+	// File stepper relative to an explicit URI (the bottom bar passes the
+	// file it is showing). When that file just left the review list
+	// (approved), fallbackIdx is its last valid index, clamped into the
+	// shrunken list — so Next lands on the file after it, not back on 0.
+	getNextUriIdxFromUri(uri: URI | null, fallbackIdx: number | null, step: 1 | -1): number | null {
 		// If no URIs with changes, return null
 		if (this.sortedURIs.length === 0) return null;
 
-		// If no active URI, return first or last based on step
-		if (!this.activeURI) {
-			return step === 1 ? 0 : this.sortedURIs.length - 1;
-		}
+		const currentIdx = uri ? this.sortedURIs.findIndex(u => u.fsPath === uri.fsPath) : -1;
 
-		// Find current index
-		const currentIdx = this.sortedURIs.findIndex(uri => uri.fsPath === this.activeURI?.fsPath);
-
-		// If not found, return first or last based on step
-		if (currentIdx === -1) {
-			return step === 1 ? 0 : this.sortedURIs.length - 1;
-		}
+		const baseIdx = currentIdx !== -1 ? currentIdx
+			: fallbackIdx !== null ? Math.min(fallbackIdx, this.sortedURIs.length - 1)
+			: step === 1 ? 0 : this.sortedURIs.length - 1;
 
 		// Calculate next index with wrapping
-		const nextIdx = (currentIdx + step + this.sortedURIs.length) % this.sortedURIs.length;
+		const nextIdx = (baseIdx + step + this.sortedURIs.length) % this.sortedURIs.length;
 		return nextIdx;
 	}
 
-	goToDiffIdx(idx: number | null): void {
-		// If null or no active URI, return
-		if (idx === null || !this.activeURI) return;
+	getNextUriIdx(step: 1 | -1): number | null {
+		const uri = this.getActionURI();
+		return this.getNextUriIdxFromUri(uri, null, step);
+	}
 
-		// Get state for the current URI
-		const state = this.stateOfURI[this.activeURI.fsPath];
+	// The URI keybindings act on: activeURI when it still has review state,
+	// else the focused editor's file (covers stale/dangling activeURI).
+	getActionURI(): URI | null {
+		if (this.activeURI && this.stateOfURI[this.activeURI.fsPath]) return this.activeURI;
+		const editor = this._codeEditorService.getFocusedCodeEditor()
+			|| this._codeEditorService.getActiveCodeEditor();
+		const uri = editor?.getModel()?.uri ?? null;
+		if (uri && this.stateOfURI[uri.fsPath]) return uri;
+		return this.activeURI;
+	}
+
+	goToDiffIdxInUri(uri: URI, idx: number | null): void {
+		// If null, return
+		if (idx === null) return;
+
+		// Get state for the given URI (create it if the file was edited
+		// while closed — otherwise the arrows stay dead until an
+		// accept/reject forces a state rebuild).
+		const state = this.stateOfURI[uri.fsPath] ?? this._ensureStateForUri(uri);
 		if (!state) return;
 
 		const { sortedDiffIds } = state;
@@ -454,8 +587,21 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 		// Reveal the line in the editor
 		editor.revealLineNearTop(diff.startLine - 1, ScrollType.Immediate);
 
+		// This is the file the reviewer is looking at — keep activeURI in
+		// sync so keybindings and the next/prev computations agree.
+		if (this.activeURI?.fsPath !== uri.fsPath) {
+			this.activeURI = uri;
+			this._onDidChangeActiveURI.fire({ uri });
+		}
+
 		// Update the current diff index
-		this.setDiffIdx(this.activeURI, idx);
+		this.setDiffIdx(uri, idx);
+	}
+
+	goToDiffIdx(idx: number | null): void {
+		const uri = this.getActionURI();
+		if (!uri) return;
+		this.goToDiffIdxInUri(uri, idx);
 	}
 
 	async goToURIIdx(idx: number | null): Promise<void> {
@@ -465,6 +611,14 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 		// Get the URI at the specified index
 		const nextURI = this.sortedURIs[idx];
 		if (!nextURI) return;
+
+		// Sync immediately (openCodeEditor's model-change event arrives
+		// async — without this a quick approve after navigating still sees
+		// the old file and Next wraps back to index 0).
+		if (this.activeURI?.fsPath !== nextURI.fsPath) {
+			this.activeURI = nextURI;
+			this._onDidChangeActiveURI.fire({ uri: nextURI });
+		}
 
 		// Get the model for this URI
 		const { model } = await this._voidModelService.getModelSafe(nextURI);
@@ -594,7 +748,7 @@ registerAction2(class extends Action2 {
 		const metricsService = accessor.get(IMetricsService);
 
 
-		const activeURI = commandBarService.activeURI;
+		const activeURI = commandBarService.getActionURI();
 		if (!activeURI) return;
 
 		const commandBarState = commandBarService.stateOfURI[activeURI.fsPath];
@@ -636,7 +790,7 @@ registerAction2(class extends Action2 {
 		const commandBarService = accessor.get(IVoidCommandBarService);
 		const metricsService = accessor.get(IMetricsService);
 
-		const activeURI = commandBarService.activeURI;
+		const activeURI = commandBarService.getActionURI();
 		if (!activeURI) return;
 
 		const commandBarState = commandBarService.stateOfURI[activeURI.fsPath];
@@ -784,7 +938,7 @@ registerAction2(class extends Action2 {
 		const editCodeService = accessor.get(IEditCodeService);
 		const metricsService = accessor.get(IMetricsService);
 
-		const activeURI = commandBarService.activeURI;
+		const activeURI = commandBarService.getActionURI();
 		if (!activeURI) return;
 
 		metricsService.capture('Accept File', { keyboard: true });
@@ -815,7 +969,7 @@ registerAction2(class extends Action2 {
 		const editCodeService = accessor.get(IEditCodeService);
 		const metricsService = accessor.get(IMetricsService);
 
-		const activeURI = commandBarService.activeURI;
+		const activeURI = commandBarService.getActionURI();
 		if (!activeURI) return;
 
 		metricsService.capture('Reject File', { keyboard: true });

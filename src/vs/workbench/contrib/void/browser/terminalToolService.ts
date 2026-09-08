@@ -13,7 +13,7 @@ import { TerminalLocation } from '../../../../platform/terminal/common/terminal.
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { ITerminalService, ITerminalInstance, ICreateTerminalOptions } from '../../../../workbench/contrib/terminal/browser/terminal.js';
-import { MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_CHARS, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js';
+import { MAX_TERMINAL_CHARS, MAX_TERMINAL_TIMEOUT_SECONDS } from '../common/prompt/prompts.js';
 import { TerminalResolveReason } from '../common/toolsServiceTypes.js';
 import { TERMINAL_AUTO_APPROVE_KEY } from '../common/storageKeys.js';
 import { timeout } from '../../../../base/common/async.js';
@@ -25,8 +25,8 @@ export interface ITerminalToolService {
 
 	listAllTerminals(): { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[];
 	runCommand(command: string, opts:
-		| { type: 'persistent', persistentTerminalId: string }
-		| { type: 'temporary', cwd: string | null, terminalId: string }
+		| { type: 'persistent', persistentTerminalId: string, timeoutSeconds: number }
+		| { type: 'temporary', cwd: string | null, terminalId: string, timeoutSeconds: number }
 		// | { type: 'apply', terminalId: string }
 	): Promise<{ interrupt: () => void; resPromise: Promise<{ result: string, resolveReason: TerminalResolveReason }> }>;
 
@@ -446,6 +446,21 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		let terminal: ITerminalInstance
 		const disposables: IDisposable[] = []
 
+		// Settles when the user stops the run while this command is pending
+		// (Stop button). Temporary terminals are disposed (as before);
+		// persistent ones stay alive — see interrupt below.
+		let userInterrupted = false
+		let resultSettled = false
+		let userInterruptResolve: (() => void) | null = null
+		const waitUntilUserInterrupt = new Promise<void>(res => { userInterruptResolve = res })
+		disposables.push(toDisposable(() => { userInterruptResolve = null }))
+
+		// Inactivity timeout (seconds of no output before the command resolves
+		// as timed-out). Temporary terminals kill the process; persistent ones
+		// keep running in the background. The LLM provides it per call via
+		// `timeout_seconds` on both terminal tools.
+		const timeoutSeconds = params.timeoutSeconds
+
 		if (isPersistent) { // BG process
 			const { persistentTerminalId } = params
 			terminal = this.persistentTerminalInstanceOfId[persistentTerminalId];
@@ -458,11 +473,18 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		}
 
 		const interrupt = () => {
-			terminal.dispose()
-			if (!isPersistent)
+			if (!isPersistent) {
+				terminal.dispose()
 				delete this.temporaryTerminalInstanceOfId[params.terminalId]
-			else
-				delete this.persistentTerminalInstanceOfId[params.persistentTerminalId]
+				return
+			}
+			// Persistent terminals are untouched by Stop: the command keeps
+			// running in the background (check it with read_terminal) and
+			// the terminal stays alive and tracked. We only stop waiting
+			// for its result. No-op once the command already settled.
+			if (resultSettled || userInterrupted) return
+			userInterrupted = true
+			userInterruptResolve?.()
 		}
 
 		const waitForResult = async () => {
@@ -519,8 +541,12 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 					new Promise<void>(res => {
 						let inactivityTimeoutId: ReturnType<typeof setTimeout>;
 						let backstopTimeoutId: ReturnType<typeof setTimeout>;
-						const inactivityMs = (isPersistent ? MAX_TERMINAL_BG_COMMAND_TIME : MAX_TERMINAL_INACTIVE_TIME) * 1000;
-						const backstopMs = isPersistent ? MAX_TERMINAL_BG_COMMAND_TIME * 1000 * 2 : Infinity;
+						const inactivityMs = timeoutSeconds * 1000;
+						// Fixed total-wait cap so healthy long commands run to
+						// completion synchronously by default. The silence
+						// window is the opt-in early return (small
+						// `timeout_seconds` backgrounds daemons fast).
+						const backstopMs = isPersistent ? MAX_TERMINAL_TIMEOUT_SECONDS * 1000 : Infinity;
 
 						const fire = (timeoutReason: 'inactivity' | 'backstop') => {
 							if (resolveReason) return
@@ -543,7 +569,24 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 					})
 
 				// wait for result
-				await Promise.any([waitUntilDone, waitUntilInterrupt])
+				await Promise.any([waitUntilDone, waitUntilInterrupt, waitUntilUserInterrupt])
+
+				// The user stopped the run while a persistent command is still
+				// going: leave it running and settle with the output so far.
+				// (Interrupted tool calls discard the result — the command
+				// itself is unaffected and keeps running in the terminal.)
+				if (userInterrupted && !resolveReason) {
+					if (!result) {
+						try {
+							const terminalId = isPersistent ? params.persistentTerminalId : params.terminalId
+							const fromLine = startMarker?.line ?? 0
+							result = await this.readTerminalFromLine(terminalId, fromLine)
+						} catch {
+							// buffer unavailable — report interruption without output
+						}
+					}
+					resolveReason = { type: 'timeout', reason: 'backstop' }
+				}
 
 
 
@@ -579,6 +622,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 						+ result.slice(result.length - half, Infinity)
 				}
 
+				resultSettled = true
 				return { result, resolveReason }
 			} finally {
 				// Always dispose temporary terminals, even if an error was thrown

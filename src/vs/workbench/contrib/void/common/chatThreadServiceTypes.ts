@@ -5,7 +5,7 @@
 
 import { URI } from '../../../../base/common/uri.js';
 import { VoidFileSnapshot } from './editCodeServiceTypes.js';
-import { AnthropicReasoning, RawToolParamsObj } from './sendLLMMessageTypes.js';
+import { AnthropicReasoning, RawToolParamsObj, ResponsesReasoningRef } from './sendLLMMessageTypes.js';
 import { ToolCallParams, ToolName, ToolResult } from './toolsServiceTypes.js';
 
 
@@ -138,6 +138,12 @@ export type ChatMessage =
 		// when reasoning tokens exhaust the output budget). Optional to stay backward
 		// compatible with chat history persisted before this field existed.
 		finishReason?: string;
+
+		// Opaque Responses API reasoning payload (see ResponsesReasoningRef),
+		// persisted so the translator can replay it next turn. Set only by
+		// responses-protocol turns; read only by the responses translator.
+		// Optional for backward-compat with history from before this field.
+		responsesReasoning?: ResponsesReasoningRef | null;
 	}
 	| ToolMessage<ToolName>
 	| DecorativeCanceledTool

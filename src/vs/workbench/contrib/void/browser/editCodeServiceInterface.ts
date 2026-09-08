@@ -59,6 +59,11 @@ export interface IEditCodeService {
 	acceptDiff({ diffid }: { diffid: number }): void;
 	rejectDiff({ diffid }: { diffid: number }): void;
 
+	// Move pending diffs (and their review UI) from one location to another,
+	// e.g. on file/folder rename. Remaps every tracked path under `from`
+	// (covers folder moves). Editor-anchored CtrlK zones are dropped.
+	transferDiffAreas(opts: { from: URI, to: URI }): void;
+
 	// events
 	onDidAddOrDeleteDiffZones: Event<{ uri: URI }>;
 	onDidChangeDiffsInDiffZoneNotStreaming: Event<{ uri: URI; diffareaid: number }>; // only fires when not streaming!!! streaming would be too much

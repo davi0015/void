@@ -11,7 +11,7 @@ import { ChatMessage, CompactionInfo } from '../common/chatThreadServiceTypes.js
 import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities } from '../common/modelCapabilities.js';
 import { reParsedToolXMLString, chat_systemMessage, chat_volatileContext } from '../common/prompt/prompts.js';
 import { availableTools } from './tools/toolRegistry.js';
-import { AnthropicLLMChatMessage, AnthropicReasoning, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, OpenAILLMChatMessage, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
+import { AnthropicLLMChatMessage, AnthropicReasoning, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, OpenAILLMChatMessage, RawToolParamsObj, ResponsesReasoningRef } from '../common/sendLLMMessageTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { ChatMode, FeatureName, ModelSelection, ProviderName } from '../common/voidSettingsTypes.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
@@ -61,6 +61,10 @@ type SimpleLLMMessage = {
 	// Optional for backward-compat with chat history persisted before this
 	// field existed (treated as "no reasoning was captured").
 	reasoningContent?: string;
+	// Opaque Responses API reasoning payload (see ResponsesReasoningRef).
+	// Threaded through to the OpenAI assistant message for responses
+	// backends; every other send path ignores it.
+	responsesReasoning?: ResponsesReasoningRef | null;
 }
 
 
@@ -367,6 +371,12 @@ const prepareMessages_openai_tools = (
 				// is already embedded in content as <think> tags by the server,
 				// so it naturally round-trips without this field.
 				out.reasoning_content = currMsg.reasoningContent
+			}
+			if (currMsg.responsesReasoning) {
+				// Responses API backends: the translator replays this as a
+				// `reasoning` input item next turn. Every other send path
+				// ignores the field.
+				out.responsesReasoning = currMsg.responsesReasoning
 			}
 			newMessages.push(out)
 			continue
@@ -1336,6 +1346,9 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 					role: m.role,
 					content: m.displayContent,
 					anthropicReasoning: m.anthropicReasoning,
+					// Opaque Responses API reasoning payload for replay (see
+					// ResponsesReasoningRef). Absent on non-responses turns.
+					responsesReasoning: m.responsesReasoning,
 					// Pass the persisted `reasoning` text through verbatim, including
 					// `""`. The downstream `prepareMessages_openai_tools` gate distinguishes
 					// `undefined` (no reasoning field captured — old history from before

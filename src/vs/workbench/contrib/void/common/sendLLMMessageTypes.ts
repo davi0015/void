@@ -57,6 +57,9 @@ export type OpenAILLMChatMessage = {
 	// note-deepseek.md §5. Only emitted for providers we know consume this field
 	// — for everyone else it'd be unspecified noise on the wire.
 	reasoning_content?: string;
+	// Responses API reasoning replay (see ResponsesReasoningRef). Read only
+	// by the responses translator; ignored by every other send path.
+	responsesReasoning?: ResponsesReasoningRef | null;
 } | {
 	role: 'tool',
 	content: string;
@@ -79,6 +82,20 @@ export type GeminiLLMChatMessage = {
 }
 
 export type LLMChatMessage = AnthropicLLMChatMessage | OpenAILLMChatMessage | GeminiLLMChatMessage
+
+
+// Opaque reasoning payload captured from an OpenAI Responses API reasoning
+// item (see ResponseReasoningItem). Carried as a passthrough — on the
+// persisted assistant ChatMessage, through SimpleLLMMessage, onto the
+// OpenAI assistant message (like `reasoning_content`) — so the responses
+// translator can replay it as a `reasoning` input item next turn and the
+// model keeps its chain-of-thought context. All fields optional: backends
+// that don't emit a piece simply don't store it. Never displayed.
+export type ResponsesReasoningRef = {
+	id?: string;
+	encrypted_content?: string;
+	summaryText?: string;
+}
 
 
 
@@ -147,7 +164,7 @@ export type OnText = (p: { fullText: string; fullReasoning: string; toolCalls?: 
 // undefined, which renders as "no warning" (the same as before this was added).
 //
 // `toolCalls` — see `OnText` above. Empty/undefined on pure-text responses.
-export type OnFinalMessage = (p: { fullText: string; fullReasoning: string; toolCalls?: RawToolCallObj[]; anthropicReasoning: AnthropicReasoning[] | null; usage?: LLMUsage; finishReason?: string }) => void
+export type OnFinalMessage = (p: { fullText: string; fullReasoning: string; toolCalls?: RawToolCallObj[]; anthropicReasoning: AnthropicReasoning[] | null; usage?: LLMUsage; finishReason?: string; responsesReasoning?: ResponsesReasoningRef | null }) => void
 export type OnError = (p: { message: string; fullError: Error | null }) => void
 export type OnAbort = () => void
 export type AbortRef = { current: (() => void) | null }

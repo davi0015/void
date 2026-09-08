@@ -4,13 +4,14 @@
  *--------------------------------------------------------------------------------------*/
 
 import { Emitter, Event } from '../../../../base/common/event.js';
-import { Disposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { IEncryptionService } from '../../../../platform/encryption/common/encryptionService.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { IMetricsService } from './metricsService.js';
+import { isMacintosh } from '../../../../base/common/platform.js';
 import { defaultProviderSettings, getModelCapabilities, ModelOverrides } from './modelCapabilities.js';
 import { VOID_SETTINGS_STORAGE_KEY } from './storageKeys.js';
 import { defaultSettingsOfProvider, FeatureName, ProviderName, ModelSelectionOfFeature, SettingsOfProvider, SettingName, providerNames, ModelSelection, modelSelectionsEqual, featureNames, VoidStatefulModelInfo, GlobalSettings, GlobalSettingName, defaultGlobalSettings, ModelSelectionOptions, OptionsOfModelSelection, ChatMode, OverridesOfModel, defaultOverridesOfModel, MCPUserStateOfName as MCPUserStateOfName, MCPUserState, BackendId, BackendProtocol, BackendProviderSettings, isBackendId, registerBackendDisplayNames, displayInfoOfProviderName } from './voidSettingsTypes.js';
@@ -273,6 +274,19 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 		this._resolver = resolver
 
 		this.readAndInitializeState()
+
+		// Cross-window sync (multiple Void windows open at once): adopt
+		// settings writes from other windows live. The platform broadcasts
+		// main-process storage changes to every window; without this, each
+		// window keeps its startup snapshot forever — models added elsewhere
+		// never appear, and a reload can even write the stale snapshot back
+		// over them (see _storeState below). Own writes are already applied
+		// locally, so only external events reload.
+		const storageDisposables = this._register(new DisposableStore())
+		this._storageService.onDidChangeValue(StorageScope.APPLICATION, VOID_SETTINGS_STORAGE_KEY, storageDisposables)((e) => {
+			if (!e.external) return
+			this._reloadExternalState()
+		})
 	}
 
 
@@ -292,10 +306,11 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 
 
 
-	async readAndInitializeState() {
-		let readS: VoidSettingsState
+	// Shared read → migrate → validate pipeline (used by init below and by
+	// the cross-window reload). Never throws: anything unparseable falls
+	// back to defaults, exactly like the historical init behavior.
+	private _migrateAndValidateState(readS: VoidSettingsState): VoidSettingsState {
 		try {
-			readS = await this._readState();
 			// 1.0.3 addition, remove when enough users have had this code run
 			if (readS.globalSettings.includeToolLintErrors === undefined) readS.globalSettings.includeToolLintErrors = true
 
@@ -316,6 +331,12 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			if (readS.globalSettings.autoOutlineReadFile === undefined) readS.globalSettings.autoOutlineReadFile = true;
 
 			if (readS.globalSettings.rulesPaths === undefined) readS.globalSettings.rulesPaths = '';
+
+			// add notification settings
+			if (readS.globalSettings.notificationsEnabled === undefined) readS.globalSettings.notificationsEnabled = isMacintosh;
+			if (readS.globalSettings.notifyOnApproval === undefined) readS.globalSettings.notifyOnApproval = true;
+			if (readS.globalSettings.notifyOnDone === undefined) readS.globalSettings.notifyOnDone = true;
+			if (readS.globalSettings.notificationSound === undefined) readS.globalSettings.notificationSound = true;
 
 			// add SemanticSearch feature
 			if (readS.modelSelectionOfFeature && !readS.modelSelectionOfFeature['SemanticSearch']) {
@@ -374,10 +395,38 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			readS = defaultState()
 		}
 
-		this.state = readS
-		this.state = _stateWithMergedDefaultModels(this.state)
-		this.state = _validatedModelState(this.state);
+		readS = _stateWithMergedDefaultModels(readS)
+		readS = _validatedModelState(readS);
+		return readS
+	}
 
+	// Cross-window reload (see constructor): re-read the blob another
+	// window just wrote and adopt it. Deliberately no store-back — the
+	// writer is authoritative, and writing here could clobber a newer
+	// concurrent write. A failed read keeps current state (never reset
+	// live state on a bad read).
+	private async _reloadExternalState(): Promise<void> {
+		let readS: VoidSettingsState
+		try {
+			readS = await this._readState()
+		}
+		catch (e) {
+			return
+		}
+		this.state = this._migrateAndValidateState(readS)
+		this._onDidChangeState.fire()
+	}
+
+	async readAndInitializeState() {
+		let readS: VoidSettingsState
+		try {
+			readS = await this._readState();
+		}
+		catch (e) {
+			readS = defaultState()
+		}
+
+		this.state = this._migrateAndValidateState(readS)
 		await this._storeState();
 		this._resolver();
 		this._onDidChangeState.fire();
@@ -405,6 +454,12 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 		const stateToStore = { ...this.state, settingsOfProvider: cleanSettings }
 		const encryptedState = await this._encryptionService.encrypt(JSON.stringify(stateToStore))
 		this._storageService.store(VOID_SETTINGS_STORAGE_KEY, encryptedState, StorageScope.APPLICATION, StorageTarget.USER);
+		// Flush eagerly so other windows (and any imminent reload) see this
+		// write immediately. Renderer storage otherwise sits in a local
+		// cache for up to 60s before reaching the main-process DB — a
+		// reload in that window reads stale data and writes it back over
+		// this update, losing it permanently.
+		await this._storageService.flush()
 	}
 
 	setSettingOfProvider: SetSettingOfProviderFn = async (providerName, settingName, newVal) => {
