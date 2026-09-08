@@ -446,6 +446,15 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		let terminal: ITerminalInstance
 		const disposables: IDisposable[] = []
 
+		// Settles when the user stops the run while this command is pending
+		// (Stop button). Temporary terminals are disposed (as before);
+		// persistent ones stay alive — see interrupt below.
+		let userInterrupted = false
+		let resultSettled = false
+		let userInterruptResolve: (() => void) | null = null
+		const waitUntilUserInterrupt = new Promise<void>(res => { userInterruptResolve = res })
+		disposables.push(toDisposable(() => { userInterruptResolve = null }))
+
 		// Inactivity timeout (seconds of no output before the command resolves
 		// as timed-out). Temporary terminals kill the process; persistent ones
 		// keep running in the background. The LLM provides it per call via
@@ -464,11 +473,18 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		}
 
 		const interrupt = () => {
-			terminal.dispose()
-			if (!isPersistent)
+			if (!isPersistent) {
+				terminal.dispose()
 				delete this.temporaryTerminalInstanceOfId[params.terminalId]
-			else
-				delete this.persistentTerminalInstanceOfId[params.persistentTerminalId]
+				return
+			}
+			// Persistent terminals are untouched by Stop: the command keeps
+			// running in the background (check it with read_terminal) and
+			// the terminal stays alive and tracked. We only stop waiting
+			// for its result. No-op once the command already settled.
+			if (resultSettled || userInterrupted) return
+			userInterrupted = true
+			userInterruptResolve?.()
 		}
 
 		const waitForResult = async () => {
@@ -553,7 +569,24 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 					})
 
 				// wait for result
-				await Promise.any([waitUntilDone, waitUntilInterrupt])
+				await Promise.any([waitUntilDone, waitUntilInterrupt, waitUntilUserInterrupt])
+
+				// The user stopped the run while a persistent command is still
+				// going: leave it running and settle with the output so far.
+				// (Interrupted tool calls discard the result — the command
+				// itself is unaffected and keeps running in the terminal.)
+				if (userInterrupted && !resolveReason) {
+					if (!result) {
+						try {
+							const terminalId = isPersistent ? params.persistentTerminalId : params.terminalId
+							const fromLine = startMarker?.line ?? 0
+							result = await this.readTerminalFromLine(terminalId, fromLine)
+						} catch {
+							// buffer unavailable — report interruption without output
+						}
+					}
+					resolveReason = { type: 'timeout', reason: 'backstop' }
+				}
 
 
 
@@ -589,6 +622,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 						+ result.slice(result.length - half, Infinity)
 				}
 
+				resultSettled = true
 				return { result, resolveReason }
 			} finally {
 				// Always dispose temporary terminals, even if an error was thrown
