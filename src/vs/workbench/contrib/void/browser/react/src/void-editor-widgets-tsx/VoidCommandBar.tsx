@@ -110,6 +110,13 @@ export const VoidCommandBar = ({ uri, editor }: VoidCommandBarProps) => {
 			: _latestValidUriIdxRef.current < sortedCommandBarURIs.length ? _latestValidUriIdxRef.current
 				: null
 
+	// Last valid index clamped into the shrunken list: when this file just
+	// left review (approved), Next continues after it instead of wrapping
+	// back to index 0. Skipped files keep their order.
+	const clampedFallbackIdx = sortedCommandBarURIs.length === 0 ? null
+		: _latestValidUriIdxRef.current === null ? null
+			: Math.min(_latestValidUriIdxRef.current, sortedCommandBarURIs.length - 1)
+
 	// when change URI, scroll to the proper spot
 	useEffect(() => {
 		setTimeout(() => {
@@ -118,7 +125,7 @@ export const VoidCommandBar = ({ uri, editor }: VoidCommandBarProps) => {
 			const s = commandBarService.stateOfURI[uri.fsPath]
 			if (!s) return
 			const { diffIdx } = s
-			commandBarService.goToDiffIdx(diffIdx ?? 0)
+			commandBarService.goToDiffIdxInUri(uri, diffIdx ?? 0)
 		}, 50)
 	}, [uri, commandBarService])
 
@@ -137,10 +144,10 @@ export const VoidCommandBar = ({ uri, editor }: VoidCommandBarProps) => {
 	const streamState = uri ? commandBarService.getStreamState(uri) : null
 	const showAcceptRejectAll = streamState === 'idle-has-changes'
 
-	const nextDiffIdx = commandBarService.getNextDiffIdx(1)
-	const prevDiffIdx = commandBarService.getNextDiffIdx(-1)
-	const nextURIIdx = commandBarService.getNextUriIdx(1)
-	const prevURIIdx = commandBarService.getNextUriIdx(-1)
+	const nextDiffIdx = uri ? commandBarService.getNextDiffIdxForUri(uri, 1) : null
+	const prevDiffIdx = uri ? commandBarService.getNextDiffIdxForUri(uri, -1) : null
+	const nextURIIdx = commandBarService.getNextUriIdxFromUri(uri ?? null, clampedFallbackIdx, 1)
+	const prevURIIdx = commandBarService.getNextUriIdxFromUri(uri ?? null, clampedFallbackIdx, -1)
 
 	const upDownDisabled = prevDiffIdx === null || nextDiffIdx === null
 	const leftRightDisabled = prevURIIdx === null || nextURIIdx === null
@@ -256,11 +263,11 @@ export const VoidCommandBar = ({ uri, editor }: VoidCommandBarProps) => {
 					<button
 						className="cursor-pointer"
 						disabled={upDownDisabled}
-						onClick={() => commandBarService.goToDiffIdx(prevDiffIdx)}
+						onClick={() => { if (uri) commandBarService.goToDiffIdxInUri(uri, prevDiffIdx) }}
 						onKeyDown={(e) => {
 							if (e.key === 'Enter' || e.key === ' ') {
 								e.preventDefault();
-								commandBarService.goToDiffIdx(prevDiffIdx);
+								if (uri) commandBarService.goToDiffIdxInUri(uri, prevDiffIdx);
 							}
 						}}
 						data-tooltip-id="void-tooltip"
@@ -281,11 +288,11 @@ export const VoidCommandBar = ({ uri, editor }: VoidCommandBarProps) => {
 					<button
 						className="cursor-pointer"
 						disabled={upDownDisabled}
-						onClick={() => commandBarService.goToDiffIdx(nextDiffIdx)}
+						onClick={() => { if (uri) commandBarService.goToDiffIdxInUri(uri, nextDiffIdx) }}
 						onKeyDown={(e) => {
 							if (e.key === 'Enter' || e.key === ' ') {
 								e.preventDefault();
-								commandBarService.goToDiffIdx(nextDiffIdx);
+								if (uri) commandBarService.goToDiffIdxInUri(uri, nextDiffIdx);
 							}
 						}}
 						data-tooltip-id="void-tooltip"
