@@ -382,7 +382,8 @@ export const shouldShowOwnershipBanner = (thread: Pick<ThreadType, 'workspaceUri
 export type IsRunningType =
 	| 'LLM' // the LLM is currently streaming
 	| 'tool' // whether a tool is currently running
-	| 'awaiting_user' // awaiting user call
+	| 'awaiting_user' // paused for approval — a tool_request is actionable
+	| 'waiting_tools' // parked: batch drained, background concurrent tools still running (auto-resumes, nothing to approve)
 	| 'idle' // nothing is running now, but the chat should still appear like it's going (used in-between calls)
 	| undefined
 
@@ -423,6 +424,12 @@ export type ThreadStreamState = {
 		interrupt: Promise<() => void>;
 	} | {
 		isRunning: 'awaiting_user';
+		error?: undefined;
+		llmInfo?: undefined;
+		toolInfo?: undefined;
+		interrupt?: undefined;
+	} | { // parked on background concurrent tools (auto-resumes, nothing actionable)
+		isRunning: 'waiting_tools';
 		error?: undefined;
 		llmInfo?: undefined;
 		toolInfo?: undefined;
@@ -501,6 +508,9 @@ export interface IChatThreadService {
 
 	onDidChangeCurrentThread: Event<void>;
 	onDidChangeStreamState: Event<{ threadId: string }>
+	onDidChangeUnreadThreads: Event<void>;
+	getUnreadThreadIds(): string[];
+	markThreadRead(threadId: string): void;
 
 	getCurrentThread(): ThreadType;
 	openNewThread(): void;
@@ -620,6 +630,18 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	private readonly _onDidChangeStreamState = new Emitter<{ threadId: string }>();
 	readonly onDidChangeStreamState: Event<{ threadId: string }> = this._onDidChangeStreamState.event;
+
+	// Threads whose run finished (or errored) while the user was looking
+	// elsewhere — drives the green "completed, unread" tab dot. In-memory
+	// only (a reload clears it); cleared when the user switches to the thread.
+	private readonly _unreadThreadIds = new Set<string>();
+	private readonly _onDidChangeUnreadThreads = new Emitter<void>();
+	readonly onDidChangeUnreadThreads: Event<void> = this._onDidChangeUnreadThreads.event;
+	getUnreadThreadIds(): string[] { return [...this._unreadThreadIds] }
+	markThreadRead(threadId: string): void {
+		if (this._unreadThreadIds.delete(threadId))
+			this._onDidChangeUnreadThreads.fire()
+	}
 
 	readonly streamState: ThreadStreamState = {}
 	// Per-thread latest LLM request id (from IRequestTelemetryService). Tool
@@ -2000,6 +2022,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	 * Each call to `_runToolCall` validates, checks approval, and either runs the tool
 	 * or pauses for user approval. Returns:
 	 *   - 'awaiting_user' if a tool paused for approval (remaining tools stay pending)
+	 *   - 'waiting_tools' if the batch is empty but background concurrent tools
+	 *     are still running (nothing actionable — caller must not resume yet)
 	 *   - 'interrupted' if a tool was interrupted (agent should terminate)
 	 *   - 'done' if all pending tools ran to a terminal state
 	 */
@@ -2045,7 +2069,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		return true
 	}
 
-	private _tryDrainPendingBatch = async (threadId: string): Promise<'done' | 'awaiting_user' | 'interrupted'> => {
+	private _tryDrainPendingBatch = async (threadId: string): Promise<'done' | 'awaiting_user' | 'waiting_tools' | 'interrupted'> => {
 		while (true) {
 			// If the stream was cleared (e.g. by abortRunning) while a tool was
 			// finishing, stop processing — the caller must not continue the
@@ -2060,12 +2084,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				// ask for approval individually.
 				this._autoApproveRestOfBatchOfThreadId.delete(threadId)
 				// No more pending tools — if concurrent terminal tools are still
-				// running, return 'awaiting_user' so the caller doesn't resume the
-				// agent prematurely. _checkAndContinueAfterConcurrentResolution
-				// (called from each concurrent tool's finally block) will resume
-				// the agent when all concurrent tools finish.
+				// running, park as 'waiting_tools' so the caller doesn't resume
+				// the agent prematurely. This is NOT 'awaiting_user': nothing
+				// is actionable, so no approval icon/notification fires.
+				// _checkAndContinueAfterConcurrentResolution (called from each
+				// concurrent tool's finally block) will resume the agent when
+				// all concurrent tools finish.
 				if ((this._concurrentRunningCountOfThreadId.get(threadId) ?? 0) > 0)
-					return 'awaiting_user'
+					return 'waiting_tools'
 				return 'done'
 			}
 			const next = pending[0]
@@ -2341,6 +2367,23 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (!tool) return
 
 		this._fireConcurrentTerminal(threadId, tool)
+		this._refreshApprovalOrParkedState(threadId, tool.id)
+	}
+
+	// After a per-tool approve/reject while concurrent tools run, the
+	// 'awaiting_user' state may be stale: the approved/rejected tool is no
+	// longer pending, and if nothing else needs approval the orange dot
+	// would stick until the terminals finish. Recompute — genuine pending
+	// approvals keep 'awaiting_user', otherwise park as 'waiting_tools'.
+	// `excludeId` covers the just-approved tool: firing is fire-and-forget,
+	// so its message still reads as pending synchronously after the call.
+	private _refreshApprovalOrParkedState(threadId: string, excludeId?: string) {
+		if (this.streamState[threadId]?.isRunning !== 'awaiting_user') return
+		const stillPending = this._getPendingBatchTools(threadId)
+			.filter(t => t.id !== excludeId)
+		if (stillPending.length > 0) return
+		if ((this._concurrentRunningCountOfThreadId.get(threadId) ?? 0) === 0) return
+		this._setStreamState(threadId, { isRunning: 'waiting_tools' })
 	}
 
 	/**
@@ -2377,6 +2420,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			mcpServerName: tool.mcpServerName,
 		})
 
+		this._refreshApprovalOrParkedState(threadId)
 		this._checkAndContinueAfterConcurrentResolution(threadId)
 	}
 
@@ -2468,6 +2512,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				this._setStreamState(threadId, { isRunning: 'awaiting_user' })
 				return
 			}
+			if (drainRes === 'waiting_tools') {
+				this._setStreamState(threadId, { isRunning: 'waiting_tools' })
+				return
+			}
 			// drainRes === 'done': all tools resolved — resume the agent loop.
 			// But bail if the stream was cleared (e.g. by abortRunning) while
 			// we were draining. Without this, _runChatAgent would set the
@@ -2547,6 +2595,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// pending ones — otherwise they'd keep running in the background.
 			await this._interruptConcurrentTools(threadId)
 			this.rejectLatestToolRequest(threadId, false)
+		}
+		else if (this.streamState[threadId]?.isRunning === 'waiting_tools') {
+			// Parked on background tools with nothing pending approval —
+			// stop the tools and clear. The generic tail below resets state.
+			await this._interruptConcurrentTools(threadId)
 		}
 		else if (this.streamState[threadId]?.isRunning === 'idle') {
 			// do nothing
@@ -2873,6 +2926,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			}
 			if (drainRes === 'awaiting_user') {
 				this._setStreamState(threadId, { isRunning: 'awaiting_user' })
+				return
+			}
+			if (drainRes === 'waiting_tools') {
+				this._setStreamState(threadId, { isRunning: 'waiting_tools' })
 				return
 			}
 			// drainRes === 'done': fall through to the main LLM loop below.
@@ -3205,6 +3262,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						return
 					}
 					if (batchRes === 'awaiting_user') { isRunningWhenEnd = 'awaiting_user' }
+				else if (batchRes === 'waiting_tools') { isRunningWhenEnd = 'waiting_tools' }
 					else {
 						// Abort may have fired while tools were running. If so,
 						// streamState is undefined — don't continue the loop.
@@ -3225,6 +3283,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// if awaiting user approval, keep isRunning true, else end isRunning
 		this._setStreamState(threadId, { isRunning: isRunningWhenEnd })
+
+		// The run ended (done or error) while the user was looking elsewhere —
+		// mark unread so the tab shows the green "completed" dot until visited.
+		if (isRunningWhenEnd === undefined && threadId !== this.state.currentThreadId
+			&& !this._unreadThreadIds.has(threadId)) {
+			this._unreadThreadIds.add(threadId)
+			this._onDidChangeUnreadThreads.fire()
+		}
 
 		// checkpoint disabled — see checkpoint-storage-refactor.md
 		// if (!isRunningWhenEnd) this._addUserCheckpoint({ threadId })
@@ -3711,9 +3777,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		const shouldNotify = () => threadId !== this.state.currentThreadId || !this._hostService.hasFocus
 		// Don't fire "chat ready" when the agent paused for approval —
-		// the approval notification is already shown, and the agent
-		// hasn't actually finished.
-		const isAwaitingApproval = () => this.streamState[threadId]?.isRunning === 'awaiting_user'
+		// the approval notification is already shown — nor while parked on
+		// background tools (nothing finished yet). The agent hasn't actually
+		// finished in either case.
+		const isStillWorking = () => {
+			const s = this.streamState[threadId]?.isRunning
+			return s === 'awaiting_user' || s === 'waiting_tools'
+		}
 
 		const showDoneNotification = (error: string | null) => {
 			if (!this._shouldNotify('done')) return
@@ -3757,7 +3827,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 
 		p.then(() => {
-			if (shouldNotify() && !isAwaitingApproval()) { showDoneNotification(null) }
+			if (shouldNotify() && !isStillWorking()) { showDoneNotification(null) }
 		}).catch((e) => {
 			if (shouldNotify()) { showDoneNotification(getErrorMessage(e)) }
 			throw e
@@ -4398,6 +4468,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// landing paths above. Updates the per-workspace last-active map and
 	// reapplies the saved per-thread model selection.
 	private _afterCurrentThreadChanged(threadId: string): void {
+		// Visiting a thread marks it read (clears the green unread dot).
+		this.markThreadRead(threadId)
 		// Phase E — remember "last thread looked at in this workspace" so the
 		// next reload (or reopen of this workspace in another window) can
 		// restore the user's place. We key on the *current window's*
@@ -4624,6 +4696,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	deleteThread(threadId: string): void {
 		const { allThreads: currentThreads } = this.state
 		const deletedThread = currentThreads[threadId]
+
+		this.markThreadRead(threadId)
 
 		// Clean up image files owned by this thread.
 		// Load messages first so image paths are available for cleanup.

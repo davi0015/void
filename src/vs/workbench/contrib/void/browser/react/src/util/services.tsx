@@ -93,6 +93,9 @@ const ctrlKZoneStreamingStateListeners: Set<(diffareaid: number, s: boolean) => 
 const commandBarURIStateListeners: Set<(uri: URI) => void> = new Set();
 const activeURIListeners: Set<(uri: URI | null) => void> = new Set();
 
+let unreadThreadIds: string[] = []
+const unreadThreadListeners: Set<() => void> = new Set()
+
 const mcpListeners: Set<() => void> = new Set()
 
 let semanticIndexStatus: IndexStatus = 'idle'
@@ -197,6 +200,14 @@ export const _registerServices = (accessor: ServicesAccessor) => {
 	disposables.push(
 		voidCommandBarService.onDidChangeActiveURI(({ uri }) => {
 			activeURIListeners.forEach(l => l(uri));
+		})
+	)
+
+	unreadThreadIds = chatThreadsStateService.getUnreadThreadIds()
+	disposables.push(
+		chatThreadsStateService.onDidChangeUnreadThreads(() => {
+			unreadThreadIds = chatThreadsStateService.getUnreadThreadIds()
+			unreadThreadListeners.forEach(l => l())
 		})
 	)
 
@@ -596,6 +607,18 @@ export const useCommandBarState = () => {
 
 
 
+// Threads whose run finished while the user was elsewhere (green tab dot).
+// Cleared by the service when the thread is visited or deleted.
+export const useUnreadThreadIds = () => {
+	const [s, ss] = useState(unreadThreadIds)
+	useEffect(() => {
+		ss(unreadThreadIds)
+		const listener = () => { ss(unreadThreadIds) }
+		unreadThreadListeners.add(listener);
+		return () => { unreadThreadListeners.delete(listener) };
+	}, [])
+	return s
+}
 // roughly gets the active URI - this is used to get the history of recent URIs
 export const useActiveURI = () => {
 	const accessor = useAccessor()
