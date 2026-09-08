@@ -32,9 +32,10 @@ export const MAX_TERMINAL_CHARS = 100_000
 // the command is killed). The LLM can raise it per call via `timeout_seconds`.
 export const DEFAULT_TERMINAL_TIMEOUT_SECONDS = 60
 // Hard ceiling for the LLM-provided `timeout_seconds` — bounds how long one
-// command can block the agent loop.
+// command can block the agent loop. Also the default for
+// `run_persistent_command` (waits for completion); the agent passes a
+// smaller value to background early (daemons) or tolerate less silence.
 export const MAX_TERMINAL_TIMEOUT_SECONDS = 600
-export const MAX_TERMINAL_BG_COMMAND_TIME = 5
 
 
 // Maximum character limits for prefix and suffix context
