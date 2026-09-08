@@ -13,7 +13,7 @@ import { TerminalLocation } from '../../../../platform/terminal/common/terminal.
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { ITerminalService, ITerminalInstance, ICreateTerminalOptions } from '../../../../workbench/contrib/terminal/browser/terminal.js';
-import { MAX_TERMINAL_CHARS } from '../common/prompt/prompts.js';
+import { MAX_TERMINAL_CHARS, MAX_TERMINAL_TIMEOUT_SECONDS } from '../common/prompt/prompts.js';
 import { TerminalResolveReason } from '../common/toolsServiceTypes.js';
 import { TERMINAL_AUTO_APPROVE_KEY } from '../common/storageKeys.js';
 import { timeout } from '../../../../base/common/async.js';
@@ -542,11 +542,11 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 						let inactivityTimeoutId: ReturnType<typeof setTimeout>;
 						let backstopTimeoutId: ReturnType<typeof setTimeout>;
 						const inactivityMs = timeoutSeconds * 1000;
-						// Backstop scales with the inactivity timeout (2x) so a
-						// raised `timeout_seconds` on a persistent terminal
-						// actually extends the total wait — a fixed backstop
-						// would fire first and make the raise pointless.
-						const backstopMs = isPersistent ? timeoutSeconds * 1000 * 2 : Infinity;
+						// Fixed total-wait cap so healthy long commands run to
+						// completion synchronously by default. The silence
+						// window is the opt-in early return (small
+						// `timeout_seconds` backgrounds daemons fast).
+						const backstopMs = isPersistent ? MAX_TERMINAL_TIMEOUT_SECONDS * 1000 : Infinity;
 
 						const fire = (timeoutReason: 'inactivity' | 'backstop') => {
 							if (resolveReason) return

@@ -1,4 +1,4 @@
-import { MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_TIMEOUT_SECONDS } from '../../common/prompt/prompts.js'
+import { MAX_TERMINAL_TIMEOUT_SECONDS } from '../../common/prompt/prompts.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
 import { validateStr, validateProposedTerminalId, validateTimeoutSeconds } from './toolHelpers.js'
@@ -10,13 +10,13 @@ const terminalDescHelper =
 	' Pipe pagers to `cat` (e.g. `git diff | cat`). If a command hangs, it may be waiting for input.'
 
 const timeoutHelper =
-	`Optional. Inactivity timeout in whole seconds — results are returned after this long with no new output, while the command keeps running in the background. Defaults to ${MAX_TERMINAL_BG_COMMAND_TIME}. ` +
-	`Raise it (up to ${MAX_TERMINAL_TIMEOUT_SECONDS}) when waiting on a long-running command. ` +
-	`Do not raise it when a command seems stuck: silence usually means it is waiting for input.`
+	`Optional. Seconds to wait for the command to finish — defaults to ${MAX_TERMINAL_TIMEOUT_SECONDS} (waits for completion). ` +
+	`Pass a smaller value for commands that never exit (dev servers, watch mode) or to stop waiting early: results return after that long with no new output while the command keeps running in the background. ` +
+	`Silence usually means the command is waiting for input — avoid interactive commands (see below).`
 
 export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_command'> = {
 	name: 'run_persistent_command',
-	description: `Runs a terminal command in the persistent terminal that you created with open_persistent_terminal (returns results after \`timeout_seconds\` with no output — defaults to ${MAX_TERMINAL_BG_COMMAND_TIME}s — and the command keeps running in the background). If the result says the command is still running, check on it later with read_terminal (no sleep/wait commands — they change nothing and only waste a step). ${terminalDescHelper}`,
+	description: `Runs a terminal command in the persistent terminal that you created with open_persistent_terminal. Waits until the command finishes (up to ${MAX_TERMINAL_TIMEOUT_SECONDS}s). For commands that never exit (dev servers, watch mode), pass a small \`timeout_seconds\` (e.g. 30) to return early while it keeps running in the background. If the result says the command is still running, check on it later with read_terminal (no sleep/wait commands — they change nothing and only waste a step). ${terminalDescHelper}`,
 	params: {
 		command: { description: 'The terminal command to run.' },
 		persistent_terminal_id: { description: 'The ID of the terminal created using open_persistent_terminal.' },
@@ -28,7 +28,7 @@ export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_co
 		const { command: commandUnknown, persistent_terminal_id: persistentTerminalIdUnknown, timeout_seconds: timeoutSecondsUnknown } = raw
 		const command = validateStr('command', commandUnknown)
 		const persistentTerminalId = validateProposedTerminalId(persistentTerminalIdUnknown)
-		const timeoutSeconds = validateTimeoutSeconds(timeoutSecondsUnknown, MAX_TERMINAL_BG_COMMAND_TIME)
+		const timeoutSeconds = validateTimeoutSeconds(timeoutSecondsUnknown, MAX_TERMINAL_TIMEOUT_SECONDS)
 		return { command, persistentTerminalId, timeoutSeconds }
 	},
 
@@ -49,10 +49,9 @@ export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_co
 			if (resolveReason.reason === 'inactivity') {
 				return `${result_}\nCommand timed out after ${timeoutSeconds}s of no output. It may be waiting for input (e.g. a pager, y/n prompt). The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal. Do NOT run sleep or any wait command to wait for it.`
 			}
-			// The backstop fires at 2x the inactivity timeout (see
-			// terminalToolService) — reflect that here so the LLM knows the
-			// actual maximum wait, not just the quiet window.
-			return `${result_}\nCommand is still running and producing output after ${timeoutSeconds * 2}s. The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal. Do NOT run sleep or any wait command to wait for it.`
+			// The backstop is a fixed total-wait cap (see terminalToolService),
+			// independent of the silence window.
+			return `${result_}\nCommand is still running after the maximum wait (${MAX_TERMINAL_TIMEOUT_SECONDS}s). The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal. Do NOT run sleep or any wait command to wait for it.`
 		}
 		throw new Error(`Unexpected internal error: Terminal command did not resolve with a valid reason.`)
 	},
