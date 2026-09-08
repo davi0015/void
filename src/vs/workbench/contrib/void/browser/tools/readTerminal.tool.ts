@@ -4,7 +4,7 @@ import { validateStr, validateNumber } from './toolHelpers.js'
 
 export const readTerminalToolCore: ToolDefinitionCore<'read_terminal'> = {
 	name: 'read_terminal',
-	description: `Reads the scrollback buffer of any terminal (Void or user-created). Returns the terminal output, current status (idle/running/exited), and command history with exit codes. Use this to check on a persistent terminal after a timeout, inspect a dev server's logs, or see output from a user-created terminal. The terminal names are shown in the system info under "Terminals". Pass last_n_commands to retrieve output from only the last N commands (useful when the full buffer is too long or truncated).`,
+	description: `Reads the scrollback buffer of any terminal (Void or user-created). Returns the terminal output, current status (idle/running/exited), and command history with exit codes. Use this to check on a persistent terminal after a timeout, inspect a dev server's logs, or see output from a user-created terminal. The terminal names are shown in the system info under "Terminals". Pass last_n_commands to retrieve output from only the last N commands (useful when the full buffer is too long or truncated). This is the follow-up when run_persistent_command reports a command is still running — re-call it to check completion; never run sleep/wait commands to wait.`,
 	params: {
 		terminal_name: { description: 'The name of the terminal to read, as shown in the system info under "Terminals".' },
 		last_n_commands: { description: 'Optional. If provided, returns only the output of the last N commands (e.g. 1 for just the most recent command, 3 for the last three). Omit to get the full scrollback buffer and full command history.' },

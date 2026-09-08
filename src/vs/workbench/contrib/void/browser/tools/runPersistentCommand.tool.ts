@@ -16,7 +16,7 @@ const timeoutHelper =
 
 export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_command'> = {
 	name: 'run_persistent_command',
-	description: `Runs a terminal command in the persistent terminal that you created with open_persistent_terminal (returns results after \`timeout_seconds\` with no output — defaults to ${MAX_TERMINAL_BG_COMMAND_TIME}s — and the command keeps running in the background). ${terminalDescHelper}`,
+	description: `Runs a terminal command in the persistent terminal that you created with open_persistent_terminal (returns results after \`timeout_seconds\` with no output — defaults to ${MAX_TERMINAL_BG_COMMAND_TIME}s — and the command keeps running in the background). If the result says the command is still running, check on it later with read_terminal (no sleep/wait commands — they change nothing and only waste a step). ${terminalDescHelper}`,
 	params: {
 		command: { description: 'The terminal command to run.' },
 		persistent_terminal_id: { description: 'The ID of the terminal created using open_persistent_terminal.' },
@@ -47,12 +47,12 @@ export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_co
 		// bg command
 		if (resolveReason.type === 'timeout') {
 			if (resolveReason.reason === 'inactivity') {
-				return `${result_}\nCommand timed out after ${timeoutSeconds}s of no output. It may be waiting for input (e.g. a pager, y/n prompt). The terminal is still running in terminal ${persistentTerminalId}.`
+				return `${result_}\nCommand timed out after ${timeoutSeconds}s of no output. It may be waiting for input (e.g. a pager, y/n prompt). The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal. Do NOT run sleep or any wait command to wait for it.`
 			}
 			// The backstop fires at 2x the inactivity timeout (see
 			// terminalToolService) — reflect that here so the LLM knows the
 			// actual maximum wait, not just the quiet window.
-			return `${result_}\nCommand is still running and producing output after ${timeoutSeconds * 2}s. The terminal is still running in terminal ${persistentTerminalId}.`
+			return `${result_}\nCommand is still running and producing output after ${timeoutSeconds * 2}s. The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal. Do NOT run sleep or any wait command to wait for it.`
 		}
 		throw new Error(`Unexpected internal error: Terminal command did not resolve with a valid reason.`)
 	},
