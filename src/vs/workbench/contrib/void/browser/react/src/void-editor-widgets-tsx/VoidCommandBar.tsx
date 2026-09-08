@@ -117,6 +117,13 @@ export const VoidCommandBar = ({ uri, editor }: VoidCommandBarProps) => {
 		: _latestValidUriIdxRef.current === null ? null
 			: Math.min(_latestValidUriIdxRef.current, sortedCommandBarURIs.length - 1)
 
+	// Removed file was last (or beyond): no successor slid into its slot,
+	// so Next wraps to the first file instead of stepping backwards.
+	const removedWasLast = currFileIdx === null
+		&& sortedCommandBarURIs.length > 0
+		&& _latestValidUriIdxRef.current !== null
+		&& _latestValidUriIdxRef.current >= sortedCommandBarURIs.length
+
 	// when change URI, scroll to the proper spot
 	useEffect(() => {
 		setTimeout(() => {
@@ -148,10 +155,11 @@ export const VoidCommandBar = ({ uri, editor }: VoidCommandBarProps) => {
 	const prevDiffIdx = uri ? commandBarService.getNextDiffIdxForUri(uri, -1) : null
 	// When this file already left review (approved), it has no index — Next
 	// means the successor that slid into its last valid position (a plain +1
-	// would skip over it), Prev means one before that.
+	// would skip over it), or wraps to the first file when it was last.
+	// Prev means one before that.
 	const nextURIIdx = currFileIdx !== null
 		? commandBarService.getNextUriIdxFromUri(uri ?? null, clampedFallbackIdx, 1)
-		: clampedFallbackIdx
+		: removedWasLast ? 0 : clampedFallbackIdx
 	const prevURIIdx = commandBarService.getNextUriIdxFromUri(uri ?? null, clampedFallbackIdx, -1)
 
 	const upDownDisabled = prevDiffIdx === null || nextDiffIdx === null
