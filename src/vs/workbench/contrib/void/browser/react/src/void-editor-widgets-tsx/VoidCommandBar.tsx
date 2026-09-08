@@ -146,7 +146,12 @@ export const VoidCommandBar = ({ uri, editor }: VoidCommandBarProps) => {
 
 	const nextDiffIdx = uri ? commandBarService.getNextDiffIdxForUri(uri, 1) : null
 	const prevDiffIdx = uri ? commandBarService.getNextDiffIdxForUri(uri, -1) : null
-	const nextURIIdx = commandBarService.getNextUriIdxFromUri(uri ?? null, clampedFallbackIdx, 1)
+	// When this file already left review (approved), it has no index — Next
+	// means the successor that slid into its last valid position (a plain +1
+	// would skip over it), Prev means one before that.
+	const nextURIIdx = currFileIdx !== null
+		? commandBarService.getNextUriIdxFromUri(uri ?? null, clampedFallbackIdx, 1)
+		: clampedFallbackIdx
 	const prevURIIdx = commandBarService.getNextUriIdxFromUri(uri ?? null, clampedFallbackIdx, -1)
 
 	const upDownDisabled = prevDiffIdx === null || nextDiffIdx === null

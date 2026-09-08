@@ -469,13 +469,15 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 		// delete from state
 		delete this.stateOfURI[uri.fsPath]
 		// Don't leave activeURI dangling on the removed file (e.g. the file
-		// just approved): hand it to the entry that slid into its index so
-		// Next/Prev continue from the reviewer's position instead of jumping
-		// back to index 0.
+		// just approved): park it on the predecessor (wrapping) so a
+		// relative Next (+1, keybindings) lands on the successor that slid
+		// into the removed slot — the same file the tab bar navigates to
+		// directly — instead of jumping back to index 0.
 		if (this.activeURI?.fsPath === uri.fsPath) {
-			const successor = this.sortedURIs[Math.min(i, this.sortedURIs.length - 1)] ?? null
-			this.activeURI = successor
-			this._onDidChangeActiveURI.fire({ uri: successor })
+			const parked = this.sortedURIs.length === 0 ? null
+				: this.sortedURIs[(i - 1 + this.sortedURIs.length) % this.sortedURIs.length]
+			this.activeURI = parked
+			this._onDidChangeActiveURI.fire({ uri: parked })
 		}
 	}
 
