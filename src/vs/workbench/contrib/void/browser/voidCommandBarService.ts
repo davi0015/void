@@ -92,7 +92,6 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 	// depends on uri -> diffZone -> {streaming, diffs}
 	public stateOfURI: { [uri: string]: CommandBarStateType } = {}
 	public sortedURIs: URI[] = [] // keys of state (depends on diffZones in the uri)
-	private readonly _listenToTheseURIs = new Set<URI>() // uriFsPaths
 
 	// Emits when a URI's stream state changes between idle, streaming, and acceptRejectAll
 	private readonly _onDidChangeState = new Emitter<{ uri: URI }>();
@@ -115,14 +114,12 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 		super();
 
 
-		const registeredModelURIs = new Set<string>()
 		const initializeModel = async (model: ITextModel) => {
 			// Skip non-workspace models (chat code blocks are inmemory:// + isForSimpleWidget)
 			if (model.uri.scheme === Schemas.inMemory || model.isForSimpleWidget) return
-			// do not add listeners to the same model twice - important, or will see duplicates
-			if (registeredModelURIs.has(model.uri.fsPath)) return
-			registeredModelURIs.add(model.uri.fsPath)
-			this._listenToTheseURIs.add(model.uri)
+			// Review state is driven by diff-zone events, not open models —
+			// just reconcile in case edits landed before the model mounted.
+			this._ensureStateForUri(model.uri)
 		}
 		// initialize all existing models + initialize when a new model mounts
 		this._modelService.getModels().forEach(model => { initializeModel(model) })
@@ -135,12 +132,13 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 			this._ensureStateForUri(model.uri)
 		}));
 		this._register(this._modelService.onModelRemoved(model => {
-			registeredModelURIs.delete(model.uri.fsPath)
-			this._listenToTheseURIs.delete(model.uri)
-			// Drop command-bar state for removed models so the Accept/Reject
-			// widget doesn't linger after delete (editCodeService cleanup
-			// fires onDidAddOrDeleteDiffZones too, but don't rely on ordering).
-			if (this.stateOfURI[model.uri.fsPath]) {
+			// Drop command-bar state for removed models only when no diffs
+			// remain (e.g. file deleted — editCodeService cleanup fires
+			// onDidAddOrDeleteDiffZones too, but don't rely on ordering).
+			// A closed tab with pending diffs keeps its entry so the bar
+			// (and Next navigation) survives on other editors.
+			const zonesRemain = (this._editCodeService.diffAreasOfURI[model.uri.fsPath]?.size ?? 0) > 0
+			if (this.stateOfURI[model.uri.fsPath] && !zonesRemain) {
 				this._deleteURIEntryFromState(model.uri)
 				this._onDidChangeState.fire({ uri: model.uri })
 			}
@@ -174,12 +172,10 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 			const fromPath = e.resource.fsPath
 			const toPath = e.target.resource.fsPath
 			if (fromPath === toPath) return
-			for (const uri of [...this._listenToTheseURIs]) {
+			for (const uri of [...this.sortedURIs]) {
 				if (uri.fsPath !== fromPath && !uri.fsPath.startsWith(fromPath + '/')) continue
 				const newPath = uri.fsPath === fromPath ? toPath : toPath + uri.fsPath.slice(fromPath.length)
 				const newUri = URI.file(newPath)
-				this._listenToTheseURIs.delete(uri)
-				this._listenToTheseURIs.add(newUri)
 				const state = this.stateOfURI[uri.fsPath]
 				if (state) {
 					this.stateOfURI[newPath] = state
@@ -193,22 +189,12 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 				}
 				this._onDidChangeState.fire({ uri: newUri })
 			}
-			// Reconcile: if the edit service transferred diffs to a URI we
-			// weren't listening to yet (new model not mounted at event time),
-			// create its state entry now instead of waiting for the next event.
-			for (const uri of this._listenToTheseURIs) {
-				if (this.stateOfURI[uri.fsPath]) continue
-				const zones = this._editCodeService.diffAreasOfURI[uri.fsPath]
-				if (!zones || zones.size === 0) continue
-				this._addURIEntryToState(uri)
-				const ids = [...zones]
-				this._setState(uri, {
-					sortedDiffZoneIds: ids,
-					sortedDiffIds: this._computeSortedDiffs(ids),
-					isStreaming: this._isAnyDiffZoneStreaming(ids),
-					diffIdx: null,
-				})
-				this._onDidChangeState.fire({ uri })
+			// Reconcile: if the edit service transferred diffs to a URI with
+			// no state entry yet (e.g. no open model at event time), create
+			// it now instead of waiting for the next event.
+			for (const fsPath of Object.keys(this._editCodeService.diffAreasOfURI)) {
+				if (this.stateOfURI[fsPath]) continue
+				this._ensureStateForUri(URI.file(fsPath))
 			}
 		}));
 
@@ -246,8 +232,8 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 
 		// state updaters
 		this._register(this._editCodeService.onDidAddOrDeleteDiffZones(e => {
-			for (const uri of this._listenToTheseURIs) {
-				if (e.uri.fsPath !== uri.fsPath) continue
+			for (const uri of [e.uri]) {
+				if (uri.scheme !== Schemas.file) continue
 				// --- sortedURIs: delete if empty, add if not in state yet
 				const diffZones = this._getDiffZonesOnURI(uri)
 				if (diffZones.length === 0) {
@@ -294,8 +280,8 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 
 		}))
 		this._register(this._editCodeService.onDidChangeDiffsInDiffZoneNotStreaming(e => {
-			for (const uri of this._listenToTheseURIs) {
-				if (e.uri.fsPath !== uri.fsPath) continue
+			for (const uri of [e.uri]) {
+				if (uri.scheme !== Schemas.file) continue
 				// --- sortedURIs: no change
 				// --- state:
 				// sortedDiffIds gets a change to it, so gets recomputed
@@ -328,8 +314,8 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 			}
 		}))
 		this._register(this._editCodeService.onDidChangeStreamingInDiffZone(e => {
-			for (const uri of this._listenToTheseURIs) {
-				if (e.uri.fsPath !== uri.fsPath) continue
+			for (const uri of [e.uri]) {
+				if (uri.scheme !== Schemas.file) continue
 				// --- sortedURIs: no change
 				// --- state:
 				const currState = this.stateOfURI[uri.fsPath]
