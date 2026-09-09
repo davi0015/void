@@ -628,17 +628,18 @@ export const useUnreadThreadIds = () => {
 	return s
 }
 
-// Follow-up message queued while a run streams (single slot per thread).
-// Auto-sent by the service when the run ends; cleared on visit-cancel.
-export const useQueuedMessage = (threadId: string) => {
+// Follow-ups queued while a run streams (FIFO list per thread).
+// The head auto-sends when the run ends; items are edited/sent/deleted
+// from the queue list UI.
+export const useQueuedMessages = (threadId: string) => {
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
-	const [s, ss] = useState(() => chatThreadsService.getQueuedMessage(threadId))
+	const [s, ss] = useState(() => chatThreadsService.getQueuedMessages(threadId))
 	useEffect(() => {
-		ss(chatThreadsService.getQueuedMessage(threadId))
+		ss(chatThreadsService.getQueuedMessages(threadId))
 		const listener = (tid: string) => {
 			if (tid !== threadId) return
-			ss(chatThreadsService.getQueuedMessage(threadId))
+			ss(chatThreadsService.getQueuedMessages(threadId))
 		}
 		queuedMessageListeners.add(listener);
 		return () => { queuedMessageListeners.delete(listener) };

@@ -8,7 +8,7 @@ import { flushSync } from 'react-dom';
 
 
 
-import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction, useAnyThreadRunning, useSemanticIndexState, useQueuedMessage } from '../util/services.js';
+import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction, useAnyThreadRunning, useSemanticIndexState, useQueuedMessages } from '../util/services.js';
 
 import { ChatMarkdownRender, ChatMessageLocation } from '../markdown/ChatMarkdownRender.js';
 import { URI } from '../../../../../../../base/common/uri.js';
@@ -23,7 +23,7 @@ import { ChatMode, displayInfoOfProviderName, FeatureName, isFeatureNameDisabled
 import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
-import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning, Scissors, AlertTriangle, Brain, Clock } from 'lucide-react';
+import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning, Scissors, AlertTriangle, Brain, Clock, ArrowUp } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { generateUuid } from '../../../../../../../base/common/uuid.js';
 import { VSBuffer } from '../../../../../../../base/common/buffer.js';
@@ -820,9 +820,7 @@ interface VoidChatAreaProps {
 	// Form controls
 	onSubmit: () => void;
 	onAbort: () => void;
-	// Tooltip for the submit arrow while streaming (undefined = none).
-	// While streaming the arrow opens the send/queue chooser, it never acts.
-	submitTooltip?: string;
+
 	isStreaming: boolean;
 	isDisabled?: boolean;
 	divRef?: React.RefObject<HTMLDivElement | null>;
@@ -858,7 +856,6 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 	children,
 	onSubmit,
 	onAbort,
-	submitTooltip,
 	onClose,
 	onClickAnywhere,
 	divRef,
@@ -986,11 +983,15 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 					)}
 
 					{(() => {
-						const submitBtn = <ButtonSubmit onClick={onSubmit} disabled={isDisabled}
-							{...(submitTooltip && isStreaming ? { 'data-tooltip-id': 'void-tooltip', 'data-tooltip-content': submitTooltip, 'data-tooltip-place': 'top' } : {})} />
-						const button = isStreaming
-							? <>{submitBtn}<ButtonStop onClick={onAbort} /></>
-							: submitBtn
+						// Single smart button: idle always submits; streaming
+						// with text queues on press; streaming and empty shows
+						// only Stop. The arrow never stops a run implicitly.
+						const submitBtn = isStreaming
+							? <ButtonSubmit onClick={onSubmit} disabled={isDisabled} data-tooltip-id='void-tooltip' data-tooltip-content='Queue message' data-tooltip-place='top' />
+							: <ButtonSubmit onClick={onSubmit} disabled={isDisabled} />
+						const button = isStreaming && isDisabled
+							? <ButtonStop onClick={onAbort} />
+							: <>{submitBtn}{isStreaming ? <ButtonStop onClick={onAbort} /> : null}</>
 						if (!threadIdForUsageRing) return button
 						return (
 							<SubmitButtonWithUsageRing threadId={threadIdForUsageRing} featureName={featureName}>
@@ -3340,9 +3341,6 @@ export const SidebarChat = () => {
 	// active view without knowing about the LRU cache.
 	const scrollContainerRef = getScrollContainerRef(currentThread.id)
 
-	// While parked for approval, Enter queues instead of interrupting —
-	// implicitly discarding a pending approval would be data loss.
-	const isAwaitingApproval = isRunning === 'awaiting_user'
 
 	// Synchronous reentrancy guard. The React-state-derived `isRunning`
 	// check below is necessary but NOT sufficient to prevent duplicate
@@ -3367,9 +3365,11 @@ export const SidebarChat = () => {
 		// before yielding makes any flushed-later keydowns see an empty
 		// textarea and bail via `isDisabled`.
 		const userMessage = _forceSubmit || textAreaRef.current?.value || ''
+		if (!userMessage && !_forceSubmit) return null
 		const _chatSelections = [...selections] // snapshot before clearing
 		setSelections([]) // clear staging
 		textAreaFnsRef.current?.setValue('')
+		setInstructionsAreEmpty(true)
 		draftsRef.current.delete(chatThreadsService.state.currentThreadId)
 
 		// Extract in-memory bytes for the service layer (reads from memory,
@@ -3418,7 +3418,10 @@ export const SidebarChat = () => {
 		// one branch and removes any "what if" worry.
 		if (isCurrentThreadReadOnly) return
 		if (isDisabled && !_forceSubmit) return
-		if (isAwaitingApproval && !_forceSubmit) { onQueue(); return }
+		// While streaming (including parked for approval) the single input
+		// button queues — it never stops the run. Force-send lives on each
+		// queued row; Stop stays the only implicit destructive action.
+		if (isRunning && !_forceSubmit) { onQueue(); return }
 
 		const payload = captureInputPayload(_forceSubmit)
 		if (!payload) return
@@ -3436,7 +3439,7 @@ export const SidebarChat = () => {
 
 		textAreaRef.current?.focus() // focus input after submit
 
-	}, [captureInputPayload, chatThreadsService, isAwaitingApproval, onQueue, isCurrentThreadReadOnly, textAreaRef])
+	}, [captureInputPayload, chatThreadsService, onQueue, isCurrentThreadReadOnly, textAreaRef])
 
 	const onAbort = async () => {
 		const threadId = currentThread.id
@@ -3446,12 +3449,92 @@ export const SidebarChat = () => {
 	const keybindingString = accessor.get('IKeybindingService').lookupKeybinding(VOID_CTRL_L_ACTION_ID)?.getLabel()
 
 	const threadId = currentThread.id
-	const queuedMessage = useQueuedMessage(currentThread.id)
-	// Send/queue chooser: while streaming, the arrow opens this menu instead
-	// of acting — Enter/arrow never implicitly stops a run.
-	const [showSendChoice, setShowSendChoice] = useState(false)
-	// The run ended while the menu was open — its options no longer apply.
-	useEffect(() => { if (!isRunning) setShowSendChoice(false) }, [isRunning])
+	const queuedMessages = useQueuedMessages(currentThread.id)
+
+	// Load a queued item back into the input for editing. Attachments whose
+	// image bytes are gone are dropped rather than sent broken.
+	const onEditQueued = useCallback((id: string) => {
+		const item = chatThreadsService.getQueuedMessages(currentThread.id).find(m => m.id === id)
+		if (!item) return
+		const restoredSelections: StagingSelectionItem[] = []
+		for (const s of item.chatSelections) {
+			if (s.type !== 'Image') { restoredSelections.push(s); continue }
+			const bytes = item.pendingImageBytes.get(s.uri.path)
+			const entry = pendingImageData.get(s.uri.path)
+			if (bytes && entry) { entry.bytes = bytes; restoredSelections.push(s) }
+		}
+		setSelections(restoredSelections)
+		textAreaFnsRef.current?.setValue(item.userMessage)
+		onChangeText(item.userMessage)
+		chatThreadsService.removeQueuedMessage(currentThread.id, id)
+		textAreaRef.current?.focus()
+	}, [chatThreadsService, currentThread.id, onChangeText, setSelections, textAreaFnsRef, textAreaRef])
+
+	// Send a queued item immediately (aborts any running turn first —
+	// explicit click, so stopping the run here is intended).
+	const onSendQueuedNow = useCallback(async (id: string) => {
+		if (isSubmittingRef.current) return
+		const threadId = currentThread.id
+		const item = chatThreadsService.getQueuedMessages(threadId).find(m => m.id === id)
+		if (!item) return
+		isSubmittingRef.current = true
+		try {
+			chatThreadsService.removeQueuedMessage(threadId, id)
+			await chatThreadsService.addUserMessageAndStreamResponse({
+				userMessage: item.userMessage,
+				_chatSelections: item.chatSelections,
+				threadId,
+				_pendingImageBytes: item.pendingImageBytes,
+				modelSelectionOptionsOverride: item.modelSelectionOptionsOverride,
+			})
+		} catch (e) {
+			console.error('Error while sending queued message:', e)
+		} finally {
+			isSubmittingRef.current = false
+		}
+		textAreaRef.current?.focus()
+	}, [chatThreadsService, currentThread.id, textAreaRef])
+
+	const queueActionBtn = 'shrink-0 p-0.5 rounded cursor-pointer text-void-fg-3 hover:text-void-fg-1 hover:bg-void-bg-3'
+	const queueListHTML = queuedMessages.length > 0 ? (
+		<div className='flex flex-col gap-1 mb-1'>
+			<div className='text-[11px] text-void-fg-3 opacity-70 px-1 select-none'>
+				Queued ({queuedMessages.length}) — sends in order when the run finishes
+			</div>
+			{queuedMessages.map((item, i) => (
+				<div key={item.id} className='group flex items-center gap-1.5 px-2 py-1 rounded border border-void-border-2 bg-void-bg-1 text-xs text-void-fg-3'>
+					<span className='shrink-0 opacity-60'>{i + 1}</span>
+					<span className='flex-1 truncate'
+						data-tooltip-id='void-tooltip'
+						data-tooltip-content={item.userMessage || '(attachments)'}
+						data-tooltip-place='top'
+					>
+						{item.userMessage || '(attachments)'}
+					</span>
+					<div className='flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100'>
+						<button type='button' className={queueActionBtn}
+							data-tooltip-id='void-tooltip' data-tooltip-content='Edit (load back into input)' data-tooltip-place='top'
+							onClick={() => onEditQueued(item.id)}
+						>
+							<Pencil size={12} />
+						</button>
+						<button type='button' className={queueActionBtn}
+							data-tooltip-id='void-tooltip' data-tooltip-content='Send immediately (stops current run)' data-tooltip-place='top'
+							onClick={() => onSendQueuedNow(item.id)}
+						>
+							<ArrowUp size={12} />
+						</button>
+						<button type='button' className={queueActionBtn}
+							data-tooltip-id='void-tooltip' data-tooltip-content='Delete queued message' data-tooltip-place='top'
+							onClick={() => chatThreadsService.removeQueuedMessage(currentThread.id, item.id)}
+						>
+							<X size={12} />
+						</button>
+					</div>
+				</div>
+			))}
+		</div>
+	) : null
 	// checkpoint disabled — see checkpoint-storage-refactor.md
 	// const currCheckpointIdx = chatThreadsState.allThreads[threadId]?.state?.currCheckpointIdx ?? undefined
 
@@ -3509,16 +3592,12 @@ export const SidebarChat = () => {
 		draftsRef.current.set(currentThread.id, newStr)
 	}, [setInstructionsAreEmpty, currentThread.id])
 	const onKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
-		if (e.key === 'Escape' && showSendChoice) {
-			setShowSendChoice(false)
-			return
-		}
 		if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
 			onSubmit()
 		} else if (e.key === 'Escape' && isRunning) {
 			onAbort()
 		}
-	}, [onSubmit, onAbort, isRunning, showSendChoice])
+	}, [onSubmit, onAbort, isRunning])
 
 	const mainImageAttach = useImageAttach(selections, setSelections)
 	const mainImageUploadEnabled = useImageUploadEnabled()
@@ -3529,69 +3608,12 @@ export const SidebarChat = () => {
 	// dropdown, etc. Keyboard `Enter` is independently blocked via
 	// `isDisabled` above. The banner above the messages explains why
 	// it's grayed out and offers Copy/Move.
-	const queuedChipHTML = queuedMessage ? (
-		<div className='flex items-center gap-2 px-2 py-1 mb-1 rounded border border-void-border-2 bg-void-bg-1 text-xs text-void-fg-3'>
-			<Clock size={12} className='shrink-0' />
-			<span className='flex-1 truncate'
-				data-tooltip-id='void-tooltip'
-				data-tooltip-content={queuedMessage.userMessage || '(attachments)'}
-				data-tooltip-place='top'
-			>
-				Queued for after this run: {queuedMessage.userMessage || '(attachments)'}
-			</span>
-			<button type='button'
-				className='shrink-0 cursor-pointer hover:text-void-fg-1'
-				data-tooltip-id='void-tooltip'
-				data-tooltip-content='Discard queued message'
-				data-tooltip-place='top'
-				onClick={() => chatThreadsService.clearQueuedMessage(currentThread.id)}
-			>
-				<X size={12} />
-			</button>
-		</div>
-	) : null
-
-	// Chooser rows: send-now is destructive, so it is offered only while the
-	// run is genuinely working — never while parked for approval (that would
-	// silently discard the pending approval).
-	const sendChoiceHTML = showSendChoice && isRunning ? (
-		<>
-			<div className='fixed inset-0 z-10' onClick={() => setShowSendChoice(false)} />
-			<div className='absolute bottom-full right-0 z-20 mb-1 w-56 overflow-hidden rounded-md border border-void-border-1 bg-void-bg-2 shadow-md'>
-				{!isAwaitingApproval && (
-					<button type='button'
-						className='flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-void-bg-3 cursor-pointer'
-						onClick={() => { setShowSendChoice(false); onSubmit() }}
-					>
-						<span className='text-xs text-void-fg-1 font-medium'>Send now</span>
-						<span className='text-[11px] text-void-fg-3'>Stop the current run and send</span>
-					</button>
-				)}
-				<button type='button'
-					className='flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-void-bg-3 cursor-pointer'
-					onClick={() => { setShowSendChoice(false); onQueue() }}
-				>
-					<span className='text-xs text-void-fg-1 font-medium'>Queue for after</span>
-					<span className='text-[11px] text-void-fg-3'>Send when this run finishes</span>
-				</button>
-				<button type='button'
-					className='flex w-full px-3 py-1.5 text-left text-xs text-void-fg-3 hover:bg-void-bg-3 cursor-pointer'
-					onClick={() => setShowSendChoice(false)}
-				>
-					Cancel
-				</button>
-			</div>
-		</>
-	) : null
-
-	const inputChatArea = <div className={`${isCurrentThreadReadOnly ? 'pointer-events-none opacity-60' : ''} relative`}>
-		{queuedChipHTML}
-		{sendChoiceHTML}
+	const inputChatArea = <div className={isCurrentThreadReadOnly ? 'pointer-events-none opacity-60' : ''}>
+		{queueListHTML}
 		<VoidChatArea
 			featureName='Chat'
-			onSubmit={() => { if (isRunning) setShowSendChoice(true); else onSubmit() }}
+			onSubmit={() => onSubmit()}
 			onAbort={onAbort}
-			submitTooltip={isRunning ? 'Send or queue options' : undefined}
 			isStreaming={!!isRunning}
 			isDisabled={isDisabled}
 			showSelections={true}

@@ -387,11 +387,13 @@ export type IsRunningType =
 	| 'idle' // nothing is running now, but the chat should still appear like it's going (used in-between calls)
 	| undefined
 
-// A follow-up message typed while a run was streaming. Single slot per
-// thread (new replaces old); captured with the same snapshot the send
-// path builds (text + selections + image bytes + model override) and
-// auto-sent as the next turn when the run ends naturally.
+// Follow-ups typed while a run is streaming, in FIFO order. Captured with
+// the same snapshot the send path builds (text + selections + image bytes
+// + model override); the head auto-sends as the next turn when the run ends
+// naturally. Appends never replace — the list UI lets the user edit,
+// send-now, or delete each item.
 export type QueuedMessage = {
+	id: string;
 	userMessage: string;
 	chatSelections: StagingSelectionItem[];
 	pendingImageBytes: Map<string, Uint8Array>;
@@ -523,9 +525,10 @@ export interface IChatThreadService {
 	getUnreadThreadIds(): string[];
 	markThreadRead(threadId: string): void;
 	onDidChangeQueuedMessage: Event<{ threadId: string }>;
-	getQueuedMessage(threadId: string): QueuedMessage | undefined;
-	queueUserMessage(threadId: string, msg: QueuedMessage): void;
-	clearQueuedMessage(threadId: string): void;
+	getQueuedMessages(threadId: string): QueuedMessage[];
+	queueUserMessage(threadId: string, msg: Omit<QueuedMessage, 'id'>): string;
+	removeQueuedMessage(threadId: string, id: string): void;
+	clearQueuedMessages(threadId: string): void;
 
 	getCurrentThread(): ThreadType;
 	openNewThread(): void;
@@ -658,24 +661,37 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._onDidChangeUnreadThreads.fire()
 	}
 
-	// Follow-up typed while a run was streaming. Single slot per thread —
-	// queuing again replaces. Auto-sent as the next turn when the run ends
-	// naturally (not on approval-parked ends). Kept on abort: stopping
-	// deliberately preserves the queued message for a manual send.
-	// In-memory only, dropped with the thread.
-	private readonly _queuedMessageOfThreadId = new Map<string, QueuedMessage>();
+	// Follow-ups typed while a run is streaming (FIFO; see QueuedMessage).
+	// The head auto-sends as the next turn when the run ends naturally (not
+	// on approval-parked ends). Kept on abort: stopping deliberately
+	// preserves the list for manual send-now. In-memory only, dropped with
+	// the thread.
+	private readonly _queuedMessagesOfThreadId = new Map<string, QueuedMessage[]>();
 	private readonly _onDidChangeQueuedMessage = new Emitter<{ threadId: string }>();
 	readonly onDidChangeQueuedMessage: Event<{ threadId: string }> = this._onDidChangeQueuedMessage.event;
-	getQueuedMessage(threadId: string): QueuedMessage | undefined {
-		return this._queuedMessageOfThreadId.get(threadId)
+	getQueuedMessages(threadId: string): QueuedMessage[] {
+		return [...(this._queuedMessagesOfThreadId.get(threadId) ?? [])]
 	}
-	queueUserMessage(threadId: string, msg: QueuedMessage): void {
-		if (!this.state.allThreads[threadId]) return
-		this._queuedMessageOfThreadId.set(threadId, msg)
+	queueUserMessage(threadId: string, msg: Omit<QueuedMessage, 'id'>): string {
+		if (!this.state.allThreads[threadId]) return ''
+		const id = generateUuid()
+		const list = this._queuedMessagesOfThreadId.get(threadId) ?? []
+		list.push({ ...msg, id })
+		this._queuedMessagesOfThreadId.set(threadId, list)
+		this._onDidChangeQueuedMessage.fire({ threadId })
+		return id
+	}
+	removeQueuedMessage(threadId: string, id: string): void {
+		const list = this._queuedMessagesOfThreadId.get(threadId)
+		if (!list) return
+		const next = list.filter(m => m.id !== id)
+		if (next.length === list.length) return
+		if (next.length === 0) this._queuedMessagesOfThreadId.delete(threadId)
+		else this._queuedMessagesOfThreadId.set(threadId, next)
 		this._onDidChangeQueuedMessage.fire({ threadId })
 	}
-	clearQueuedMessage(threadId: string): void {
-		if (this._queuedMessageOfThreadId.delete(threadId))
+	clearQueuedMessages(threadId: string): void {
+		if (this._queuedMessagesOfThreadId.delete(threadId))
 			this._onDidChangeQueuedMessage.fire({ threadId })
 	}
 
@@ -3334,16 +3350,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// Fire-and-forget so this run's completion (notification, unread)
 		// isn't held back by the follow-up turn.
 		if (isRunningWhenEnd === undefined) {
-			const queued = this._queuedMessageOfThreadId.get(threadId)
-			if (queued) {
-				this._queuedMessageOfThreadId.delete(threadId)
-				this._onDidChangeQueuedMessage.fire({ threadId })
+			const head = this._queuedMessagesOfThreadId.get(threadId)?.[0]
+			if (head) {
+				this.removeQueuedMessage(threadId, head.id)
 				this.addUserMessageAndStreamResponse({
-					userMessage: queued.userMessage,
-					_chatSelections: queued.chatSelections,
+					userMessage: head.userMessage,
+					_chatSelections: head.chatSelections,
 					threadId,
-					_pendingImageBytes: queued.pendingImageBytes,
-					modelSelectionOptionsOverride: queued.modelSelectionOptionsOverride,
+					_pendingImageBytes: head.pendingImageBytes,
+					modelSelectionOptionsOverride: head.modelSelectionOptionsOverride,
 				}).catch(e => { console.error('Error while sending queued message:', e) })
 			}
 		}
@@ -4754,7 +4769,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const deletedThread = currentThreads[threadId]
 
 		this.markThreadRead(threadId)
-		this.clearQueuedMessage(threadId)
+		this.clearQueuedMessages(threadId)
 
 		// Clean up image files owned by this thread.
 		// Load messages first so image paths are available for cleanup.
