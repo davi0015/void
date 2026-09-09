@@ -3451,6 +3451,80 @@ export const SidebarChat = () => {
 	const threadId = currentThread.id
 	const queuedMessages = useQueuedMessages(currentThread.id)
 
+	// checkpoint disabled — see checkpoint-storage-refactor.md
+	// const currCheckpointIdx = chatThreadsState.allThreads[threadId]?.state?.currCheckpointIdx ?? undefined
+
+
+
+	// resolve mount info
+	const isResolved = chatThreadsState.allThreads[threadId]?.state.mountedInfo?.mountedIsResolvedRef.current
+	useEffect(() => {
+		if (isResolved) return
+		chatThreadsState.allThreads[threadId]?.state.mountedInfo?._whenMountedResolver?.({
+			textAreaRef: textAreaRef,
+			scrollToBottom: () => scrollToBottom(scrollContainerRef),
+		})
+
+	}, [chatThreadsState, threadId, textAreaRef, scrollContainerRef, isResolved])
+
+	// Sync the "input is empty" flag with the draft for the new thread.
+	useEffect(() => {
+		const draft = draftsRef.current.get(currentThread.id) ?? ''
+		setInstructionsAreEmpty(!draft)
+	}, [currentThread.id])
+
+	// Render one ThreadMessagesView per cached thread id, with only the active
+	// one visible. The hidden views preserve their full React state (bubble
+	// collapse toggles, scroll position, streaming progress) and their DOM —
+	// returning to a recently-seen thread is near-instant because no mount/
+	// unmount cycle happens; only the `hidden` attribute flips.
+	const messagesHTML = (
+		<div className='relative flex-1 min-h-0 w-full'>
+			{visibleCachedIds.map(id => (
+				<div
+					key={id}
+					// Stack all cached thread views in the same box; only the
+					// active one's `hidden=false` makes it visible. Absolute
+					// positioning lets hidden views take zero layout space
+					// while still being part of the DOM / React tree.
+					className='absolute inset-0'
+					hidden={id !== currentThread.id}
+				>
+					<ErrorBoundary>
+						<ThreadMessagesView
+							threadId={id}
+							isActive={id === currentThread.id}
+							scrollContainerRef={getScrollContainerRef(id)}
+						/>
+					</ErrorBoundary>
+				</div>
+			))}
+		</div>
+	)
+
+
+	const onChangeText = useCallback((newStr: string) => {
+		setInstructionsAreEmpty(!newStr)
+		draftsRef.current.set(currentThread.id, newStr)
+	}, [setInstructionsAreEmpty, currentThread.id])
+	const onKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
+		if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+			onSubmit()
+		} else if (e.key === 'Escape' && isRunning) {
+			onAbort()
+		}
+	}, [onSubmit, onAbort, isRunning])
+
+	const mainImageAttach = useImageAttach(selections, setSelections)
+	const mainImageUploadEnabled = useImageUploadEnabled()
+
+	// Phase E commit 4 — when the current thread is read-only (foreign
+	// workspace), wrap the input in a `pointer-events-none opacity-60`
+	// shell so mouse / touch can't focus the textarea, click the model
+	// dropdown, etc. Keyboard `Enter` is independently blocked via
+	// `isDisabled` above. The banner above the messages explains why
+	// it's grayed out and offers Copy/Move.
+
 	// Load a queued item back into the input for editing. Attachments whose
 	// image bytes are gone are dropped rather than sent broken.
 	const onEditQueued = useCallback((id: string) => {
@@ -3535,79 +3609,6 @@ export const SidebarChat = () => {
 			))}
 		</div>
 	) : null
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// const currCheckpointIdx = chatThreadsState.allThreads[threadId]?.state?.currCheckpointIdx ?? undefined
-
-
-
-	// resolve mount info
-	const isResolved = chatThreadsState.allThreads[threadId]?.state.mountedInfo?.mountedIsResolvedRef.current
-	useEffect(() => {
-		if (isResolved) return
-		chatThreadsState.allThreads[threadId]?.state.mountedInfo?._whenMountedResolver?.({
-			textAreaRef: textAreaRef,
-			scrollToBottom: () => scrollToBottom(scrollContainerRef),
-		})
-
-	}, [chatThreadsState, threadId, textAreaRef, scrollContainerRef, isResolved])
-
-	// Sync the "input is empty" flag with the draft for the new thread.
-	useEffect(() => {
-		const draft = draftsRef.current.get(currentThread.id) ?? ''
-		setInstructionsAreEmpty(!draft)
-	}, [currentThread.id])
-
-	// Render one ThreadMessagesView per cached thread id, with only the active
-	// one visible. The hidden views preserve their full React state (bubble
-	// collapse toggles, scroll position, streaming progress) and their DOM —
-	// returning to a recently-seen thread is near-instant because no mount/
-	// unmount cycle happens; only the `hidden` attribute flips.
-	const messagesHTML = (
-		<div className='relative flex-1 min-h-0 w-full'>
-			{visibleCachedIds.map(id => (
-				<div
-					key={id}
-					// Stack all cached thread views in the same box; only the
-					// active one's `hidden=false` makes it visible. Absolute
-					// positioning lets hidden views take zero layout space
-					// while still being part of the DOM / React tree.
-					className='absolute inset-0'
-					hidden={id !== currentThread.id}
-				>
-					<ErrorBoundary>
-						<ThreadMessagesView
-							threadId={id}
-							isActive={id === currentThread.id}
-							scrollContainerRef={getScrollContainerRef(id)}
-						/>
-					</ErrorBoundary>
-				</div>
-			))}
-		</div>
-	)
-
-
-	const onChangeText = useCallback((newStr: string) => {
-		setInstructionsAreEmpty(!newStr)
-		draftsRef.current.set(currentThread.id, newStr)
-	}, [setInstructionsAreEmpty, currentThread.id])
-	const onKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
-		if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-			onSubmit()
-		} else if (e.key === 'Escape' && isRunning) {
-			onAbort()
-		}
-	}, [onSubmit, onAbort, isRunning])
-
-	const mainImageAttach = useImageAttach(selections, setSelections)
-	const mainImageUploadEnabled = useImageUploadEnabled()
-
-	// Phase E commit 4 — when the current thread is read-only (foreign
-	// workspace), wrap the input in a `pointer-events-none opacity-60`
-	// shell so mouse / touch can't focus the textarea, click the model
-	// dropdown, etc. Keyboard `Enter` is independently blocked via
-	// `isDisabled` above. The banner above the messages explains why
-	// it's grayed out and offers Copy/Move.
 	const inputChatArea = <div className={isCurrentThreadReadOnly ? 'pointer-events-none opacity-60' : ''}>
 		{queueListHTML}
 		<VoidChatArea
