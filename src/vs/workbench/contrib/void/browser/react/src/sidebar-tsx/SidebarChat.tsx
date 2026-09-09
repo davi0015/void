@@ -983,15 +983,16 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 					)}
 
 					{(() => {
-						// Single smart button: idle always submits; streaming
-						// with text queues on press; streaming and empty shows
-						// only Stop. The arrow never stops a run implicitly.
+						// One button only: Stop when streaming and empty,
+						// otherwise Submit (streaming + typing queues on press).
+						// Esc still aborts any run; clearing the input brings
+						// Stop back.
 						const submitBtn = isStreaming
 							? <ButtonSubmit onClick={onSubmit} disabled={isDisabled} data-tooltip-id='void-tooltip' data-tooltip-content='Queue message' data-tooltip-place='top' />
 							: <ButtonSubmit onClick={onSubmit} disabled={isDisabled} />
 						const button = isStreaming && isDisabled
 							? <ButtonStop onClick={onAbort} />
-							: <>{submitBtn}{isStreaming ? <ButtonStop onClick={onAbort} /> : null}</>
+							: submitBtn
 						if (!threadIdForUsageRing) return button
 						return (
 							<SubmitButtonWithUsageRing threadId={threadIdForUsageRing} featureName={featureName}>
