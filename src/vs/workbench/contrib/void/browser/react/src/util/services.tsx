@@ -96,6 +96,8 @@ const activeURIListeners: Set<(uri: URI | null) => void> = new Set();
 let unreadThreadIds: string[] = []
 const unreadThreadListeners: Set<() => void> = new Set()
 
+const queuedMessageListeners: Set<(threadId: string) => void> = new Set()
+
 const mcpListeners: Set<() => void> = new Set()
 
 let semanticIndexStatus: IndexStatus = 'idle'
@@ -208,6 +210,12 @@ export const _registerServices = (accessor: ServicesAccessor) => {
 		chatThreadsStateService.onDidChangeUnreadThreads(() => {
 			unreadThreadIds = chatThreadsStateService.getUnreadThreadIds()
 			unreadThreadListeners.forEach(l => l())
+		})
+	)
+
+	disposables.push(
+		chatThreadsStateService.onDidChangeQueuedMessage(({ threadId }) => {
+			queuedMessageListeners.forEach(l => l(threadId))
 		})
 	)
 
@@ -617,6 +625,25 @@ export const useUnreadThreadIds = () => {
 		unreadThreadListeners.add(listener);
 		return () => { unreadThreadListeners.delete(listener) };
 	}, [])
+	return s
+}
+
+// Follow-ups queued while a run streams (FIFO list per thread).
+// The head auto-sends when the run ends; items are edited/sent/deleted
+// from the queue list UI.
+export const useQueuedMessages = (threadId: string) => {
+	const accessor = useAccessor()
+	const chatThreadsService = accessor.get('IChatThreadService')
+	const [s, ss] = useState(() => chatThreadsService.getQueuedMessages(threadId))
+	useEffect(() => {
+		ss(chatThreadsService.getQueuedMessages(threadId))
+		const listener = (tid: string) => {
+			if (tid !== threadId) return
+			ss(chatThreadsService.getQueuedMessages(threadId))
+		}
+		queuedMessageListeners.add(listener);
+		return () => { queuedMessageListeners.delete(listener) };
+	}, [chatThreadsService, threadId])
 	return s
 }
 // roughly gets the active URI - this is used to get the history of recent URIs
