@@ -820,9 +820,8 @@ interface VoidChatAreaProps {
 	// Form controls
 	onSubmit: () => void;
 	onAbort: () => void;
-	// Queue a message for when the run finishes (shown only while streaming).
-	onQueue?: () => void;
 	// Tooltip for the submit arrow while streaming (undefined = none).
+	// While streaming the arrow opens the send/queue chooser, it never acts.
 	submitTooltip?: string;
 	isStreaming: boolean;
 	isDisabled?: boolean;
@@ -859,7 +858,6 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 	children,
 	onSubmit,
 	onAbort,
-	onQueue,
 	submitTooltip,
 	onClose,
 	onClickAnywhere,
@@ -988,13 +986,10 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 					)}
 
 					{(() => {
-						const queueBtn = onQueue && isStreaming
-							? <QueueButton onClick={onQueue} disabled={isDisabled} />
-							: null
 						const submitBtn = <ButtonSubmit onClick={onSubmit} disabled={isDisabled}
 							{...(submitTooltip && isStreaming ? { 'data-tooltip-id': 'void-tooltip', 'data-tooltip-content': submitTooltip, 'data-tooltip-place': 'top' } : {})} />
 						const button = isStreaming
-							? <>{queueBtn}{submitBtn}<ButtonStop onClick={onAbort} /></>
+							? <>{submitBtn}<ButtonStop onClick={onAbort} /></>
 							: submitBtn
 						if (!threadIdForUsageRing) return button
 						return (
@@ -1029,23 +1024,6 @@ export const ButtonSubmit = ({ className, disabled, ...props }: ButtonProps & Re
 		{...props}
 	>
 		<IconArrowUp size={DEFAULT_BUTTON_SIZE} className="stroke-[2] p-[2px]" />
-	</button>
-}
-
-export const QueueButton = ({ className, disabled, ...props }: ButtonProps & Required<Pick<ButtonProps, 'disabled'>>) => {
-	return <button
-		type='button'
-		className={`rounded-full flex-shrink-0 flex-grow-0 flex items-center justify-center
-			${disabled ? 'opacity-40 cursor-default' : 'cursor-pointer text-void-fg-3 hover:text-void-fg-1 hover:bg-void-bg-2'}
-			${className}
-		`}
-		data-tooltip-id='void-tooltip'
-		data-tooltip-content='Queue message for when the run finishes'
-		data-tooltip-place='top'
-		disabled={disabled}
-		{...props}
-	>
-		<Clock size={DEFAULT_BUTTON_SIZE} className="p-[4px]" />
 	</button>
 }
 
@@ -3469,6 +3447,11 @@ export const SidebarChat = () => {
 
 	const threadId = currentThread.id
 	const queuedMessage = useQueuedMessage(currentThread.id)
+	// Send/queue chooser: while streaming, the arrow opens this menu instead
+	// of acting — Enter/arrow never implicitly stops a run.
+	const [showSendChoice, setShowSendChoice] = useState(false)
+	// The run ended while the menu was open — its options no longer apply.
+	useEffect(() => { if (!isRunning) setShowSendChoice(false) }, [isRunning])
 	// checkpoint disabled — see checkpoint-storage-refactor.md
 	// const currCheckpointIdx = chatThreadsState.allThreads[threadId]?.state?.currCheckpointIdx ?? undefined
 
@@ -3526,12 +3509,16 @@ export const SidebarChat = () => {
 		draftsRef.current.set(currentThread.id, newStr)
 	}, [setInstructionsAreEmpty, currentThread.id])
 	const onKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
+		if (e.key === 'Escape' && showSendChoice) {
+			setShowSendChoice(false)
+			return
+		}
 		if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
 			onSubmit()
 		} else if (e.key === 'Escape' && isRunning) {
 			onAbort()
 		}
-	}, [onSubmit, onAbort, isRunning])
+	}, [onSubmit, onAbort, isRunning, showSendChoice])
 
 	const mainImageAttach = useImageAttach(selections, setSelections)
 	const mainImageUploadEnabled = useImageUploadEnabled()
@@ -3564,14 +3551,47 @@ export const SidebarChat = () => {
 		</div>
 	) : null
 
-	const inputChatArea = <div className={isCurrentThreadReadOnly ? 'pointer-events-none opacity-60' : ''}>
+	// Chooser rows: send-now is destructive, so it is offered only while the
+	// run is genuinely working — never while parked for approval (that would
+	// silently discard the pending approval).
+	const sendChoiceHTML = showSendChoice && isRunning ? (
+		<>
+			<div className='fixed inset-0 z-10' onClick={() => setShowSendChoice(false)} />
+			<div className='absolute bottom-full right-0 z-20 mb-1 w-56 overflow-hidden rounded-md border border-void-border-1 bg-void-bg-2 shadow-md'>
+				{!isAwaitingApproval && (
+					<button type='button'
+						className='flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-void-bg-3 cursor-pointer'
+						onClick={() => { setShowSendChoice(false); onSubmit() }}
+					>
+						<span className='text-xs text-void-fg-1 font-medium'>Send now</span>
+						<span className='text-[11px] text-void-fg-3'>Stop the current run and send</span>
+					</button>
+				)}
+				<button type='button'
+					className='flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-void-bg-3 cursor-pointer'
+					onClick={() => { setShowSendChoice(false); onQueue() }}
+				>
+					<span className='text-xs text-void-fg-1 font-medium'>Queue for after</span>
+					<span className='text-[11px] text-void-fg-3'>Send when this run finishes</span>
+				</button>
+				<button type='button'
+					className='flex w-full px-3 py-1.5 text-left text-xs text-void-fg-3 hover:bg-void-bg-3 cursor-pointer'
+					onClick={() => setShowSendChoice(false)}
+				>
+					Cancel
+				</button>
+			</div>
+		</>
+	) : null
+
+	const inputChatArea = <div className={`${isCurrentThreadReadOnly ? 'pointer-events-none opacity-60' : ''} relative`}>
 		{queuedChipHTML}
+		{sendChoiceHTML}
 		<VoidChatArea
 			featureName='Chat'
-			onSubmit={() => onSubmit()}
+			onSubmit={() => { if (isRunning) setShowSendChoice(true); else onSubmit() }}
 			onAbort={onAbort}
-			onQueue={isRunning ? onQueue : undefined}
-			submitTooltip={isAwaitingApproval ? 'Queue message (approval pending)' : isRunning ? 'Stop current run and send' : undefined}
+			submitTooltip={isRunning ? 'Send or queue options' : undefined}
 			isStreaming={!!isRunning}
 			isDisabled={isDisabled}
 			showSelections={true}
