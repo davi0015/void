@@ -107,11 +107,9 @@ export class ExtensionsProposedApi {
 			return;
 		}
 
-		if (!extension.isBuiltin && isNonEmptyArray(extension.enabledApiProposals)) {
-			// restrictive: extension cannot use proposed API in this context and its declaration is nulled
-			this._logService.error(`Extension '${extension.identifier.value} CANNOT USE these API proposals '${extension.enabledApiProposals?.join(', ') || '*'}'. You MUST start in extension development mode or use the --enable-proposed-api command line flag`);
-			extension.enabledApiProposals = [];
-		}
+		// [VOID] Trust each extension's own enabledApiProposals declaration instead of
+		// stripping them for non-builtin extensions. This allows marketplace extensions
+		// like Jupyter to use proposed APIs without maintaining a product.json allowlist.
 	}
 }
 
