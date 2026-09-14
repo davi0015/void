@@ -18,9 +18,19 @@ import { readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { preflight } from './harness.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const only = process.argv.find((a) => a.startsWith('--only='))?.split('=')[1]
+
+// Checked here as well as inside the test files: a throw from a node:test hook
+// reports every scenario as cancelled, which buries the actual reason.
+try {
+	preflight()
+} catch (err) {
+	console.error(String(err?.message ?? err))
+	process.exit(2)
+}
 
 const files = readdirSync(HERE)
 	.filter((f) => f.endsWith('.test.mjs'))

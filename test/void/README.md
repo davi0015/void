@@ -4,10 +4,15 @@ Tests that drive the real application (Electron under Playwright) and assert
 against what actually reached disk.
 
 ```
-npm run test-void                      # every test/void/*.test.mjs
-node test/void/run.mjs --only=durable  # files matching a substring
-VOID_EXPECT=lost npm run test-void     # invert subject assertions (see below)
+npm run test-void                          # every test/void/*.test.mjs
+npm run test-void -- --only=durable        # files matching a substring
+node test/void/run.mjs --only=durable      # same, without npm in the way
+VOID_EXPECT=lost npm run test-void         # invert subject assertions (see below)
 ```
+
+There is deliberately no per-test npm script. One entry point plus `--only`
+covers both "run everything" and "run this area", and per-file aliases would
+multiply with every new test file.
 
 Requires a compiled build and a downloaded Electron (`npm run compile`,
 `npm run electron`). The runner checks this up front and says so.
