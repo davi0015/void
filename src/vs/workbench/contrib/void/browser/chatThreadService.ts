@@ -1249,10 +1249,21 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// back uncompacted on the next launch while the user believes it is
 	// compacted, and the context is immediately over budget again.
 	//
-	// Flushing here rather than waiting for shutdown makes the write durable
-	// at the moment it happens, so it survives a crash or force-quit as well
-	// as a clean one. The cost is one synchronous serialization on an action
-	// that already spent seconds on an LLM request.
+	// Flushing here rather than waiting for shutdown hands the write to the
+	// storage layer at the moment it happens instead of leaving it in this
+	// service's queue until a lifecycle event fires, so it no longer depends
+	// on shutdown ordering at all: the workbench's own close path persists
+	// whatever storage has pending.
+	//
+	// This is not a synchronous write to disk. The storage layer debounces its
+	// own handoff (100ms in the renderer, then again in the main process before
+	// the SQLite write), so a hard kill inside that ~200ms window is still
+	// lost — the same exposure every other persisted setting has. What this
+	// removes is the much larger window where a completed compaction sat only
+	// in memory awaiting a shutdown hook that could not persist it.
+	//
+	// The cost is one synchronous serialization on an action that already
+	// spent seconds on an LLM request.
 	private _storeThreadDurably(threadId: string, thread: ThreadType, updateIndex = false) {
 		this._storeThread(threadId, thread, updateIndex)
 		this._flushPendingThreadWrites()
