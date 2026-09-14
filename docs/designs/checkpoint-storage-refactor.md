@@ -60,16 +60,22 @@ The checkpoint feature (undo/redo file state via "Checkpoint" buttons in chat) h
 
 ### Message storage (simplified)
 
-`messageCount` was removed — it was only needed to handle gaps from deleted checkpoint keys. With checkpoints disabled, message keys are always contiguous `0, 1, 2, ...`. The read loop reads until `undefined`:
+`messageCount` was removed — it was only needed to handle gaps from deleted checkpoint keys.
+
+**Correction (added later):** the claim that message keys are now "always contiguous" does not hold, and the read loop does not read until `undefined`. Gaps can still exist, so the loop scans a bounded range and **skips** gaps rather than stopping at the first one, compacting survivors to contiguous indices as it goes:
 
 ```typescript
 let writeIdx = 0
-for (let i = 0; ; i++) {
+let lastIdx = -1
+for (let i = 0; i < 100000; i++) {
     const msgRaw = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.' + i, ...)
-    if (msgRaw === undefined) break
+    if (msgRaw === undefined) continue         // skip gaps — NOT break
+    lastIdx = i
     const msg = JSON.parse(msgRaw, ...) as any
-    if (msg.role === 'checkpoint') continue // @deprecated Migration 2 — discard old checkpoint data
+    if (msg.role === 'checkpoint') continue    // @deprecated Migration 2 — discard old checkpoint data
     if (writeIdx !== i) {
+        // compact: re-store at contiguous index, remove the old key
+    }
         // compact: re-store at contiguous index
         this._storageService.store(MESSAGE_KEY_PREFIX + threadId + '.' + writeIdx, ...)
         this._storageService.remove(MESSAGE_KEY_PREFIX + threadId + '.' + i, ...)
@@ -84,6 +90,8 @@ New messages append at `messages.length`:
 const msgIdx = oldThread.messages.length
 this._storeMessageKey(threadId, msgIdx, message)
 ```
+
+**Two consequences worth noting.** This scan runs on **every** full thread load — it is not gated to first-run migration — so the cost is paid on every thread switch, not once. And the compaction it performs **renumbers** the message array, which is why `compactionBoundaryIdx` (a positional index) can end up pointing at the wrong message. Both are analysed in `thread-storage.md`.
 
 ### Why disabled
 
