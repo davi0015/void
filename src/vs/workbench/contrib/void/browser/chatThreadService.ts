@@ -975,6 +975,27 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// the last 500ms of message/usage/metadata writes. Without this,
 		// a reload window can drop the most recent messages, causing
 		// compaction boundary mismatches and prefix cache invalidation.
+		//
+		// This has to run on onBeforeShutdown, not on onWillShutdown alone.
+		// The workbench registers its own onWillShutdown listener during
+		// startup (electron-sandbox/desktop.main.ts) which closes storage.
+		// Storage.close() sets StorageState.Closed synchronously, before its
+		// first await, and Storage.set() returns early — silently discarding
+		// the value — once that state is set. Listeners fire in registration
+		// order and the workbench's listener was registered long before this
+		// service exists, so a flush on onWillShutdown always runs after
+		// storage has closed: every write it makes is dropped with no error.
+		//
+		// onBeforeShutdown is a strictly earlier phase. The main process
+		// sends vscode:onBeforeUnload and waits for the veto round-trip
+		// before it sends vscode:onWillUnload, so this flush lands while
+		// storage is still open. Storage.close() then flushes the pending
+		// inserts it accumulated, which is what makes them durable.
+		this._register(this._lifecycleService.onBeforeShutdown(() => {
+			this._flushPendingThreadWrites()
+		}))
+		// Retained as a fallback for shutdown paths that do not fire
+		// onBeforeShutdown. A no-op when the earlier flush already ran.
 		this._register(this._lifecycleService.onWillShutdown(() => {
 			this._flushPendingThreadWrites()
 		}))
@@ -1216,6 +1237,25 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (!this._storeThreadFlushScheduler.isScheduled()) {
 			this._storeThreadFlushScheduler.schedule()
 		}
+	}
+
+	// Store a thread and persist it immediately, bypassing the 500ms
+	// coalescing window that _storeThread normally uses.
+	//
+	// Use this for writes whose loss is user-visible and unrecoverable.
+	// Compaction is the canonical case: it is user-initiated, infrequent, and
+	// the summarization request that produced it has already been paid for in
+	// tokens. Losing the write discards that work silently — the thread comes
+	// back uncompacted on the next launch while the user believes it is
+	// compacted, and the context is immediately over budget again.
+	//
+	// Flushing here rather than waiting for shutdown makes the write durable
+	// at the moment it happens, so it survives a crash or force-quit as well
+	// as a clean one. The cost is one synchronous serialization on an action
+	// that already spent seconds on an LLM request.
+	private _storeThreadDurably(threadId: string, thread: ThreadType, updateIndex = false) {
+		this._storeThread(threadId, thread, updateIndex)
+		this._flushPendingThreadWrites()
 	}
 
 	// Write an individual message key. Called by _addMessageToThread,
@@ -5622,7 +5662,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				this.latestUsageOfThreadId[threadId] = preCompactionLatestUsage
 			}
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
-			this._storeThread(threadId, updatedThread)
+			// Durable write: the summarization request has already been paid
+			// for, so losing this write silently discards it on next launch.
+			this._storeThreadDurably(threadId, updatedThread)
 			this._setState({ allThreads: newThreads })
 			return null
 		} catch (e) {
