@@ -971,32 +971,31 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// 	disposablesOfModelId[e.id].forEach(d => d.dispose())
 		// }))
 
-		// Flush pending writes on shutdown so reload/close doesn't lose
-		// the last 500ms of message/usage/metadata writes. Without this,
-		// a reload window can drop the most recent messages, causing
-		// compaction boundary mismatches and prefix cache invalidation.
+		// Flush pending writes when the window unloads, so that quitting or
+		// reloading does not lose the last 500ms of message/usage/metadata
+		// writes. Without this a reload can drop the most recent messages,
+		// causing compaction boundary mismatches and prefix cache invalidation.
 		//
-		// This has to run on onBeforeShutdown, not on onWillShutdown alone.
-		// The workbench registers its own onWillShutdown listener during
-		// startup (electron-sandbox/desktop.main.ts) which closes storage.
-		// Storage.close() sets StorageState.Closed synchronously, before its
-		// first await, and Storage.set() returns early — silently discarding
-		// the value — once that state is set. Listeners fire in registration
-		// order and the workbench's listener was registered long before this
-		// service exists, so a flush on onWillShutdown always runs after
-		// storage has closed: every write it makes is dropped with no error.
+		// This has to be onBeforeShutdown, and deliberately NOT onWillShutdown.
+		// It used to be on onWillShutdown, where it silently did nothing: the
+		// workbench closes storage from its own onWillShutdown listener,
+		// registered during startup (electron-sandbox/desktop.main.ts; the web
+		// workbench does the same via onWillShutdownDisposables in
+		// browser/web.main.ts), long before this service exists. Listeners fire
+		// in registration order, Storage.close() sets StorageState.Closed
+		// synchronously before its first await, and Storage.set() returns early
+		// once that state is set — discarding the value with no error. So a
+		// flush there always ran after storage had closed and every write it
+		// made was dropped, which is how a completed compaction could vanish.
 		//
-		// onBeforeShutdown is a strictly earlier phase. The main process
-		// sends vscode:onBeforeUnload and waits for the veto round-trip
-		// before it sends vscode:onWillUnload, so this flush lands while
-		// storage is still open. Storage.close() then flushes the pending
-		// inserts it accumulated, which is what makes them durable.
+		// onBeforeShutdown is a strictly earlier phase: the main process sends
+		// vscode:onBeforeUnload and waits for the veto round-trip before it
+		// sends vscode:onWillUnload. This flush therefore lands while storage is
+		// still open, and the workbench's later close() flushes the pending
+		// inserts it accumulated. Adding a second flush on onWillShutdown would
+		// not be a backstop — it cannot succeed in either workbench, by the
+		// registration order described above.
 		this._register(this._lifecycleService.onBeforeShutdown(() => {
-			this._flushPendingThreadWrites()
-		}))
-		// Retained as a fallback for shutdown paths that do not fire
-		// onBeforeShutdown. A no-op when the earlier flush already ran.
-		this._register(this._lifecycleService.onWillShutdown(() => {
 			this._flushPendingThreadWrites()
 		}))
 
