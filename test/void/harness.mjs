@@ -262,7 +262,13 @@ export function pendingThreadWrites(page) {
  */
 export function stubLLM(page, text, { usage } = {}) {
 	return page.evaluate(({ text, usage }) => {
-		globalThis.__voidChatThreadService._llmMessageService.sendLLMMessage = (opts) => {
+		// Every outgoing request is recorded so a test can assert on what the
+		// model was actually sent — the only way to check prompt construction
+		// (system message, compaction summary, history) without a provider.
+		const g = globalThis
+		g.__voidLLMRequests = []
+		g.__voidChatThreadService._llmMessageService.sendLLMMessage = (opts) => {
+			try { g.__voidLLMRequests.push(opts) } catch { /* ignore */ }
 			setTimeout(() => {
 				const u = usage ?? { inputTokens: 1000, outputTokens: 100, totalTokens: 1100, requestCount: 1 }
 				try { opts.onText?.({ usage: u }) } catch { /* ignore */ }
@@ -271,6 +277,20 @@ export function stubLLM(page, text, { usage } = {}) {
 			return { cancel: () => { /* nothing to cancel */ } }
 		}
 	}, { text, usage })
+}
+
+/**
+ * Everything stubLLM was asked to send, as a JSON string. Serialized rather than
+ * returned structurally so assertions do not depend on the provider-specific
+ * message shape, which differs per provider.
+ */
+export function capturedLLMRequests(page) {
+	return page.evaluate(() => JSON.stringify(globalThis.__voidLLMRequests ?? []))
+}
+
+/** How many requests stubLLM has been asked to send so far. */
+export function capturedLLMRequestCount(page) {
+	return page.evaluate(() => (globalThis.__voidLLMRequests ?? []).length)
 }
 
 /** Fills the current thread with synthetic messages via the dev hook. */
