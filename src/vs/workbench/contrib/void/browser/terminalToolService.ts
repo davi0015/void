@@ -527,6 +527,40 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 					disposables.push(l)
 				})
 
+				// [VOID] Fail fast when the shell dies or fails to launch (e.g. pty
+				// exhaustion — "posix_openpt failed: Device not configured").
+				// createTerminal never throws on launch failure: VS Code reports it
+				// asynchronously via the terminal's exit event and renders the
+				// error into the buffer. Without this listener, a dead-on-arrival
+				// terminal is indistinguishable from a running command (no output,
+				// no command-finished), so the tool blocks for the full inactivity
+				// timeout while the UI shows only the restart loop.
+				const waitUntilShellExit = new Promise<void>(resolve => {
+					const l = terminal.onExit(async (exitCodeOrError) => {
+						if (resolveReason) return // command already completed normally
+						// Launch failures arrive as an ITerminalLaunchError on this event —
+						// e.g. "A native exception occurred during launch (posix_openpt
+						// failed: Device not configured)". VS Code only renders it as a
+						// desktop notification, so pull it from the event directly.
+						const launchErrorMessage = typeof exitCodeOrError === 'object' && exitCodeOrError !== null ? exitCodeOrError.message : undefined
+						let output = ''
+						try {
+							const terminalId = isPersistent ? params.persistentTerminalId : params.terminalId
+							output = await this.readTerminalFromLine(terminalId, startMarker?.line ?? 0)
+						} catch {
+							// buffer unavailable
+						}
+						const parts: string[] = []
+						if (launchErrorMessage) parts.push(`Terminal error: ${launchErrorMessage}`)
+						if (output) parts.push(output)
+						if (parts.length === 0) parts.push(`The terminal's shell exited before the command completed (exit code: ${terminal.exitCode ?? 'unknown'}).`)
+						result = parts.join('\n')
+						resolveReason = { type: 'done', exitCode: terminal.exitCode ?? 0 }
+						resolve()
+					})
+					disposables.push(l)
+				})
+
 
 				// send the command now that listeners are attached
 				await terminal.sendText(command, true)
@@ -569,7 +603,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 					})
 
 				// wait for result
-				await Promise.any([waitUntilDone, waitUntilInterrupt, waitUntilUserInterrupt])
+				await Promise.any([waitUntilDone, waitUntilInterrupt, waitUntilUserInterrupt, waitUntilShellExit])
 
 				// The user stopped the run while a persistent command is still
 				// going: leave it running and settle with the output so far.
