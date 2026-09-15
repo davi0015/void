@@ -1492,7 +1492,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// interrupted_streaming_tool entries are skipped. We must map the
 		// ChatMessage boundary to the corresponding SimpleLLMMessage index.
 		let llmMessages: SimpleLLMMessage[]
-		if (manualCompaction && manualCompaction.boundaryIdx > 0) {
+		if (manualCompaction && manualCompaction.boundaryIdx >= 0) {
 			let llmBoundary = 0
 			for (let ci = 0; ci < Math.min(manualCompaction.boundaryIdx, chatMessages.length); ci++) {
 				const role = chatMessages[ci].role
@@ -1500,7 +1500,10 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 					llmBoundary++
 				}
 			}
-			if (llmBoundary > 0 && llmBoundary <= llmMessagesRaw.length) {
+			// `llmBoundary <= length` alone: at boundary 0 nothing is replaced, and
+			// the summary must still be prepended in front of the whole history.
+			// Requiring `llmBoundary > 0` dropped the compaction instead.
+			if (llmBoundary <= llmMessagesRaw.length) {
 				// The summary user message already has the directory listing
 				// baked in at compaction time (same pattern as the first user
 				// message in normal chat). Content is stable across turns.

@@ -1552,7 +1552,23 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// Only trigger a state update if we actually got messages —
 		// avoids a redundant re-render for threads that are genuinely empty
 		if (fullThread.messages.length > 0) {
-			const updatedThread = { ...existing, messages: fullThread.messages }
+			const updatedThread = {
+				...existing,
+				messages: fullThread.messages,
+				// _readThread remaps the boundary for threads that still carry
+				// checkpoint-era gaps and persists the correction. Take that one
+				// field into memory too, or the session keeps using the stale
+				// index while storage holds the corrected one — wrong until the
+				// next restart, which is when it silently becomes right.
+				//
+				// Only this field, deliberately: a wholesale spread of
+				// fullThread would also overwrite in-memory state with the
+				// persisted copy, which can be older than memory whenever a
+				// write is still sitting in the 500ms coalescing window.
+				...(fullThread.compactionBoundaryIdx !== undefined
+					? { compactionBoundaryIdx: fullThread.compactionBoundaryIdx }
+					: {}),
+			}
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 			this._setState({ allThreads: newThreads })
 		}
@@ -3086,7 +3102,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const pendingImageBytes = this._pendingImageBytesByThread.get(threadId)
 			const currentThread = this.state.allThreads[threadId]
 			const frozenAiInstructions = currentThread?.frozenAiInstructions
-			const manualCompaction = currentThread?.compactionSummary && currentThread?.compactionBoundaryIdx
+			// `!== undefined`, not truthiness: a boundary of 0 is legitimate (it
+			// means the summary sits in front of the entire history) and the load
+			// path's remap can produce exactly 0. Testing it for truthiness
+			// silently discarded the compaction.
+			const manualCompaction = currentThread?.compactionSummary && currentThread.compactionBoundaryIdx !== undefined
 				? { summary: currentThread.compactionSummary, boundaryIdx: currentThread.compactionBoundaryIdx }
 				: undefined
 			const { messages, separateSystemMessage, compactionInfo, sentChars, telemetryRequestId } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
@@ -5533,7 +5553,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		]
 		const currentThread = this.state.allThreads[threadId]
 		const frozenAiInstructions = currentThread?.frozenAiInstructions
-		const manualCompaction = currentThread?.compactionSummary && currentThread?.compactionBoundaryIdx
+		// See the matching comment in _runChatAgent — boundary 0 is valid.
+		const manualCompaction = currentThread?.compactionSummary && currentThread.compactionBoundaryIdx !== undefined
 			? { summary: currentThread.compactionSummary, boundaryIdx: currentThread.compactionBoundaryIdx }
 			: undefined
 
@@ -5670,6 +5691,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			if (preCompactionLatestUsage) {
 				updatedThread.latestUsage = preCompactionLatestUsage
 				this.latestUsageOfThreadId[threadId] = preCompactionLatestUsage
+				// The summarization request's own usage is queued in
+				// _pendingUsageWrites, and the flush prefers that map over the
+				// thread's usage. Drop it, or the restored value above is
+				// discarded on the way to disk and the ring jumps on reopen.
+				this._pendingUsageWrites.delete(threadId)
 			}
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 			// Durable write: the summarization request has already been paid
@@ -5687,6 +5713,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				if (currentThread) {
 					currentThread.latestUsage = preCompactionLatestUsage
 					this.latestUsageOfThreadId[threadId] = preCompactionLatestUsage
+					// Same as the success path: the failed request's usage is
+					// queued in _pendingUsageWrites and would otherwise land on
+					// disk, disagreeing with the value restored here. Dropping it
+					// leaves the previously persisted usage, which is this value.
+					this._pendingUsageWrites.delete(threadId)
 				}
 			}
 			return msg
