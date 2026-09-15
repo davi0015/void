@@ -29,11 +29,11 @@ export const THREAD_INDEX_KEY = 'void.chatThreadIndex'
 // is O(1) instead of re-serializing the entire thread.
 export const MESSAGE_KEY_PREFIX = 'void.chatMsg.'
 
-// Checkpoint storage. Checkpoint snapshots (full file content) are stored
-// separately from conversation messages so they don't bloat the message
-// keys that get loaded at startup. Key format: `void.chatCheckpoint.{threadId}.{messageIndex}`
-// — uses the same index as the position in the messages array, so reads
-// can check both message and checkpoint keys at each index.
+// Legacy checkpoint storage. The feature was removed, but threads written
+// before the removal still carry `role: 'checkpoint'` records in their message
+// keys, and the load path reads those indices to remap `compactionBoundaryIdx`.
+// This prefix exists only so those old keys can be deleted — see
+// `chatThreadService._readThread`. Format: `void.chatCheckpoint.{threadId}.{messageIndex}`.
 export const CHECKPOINT_KEY_PREFIX = 'void.chatCheckpoint.'
 
 // Frequently-changing usage stats (latestUsage, cumulativeUsage, etc.)

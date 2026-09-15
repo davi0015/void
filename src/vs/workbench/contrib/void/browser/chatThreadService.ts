@@ -22,15 +22,13 @@ import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCa
 import { IToolsService } from './toolsService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
-import { ChatMessage, CodespanLocationLink, CompactionInfo, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js'; // checkpoint disabled: CheckpointEntry removed
+import { ChatMessage, CodespanLocationLink, CompactionInfo, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js';
 import { Position } from '../../../../editor/common/core/position.js';
 import { IMetricsService } from '../common/metricsService.js';
 
 import { IVoidModelService } from '../common/voidModelService.js';
 import { findLast } from '../../../../base/common/arraysFind.js';
-import { IEditCodeService } from './editCodeServiceInterface.js';
 import { ITerminalToolService } from './terminalToolService.js';
-// import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js'; // checkpoint disabled — see checkpoint-storage-refactor.md
 import { truncate } from '../../../../base/common/strings.js';
 import { CHECKPOINT_KEY_PREFIX, LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, MESSAGE_KEY_PREFIX, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY, USAGE_KEY_PREFIX } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
@@ -99,27 +97,6 @@ const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | u
 }
 
 
-/*
-
-Store a checkpoint of all "before" files on each x.
-x's show up before user messages and LLM edit tool calls.
-
-x     A          (edited A -> A')
-(... user modified changes ...)
-User message
-
-x     A' B C     (edited A'->A'', B->B', C->C')
-LLM Edit
-x
-LLM Edit
-x
-LLM Edit
-
-
-INVARIANT:
-A checkpoint appears before every LLM message, and before every user message (before user really means directly after LLM is done).
-*/
-
 
 type UserMessageType = ChatMessage & { role: 'user' }
 type UserMessageState = UserMessageType['state']
@@ -143,9 +120,6 @@ export type ThreadType = {
 	lastModified: string; // ISO string
 
 	messages: ChatMessage[];
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// checkpoints: CheckpointEntry[];
-	filesWithUserChanges: Set<string>;
 
 
 	// Last-seen token usage from the LLM for this thread. Persisted so the
@@ -274,8 +248,6 @@ export type ThreadType = {
 
 	// this doesn't need to go in a state object, but feels right
 	state: {
-		// checkpoint disabled — see checkpoint-storage-refactor.md
-		// currCheckpointIdx: number | null;
 		stagingSelections: StagingSelectionItem[];
 		focusedMessageIdx: number | undefined; // index of the user message that is being edited (undefined if none)
 
@@ -350,8 +322,8 @@ export const isThreadInWorkspaceScope = (thread: Pick<ThreadType, 'workspaceUri'
 // window) — there's no "foreign" reference frame to compare against.
 //
 // Used as the single gating predicate for every mutation entry point on
-// `IChatThreadService` (send / edit / approve / reject / checkpoint
-// restore / staging selections). Service-level rather than UI-level so
+// `IChatThreadService` (send / edit / approve / reject / staging
+// selections). Service-level rather than UI-level so
 // the read-only invariant holds even if a future UI bug exposes a
 // disabled button as still-clickable.
 export const isThreadReadOnly = (thread: Pick<ThreadType, 'workspaceUri'> | undefined, currentWorkspaceUri: string | undefined): boolean => {
@@ -473,19 +445,16 @@ const newThreadObject = (workspace?: { uri?: string, label?: string }) => {
 		createdAt: now,
 		lastModified: now,
 		messages: [],
-		// checkpoints: [], // checkpoint disabled
 		workspaceUri: workspace?.uri,
 		workspaceLabel: workspace?.label,
 		// grants nothing on top of global config — out-of-the-box behavior is
 		// identical to threads created before this field existed.
 		permissionMode: 'read_only',
 		state: {
-			// currCheckpointIdx: null, // checkpoint disabled
 			stagingSelections: [],
 			focusedMessageIdx: undefined,
 			linksOfMessageIdx: {},
 		},
-		filesWithUserChanges: new Set()
 	} satisfies ThreadType
 }
 
@@ -614,9 +583,6 @@ export interface IChatThreadService {
 	approveToolRequest(threadId: string, toolId: string): void;
 	rejectToolRequest(threadId: string, toolId: string): void;
 
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// jumpToCheckpointBeforeMessageIdx(opts: { threadId: string, messageIdx: number, jumpToUserModified: boolean }): void;
-
 	focusCurrentChat: () => Promise<void>
 	blurCurrentChat: () => Promise<void>
 
@@ -742,9 +708,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	readonly cumulativeCompactionThisThreadOfThreadId: { [threadId: string]: CompactionInfo | undefined } = {}
 	state: ThreadsState // allThreads is persisted, currentThread is not
 
-	// used in checkpointing
-	// private readonly _userModifiedFilesToCheckInCheckpoints = new LRUCache<string, null>(50)
-
 
 
 	constructor(
@@ -755,9 +718,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IVoidSettingsService private readonly _settingsService: IVoidSettingsService,
 		@ILanguageFeaturesService private readonly _languageFeaturesService: ILanguageFeaturesService,
 		@IMetricsService private readonly _metricsService: IMetricsService,
-		// checkpoint disabled — _editCodeService only used by checkpoint methods
-		// kept in constructor for DI ordering; see checkpoint-storage-refactor.md
-		@IEditCodeService private readonly _editCodeService: IEditCodeService,
 		@IConvertToLLMMessageService private readonly _convertToLLMMessagesService: IConvertToLLMMessageService,
 		@IWorkspaceContextService private readonly _workspaceContextService: IWorkspaceContextService,
 		@IDirectoryStrService private readonly _directoryStringService: IDirectoryStrService,
@@ -771,7 +731,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@INativeHostService private readonly _nativeHostService: INativeHostService,
 	) {
 		super()
-		void this._editCodeService // checkpoint disabled — kept for DI, see checkpoint-storage-refactor.md
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string, pinnedThreadIds: [] } // default state
 
 		const readThreads = this._loadAllThreads() || {}
@@ -955,21 +914,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			}
 		}))
 
-
-		// keep track of user-modified files
-		// const disposablesOfModelId: { [modelId: string]: IDisposable[] } = {}
-		// this._register(
-		// 	this._modelService.onModelAdded(e => {
-		// 		if (!(e.id in disposablesOfModelId)) disposablesOfModelId[e.id] = []
-		// 		disposablesOfModelId[e.id].push(
-		// 			e.onDidChangeContent(() => { this._userModifiedFilesToCheckInCheckpoints.set(e.uri.fsPath, null) })
-		// 		)
-		// 	})
-		// )
-		// this._register(this._modelService.onModelRemoved(e => {
-		// 	if (!(e.id in disposablesOfModelId)) return
-		// 	disposablesOfModelId[e.id].forEach(d => d.dispose())
-		// }))
 
 		// Flush pending writes when the window unloads, so that quitting or
 		// reloading does not lose the last 500ms of message/usage/metadata
@@ -1162,8 +1106,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// At startup, only metadata is loaded for all threads; messages are
 	// loaded on demand when the user switches to a thread.
 	private _loadedMessageThreadIds = new Set<string>()
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// private _pendingCheckpointKeyWrites = new Map<string, CheckpointEntry>()
 
 	// Which fields go in which key. Static metadata is written rarely
 	// (user actions, compaction). Usage is written at ~5Hz during
@@ -1192,15 +1134,32 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const metadata: Record<string, unknown> = {}
 		const usage: Record<string, unknown> = {}
 		for (const [key, value] of Object.entries(thread)) {
-			if (key === 'messages') continue // checkpoint disabled — checkpoints field removed
+			if (key === 'messages') continue // messages live under their own keys
 			if (key === 'title') continue // ephemeral — computed on read, not persisted
 			if (ChatThreadService._USAGE_FIELDS.has(key)) {
 				usage[key] = value
+			} else if (key === 'state') {
+				metadata[key] = ChatThreadService._stripRuntimeState(value)
 			} else {
 				metadata[key] = value
 			}
 		}
 		return { metadata, usage }
+	}
+
+	// `state` is persisted wholesale, but `state.mountedInfo` is live wiring for
+	// the mounted UI: a Promise, its resolver, and a ref. None of it is data, and
+	// serializing it wrote `{"whenMounted":{},"mountedIsResolvedRef":{"current":false}}`
+	// into every thread's metadata. The live object keeps the field — this only
+	// shapes what is written.
+	private static _stripRuntimeState(state: unknown): unknown {
+		if (state === null || typeof state !== 'object') return state
+		const persisted: Record<string, unknown> = {}
+		for (const [key, value] of Object.entries(state)) {
+			if (key === 'mountedInfo') continue
+			persisted[key] = value
+		}
+		return persisted
 	}
 
 	private _storeThread(threadId: string, thread: ThreadType | undefined, updateIndex = false) {
@@ -1216,7 +1175,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				if (this._storageService.get(msgKey, StorageScope.APPLICATION) === undefined) break
 				this._storageService.remove(msgKey, StorageScope.APPLICATION)
 			}
-			// Remove checkpoint keys (separate sequential range)
+			// Remove legacy checkpoint keys (separate sequential range)
 			for (let i = 0; ; i++) {
 				const checkpointKey = CHECKPOINT_KEY_PREFIX + threadId + '.' + i
 				if (this._storageService.get(checkpointKey, StorageScope.APPLICATION) === undefined) break
@@ -1275,12 +1234,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._scheduleThreadFlush()
 	}
 
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// private _storeCheckpointKey(threadId: string, msgIdx: number, checkpoint: CheckpointEntry) {
-	// 	this._pendingCheckpointKeyWrites.set(threadId + '.' + msgIdx, checkpoint)
-	// 	this._scheduleThreadFlush()
-	// }
-
 	private _scheduleThreadFlush() {
 		if (!this._storeThreadFlushScheduler) {
 			this._storeThreadFlushScheduler = new RunOnceScheduler(() => this._flushPendingThreadWrites(), 500)
@@ -1290,21 +1243,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._storeThreadFlushScheduler.schedule()
 		}
 	}
-
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// private _deleteCheckpointKeysFrom(threadId: string, fromIdx: number) {
-	// 	for (let i = fromIdx; ; i++) {
-	// 		const key = CHECKPOINT_KEY_PREFIX + threadId + '.' + i
-	// 		if (this._storageService.get(key, StorageScope.APPLICATION) === undefined) break
-	// 		this._storageService.remove(key, StorageScope.APPLICATION)
-	// 	}
-	// 	for (const k of this._pendingCheckpointKeyWrites.keys()) {
-	// 		if (k.startsWith(threadId + '.')) {
-	// 			const idx = parseInt(k.slice(threadId.length + 1), 10)
-	// 			if (idx >= fromIdx) this._pendingCheckpointKeyWrites.delete(k)
-	// 		}
-	// 	}
-	// }
 
 	// Delete message keys from fromIdx onward (for truncate/rollback).
 	private _deleteMessageKeysFrom(threadId: string, fromIdx: number) {
@@ -1320,13 +1258,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				if (idx >= fromIdx) this._pendingMessageKeyWrites.delete(k)
 			}
 		}
-		// checkpoint disabled — _pendingCheckpointKeyWrites always empty
-		// for (const k of this._pendingCheckpointKeyWrites.keys()) {
-		// 	if (k.startsWith(threadId + '.')) {
-		// 		const idx = parseInt(k.slice(threadId.length + 1), 10)
-		// 		if (idx >= fromIdx) this._pendingCheckpointKeyWrites.delete(k)
-		// 	}
-		// }
 	}
 
 	// Write all messages for a thread (used after truncation/mutation
@@ -1340,7 +1271,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	private _flushPendingThreadWrites() {
-		if (this._pendingThreadWrites.size === 0 && this._pendingUsageWrites.size === 0 && this._pendingMessageKeyWrites.size === 0) return // checkpoint disabled — _pendingCheckpointKeyWrites always empty
+		if (this._pendingThreadWrites.size === 0 && this._pendingUsageWrites.size === 0 && this._pendingMessageKeyWrites.size === 0) return
 
 		// Split each thread into metadata + usage and write separately.
 		// Usage-only writes from _storeUsage take precedence (they're
@@ -1367,15 +1298,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._storageService.store(MESSAGE_KEY_PREFIX + key, JSON.stringify(message), StorageScope.APPLICATION, StorageTarget.USER)
 		}
 
-		// checkpoint disabled — _pendingCheckpointKeyWrites always empty
-		// for (const [key, checkpoint] of this._pendingCheckpointKeyWrites) {
-		// 	this._storageService.store(CHECKPOINT_KEY_PREFIX + key, JSON.stringify(checkpoint), StorageScope.APPLICATION, StorageTarget.USER)
-		// }
-
 		this._pendingThreadWrites.clear()
 		this._pendingUsageWrites.clear()
 		this._pendingMessageKeyWrites.clear()
-		// this._pendingCheckpointKeyWrites.clear() // checkpoint disabled
 	}
 
 	private _writeThreadIndex(delta?: { added?: string, removed?: string }) {
@@ -1462,8 +1387,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 
 		const messages: ChatMessage[] = []
-		// checkpoint disabled — see checkpoint-storage-refactor.md
-		// const checkpoints: CheckpointEntry[] = []
 
 		// @deprecated Migration 2: old per-message format. Checkpoints were
 		// stored inline in void.chatMsg.* keys. Read all keys, skip gaps (from
@@ -1502,8 +1425,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			}
 		}
 
-		// checkpoint disabled — delete any old checkpoint keys
-		// see checkpoint-storage-refactor.md
+		// Delete any legacy checkpoint keys left by a pre-removal version.
+		// Retained until the message store renumbers indices (S10): these keys
+		// are only still reachable because checkpoint records occupy message
+		// indices, which is the shape the load loop above tolerates.
 		for (let i = 0; ; i++) {
 			const checkpointKey = CHECKPOINT_KEY_PREFIX + threadId + '.' + i
 			if (this._storageService.get(checkpointKey, StorageScope.APPLICATION) === undefined) break
@@ -1524,8 +1449,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const thread: ThreadType = { ...metadataParsed, ...usageParsed, messages } as ThreadType
 		if (!thread.state) {
 			thread.state = {
-				// checkpoint disabled — see checkpoint-storage-refactor.md
-				// currCheckpointIdx: null,
 				stagingSelections: [],
 				focusedMessageIdx: undefined,
 				linksOfMessageIdx: {},
@@ -2723,8 +2646,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// do nothing
 		}
 
-		// this._addUserCheckpoint({ threadId }) // checkpoint disabled — see checkpoint-storage-refactor.md
-
 		// interrupt any effects
 		const interrupt = await this.streamState[threadId]?.interrupt
 		if (typeof interrupt === 'function')
@@ -2856,9 +2777,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				logToolTelemetry('invalid_params', errorMessage.length)
 				return {}
 			}
-			// checkpoint disabled — see checkpoint-storage-refactor.md
-			// if (toolName === 'edit_file') { this._addToolEditCheckpoint({ threadId, uri: (toolParams as BuiltinToolCallParams['edit_file']).uri }) }
-			// if (toolName === 'rewrite_file') { this._addToolEditCheckpoint({ threadId, uri: (toolParams as BuiltinToolCallParams['rewrite_file']).uri }) }
 
 			// 2. if tool requires approval, break from the loop, awaiting approval
 
@@ -3027,7 +2945,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, rawParamsStr: callThisToolFirst.rawParamsStr, validatedParams: callThisToolFirst.params })
 			if (interrupted) {
 				this._setStreamState(threadId, undefined)
-				// this._addUserCheckpoint({ threadId }) // checkpoint disabled
 				return
 			}
 			// If this tool had merged siblings from a pre-approval merge, record
@@ -3039,7 +2956,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const drainRes = await this._tryDrainPendingBatch(threadId)
 			if (drainRes === 'interrupted') {
 				this._setStreamState(threadId, undefined)
-				// this._addUserCheckpoint({ threadId }) // checkpoint disabled
 				return
 			}
 			if (drainRes === 'awaiting_user') {
@@ -3328,7 +3244,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						}
 
 						this._setStreamState(threadId, { isRunning: undefined, error })
-						// this._addUserCheckpoint({ threadId }) // checkpoint disabled
 						return
 					}
 				}
@@ -3433,9 +3348,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			}
 		}
 
-		// checkpoint disabled — see checkpoint-storage-refactor.md
-		// if (!isRunningWhenEnd) this._addUserCheckpoint({ threadId })
-
 		// capture number of messages sent
 		this._metricsService.capture('Agent Loop Done', { nMessagesSent, chatMode })
 
@@ -3520,25 +3432,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// private _addCheckpoint(threadId: string, checkpoint: CheckpointEntry) {
-	// 	const { allThreads } = this.state
-	// 	const oldThread = allThreads[threadId]
-	// 	if (!oldThread) return
-	// 	const msgIdx = oldThread.messages.length
-	// 	const checkpointIdx = oldThread.checkpoints.length
-	// 	const checkpointWithIdx = { ...checkpoint, messageIdx: msgIdx }
-	// 	const updatedThread = {
-	// 		...oldThread,
-	// 		lastModified: new Date().toISOString(),
-	// 		checkpoints: [...oldThread.checkpoints, checkpointWithIdx],
-	// 	}
-	// 	this._storeCheckpointKey(threadId, checkpointIdx, checkpointWithIdx)
-	// 	const newThreads = { ...allThreads, [threadId]: updatedThread }
-	// 	this._storeThread(threadId, updatedThread)
-	// 	this._setState({ allThreads: newThreads })
-	// }
-
 
 
 	private _editMessageInThread(threadId: string, messageIdx: number, newMessage: ChatMessage,) {
@@ -3568,157 +3461,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._setState({ allThreads: newThreads }, true)
 	}
 
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// private _editCheckpointInThread(threadId: string, checkpointIdx: number, newCheckpoint: CheckpointEntry) {
-	// 	const { allThreads } = this.state
-	// 	const oldThread = allThreads[threadId]
-	// 	if (!oldThread) return
-	// 	const updatedThread = {
-	// 		...oldThread,
-	// 		lastModified: new Date().toISOString(),
-	// 		checkpoints: [
-	// 			...oldThread.checkpoints.slice(0, checkpointIdx),
-	// 			newCheckpoint,
-	// 			...oldThread.checkpoints.slice(checkpointIdx + 1, Infinity),
-	// 		],
-	// 	}
-	// 	this._storeCheckpointKey(threadId, checkpointIdx, newCheckpoint)
-	// 	const newThreads = { ...allThreads, [threadId]: updatedThread }
-	// 	this._storeThread(threadId, updatedThread)
-	// 	this._setState({ allThreads: newThreads })
-	// }
-
-	// private _getCheckpointInfo = (checkpoint: CheckpointEntry, fsPath: string, opts: { includeUserModifiedChanges: boolean }) => {
-	// 	const voidFileSnapshot = checkpoint.voidFileSnapshotOfURI ? checkpoint.voidFileSnapshotOfURI[fsPath] ?? null : null
-	// 	if (!opts.includeUserModifiedChanges) { return { voidFileSnapshot, } }
-	// 	const userModifiedVoidFileSnapshot = fsPath in checkpoint.userModifications.voidFileSnapshotOfURI ? checkpoint.userModifications.voidFileSnapshotOfURI[fsPath] ?? null : null
-	// 	return { voidFileSnapshot: userModifiedVoidFileSnapshot ?? voidFileSnapshot, }
-	// }
-
-	// private _computeNewCheckpointInfo({ threadId }: { threadId: string }) {
-	// 	const thread = this.state.allThreads[threadId]
-	// 	if (!thread) return
-	// 	const lastCheckpointIdx = thread.checkpoints.length - 1
-	// 	if (lastCheckpointIdx === -1) return
-	// 	const voidFileSnapshotOfURI: { [fsPath: string]: VoidFileSnapshot | undefined } = {}
-	// 	const { lastIdxOfURI } = this._getCheckpointsBetween({ threadId, loIdx: 0, hiIdx: lastCheckpointIdx, }) ?? {}
-	// 	for (const fsPath in lastIdxOfURI ?? {}) {
-	// 		const { model } = this._voidModelService.getModelFromFsPath(fsPath)
-	// 		if (!model) continue
-	// 		const checkpoint2 = thread.checkpoints[lastIdxOfURI[fsPath]] || null
-	// 		if (!checkpoint2) continue
-	// 		const res = this._getCheckpointInfo(checkpoint2, fsPath, { includeUserModifiedChanges: false })
-	// 		if (!res) continue
-	// 		const { voidFileSnapshot: oldVoidFileSnapshot } = res
-	// 		const voidFileSnapshot = this._editCodeService.getVoidFileSnapshot(URI.file(fsPath))
-	// 		if (oldVoidFileSnapshot && oldVoidFileSnapshot.entireFileCode === voidFileSnapshot.entireFileCode) continue
-	// 		voidFileSnapshotOfURI[fsPath] = voidFileSnapshot
-	// 	}
-	// 	return { voidFileSnapshotOfURI }
-	// }
 
 
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// private _addUserCheckpoint({ threadId }: { threadId: string }) {
-	// 	const thread = this.state.allThreads[threadId]
-	// 	if (!thread) return
-	// 	if (thread.checkpoints.length === 0) {
-	// 		this._addCheckpoint(threadId, {
-	// 			role: 'checkpoint',
-	// 			type: 'user_edit',
-	// 			messageIdx: 0,
-	// 			voidFileSnapshotOfURI: {},
-	// 			userModifications: { voidFileSnapshotOfURI: {}, },
-	// 		})
-	// 		return
-	// 	}
-	// 	const { voidFileSnapshotOfURI } = this._computeNewCheckpointInfo({ threadId }) ?? {}
-	// 	if (!voidFileSnapshotOfURI || Object.keys(voidFileSnapshotOfURI).length === 0) return
-	// 	this._addCheckpoint(threadId, {
-	// 		role: 'checkpoint',
-	// 		type: 'user_edit',
-	// 		messageIdx: 0,
-	// 		voidFileSnapshotOfURI,
-	// 		userModifications: { voidFileSnapshotOfURI: {}, },
-	// 	})
-	// }
-
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// private _addToolEditCheckpoint({ threadId, uri, }: { threadId: string, uri: URI }) {
-	// 	const thread = this.state.allThreads[threadId]
-	// 	if (!thread) return
-	// 	const { model } = this._voidModelService.getModel(uri)
-	// 	if (!model) return
-	// 	const voidFileSnapshot = this._editCodeService.getVoidFileSnapshot(uri)
-	// 	const { lastIdxOfURI } = this._getCheckpointsBetween({ threadId, loIdx: 0, hiIdx: thread.checkpoints.length - 1 }) ?? {}
-	// 	const lastIdx = lastIdxOfURI?.[uri.fsPath]
-	// 	if (lastIdx !== undefined) {
-	// 		const lastCheckpoint = thread.checkpoints[lastIdx]
-	// 		const res = this._getCheckpointInfo(lastCheckpoint, uri.fsPath, { includeUserModifiedChanges: false })
-	// 		if (res?.voidFileSnapshot && res.voidFileSnapshot.entireFileCode === voidFileSnapshot.entireFileCode) return
-	// 	}
-	// 	this._addCheckpoint(threadId, {
-	// 		role: 'checkpoint',
-	// 		type: 'tool_edit',
-	// 		messageIdx: 0,
-	// 		voidFileSnapshotOfURI: { [uri.fsPath]: voidFileSnapshot },
-	// 		userModifications: { voidFileSnapshotOfURI: {} },
-	// 	})
-	// }
-
-
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// private _getCheckpointBeforeMessage = ({ threadId, messageIdx }: { threadId: string, messageIdx: number }): [CheckpointEntry, number] | undefined => {
-	// 	const thread = this.state.allThreads[threadId]
-	// 	if (!thread) return undefined
-	// 	for (let i = thread.checkpoints.length - 1; i >= 0; i--) {
-	// 		if (thread.checkpoints[i].messageIdx <= messageIdx) {
-	// 			return [thread.checkpoints[i], i]
-	// 		}
-	// 	}
-	// 	return undefined
-	// }
-
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// private _getCheckpointsBetween({ threadId, loIdx, hiIdx }: { threadId: string, loIdx: number, hiIdx: number }) {
-	// 	const thread = this.state.allThreads[threadId]
-	// 	if (!thread) return { lastIdxOfURI: {} }
-	// 	const lastIdxOfURI: { [fsPath: string]: number } = {}
-	// 	for (let i = loIdx; i <= hiIdx; i += 1) {
-	// 		const checkpoint = thread.checkpoints[i]
-	// 		if (!checkpoint) continue
-	// 		for (const fsPath in checkpoint.voidFileSnapshotOfURI) {
-	// 			lastIdxOfURI[fsPath] = i
-	// 		}
-	// 	}
-	// 	return { lastIdxOfURI }
-	// }
-
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// private _readCurrentCheckpoint(threadId: string): [CheckpointEntry, number] | undefined {
-	// 	const thread = this.state.allThreads[threadId]
-	// 	if (!thread) return
-	// 	const { currCheckpointIdx } = thread.state
-	// 	if (currCheckpointIdx === null) return
-	// 	const checkpoint = thread.checkpoints[currCheckpointIdx]
-	// 	if (!checkpoint) return
-	// 	return [checkpoint, currCheckpointIdx]
-	// }
-	// private _addUserModificationsToCurrCheckpoint({ threadId }: { threadId: string }) {
-	// 	const { voidFileSnapshotOfURI } = this._computeNewCheckpointInfo({ threadId }) ?? {}
-	// 	const res = this._readCurrentCheckpoint(threadId)
-	// 	if (!res) return
-	// 	const [checkpoint, checkpointIdx] = res
-	// 	this._editCheckpointInThread(threadId, checkpointIdx, {
-	// 		...checkpoint,
-	// 		userModifications: { voidFileSnapshotOfURI: voidFileSnapshotOfURI ?? {}, },
-	// 	})
-	// }
-
-
-	// checkpoint disabled — see checkpoint-storage-refactor.md
-	// jumpToCheckpointBeforeMessageIdx({ threadId, messageIdx, jumpToUserModified }: { threadId: string, messageIdx: number, jumpToUserModified: boolean }) {
-	// }
 
 
 	/**
@@ -4003,11 +3747,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// accumulating across turns.
 		this._resetCumulativeThisTurn(threadId)
 
-		// checkpoint disabled — see checkpoint-storage-refactor.md
-		// if (thread.messages.length === 0) {
-		// 	this._addUserCheckpoint({ threadId })
-		// }
-
 
 		// add user's message to chat history
 		const instructions = userMessage
@@ -4070,8 +3809,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 		this._addMessageToThread(threadId, userHistoryElt)
 		this._setThreadLastAppliedRules(threadId, currentRulesContent)
-
-		// this._setThreadState(threadId, { currCheckpointIdx: null }) // checkpoint disabled
 
 		// scroll to bottom
 		this.state.allThreads[threadId]?.state.mountedInfo?.whenMounted.then(m => {
@@ -4214,11 +3951,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const thread = this.state.allThreads[threadId];
 		if (!thread) return
 
-		// checkpoint disabled — see checkpoint-storage-refactor.md
-		// if (thread.state.currCheckpointIdx !== null) {
-		// 	this._setThreadState(threadId, { currCheckpointIdx: null })
-		// }
-
 		await this._addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes, modelSelectionOptionsOverride });
 
 	}
@@ -4246,13 +3978,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// clear messages up to the index
 		const slicedMessages = thread.messages.slice(0, messageIdx)
 		const removedMessages = thread.messages.slice(messageIdx)
-		// checkpoint disabled — see checkpoint-storage-refactor.md
-		// const slicedCheckpoints = thread.checkpoints.filter(c => c.messageIdx < messageIdx)
-		// const removedCheckpointCount = thread.checkpoints.length - slicedCheckpoints.length
 		this._deleteMessageKeysFrom(thread.id, messageIdx)
-		// if (removedCheckpointCount > 0) {
-		// 	this._deleteCheckpointKeysFrom(thread.id, slicedCheckpoints.length)
-		// }
 		const updatedThread = { ...thread, messages: slicedMessages }
 		this._storeThread(thread.id, updatedThread)
 		this._setState({
@@ -4691,7 +4417,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	// Phase E — gate every thread-mutating service entry point. Foreign
 	// threads (tagged to another workspace) are read-only from this
-	// window: send, edit, approve/reject, checkpoint-restore, and
+	// window: send, edit, approve/reject, and
 	// staging-selection writes all short-circuit when this returns true.
 	// Centralised here (instead of each method copy-pasting the predicate)
 	// so the rule stays consistent and a future change to the read-only
@@ -4933,7 +4659,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// trace it back. Usage / compaction counters are reset because the
 	// "lifetime cost" of the source thread accrued in another workspace's
 	// context — carrying the totals over is misleading. Messages,
-	// checkpoints, model selection, and staging all carry over verbatim.
+	// model selection, and staging all carry over verbatim.
 	//
 	// Auto-pins the new thread + switches to it, mirroring the user's
 	// expectation that "Copy" produces something they can immediately work
@@ -4966,10 +4692,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 		const newThreads = { ...this.state.allThreads, [newId]: cloned }
 		this._storeAllMessageKeys(newId, cloned.messages)
-		// checkpoint disabled — see checkpoint-storage-refactor.md
-		// for (let i = 0; i < cloned.checkpoints.length; i++) {
-		// 	this._storeCheckpointKey(newId, i, cloned.checkpoints[i])
-		// }
 		this._storeThread(newId, cloned, true)
 		this._loadedMessageThreadIds.add(newId) // cloned thread already has messages in memory
 		// Drop in-memory telemetry mirrors for the new id (defensive — should
@@ -5281,9 +5003,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			}
 		})
 
-		// // when change focused message idx, jump - do not jump back when click edit, too confusing.
-		// if (messageIdx !== undefined)
-		// 	this.jumpToCheckpointBeforeMessageIdx({ threadId, messageIdx, jumpToUserModified: true })
 	}
 
 

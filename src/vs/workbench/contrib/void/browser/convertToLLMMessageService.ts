@@ -1488,8 +1488,8 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// after the boundary pass through unchanged.
 		//
 		// `boundaryIdx` is an index into the ChatMessage[] array, but
-		// `llmMessagesRaw` is a SimpleLLMMessage[] where checkpoint and
-		// interrupted_streaming_tool entries are skipped. We must map the
+		// `llmMessagesRaw` is a SimpleLLMMessage[] where interrupted_streaming_tool
+		// entries are skipped. We must map the
 		// ChatMessage boundary to the corresponding SimpleLLMMessage index.
 		let llmMessages: SimpleLLMMessage[]
 		if (manualCompaction && manualCompaction.boundaryIdx >= 0) {
