@@ -1147,6 +1147,26 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		return { metadata, usage }
 	}
 
+	// Fields that older builds persisted and that `ThreadType` no longer declares.
+	// Removing them from the type is not enough on its own: every `_readThread`
+	// return path spreads the parsed metadata into the thread, so a key left here
+	// rides into memory and `_splitThreadForStorage` writes it straight back out.
+	// The field is then resurrected on every write and never converges — real
+	// databases showed every thread row still carrying `filesWithUserChanges`, and
+	// most still carrying `state.currCheckpointIdx`, long after both left the type.
+	// Dropping them at the single parse point is what makes the removal stick.
+	private static _dropLegacyThreadFields(metadata: Record<string, any>): void {
+		delete metadata.filesWithUserChanges // bug 11 — a Set, serialized as {}
+		delete metadata.checkpoints // removed with the checkpoint feature
+		if (metadata.state) {
+			delete metadata.state.currCheckpointIdx // removed with the checkpoint feature
+			// `mountedInfo` is live mount wiring, not data. `_stripRuntimeState`
+			// keeps it off disk; dropping it here too means a loaded thread never
+			// claims a `whenMounted` Promise that it does not actually have.
+			delete metadata.state.mountedInfo
+		}
+	}
+
 	// `state` is persisted wholesale, but `state.mountedInfo` is live wiring for
 	// the mounted UI: a Promise, its resolver, and a ref. None of it is data, and
 	// serializing it wrote `{"whenMounted":{},"mountedIsResolvedRef":{"current":false}}`
@@ -1321,6 +1341,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (!metadataRaw) return undefined
 
 		const metadataParsed = JSON.parse(metadataRaw, ChatThreadService._storageReviver) as any
+		ChatThreadService._dropLegacyThreadFields(metadataParsed)
 
 		// @deprecated Migration 1: very old format has messages array inline in metadata.
 		// Split into per-message keys, discarding old checkpoint data.

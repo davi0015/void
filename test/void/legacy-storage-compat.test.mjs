@@ -152,4 +152,64 @@ describe('legacy thread storage compatibility', () => {
 			assert.ok(stillLive, 'stripping mountedInfo from storage also removed it from the live thread')
 		})
 	})
+
+	test('fields removed from ThreadType do not come back from older threads', async (t) => {
+		// Removing a field from the type is not enough. Every _readThread path
+		// spreads the parsed metadata into the thread, so a key an older build
+		// wrote rides into memory and _splitThreadForStorage writes it straight
+		// back — resurrection on every write, forever. Real databases show it:
+		// every thread row still carries filesWithUserChanges, and most still
+		// carry state.currCheckpointIdx, long after both left the type.
+		await h.withScenario('legacy-storage/resurrected-fields', async (s) => {
+			// Seed the shape an older build left behind. The write path keeps
+			// these keys — they are not the one field it knows to strip — which
+			// is exactly how they survive on disk today.
+			const seeded = await s.page.evaluate(() => {
+				const svc = globalThis.__voidChatThreadService
+				const id = svc.state.currentThreadId
+				const current = svc.state.allThreads[id]
+				const legacy = {
+					...current,
+					messages: [],
+					filesWithUserChanges: {},
+					state: { ...current.state, currCheckpointIdx: null },
+				}
+				svc._storeThread(id, legacy)
+				svc._flushPendingThreadWrites()
+				return { id }
+			})
+
+			// Guard: the fixture must actually have put them on disk, or their
+			// absence after the rewrite would prove nothing.
+			await h.sleep(600)
+			const before = s.readThread(seeded.id) ?? ''
+			assert.ok(before.includes('filesWithUserChanges'), 'fixture did not seed filesWithUserChanges on disk')
+			assert.ok(before.includes('currCheckpointIdx'), 'fixture did not seed currCheckpointIdx on disk')
+
+			// Load as a restart would, then write back — one ordinary use.
+			const loaded = await s.page.evaluate((id) => {
+				const svc = globalThis.__voidChatThreadService
+				const thread = svc._readThread(id, false)
+				const inMemory = {
+					filesWithUserChanges: 'filesWithUserChanges' in thread,
+					stateCurrCheckpointIdx: 'currCheckpointIdx' in (thread.state ?? {}),
+				}
+				svc._storeThreadDurably(id, thread)
+				return inMemory
+			}, seeded.id)
+
+			await h.sleep(600)
+			const after = s.readThread(seeded.id) ?? ''
+			trace(t, s)
+
+			// Control: real metadata survives the rewrite, so a strip that
+			// dropped everything would not read as success.
+			assert.ok(after.includes('stagingSelections'), 'the rewrite dropped real metadata too')
+
+			h.assertAbsent('filesWithUserChanges in memory after load', !loaded.filesWithUserChanges, { subject: true })
+			h.assertAbsent('state.currCheckpointIdx in memory after load', !loaded.stateCurrCheckpointIdx, { subject: true })
+			h.assertAbsent('filesWithUserChanges rewritten to disk', !after.includes('filesWithUserChanges'), { subject: true })
+			h.assertAbsent('state.currCheckpointIdx rewritten to disk', !after.includes('currCheckpointIdx'), { subject: true })
+		})
+	})
 })

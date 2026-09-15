@@ -380,6 +380,21 @@ records still loads*, which is what fixes this boundary. `test/void/legacy-stora
 holds that as a control scenario: it passes before and after S3, and it is what
 stops the cleanup from over-deleting.
 
+**Removing a field from the type does not remove it from stored threads.** Every
+`_readThread` return path spreads the parsed metadata into the thread, so a key an
+older build wrote rides into memory, and `_splitThreadForStorage` — which
+serializes every key it does not explicitly skip — writes it straight back out.
+The field is resurrected on every write and never converges. Removal therefore
+needs a drop at the read parse point as well, which is what
+`ChatThreadService._dropLegacyThreadFields` is for. This was found by querying a
+real database rather than a fixture: all 46 thread rows still carried
+`filesWithUserChanges` and 40 carried `state.currCheckpointIdx`, long after both
+had left the type — including rows written by the build that removed them.
+
+The general fix is an allowlist serializer that writes only declared fields; that
+is what the explicit record format in S10 provides. Until then, any field removed
+from `ThreadType` needs a matching entry in `_dropLegacyThreadFields`.
+
 If undo/revert returns as a feature, it is a separate design with its own storage decision. The one constraint this document places on it: **do not interleave snapshot records with message records again.** That single choice is what created the index drift, the dead remap, and the storage blow-up.
 
 ---
