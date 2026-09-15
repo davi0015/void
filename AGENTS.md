@@ -30,12 +30,16 @@ Decide by what the test needs, not by what it is about.
 
 - The node tier takes seconds, the end-to-end tier minutes. Prefer node, and extract pure logic into
   a dependency-free module when that is what it takes — that is why the storage work keeps its log
-  logic out of the service that hosts it.
+  logic out of the service that hosts it, and why the changed-file stepper's arithmetic lives in
+  `common/commandBarStepper.ts` rather than in the React component that renders it.
 - Node unit tests **exclude** `browser/`, `electron-sandbox/`, `electron-main/` and
   `electron-utility/` paths. A test placed beside browser code will silently not run.
 - One file per **behaviour area** with several scenarios inside. Never one file per function, and
   never a per-test npm script — `npm run test-void -- --only=<substring>` selects an area.
 - `test/void/README.md` documents the harness API.
+- **A node test still proves the logic runs.** `common/test/*.test.ts` is discovered by
+  `npm run test-node` (it globs `out/**/test/**/*.test.js`), so a new file there is live, not
+  decorative — confirm your suite appears in the run before trusting it.
 
 ## Procedure for a fix
 
