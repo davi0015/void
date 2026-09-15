@@ -23,8 +23,8 @@ export type ShallowDirectoryItem = {
 
 // Approval tiers for built-in tools. Kept separate so users can opt into auto-approve at different
 // safety levels:
-//   - 'edits'    = reversible changes (edit_file always revertable via checkpoint, create/rewrite
-//                  likewise). Workspace-scoped when auto-approved (see chatThreadService).
+//   - 'edits'    = reversible changes (edit_file is revertable through its diff zone's undo,
+//                  create/rewrite likewise). Workspace-scoped when auto-approved (see chatThreadService).
 //   - 'delete'   = irreversible destructive ops (delete_file_or_folder). Split out from 'edits' so
 //                  auto-approving normal edits doesn't silently enable auto-delete. Also workspace-
 //                  scoped when auto-approved.

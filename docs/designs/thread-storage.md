@@ -199,17 +199,17 @@ Usage fields are split into their own key precisely because they change at ~5 Hz
 | `compactionSummary` | **bulk** | bakes in a full directory listing | **store** |
 | `frozenAiInstructions` | **bulk** | global instructions + `.voidrules` + `rulesPaths` + skills index | **store**, write-once |
 | `lastAppliedRules` | medium | snapshot of `.voidrules` at last send | **store** |
-| `filesWithUserChanges` | **dead + junk** | `Set<string>`; `JSON.stringify(Set)` → `{}`, and no reviver handles it (`_storageReviver` only revives URIs). Never read anywhere — declared (`:148`) and initialized (`:488`) only | **delete** |
+| `filesWithUserChanges` | **dead + junk** | `Set<string>`; `JSON.stringify(Set)` → `{}`, and no reviver handles it (`_storageReviver` only revives URIs). Never read anywhere — declared and initialized only. **Deleted in S3** | gone |
 | `state.stagingSelections` | small | staged URIs for the composer | DB |
 | `state.focusedMessageIdx` | small | UI | DB |
 | `state.linksOfMessageIdx` | UI, **index-keyed** | `Record<messageIdx, {name: CodespanLocation}>` — positional, so it has the same fragility class as the compaction anchor | DB, flagged |
-| `state.mountedInfo` | **junk** | holds a `Promise`, a resolver function, and a ref. Persisted wholesale inside `state`, so `JSON.stringify` writes `{"whenMounted":{},"mountedIsResolvedRef":{"current":false}}` | **strip before persist** |
+| `state.mountedInfo` | **junk** | holds a `Promise`, a resolver function, and a ref. Persisted wholesale inside `state`, so `JSON.stringify` wrote `{"whenMounted":{},"mountedIsResolvedRef":{"current":false}}`. **Stripped in S3** — still live at runtime, excluded by `_splitThreadForStorage` | runtime only |
 | `title` | ephemeral | already skipped | not persisted |
 
 Three findings worth stating plainly, since none were previously documented:
 
-1. **`filesWithUserChanges` is dead code that writes `{}` into every thread's metadata.** It is a `Set`, there is no Set reviver, and nothing reads it.
-2. **`state.mountedInfo` is ephemeral runtime state being serialized as junk** into every thread's metadata, because `state` is persisted wholesale.
+1. **`filesWithUserChanges` was dead code that wrote `{}` into every thread's metadata.** It was a `Set`, there is no Set reviver, and nothing read it. Deleted in S3.
+2. **`state.mountedInfo` is ephemeral runtime state that was being serialized as junk** into every thread's metadata, because `state` is persisted wholesale. It is *live* state — `focusCurrentChat`, `blurCurrentChat` and scroll-to-bottom all await it — so S3 strips it at serialization time rather than deleting it.
 3. **`state.linksOfMessageIdx` is keyed by message index** — the same positional-identity pattern behind the compaction bugs (4 and 5).
 
 ### The message log format
@@ -340,7 +340,7 @@ Note the asymmetry: **image bytes are files, but terminal snapshot text is store
 | `compactionSummary` | unbounded — includes a directory listing | thread metadata |
 | `frozenAiInstructions` | unbounded — all rules + skills index | thread metadata |
 
-`chatThreadServiceTypes.ts:173` states terminal text "is already truncated to `TERMINAL_SNIPPET_MAX_BYTES` at capture time" — **that constant is defined nowhere in `src/`**. Truncation does happen, in `sidebarActions.ts`, using local line-count logic. The comment is stale, not the behaviour.
+`chatThreadServiceTypes.ts:173` states terminal text "is already truncated to `TERMINAL_SNIPPET_MAX_BYTES` at capture time" — **that constant is defined nowhere in `src/`**. Truncation does happen, in `sidebarActions.ts`: `truncateTerminalText` caps at `TERMINAL_SNIPPET_MAX_CHARS` (32 KiB), middle-out with a tail bias, and the line count is used only for the chip label. The comment named a constant that does not exist, in the wrong unit. The comment was stale, not the behaviour.
 
 ### Checkpoints: removed, not stored
 
@@ -353,16 +353,47 @@ Checkpoints appear in this document for exactly two reasons:
 1. **As the historical cause of bugs 2 and 3.** Because checkpoint entries occupied real indices in `messages[]`, removing them shifted every subsequent index — which is why the load path has a remap at all, and why that remap's gate is now dead code.
 2. **As residue to delete.** See the checklist below.
 
-Residue to remove as part of Part 1:
+Residue to remove as part of Part 1. The split between the two tables is not
+cosmetic: the read path has to keep tolerating legacy threads until the message
+store renumbers indices, so the second group can only go once loading no longer
+shifts positions.
+
+**Removed in S3 — writing residue, nothing reads it:**
 
 | Residue | Location |
 |---|---|
-| `CHECKPOINT_KEY_PREFIX` and `void.chatCheckpoint.*` keys | `common/storageKeys.ts`, deleted during migration |
-| `CheckpointEntry` type | `common/chatThreadServiceTypes.ts` (already out of the `ChatMessage` union) |
-| `role === 'checkpoint'` skip in the read loop | `chatThreadService.ts:1434` |
-| Commented-out checkpoint blocks and `// checkpoint disabled` markers (~65 sites) | `chatThreadService.ts`, `SidebarChat.tsx` |
+| `CheckpointEntry` type | `common/chatThreadServiceTypes.ts` |
+| Commented-out checkpoint blocks, dead helpers and `// checkpoint disabled` markers (65 sites: 39 in `chatThreadService.ts`, 13 each in `react/src/` and the generated `react/src2/`) | `chatThreadService.ts`, `react/src/sidebar-tsx/SidebarChat.tsx` |
+| `_editCodeService` injection, which existed only for the checkpoint methods | `chatThreadService.ts` constructor |
 | Forward-looking "checkpoint redesign" sections | `docs/designs/checkpoint-storage-refactor.md` |
-| `checkpointsBeforeBoundary` remap logic | `chatThreadService.ts:1425,1435,1467-1470` — obsolete once loading cannot renumber |
+
+**Deferred to S10 — the legacy read and cleanup path:**
+
+| Residue | Location | Why it must wait |
+|---|---|---|
+| `role === 'checkpoint'` skip in the read loops | `chatThreadService.ts:1423`, `:1484` | Threads written before the removal still carry these records in their message keys. Without the skip they load as real messages and are sent to the model |
+| `checkpointsBeforeBoundary` remap | `chatThreadService.ts:1475–1519` | It needs the checkpoint records still readable to compute the shift. It is also the fix for bug 3, so removing it early re-breaks the boundary S2 corrected |
+| `CHECKPOINT_KEY_PREFIX` and the two cleanup loops that use it | `common/storageKeys.ts:37`, `chatThreadService.ts:1219–1224`, `:1505–1511` | The only thing that ever deletes `void.chatCheckpoint.*`. Removing the cleaner while keeping the reader leaves those keys orphaned forever |
+
+The S3 acceptance gate requires that *a thread containing legacy checkpoint
+records still loads*, which is what fixes this boundary. `test/void/legacy-storage-compat.test.mjs`
+holds that as a control scenario: it passes before and after S3, and it is what
+stops the cleanup from over-deleting.
+
+**Removing a field from the type does not remove it from stored threads.** Every
+`_readThread` return path spreads the parsed metadata into the thread, so a key an
+older build wrote rides into memory, and `_splitThreadForStorage` — which
+serializes every key it does not explicitly skip — writes it straight back out.
+The field is resurrected on every write and never converges. Removal therefore
+needs a drop at the read parse point as well, which is what
+`ChatThreadService._dropLegacyThreadFields` is for. This was found by querying a
+real database rather than a fixture: all 46 thread rows still carried
+`filesWithUserChanges` and 40 carried `state.currCheckpointIdx`, long after both
+had left the type — including rows written by the build that removed them.
+
+The general fix is an allowlist serializer that writes only declared fields; that
+is what the explicit record format in S10 provides. Until then, any field removed
+from `ThreadType` needs a matching entry in `_dropLegacyThreadFields`.
 
 If undo/revert returns as a feature, it is a separate design with its own storage decision. The one constraint this document places on it: **do not interleave snapshot records with message records again.** That single choice is what created the index drift, the dead remap, and the storage blow-up.
 

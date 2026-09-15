@@ -89,12 +89,26 @@ a write as the subject under test; leave `subject` off for a control that must
 always succeed. A failing control means the harness is unsound, and says so,
 rather than blaming the behaviour under test.
 
+`assertAbsent(label, ok, { subject: true })` is the mirror, for a change whose
+subject is a *removal* — junk kept out of storage rather than a value written to
+it. Pass the absence itself (`!('mountedInfo' in parsed)`) as `ok`.
+
 ## Demonstrating a bug
 
-`VOID_EXPECT=lost` inverts every `subject` assertion, so the same suite that
-passes on fixed code must fail on unmodified code:
+Two directions, and they are easy to confuse:
+
+- **The red phase** is the default mode against unmodified code: the subject
+  assertion must **fail**, for the stated reason. That is what shows the bug is
+  real and the test can see it.
+- **The sensitivity check** is `VOID_EXPECT=lost`, which inverts every `subject`
+  assertion. Against the *same fixed* code it must **fail** — "lost" asks it to
+  expect a bug that is no longer there. If it still passes, the assertion was
+  vacuous. Controls never follow `VOID_EXPECT`, so they pass in both modes; that
+  is what distinguishes them from subjects.
 
 ```
-git stash && npm run compile && VOID_EXPECT=lost npm run test-void   # must fail
-git stash pop && npm run compile && npm run test-void                # must pass
+npm run test-void                                     # fixed code: must pass
+VOID_EXPECT=lost npm run test-void                    # fixed code: must fail
+git stash && npm run compile && npm run test-void     # unmodified: must fail
+git stash pop && npm run compile
 ```

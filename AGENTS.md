@@ -10,10 +10,12 @@ sequence (S1–S10, then M1–M5); work proceeds in that order, one step at a ti
 
 | path | what |
 |---|---|
-| `src/vs/workbench/contrib/void/browser/` | renderer-side AI code: chat service, tools, convert-to-LLM, React UI under `react/src2/` |
+| `src/vs/workbench/contrib/void/browser/` | renderer-side AI code: chat service, tools, convert-to-LLM, React UI under `react/src/` |
 | `src/vs/workbench/contrib/void/common/` | code shared by renderer and main |
 | `src/vs/workbench/contrib/void/electron-main/` | main-process services and their `void-channel-*` channels |
-| `src/vs/workbench/contrib/void/browser/react/out/` | prebuilt React bundles, checked in and **not** produced by `gulp compile` — run `npm run buildreact` after editing `react/src2/` |
+| `src/vs/workbench/contrib/void/browser/react/src/` | React UI source. Edit **this**, not `src2/` |
+| `src/vs/workbench/contrib/void/browser/react/src2/` | generated from `react/src/` by `scope-tailwind` — and it reformats. Gitignored; edit it and the next build overwrites you |
+| `src/vs/workbench/contrib/void/browser/react/out/` | built React bundles. Also gitignored, and **not** produced by `gulp compile`. CI runs `npm run buildreact`, which regenerates `src2/` then bundles `out/` — run it yourself after editing `react/src/`, and before any end-to-end test that depends on UI code |
 | `test/void/` | end-to-end tests (this fork's own tier) |
 | `docs/designs/` | design documents |
 
@@ -48,8 +50,11 @@ Decide by what the test needs, not by what it is about.
    a confident, wrong answer.
 5. **Fix.**
 6. **Re-run the single test, then the whole suite** (`npm run test-void`) to catch regressions.
-7. **Prove the assertions are not vacuous.** `VOID_EXPECT=lost npm run test-void` must fail against
-   unpatched code and pass against fixed code. If it cannot be made to fail, it proves nothing.
+7. **Prove the assertions are not vacuous.** `VOID_EXPECT=lost` inverts the subject assertions, so
+   it must **pass against unpatched code and fail against fixed code**. That inversion is the proof
+   an assertion tracks the behaviour; `VOID_EXPECT=present` (the default) is the normal direction.
+   Controls never follow `VOID_EXPECT` and must pass in both. If a subject cannot be made to fail
+   under `lost`, it proves nothing.
 8. **Commit with the evidence.** Imperative subject. The body carries the mechanism, what the red
    phase observed, and how the fix was verified.
 
@@ -85,8 +90,9 @@ Reuse it. Do not rebuild launch plumbing per test.
   "did shutdown persist this?" a deterministic question.
 - `stubLLM(page, text)` + `capturedLLMRequests(page)` — drive the real agent and compaction paths
   with no network, key or model, and assert what the model was actually sent.
-- `assertPersistence(label, ok, { subject })` — `subject: true` follows `VOID_EXPECT`; a control
-  (no `subject`) must always pass, and says so when it does not.
+- `assertPersistence(label, ok, { subject })` / `assertAbsent(label, ok, { subject })` — the pair for
+  changes that add a write and changes that remove one. `subject: true` follows `VOID_EXPECT`; a
+  control (no `subject`) must always pass, and says so when it does not.
 - Electron needs `--no-sandbox` in this environment; the harness supplies it plus the repo's
   platform flags. Tests run under `node:test` through `run.mjs` — never invoke bare `node --test`,
   which would execute non-test files under `test/`.
@@ -123,6 +129,12 @@ Reuse it. Do not rebuild launch plumbing per test.
 - **Do not spread a freshly read thread over the in-memory one.** The persisted copy can be older
   than memory while a write is still inside the coalescing window. Propagate the one field that was
   corrected instead.
+- **`react/src2/` and `react/out/` are both gitignored build output.** `src2/` is generated from
+  `react/src/` by `scope-tailwind`, so editing `src2/` is work the next build throws away, and a
+  change made only there never reaches the commit. Edit `react/src/`, run `npm run buildreact`, and
+  check `git status` — if the React change is real, the only tracked file that moves is under
+  `react/src/`. A comment-only React edit should leave `out/` byte-identical; that is a cheap way to
+  prove the edit was inert.
 - **Preparatory work has a test.** A change qualifies only if a user hits the problem today with a
   single agent *and* it removes a multiagent blocker. `AgentDefinition` is the instructive case: the
   type and the loop parameterization are safe, the file format is deferred.

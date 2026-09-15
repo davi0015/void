@@ -4,7 +4,6 @@
  *--------------------------------------------------------------------------------------*/
 
 import { URI } from '../../../../base/common/uri.js';
-import { VoidFileSnapshot } from './editCodeServiceTypes.js';
 import { AnthropicReasoning, RawToolParamsObj, ResponsesReasoningRef } from './sendLLMMessageTypes.js';
 import { ToolCallParams, ToolName, ToolResult } from './toolsServiceTypes.js';
 
@@ -86,21 +85,6 @@ export type DecorativeCanceledTool = {
 }
 
 
-// checkpoints — separate from chat messages. Each checkpoint records
-// `messageIdx` = the number of messages that existed when it was created,
-// meaning "after message[messageIdx-1], before message[messageIdx]".
-export type CheckpointEntry = {
-	role: 'checkpoint';
-	type: 'user_edit' | 'tool_edit';
-	messageIdx: number;
-	voidFileSnapshotOfURI: { [fsPath: string]: VoidFileSnapshot | undefined };
-
-	userModifications: {
-		voidFileSnapshotOfURI: { [fsPath: string]: VoidFileSnapshot | undefined };
-	};
-}
-
-
 // WARNING: changing this format is a big deal!!!!!! need to migrate old format to new format on users' computers so people don't get errors.
 export type ChatMessage =
 	| {
@@ -170,8 +154,9 @@ export type StagingSelectionItem = {
 	// A snapshot of terminal output (selection or last finished command).
 	// Snapshots are NEVER deduped — each capture is a distinct point in time,
 	// hence the synthetic per-snapshot URI scheme `void-terminal:/snapshot/<uuid>`.
-	// `text` is already truncated to TERMINAL_SNIPPET_MAX_BYTES at capture time
-	// so chat persistence stays bounded.
+	// `text` is capped at capture time by `truncateTerminalText` in
+	// `sidebarActions.ts` (TERMINAL_SNIPPET_MAX_CHARS = 32 KiB, middle-out with a
+	// tail bias) so chat persistence stays bounded.
 	type: 'Terminal';
 	uri: URI;
 	language: 'shellscript';

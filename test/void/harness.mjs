@@ -337,3 +337,23 @@ export function assertPersistence(label, persisted, { subject = false } = {}) {
 		`${label}: expected ${wanted ? 'persisted' : 'lost'} (VOID_EXPECT=${process.env.VOID_EXPECT ?? 'present'}), observed ${persisted ? 'persisted' : 'lost'}`,
 	)
 }
+
+/**
+ * Asserts a field is kept out of persisted state — the mirror of
+ * assertPersistence, for changes whose subject is a removal.
+ *   subject: true  — follows VOID_EXPECT. With VOID_EXPECT=lost the assertion
+ *                    inverts, so unpatched code (which still persists the
+ *                    field) passes and the fix is what makes it fail.
+ *   subject: false — a control that must always be absent.
+ */
+export function assertAbsent(label, absent, { subject = false } = {}) {
+	if (!subject) {
+		assert.equal(absent, true, `control check '${label}' was not absent — the test harness is unsound, not the behaviour under test`)
+		return
+	}
+	const wanted = expectedPersistence()
+	assert.equal(
+		absent, wanted,
+		`${label}: expected ${wanted ? 'kept out of storage' : 'still in storage'} (VOID_EXPECT=${process.env.VOID_EXPECT ?? 'present'}), observed ${absent ? 'kept out of storage' : 'still in storage'}`,
+	)
+}
