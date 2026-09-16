@@ -23,6 +23,7 @@ import { Action2, registerAction2 } from '../../../../platform/actions/common/ac
 import { VOID_ACCEPT_DIFF_ACTION_ID, VOID_REJECT_DIFF_ACTION_ID, VOID_GOTO_NEXT_DIFF_ACTION_ID, VOID_GOTO_PREV_DIFF_ACTION_ID, VOID_GOTO_NEXT_URI_ACTION_ID, VOID_GOTO_PREV_URI_ACTION_ID, VOID_ACCEPT_FILE_ACTION_ID, VOID_REJECT_FILE_ACTION_ID, VOID_ACCEPT_ALL_DIFFS_ACTION_ID, VOID_REJECT_ALL_DIFFS_ACTION_ID } from './actionIDs.js';
 import { localize2 } from '../../../../nls.js';
 import { KeybindingWeight } from '../../../../platform/keybinding/common/keybindingsRegistry.js';
+import { nextStepperIdx, prevStepperIdx, StepperPosition } from '../common/commandBarStepper.js';
 import { ServicesAccessor } from '../../../../editor/browser/editorExtensions.js';
 import { IMetricsService } from '../common/metricsService.js';
 import { KeyMod } from '../../../../editor/common/services/editorBaseApi.js';
@@ -52,7 +53,7 @@ export interface IVoidCommandBarService {
 	// not the (possibly stale) activeURI. Used by the bottom bar, which
 	// exists once per editor and knows its own URI.
 	getNextDiffIdxForUri(uri: URI, step: 1 | -1): number | null;
-	getNextUriIdxFromUri(uri: URI | null, fallbackIdx: number | null, step: 1 | -1): number | null;
+	getNextUriIdxFromUri(uri: URI | null, step: 1 | -1): number | null;
 	goToDiffIdxInUri(uri: URI, idx: number | null): void;
 	goToDiffIdx(idx: number | null): void;
 	goToURIIdx(idx: number | null): Promise<void>;
@@ -524,28 +525,24 @@ export class VoidCommandBarService extends Disposable implements IVoidCommandBar
 		return this.getNextDiffIdxForUri(uri, step);
 	}
 
-	// File stepper relative to an explicit URI (the bottom bar passes the
-	// file it is showing). When that file just left the review list
-	// (approved), fallbackIdx is its last valid index, clamped into the
-	// shrunken list — so Next lands on the file after it, not back on 0.
-	getNextUriIdxFromUri(uri: URI | null, fallbackIdx: number | null, step: 1 | -1): number | null {
-		// If no URIs with changes, return null
-		if (this.sortedURIs.length === 0) return null;
-
+	// Relative navigation from wherever the user is, for callers that have no
+	// widget position of their own — the URI keybindings and the action
+	// handlers behind them. The ordering rules live in `commandBarStepper` so
+	// this path and the per-editor bar cannot disagree; they did, and both were
+	// unable to reach a changed file the bar had never shown.
+	getNextUriIdxFromUri(uri: URI | null, step: 1 | -1): number | null {
 		const currentIdx = uri ? this.sortedURIs.findIndex(u => u.fsPath === uri.fsPath) : -1;
-
-		const baseIdx = currentIdx !== -1 ? currentIdx
-			: fallbackIdx !== null ? Math.min(fallbackIdx, this.sortedURIs.length - 1)
-			: step === 1 ? 0 : this.sortedURIs.length - 1;
-
-		// Calculate next index with wrapping
-		const nextIdx = (baseIdx + step + this.sortedURIs.length) % this.sortedURIs.length;
-		return nextIdx;
+		const position: StepperPosition = {
+			listLength: this.sortedURIs.length,
+			currentIdx: currentIdx === -1 ? null : currentIdx,
+			lastIdx: null,
+		};
+		return step === 1 ? nextStepperIdx(position) : prevStepperIdx(position);
 	}
 
 	getNextUriIdx(step: 1 | -1): number | null {
 		const uri = this.getActionURI();
-		return this.getNextUriIdxFromUri(uri, null, step);
+		return this.getNextUriIdxFromUri(uri, step);
 	}
 
 	// The URI keybindings act on: activeURI when it still has review state,

@@ -10,6 +10,7 @@ import '../styles.css'
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
+import { nextStepperIdx, prevStepperIdx, StepperPosition } from '../../../../common/commandBarStepper.js';
 import { VoidCommandBarProps } from '../../../voidCommandBarService.js';
 import { Check, EllipsisVertical, Menu, MoveDown, MoveLeft, MoveRight, MoveUp, X } from 'lucide-react';
 import {
@@ -105,24 +106,15 @@ export const VoidCommandBar = ({ uri, editor }: VoidCommandBarProps) => {
 		if (currFileIdx !== null) _latestValidUriIdxRef.current = currFileIdx
 	}, [currFileIdx])
 
-	const uriIdxInStepper = currFileIdx !== null ? currFileIdx // use currFileIdx if it exists, else use latestNotNullUriIdxRef
-		: _latestValidUriIdxRef.current === null ? null
-			: _latestValidUriIdxRef.current < sortedCommandBarURIs.length ? _latestValidUriIdxRef.current
-				: null
-
-	// Last valid index clamped into the shrunken list: when this file just
-	// left review (approved), Next continues after it instead of wrapping
-	// back to index 0. Skipped files keep their order.
-	const clampedFallbackIdx = sortedCommandBarURIs.length === 0 ? null
-		: _latestValidUriIdxRef.current === null ? null
-			: Math.min(_latestValidUriIdxRef.current, sortedCommandBarURIs.length - 1)
-
-	// Removed file was last (or beyond): no successor slid into its slot,
-	// so Next wraps to the first file instead of stepping backwards.
-	const removedWasLast = currFileIdx === null
-		&& sortedCommandBarURIs.length > 0
-		&& _latestValidUriIdxRef.current !== null
-		&& _latestValidUriIdxRef.current >= sortedCommandBarURIs.length
+	// Where this bar sits in the changed-file list. The ordering rules — what
+	// "just approved" means, and what to do when the bar has never occupied a
+	// position at all — live in `commandBarStepper` so they can be unit-tested
+	// instead of hand-checked. See that file before changing this shape.
+	const stepperPosition: StepperPosition = {
+		listLength: sortedCommandBarURIs.length,
+		currentIdx: currFileIdx,
+		lastIdx: _latestValidUriIdxRef.current,
+	}
 
 	// when change URI, scroll to the proper spot
 	useEffect(() => {
@@ -153,14 +145,8 @@ export const VoidCommandBar = ({ uri, editor }: VoidCommandBarProps) => {
 
 	const nextDiffIdx = uri ? commandBarService.getNextDiffIdxForUri(uri, 1) : null
 	const prevDiffIdx = uri ? commandBarService.getNextDiffIdxForUri(uri, -1) : null
-	// When this file already left review (approved), it has no index — Next
-	// means the successor that slid into its last valid position (a plain +1
-	// would skip over it), or wraps to the first file when it was last.
-	// Prev means one before that.
-	const nextURIIdx = currFileIdx !== null
-		? commandBarService.getNextUriIdxFromUri(uri ?? null, clampedFallbackIdx, 1)
-		: removedWasLast ? 0 : clampedFallbackIdx
-	const prevURIIdx = commandBarService.getNextUriIdxFromUri(uri ?? null, clampedFallbackIdx, -1)
+	const nextURIIdx = nextStepperIdx(stepperPosition)
+	const prevURIIdx = prevStepperIdx(stepperPosition)
 
 	const upDownDisabled = prevDiffIdx === null || nextDiffIdx === null
 	const leftRightDisabled = prevURIIdx === null || nextURIIdx === null
