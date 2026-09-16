@@ -23,6 +23,7 @@ import { IToolsService } from './toolsService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
 import { ChatMessage, CodespanLocationLink, CompactionInfo, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js';
+import { CodespanLinkMap, isResolvedCodespanLink, lookupCodespanLink, pruneCodespanLinks } from '../common/codespanLinkCache.js';
 import { Position } from '../../../../editor/common/core/position.js';
 import { IMetricsService } from '../common/metricsService.js';
 
@@ -1107,6 +1108,48 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// loaded on demand when the user switches to a thread.
 	private _loadedMessageThreadIds = new Set<string>()
 
+	// Codespan links that failed to resolve during THIS session, per thread and
+	// message. Holding them here is what stops the renderer repeating an expensive
+	// lookup — every file the conversation has touched, each definition provider, and
+	// sometimes a codebase search — on every remount of a message that mentions an
+	// ordinary word.
+	//
+	// Deliberately not persisted, and deliberately keyed separately from
+	// `state.linksOfMessageIdx`: a stored failure is indistinguishable from a
+	// success at the call site, so persisting one kept a span dead for the life of
+	// the thread even after the cause (cold language server, unready index, file not
+	// yet seen) had gone. Real profiles held 43,691 such stored nulls — 64% of all
+	// entries. Session-scoped, they cost one retry per launch and then heal.
+	private _failedCodespanLinks = new Map<string, Map<number, Set<string>>>()
+
+	// Record a failed codespan resolution for this session. Returns true if it was
+	// newly recorded.
+	private _recordFailedCodespanLink(threadId: string, messageIdx: number, codespanStr: string): boolean {
+		let ofThread = this._failedCodespanLinks.get(threadId)
+		if (!ofThread) { ofThread = new Map(); this._failedCodespanLinks.set(threadId, ofThread) }
+		let ofMessage = ofThread.get(messageIdx)
+		if (!ofMessage) { ofMessage = new Set(); ofThread.set(messageIdx, ofMessage) }
+		const isNew = !ofMessage.has(codespanStr)
+		ofMessage.add(codespanStr)
+		return isNew
+	}
+
+	private _hasFailedCodespanLink(threadId: string, messageIdx: number, codespanStr: string): boolean {
+		return this._failedCodespanLinks.get(threadId)?.get(messageIdx)?.has(codespanStr) ?? false
+	}
+
+	// Editing a message deletes it and everything after it, so failures recorded
+	// against those indices describe text that no longer exists. Keeping them would
+	// suppress the lookup for whatever lands at that index next.
+	private _forgetFailedCodespanLinksFrom(threadId: string, fromIdx: number): void {
+		const ofThread = this._failedCodespanLinks.get(threadId)
+		if (!ofThread) return
+		for (const idx of [...ofThread.keys()]) {
+			if (idx >= fromIdx) ofThread.delete(idx)
+		}
+		if (ofThread.size === 0) this._failedCodespanLinks.delete(threadId)
+	}
+
 	// Which fields go in which key. Static metadata is written rarely
 	// (user actions, compaction). Usage is written at ~5Hz during
 	// streaming. Messages are written on append/edit/truncate.
@@ -1139,7 +1182,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			if (ChatThreadService._USAGE_FIELDS.has(key)) {
 				usage[key] = value
 			} else if (key === 'state') {
-				metadata[key] = ChatThreadService._stripRuntimeState(value)
+				// The message count is only meaningful when the messages are actually
+				// in memory. A metadata-only thread carries `messages: []`, and pruning
+				// against that would drop every link the thread has ever cached — so an
+				// unloaded thread passes `undefined`, which disables the range check.
+				const messageCount = this._loadedMessageThreadIds.has(thread.id) ? thread.messages.length : undefined
+				metadata[key] = ChatThreadService._stripRuntimeState(value, messageCount)
 			} else {
 				metadata[key] = value
 			}
@@ -1167,16 +1215,44 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 	}
 
+	// Stored threads accumulated failed codespan resolutions: `addCodespanLink` used
+	// to persist whatever `generateCodespanLink` returned, including `null`. On the
+	// way out (`_stripRuntimeState`) they are no longer written; on the way in they
+	// are dropped from memory here, so a thread loaded from an older build retries
+	// the lookup rather than reading the old failure back as a cached answer.
+	//
+	// Drops only failures — entries whose value is `null`. Out-of-range indices need
+	// the message count, which is not known yet at this point (messages load later,
+	// on demand); the write path handles those.
+	private static _dropStoredCodespanFailures(metadata: Record<string, any>): void {
+		const links = metadata.state?.linksOfMessageIdx as CodespanLinkMap | undefined
+		if (!links) return
+		const { links: kept, removedUnresolved } = pruneCodespanLinks(links, undefined)
+		if (removedUnresolved > 0) metadata.state.linksOfMessageIdx = kept
+	}
+
 	// `state` is persisted wholesale, but `state.mountedInfo` is live wiring for
 	// the mounted UI: a Promise, its resolver, and a ref. None of it is data, and
 	// serializing it wrote `{"whenMounted":{},"mountedIsResolvedRef":{"current":false}}`
 	// into every thread's metadata. The live object keeps the field — this only
 	// shapes what is written.
-	private static _stripRuntimeState(state: unknown): unknown {
+	//
+	// `state.linksOfMessageIdx` is a cache of resolved codespan links, and only the
+	// usable entries are worth the bytes. Dropping the rest here is what stops a
+	// failed resolution from becoming durable (see `addCodespanLink`), and it is what
+	// reclaims entries orphaned by editing a message — 85% of the cache in a real
+	// profile, 4.6 MB of 6.5 MB. Nothing is lost that cannot be recomputed.
+	//
+	// `messageCount` is `undefined` when the messages are not loaded; see the caller.
+	private static _stripRuntimeState(state: unknown, messageCount: number | undefined): unknown {
 		if (state === null || typeof state !== 'object') return state
 		const persisted: Record<string, unknown> = {}
 		for (const [key, value] of Object.entries(state)) {
 			if (key === 'mountedInfo') continue
+			if (key === 'linksOfMessageIdx') {
+				persisted[key] = pruneCodespanLinks(value as CodespanLinkMap | undefined, messageCount).links
+				continue
+			}
 			persisted[key] = value
 		}
 		return persisted
@@ -1342,6 +1418,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		const metadataParsed = JSON.parse(metadataRaw, ChatThreadService._storageReviver) as any
 		ChatThreadService._dropLegacyThreadFields(metadataParsed)
+		ChatThreadService._dropStoredCodespanFailures(metadataParsed)
 
 		// @deprecated Migration 1: very old format has messages array inline in metadata.
 		// Split into per-message keys, discarding old checkpoint data.
@@ -3999,6 +4076,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// clear messages up to the index
 		const slicedMessages = thread.messages.slice(0, messageIdx)
 		const removedMessages = thread.messages.slice(messageIdx)
+		this._forgetFailedCodespanLinksFrom(thread.id, messageIdx)
 		this._deleteMessageKeysFrom(thread.id, messageIdx)
 		const updatedThread = { ...thread, messages: slicedMessages }
 		this._storeThread(thread.id, updatedThread)
@@ -4258,17 +4336,33 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return undefined;
 
-		const links = thread.state.linksOfMessageIdx?.[messageIdx]
-		if (!links) return undefined;
+		// A hit, ignoring stored failures — `lookupCodespanLink` is the one place that
+		// decides what counts, and it does not count a `null`. That is what makes a
+		// legacy null retry instead of reading back as an answer.
+		const link = lookupCodespanLink(thread.state.linksOfMessageIdx, messageIdx, codespanStr)
+		if (link) return link
 
-		const link = links[codespanStr]
+		// Failed earlier this session. Answering `null` rather than `undefined` is
+		// what tells the renderer not to try again: it treats any defined value as
+		// an answer, so the lookup runs at most once per session per span.
+		if (this._hasFailedCodespanLink(threadId, messageIdx, codespanStr)) return null
 
-		return link
+		return undefined
 	}
 
 	async addCodespanLink({ newLinkText, newLinkLocation, messageIdx, threadId }: { newLinkText: string, newLinkLocation: CodespanLocationLink, messageIdx: number, threadId: string }) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
+
+		// A failed resolution is not cached durably. Storing it as `null` used to be
+		// the whole bug: the next render read that null back as a hit and skipped the
+		// retry, so a span that failed once stayed dead forever. Keep it in memory for
+		// this session instead — the lookup is not repeated, and the next session
+		// tries again.
+		if (!isResolvedCodespanLink(newLinkLocation)) {
+			this._recordFailedCodespanLink(threadId, messageIdx, newLinkText)
+			return
+		}
 
 		this._setState({
 
@@ -4587,6 +4681,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		this.markThreadRead(threadId)
 		this.clearQueuedMessages(threadId)
+		this._failedCodespanLinks.delete(threadId)
 
 		// Clean up image files owned by this thread.
 		// Load messages first so image paths are available for cleanup.

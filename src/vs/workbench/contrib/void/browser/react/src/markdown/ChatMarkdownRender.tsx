@@ -204,7 +204,12 @@ const CodespanWithLink = ({ text, rawText, chatMessageLocation }: { text: string
 	useEffect(() => {
 		if (!rawText.endsWith('`')) return
 
-		// check cache first — synchronous
+		// check cache first — synchronous.
+		// Three outcomes, and the difference matters: a link means cached and fine,
+		// `null` means the resolution failed earlier in this session (so don't repeat
+		// it — the lookup can touch every file in the conversation and the language
+		// servers), and `undefined` means nothing is known yet, which includes a
+		// failure stored by an older build. Only the last one falls through to resolve.
 		const cached = chatThreadService.getCodespanLink({ codespanStr: text, messageIdx, threadId })
 		if (cached !== undefined) {
 			setLink(cached)
