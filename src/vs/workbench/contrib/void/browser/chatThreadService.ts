@@ -31,6 +31,7 @@ import { IVoidModelService } from '../common/voidModelService.js';
 import { findLast } from '../../../../base/common/arraysFind.js';
 import { ITerminalToolService } from './terminalToolService.js';
 import { truncate } from '../../../../base/common/strings.js';
+import { workspaceRelativeSearchPattern } from '../common/codespanSearchPattern.js';
 import { CHECKPOINT_KEY_PREFIX, LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, MESSAGE_KEY_PREFIX, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY, USAGE_KEY_PREFIX } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IRequestTelemetryService } from './requestTelemetryService.js';
@@ -4202,7 +4203,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const prevUris = this._getAllSeenFileURIs(threadId).reverse()
 
 		if (codespanType === 'file-or-folder') {
-			const doesUriMatchTarget = (uri: URI) => uri.path.includes(target)
+			// A reply writes a path however it likes; the workspace search matches
+			// against paths relative to a folder, so an absolute path or a `./` prefix
+			// has to be reduced before either the seen-file check or the search can
+			// match it. See `workspaceRelativeSearchPattern`.
+			const folderPaths = this._workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath)
+			const matchTarget = workspaceRelativeSearchPattern(target, folderPaths)
+			const doesUriMatchTarget = (uri: URI) => uri.path.includes(matchTarget)
 
 			// check if any prevFiles are the `target`
 			for (const uri of prevUris) {
@@ -4215,9 +4222,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// else search codebase for `target`
 			let uris: URI[] = []
 			try {
-				const { result } = await this._toolsService.callTool['search_pathnames_only']({ query: target, includePattern: null, pageNumber: 0 })
-				const { uris: uris_ } = await result
-				uris = uris_
+				// `searchPathnames`, not `callTool['search_pathnames_only']`: the tool
+				// pages its results, and its core trusts that the params already went
+				// through `validateParams` — which a direct `callTool` dispatch is not.
+				// This used to pass `pageNumber: 0`, the page before the first, so the
+				// slice came out empty and the fallback never returned a single URI.
+				uris = await this._toolsService.searchPathnames({ query: matchTarget })
 			} catch (e) {
 				return null
 			}

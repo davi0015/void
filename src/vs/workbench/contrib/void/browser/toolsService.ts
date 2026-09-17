@@ -19,6 +19,7 @@ import { IVoidSettingsService } from '../common/voidSettingsService.js'
 import { IFetchUrlService } from '../common/fetchUrlService.js'
 
 import { toolDefinitionOfToolName } from './tools/toolRegistry.js'
+import { searchWorkspacePathnames } from './tools/searchPathnames.js'
 import type { ToolCtx } from './tools/toolTypes.js'
 import { validateURIWithRoot, validateOptionalURIWithRoot } from './tools/toolHelpers.js'
 
@@ -33,6 +34,18 @@ export interface IToolsService {
 	validateParams: ValidateBuiltinParams;
 	callTool: CallBuiltinTool;
 	stringOfResult: BuiltinToolResultToString;
+
+	/**
+	 * Workspace pathname search, unpaginated, for internal callers.
+	 *
+	 * Not the `search_pathnames_only` tool: that one pages its results because it is
+	 * answering an LLM, and its core assumes params have already been through
+	 * `validateParams`. `callTool` dispatches straight to the core, so an internal
+	 * caller gets no coercion — the codespan resolver asked it for `pageNumber: 0`
+	 * for a long time and silently received nothing for every query. Reach for this
+	 * instead of `callTool` when what you want is a name rather than a page.
+	 */
+	searchPathnames: (opts: { query: string, includePattern?: string | null }) => Promise<URI[]>;
 }
 
 export const IToolsService = createDecorator<IToolsService>('ToolsService');
@@ -44,6 +57,7 @@ export class ToolsService implements IToolsService {
 	public validateParams!: ValidateBuiltinParams;
 	public callTool!: CallBuiltinTool;
 	public stringOfResult!: BuiltinToolResultToString;
+	public searchPathnames!: (opts: { query: string, includePattern?: string | null }) => Promise<URI[]>;
 
 	constructor(
 		@IFileService fileService: IFileService,
@@ -109,6 +123,9 @@ export class ToolsService implements IToolsService {
 		this.stringOfResult = Object.fromEntries(entries.map(([name, def]) =>
 			[name, (params: never, result: never) => def.stringOfResult(params, result, toolCtx)]
 		)) as BuiltinToolResultToString
+
+		// The unpaginated search, sharing one implementation with the tool above.
+		this.searchPathnames = (opts) => searchWorkspacePathnames(toolCtx, opts)
 
 	}
 

@@ -1,7 +1,7 @@
-import { CancellationToken } from '../../../../../base/common/cancellation.js'
 import { MAX_CHILDREN_URIs_PAGE } from '../../common/prompt/prompts.js'
 import { RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
+import { searchWorkspacePathnames } from './searchPathnames.js'
 import { validateStr, validatePageNum, validateOptionalStr, nextPageStr } from './toolHelpers.js'
 
 export const searchPathnamesOnlyToolCore: ToolDefinitionCore<'search_pathnames_only'> = {
@@ -23,20 +23,18 @@ export const searchPathnamesOnlyToolCore: ToolDefinitionCore<'search_pathnames_o
 	},
 
 	callTool: async ({ query: queryStr, includePattern, pageNumber }, ctx) => {
-		const query = ctx.queryBuilder.file(ctx.workspaceContextService.getWorkspace().folders.map(f => f.uri), {
-			filePattern: queryStr,
-			includePattern: includePattern ?? undefined,
-			sortByScore: true,
-		})
-		const data = await ctx.searchService.fileSearch(query, CancellationToken.None)
+		// The unpaginated search lives in `searchWorkspacePathnames`; paging is this
+		// tool's own contract, because it is answering an LLM. `pageNumber` is 1-based
+		// and is validated by `validateParams` before it reaches here — a caller that
+		// dispatches to `callTool` directly would skip that, which is how the codespan
+		// resolver ended up asking for page 0 and getting nothing for every query.
+		const all = await searchWorkspacePathnames(ctx, { query: queryStr, includePattern })
 
 		const fromIdx = MAX_CHILDREN_URIs_PAGE * (pageNumber - 1)
 		const toIdx = MAX_CHILDREN_URIs_PAGE * pageNumber - 1
-		const uris = data.results
-			.slice(fromIdx, toIdx + 1)
-			.map(({ resource }) => resource)
+		const uris = all.slice(fromIdx, toIdx + 1)
 
-		const hasNextPage = (data.results.length - 1) - toIdx >= 1
+		const hasNextPage = (all.length - 1) - toIdx >= 1
 		return { result: { uris, hasNextPage } }
 	},
 
