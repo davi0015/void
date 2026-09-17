@@ -74,6 +74,12 @@ Plain scripts (`test/void/*.mjs`), docs and `.tmp/` are not compiled at all.
   `git checkout HEAD -- <file>`.
 - **Do not switch branches while a test is running.** The watcher rebuilds and the run straddles two
   builds; this has already produced one invalid measurement.
+- **Switching branches leaves the other branch's compiled tests in `out/`.** The watcher compiles, it
+  does not delete, and the node tier globs `out/**/test/**/*.test.js` — so a suite from the branch
+  you just left keeps running and keeps passing. That inflates the count and reports on code the
+  branch does not contain: a chore branch off `main` measured 4510 when its own source had 4497,
+  the extra 13 being the previous branch's suite. Check `grep -c <SuiteName> <run output>` against
+  what the branch's `src/` actually holds, or delete the stale files from `out/` before measuring.
 - A full recompile leaves `out/` incomplete for about 75 seconds. `npm run test-void` refuses to run
   with a clear message, which is not a test failure.
 - `out/` is gitignored. Build (`npm run compile`) before any end-to-end test.

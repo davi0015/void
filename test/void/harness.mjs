@@ -173,10 +173,20 @@ export async function waitForChatService(page, timeoutMs = 120000) {
 // state.vscdb is the application-scope key/value database. Reading it directly
 // means a test asserts on what was persisted, not on what a service believes.
 
+// sqlite3 is spawned with an explicit maxBuffer. Node's default is 1 MB, and one
+// row here is a whole thread — messages, tool results, cached codespan links — so
+// the largest values in a real profile pass it: a thread in the profile this was
+// built against held 4.5 MB of metadata, and that is the thread worth verifying
+// against, since the biggest one held 61% of everything reclaimable. Without the
+// limit raised, reading it fails with a bare `spawnSync sqlite3 ENOBUFS`, which
+// says nothing about storage and reads as a broken test rather than a broken
+// harness. Bounded rather than unlimited: a runaway query should still fail.
+const MAX_SQLITE_OUTPUT_BYTES = 256 * 1024 * 1024
+
 function query(userDataDir, sql) {
 	const db = join(userDataDir, 'User', 'globalStorage', 'state.vscdb')
 	if (!existsSync(db)) return []
-	const out = execFileSync('sqlite3', [`file:${db}?mode=ro`, sql], { encoding: 'utf8' })
+	const out = execFileSync('sqlite3', [`file:${db}?mode=ro`, sql], { encoding: 'utf8', maxBuffer: MAX_SQLITE_OUTPUT_BYTES })
 	return out.split('\n').filter((l) => l.length > 0)
 }
 
