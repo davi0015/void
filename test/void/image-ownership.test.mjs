@@ -371,6 +371,70 @@ describe('image ownership', () => {
 			)
 		})
 	})
+
+	// Bug 18's own gate, and the reason it is documented as a separate defect
+	// rather than folded into image ownership: nothing above would catch it. The
+	// assertion there is that the copy's message keys reach storage, which is the
+	// mechanism — this one asks the question a user would, by quitting and
+	// reopening the profile.
+	test('a duplicated conversation comes back after a restart', async (t) => {
+		const dirs = h.createProfile('image-ownership/duplicate-reload')
+		const first = await h.launchVoid(dirs)
+		let copyId
+		try {
+			copyId = await first.page.evaluate(async () => {
+				const svc = globalThis.__voidChatThreadService
+				const id = svc.state.currentThreadId
+				svc._storeMessageKey(id, 0, {
+					role: 'user', content: 'remember me', displayContent: 'remember me', selections: null,
+				})
+				svc._flushPendingThreadWrites()
+				svc._loadedMessageThreadIds.delete(id)
+				svc._ensureMessagesLoaded(id)
+
+				const before = new Set(Object.keys(svc.state.allThreads))
+				await svc.duplicateThread(id)
+				svc._flushPendingThreadWrites()
+				return Object.keys(svc.state.allThreads).find(k => !before.has(k))
+			})
+			assert.ok(copyId, 'the duplicate was never created')
+			await h.sleep(600) // the message keys are queued on the 500ms coalescing timer
+		} finally {
+			await first.close()
+		}
+
+		const second = await h.launchVoid(dirs)
+		try {
+			const loaded = await second.page.evaluate((id) => {
+				const svc = globalThis.__voidChatThreadService
+				svc._ensureMessagesLoaded(id)
+				const thread = svc.state.allThreads[id]
+				return {
+					// Guard: the copy's metadata reached the index, so a missing
+					// conversation below is a message-storage failure and not a
+					// duplicate that was never persisted at all.
+					threadPresent: !!thread,
+					messageCount: thread?.messages?.length ?? 0,
+					texts: (thread?.messages ?? []).map(m => m.displayContent),
+				}
+			}, copyId)
+
+			trace(t, second)
+			// Guard: the copy's metadata reached the index, so a missing
+			// conversation below is a message-storage failure and not a duplicate
+			// that was never persisted at all. Must hold in every configuration.
+			assert.ok(loaded.threadPresent, 'the duplicate is not in the thread index after a restart')
+			t.diagnostic(`duplicate after restart: ${loaded.messageCount} message(s) ${JSON.stringify(loaded.texts)}`)
+
+			h.assertPersistence(
+				'the duplicated conversation after a restart',
+				loaded.texts.includes('remember me'),
+				{ subject: true },
+			)
+		} finally {
+			await second.close()
+		}
+	})
 })
 
 // A 1x1 PNG. Small enough to compress instantly, real enough for the canvas
