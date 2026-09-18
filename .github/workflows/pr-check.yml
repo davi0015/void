@@ -126,9 +126,8 @@ jobs:
           node-version-file: '.nvmrc'
           cache: 'npm'
 
-      # Covers all 49 directories in `build/npm/dirs.js`. The `v2` is a cache
-      # bust: the first version of this list was incomplete and its entry is
-      # still keyed to this lockfile. Bump it whenever the path list changes.
+      # Covers all 49 directories in `build/npm/dirs.js`. `v2` records the bust
+      # that dropped the first, incomplete entry.
       - name: Restore node_modules
         if: steps.scope.outputs.run == 'true'
         id: cache
@@ -145,7 +144,13 @@ jobs:
             test/*/node_modules
             test/*/*/node_modules
             .vscode/extensions/*/node_modules
-          key: node-modules-${{ runner.os }}-${{ runner.arch }}-v2-node${{ hashFiles('.nvmrc') }}-${{ hashFiles('package-lock.json') }}
+          # `dirs` is the hash of `build/npm/dirs.js` — the list that decides
+          # which trees exist. Without it the key only moves when the *root*
+          # lockfile does, and adding a directory there (a new built-in
+          # extension with its own lockfile) would hit a cache that predates it.
+          # The check below would then run `npm ci` on every run forever: a hit
+          # never overwrites an entry, and the post step only saves on success.
+          key: node-modules-${{ runner.os }}-${{ runner.arch }}-v2-node${{ hashFiles('.nvmrc') }}-${{ hashFiles('package-lock.json') }}-dirs${{ hashFiles('build/npm/dirs.js') }}
 
       # The tree is checked against `build/npm/dirs.js` — the list the
       # postinstall itself walks — instead of being trusted, because a cache that
