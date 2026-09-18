@@ -62,6 +62,35 @@ Decide by what the test needs, not by what it is about.
 8. **Commit with the evidence.** Imperative subject. The body carries the mechanism, what the red
    phase observed, and how the fix was verified.
 
+## Explaining a change
+
+The reader has the repository open and can read the code. What they cannot read is your reasoning,
+and they are usually asking because something did not match what they expected. Assume competence,
+not context.
+
+- **Order it: background, then the bug, then the example.** One line each on which part of the system
+  this touches and what is wrong with it, *before* any walkthrough. An explanation that opens on the
+  mechanism makes the reader reconstruct the subject from its symptoms. S5 was explained that way:
+  five steps of duplicate-and-delete before the reader was told that images live in a single flat
+  shared folder and that cleanup scans one thread's messages. The walkthrough was accurate and still
+  unreadable.
+- **Let the worked example carry the mechanism, and name the abstraction after it.** One real input
+  walked through the code — a chat message, a filename, a row — lands where a summary does not.
+  Measurements are evidence for a point, not the point; put them after it.
+- **Give a number with its precondition.** "2.17 MB reclaimed" is wrong without "…if every thread is
+  written"; "0 bytes" is wrong without "…on reload, which writes nothing". Three answers in one
+  session quoted a measurement without its precondition and all three had to be corrected. If the
+  number needs a sentence to be true, the sentence is part of the number.
+- **Check what the repository already does before proposing to build it.** A design described here as
+  future work — a pressure-gated tool-result trim — already existed as `_compactToolResultsForRequest`,
+  switched off, with the reason written beside it. Proposing to write it wasted the reader's time and
+  made the earlier explanation wrong.
+- **Answer the question that was asked.** If it has two readings, answer both in a line each rather
+  than picking one and elaborating. If part of it is unverified — the UI, a hypothesis — say which
+  part, once.
+- **When correcting yourself, state the correction and stop.** Do not restate the wrong version at
+  length, and do not re-describe a substantive error as a matter of wording.
+
 ## Build-state discipline
 
 `npm run watch-client` runs in this checkout and rebuilds `src/**/*.ts` within seconds of an edit.
