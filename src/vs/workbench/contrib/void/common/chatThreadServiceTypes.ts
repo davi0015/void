@@ -167,11 +167,12 @@ export type StagingSelectionItem = {
 	label: string; // shown in the staging chip, e.g. `npm test · exit 1`
 	state: { wasAddedAsCurrentFile: false };
 } | {
-	// An image pasted or dropped into the chat input. The raw base64 data is
-	// stored on disk under `<userRoamingDataHome>/voidImages/<threadId>/<uuid>.<ext>`
-	// and `uri` points to that file. At send time the image is either included
-	// as a native multimodal content part (if the model supports vision) or
-	// described by a vision-helper model and the text description sent instead.
+	// An image pasted or dropped into the chat input. The bytes are stored on
+	// disk inside the thread that attached them — see `threadImagePaths.ts` for
+	// the layout and for why ownership is a directory rather than a reference
+	// count — and `uri` points to that file. At send time the image is either
+	// included as a native multimodal content part (if the model supports vision)
+	// or described by a vision-helper model and the text description sent instead.
 	type: 'Image';
 	uri: URI;
 	mimeType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';

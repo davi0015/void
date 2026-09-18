@@ -11,7 +11,7 @@ Two parts, deliberately separable:
 
 ## Problem
 
-Conversation data lives in `state.vscdb` — VS Code's application-scope key-value store — under key-per-message layout. **Seventeen bugs** are catalogued in this document, numbered `bug 1` through `bug 17`. The eight sections below are the ones with a narrative and cover bugs 1–9, 15 and 16; the rest are ledger entries in [1.6 Bugs fixed in Part 1](#16-bugs-fixed-in-part-1). The first is architectural; the rest are ordinary bugs.
+Conversation data lives in `state.vscdb` — VS Code's application-scope key-value store — under key-per-message layout. **Eighteen bugs** are catalogued in this document, numbered `bug 1` through `bug 18`. The eight sections below are the ones with a narrative and cover bugs 1–9, 15 and 16; the rest are ledger entries in [1.6 Bugs fixed in Part 1](#16-bugs-fixed-in-part-1). The first is architectural; the rest are ordinary bugs.
 
 ### Bug 1 — The renderer mirrors the entire database
 
@@ -435,6 +435,8 @@ Images become **thread-owned**, fixing the GC bug by construction:
 - **Truncate → sweep the removed messages' images** against the retained prefix. The thread is loaded, so this is in-memory and cheap.
 - **`duplicateThread` copies image files** into the new thread's directory rather than sharing URIs.
 - **Eviction must never trigger image GC.** Only deletion and truncation may. An evicted thread has `messages: []`, so a scan-based GC would conclude its images are unreferenced and delete them all. Directory ownership removes the possibility rather than guarding against it.
+- **A sweep only ever touches files inside the thread's own image directory.** Truncation and duplication both walk a thread's image selections, and after S5 some of those still point at the flat directory — a legacy file that another thread may render. Deleting or moving one would be bug 6 walking back in through the door this section closes. The invariant is *no code path deletes a file it does not own*.
+- **Files already in the flat directory are not migrated here.** Attributing them needs a global view and belongs to §1.5 step 4; until that runs, a thread in use since before S5 holds messages pointing at both locations and both must render.
 
 Also: **move out of `userRoamingDataHome`** — it is the roaming profile, settings-sync territory, the wrong place for large binaries; `globalStorageHome` is correct. `cachedDescription` stays in the message payload: small text, must survive eviction.
 
@@ -453,7 +455,14 @@ Lazy and per-thread; no giant startup migration.
 1. On first load under the new version, read `void.chatMsg.<id>.*`, write `messages.jsonl`, then delete the old keys. Idempotent and resumable.
 2. **Strip `state.mountedInfo`** and **drop `filesWithUserChanges`** as threads are rewritten.
 3. **Delete checkpoint residue** per the checklist above, including `void.chatCheckpoint.*` keys.
-4. **Images:** flat `voidImages/<uuid>.<ext>` files are attributed by scanning messages. Because duplicates may share a file, attribution **copies rather than moves** when more than one thread references the same URI.
+4. **Images:** flat `voidImages/<uuid>.<ext>` files are attributed by scanning messages. Because duplicates may share a file, attribution **copies rather than moves** when more than one thread references the same URI, and the flat original is deleted only once no thread references it any more.
+
+   This step belongs here rather than to S5, and it cannot be pulled earlier. S5 changes where new images are written and stops the delete path touching a file it does not own, so from S5 onward a legacy file is simply never deleted — a leak, which is the safe direction. What S5 cannot do is *attribute* one: move-versus-copy needs to know whether any other thread references the same URI, and no per-thread path can answer that without scanning every thread.
+
+   Two consequences to carry into the implementation:
+
+   - **A two-location window is normal until this runs.** A thread in use since before S5 carries messages pointing at `voidImages/` alongside messages pointing at `threads/<threadId>/images/`. Both render, because nothing reconstructs the path on read — the URI is in the message.
+   - **This must be part of the startup pass, not the read path.** The files it collects include those leaked by threads deleted during the window, which no read path will ever visit again; a lazy implementation leaves them forever.
 5. **`compactionBoundaryIdx` carries across unchanged** — the log's explicit indices make the old numbering valid as-is.
 
 **Lazy is a choice about *latency*, not about *reach*.** Everything above runs inside `_readThread(id, true)`, which only `_ensureMessagesLoaded` calls — so it runs when the user opens a thread and never otherwise. Startup reads every thread metadata-only (`_readThread(id, false)` in `chatThreadService.ts`) and returns before the migration loop, which is deliberate: it keeps launch cheap. The consequence is that residue in a thread the user never reopens is never cleared, and per-thread cleanup converges to whatever the user happens to visit rather than to a fixed point.
@@ -490,6 +499,7 @@ Two rules follow, and they apply to the S10 format migration rather than to the 
 | 15 | Writes within the ~500 ms debounce of quitting are silently dropped (compaction, messages, usage) | Flush on `onBeforeShutdown`, which precedes the workbench's storage close; compaction additionally writes through immediately |
 | 16 | Restored post-compaction usage never written to the usage key; ring differs between live and reopened windows | Write the restored value back, or clear the thread's pending usage write before `_storeThread` |
 | 17 | A failed codespan resolution was stored as `null` and read back as a cache hit, so a span that failed once — cold language server, unready index, file not yet mentioned — stayed dead for the life of the thread; the dead entries were never reclaimed either | Failures held for the session in `_failedCodespanLinks` and never written; `common/codespanLinkCache.ts` decides what counts as a hit, and drops unresolved and out-of-range entries on write |
+| 18 | `duplicateThread` — the Duplicate action in the thread selector — persisted only thread metadata, never message keys, so a duplicated conversation came back empty after a restart while the session that created it looked fine | `_storeAllMessageKeys` for the copy. Found while fixing bug 6: the same method deep-clones image uris, so it needed the same copy-on-duplicate treatment, and copying bytes for a thread whose messages do not survive a restart would only have leaked them |
 
 ---
 
