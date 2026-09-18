@@ -26,8 +26,8 @@
 #
 #   2. node_modules is cached. `npm ci` is the single largest step and almost
 #      none of it is download — setup-node already caches the npm tarballs. It is
-#      extraction of ~2.9 GB across 48 node_modules trees, plus native builds
-#      from source (this is why the apt step exists) and 48 postinstall installs.
+#      extraction of ~2.9 GB across 49 node_modules trees, plus native builds
+#      from source (this is why the apt step exists) and 49 postinstall installs.
 #      Keyed on the lockfile, so a cache hit is the same tree `npm ci` would have
 #      produced.
 #
@@ -36,6 +36,22 @@
 #      compile — and still paid the full ten minutes. The job always runs and
 #      always reports success either way; it is a required check, so skipping it
 #      outright would leave the PR unmergeable rather than fast.
+#
+# A cache that is incomplete is a compile that fails for no visible reason. The
+# first version of this file cached six globs that covered `extensions/*` and
+# missed five directories the postinstall also populates — `extensions`,
+# `remote/web`, `test/integration/browser` and, fatally, `.vscode/extensions/*`.
+# Restoring it skipped `npm ci`, so
+# `.vscode/extensions/vscode-selfhost-test-provider` had no `istanbul-to-vscode`
+# or `cockatiel`: two "cannot find module" errors plus three implicit-any errors
+# in the callbacks whose types came from them, and the whole compile aborted
+# after 33s. That list had been checked against itself rather than against
+# `build/npm/dirs.js`, which is the list that matters.
+#
+# Two things prevent a repeat: the glob list below is verified to cover all 49
+# directories in `build/npm/dirs.js`, and the restore is *checked* rather than
+# trusted — a tree missing anything `npm ci` would have created falls back to
+# running it. A forgotten path now costs a slow run instead of a broken one.
 
 name: PR check
 
@@ -110,28 +126,85 @@ jobs:
           node-version-file: '.nvmrc'
           cache: 'npm'
 
-      - name: Cache node_modules
+      # Covers all 49 directories in `build/npm/dirs.js`. The `v2` is a cache
+      # bust: the first version of this list was incomplete and its entry is
+      # still keyed to this lockfile. Bump it whenever the path list changes.
+      - name: Restore node_modules
         if: steps.scope.outputs.run == 'true'
-        id: modules
+        id: cache
         uses: actions/cache@v4
         with:
           path: |
             node_modules
             build/node_modules
+            extensions/node_modules
             extensions/*/node_modules
             extensions/*/*/node_modules
-            test/*/node_modules
             remote/node_modules
-          key: node-modules-${{ runner.os }}-${{ runner.arch }}-node${{ hashFiles('.nvmrc') }}-${{ hashFiles('package-lock.json') }}
+            remote/web/node_modules
+            test/*/node_modules
+            test/*/*/node_modules
+            .vscode/extensions/*/node_modules
+          key: node-modules-${{ runner.os }}-${{ runner.arch }}-v2-node${{ hashFiles('.nvmrc') }}-${{ hashFiles('package-lock.json') }}
+
+      # The tree is checked against `build/npm/dirs.js` — the list the
+      # postinstall itself walks — instead of being trusted, because a cache that
+      # silently misses a directory produces a compile failure that reads as a
+      # source error. A directory declaring no dependencies is skipped: npm does
+      # not create an empty node_modules, and two entries in that list are like
+      # that today.
+      - name: Check the restored node_modules
+        if: steps.scope.outputs.run == 'true'
+        id: modules
+        run: |
+          set -uo pipefail
+          cat > /tmp/check-modules.js <<'JS'
+          const fs = require('fs');
+          const path = require('path');
+          // Absolute: this script lives in /tmp, so a relative require would
+          // resolve against /tmp rather than the checkout.
+          const { dirs } = require(path.join(process.cwd(), 'build', 'npm', 'dirs.js'));
+          const missing = [];
+          for (const dir of dirs) {
+            const modules = dir ? path.join(dir, 'node_modules') : 'node_modules';
+            if (fs.existsSync(modules)) continue;
+            const pkg = dir ? path.join(dir, 'package.json') : 'package.json';
+            let declared = 0;
+            if (fs.existsSync(pkg)) {
+              const parsed = JSON.parse(fs.readFileSync(pkg, 'utf8'));
+              for (const key of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+                declared += Object.keys(parsed[key] ?? {}).length;
+              }
+            }
+            if (declared > 0) missing.push(modules);
+          }
+          console.log(`checked ${dirs.length} directories`);
+          console.log(`MISSING=${missing.join(' ')}`);
+          JS
+
+          if ! out="$(node /tmp/check-modules.js 2>&1)"; then
+            echo "::warning::Could not verify node_modules — installing to be safe."
+            echo "${out}"
+            echo "install=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "${out}"
+          missing="$(printf '%s\n' "${out}" | sed -n 's/^MISSING=//p')"
+          if [ -n "${missing}" ]; then
+            echo "::warning::Restored node_modules is incomplete, running npm ci. Missing: ${missing}"
+            echo "install=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "install=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # Only a cache miss needs these: the headers are for native modules built
       # from source during `npm ci`, and a restored tree already has them built.
       - name: Install system dependencies
-        if: steps.scope.outputs.run == 'true' && steps.modules.outputs.cache-hit != 'true'
+        if: steps.scope.outputs.run == 'true' && steps.modules.outputs.install == 'true'
         run: sudo apt-get update && sudo apt-get install -y libxkbfile-dev libsecret-1-dev libkrb5-dev pkg-config
 
       - name: Install dependencies
-        if: steps.scope.outputs.run == 'true' && steps.modules.outputs.cache-hit != 'true'
+        if: steps.scope.outputs.run == 'true' && steps.modules.outputs.install == 'true'
         run: npm ci
 
       - name: Build React bundles
