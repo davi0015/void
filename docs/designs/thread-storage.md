@@ -11,7 +11,7 @@ Two parts, deliberately separable:
 
 ## Problem
 
-Conversation data lives in `state.vscdb` — VS Code's application-scope key-value store — under key-per-message layout. **Sixteen bugs** are catalogued in this document, numbered `bug 1` through `bug 16`. The eight sections below are the ones with a narrative and cover bugs 1–9, 15 and 16; the rest are ledger entries in [1.6 Bugs fixed in Part 1](#16-bugs-fixed-in-part-1). The first is architectural; the rest are ordinary bugs.
+Conversation data lives in `state.vscdb` — VS Code's application-scope key-value store — under key-per-message layout. **Seventeen bugs** are catalogued in this document, numbered `bug 1` through `bug 17`. The eight sections below are the ones with a narrative and cover bugs 1–9, 15 and 16; the rest are ledger entries in [1.6 Bugs fixed in Part 1](#16-bugs-fixed-in-part-1). The first is architectural; the rest are ordinary bugs.
 
 ### Bug 1 — The renderer mirrors the entire database
 
@@ -456,6 +456,15 @@ Lazy and per-thread; no giant startup migration.
 4. **Images:** flat `voidImages/<uuid>.<ext>` files are attributed by scanning messages. Because duplicates may share a file, attribution **copies rather than moves** when more than one thread references the same URI.
 5. **`compactionBoundaryIdx` carries across unchanged** — the log's explicit indices make the old numbering valid as-is.
 
+**Lazy is a choice about *latency*, not about *reach*.** Everything above runs inside `_readThread(id, true)`, which only `_ensureMessagesLoaded` calls — so it runs when the user opens a thread and never otherwise. Startup reads every thread metadata-only (`_readThread(id, false)` in `chatThreadService.ts`) and returns before the migration loop, which is deliberate: it keeps launch cheap. The consequence is that residue in a thread the user never reopens is never cleared, and per-thread cleanup converges to whatever the user happens to visit rather than to a fixed point.
+
+That was measured on a real profile while fixing bug 17. 287 checkpoint records across 23 threads, and 43,691 stored codespan failures, were all still present; they reached zero only when every thread was read in full and written back. The threads holding them were old ones — the largest, 4.5 MB of metadata and 61% of everything reclaimable, had last been opened eleven weeks earlier — which is exactly the kind of thread a read-path fix never reaches.
+
+Two rules follow, and they apply to the S10 format migration rather than to the caches here:
+
+- **A format migration must be a pass over all threads at startup, not a read-path side effect.** It has to complete without the user's cooperation. The offset table and per-thread log are what make that affordable, and residue a user could carry forever is a correctness bug rather than untidiness.
+- **Reclaiming space is a separate, one-shot step.** SQLite frees pages inside the file rather than returning them to the OS, so deleting rows does not shrink `state.vscdb`: after removing 287 rows and 48,090 cache entries the file was still its original size, with ~12 MB of free pages. A migration that intends to give space back must `VACUUM` once at the end.
+
 **Acceptance gate:** renderer memory no longer scales with total message count; a compaction anchor survives a restart on a thread that previously drifted; no thread metadata contains `mountedInfo` or `filesWithUserChanges`.
 
 ## 1.6 Bugs fixed in Part 1
@@ -480,6 +489,7 @@ Lazy and per-thread; no giant startup migration.
 | 14 | Stale claims in `checkpoint-storage-refactor.md` | Corrected alongside |
 | 15 | Writes within the ~500 ms debounce of quitting are silently dropped (compaction, messages, usage) | Flush on `onBeforeShutdown`, which precedes the workbench's storage close; compaction additionally writes through immediately |
 | 16 | Restored post-compaction usage never written to the usage key; ring differs between live and reopened windows | Write the restored value back, or clear the thread's pending usage write before `_storeThread` |
+| 17 | A failed codespan resolution was stored as `null` and read back as a cache hit, so a span that failed once — cold language server, unready index, file not yet mentioned — stayed dead for the life of the thread; the dead entries were never reclaimed either | Failures held for the session in `_failedCodespanLinks` and never written; `common/codespanLinkCache.ts` decides what counts as a hit, and drops unresolved and out-of-range entries on write |
 
 ---
 
