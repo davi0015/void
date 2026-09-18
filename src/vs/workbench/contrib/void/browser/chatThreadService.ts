@@ -39,6 +39,8 @@ import { RunOnceScheduler, timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { IWorkspaceContextService, toWorkspaceIdentifier } from '../../../../platform/workspace/common/workspace.js';
 import { basename as resourceBasename, joinPath } from '../../../../base/common/resources.js';
+import { IUserDataProfileService } from '../../../services/userDataProfile/common/userDataProfile.js';
+import { isThreadImageUri, threadImageDir, threadImageUri } from '../common/threadImagePaths.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
 import { IHostService } from '../../../services/host/browser/host.js';
@@ -507,7 +509,7 @@ export interface IChatThreadService {
 
 	// thread selector
 	deleteThread(threadId: string): void;
-	duplicateThread(threadId: string): void;
+	duplicateThread(threadId: string): Promise<string | undefined>;
 
 	// tab-strip pinning (does not affect existence — only the chat-header tab row)
 	pinThread(threadId: string): void;
@@ -537,7 +539,14 @@ export interface IChatThreadService {
 	//   copy: clone source, reset usage counters, stamp importedFrom*. Source untouched.
 	//   move: re-tag source workspaceUri to current. Source disappears from its origin workspace.
 	// Both return the id the user is now looking at (new id for copy, same id for move).
-	copyThreadToCurrentWorkspace(threadId: string): string | undefined;
+	copyThreadToCurrentWorkspace(threadId: string): Promise<string | undefined>;
+
+	/**
+	 * Where a newly attached image for the current thread belongs. The composer
+	 * asks rather than building the path, so the layout has one owner — see
+	 * `common/threadImagePaths.ts` for why an image is owned by a directory.
+	 */
+	newImageUriInCurrentThread(fileName: string): URI;
 	moveThreadToCurrentWorkspace(threadId: string): string | undefined;
 
 	// exposed getters/setters
@@ -727,6 +736,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IMCPService private readonly _mcpService: IMCPService,
 		@IRequestTelemetryService private readonly _requestTelemetryService: IRequestTelemetryService,
 		@IEnvironmentService private readonly _environmentService: IEnvironmentService,
+		@IUserDataProfileService private readonly _userDataProfileService: IUserDataProfileService,
 		@ILifecycleService private readonly _lifecycleService: ILifecycleService,
 		@ITerminalToolService private readonly _terminalToolService: ITerminalToolService,
 		@IHostService private readonly _hostService: IHostService,
@@ -4091,7 +4101,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// The edited message's images are re-sent (currSelns), so retain them.
 		// Images only in the removed tail are orphaned.
 		const retainedWithEdit: ChatMessage[] = [...slicedMessages, { role: 'user' as const, content: '', displayContent: '', selections: currSelns, state: { stagingSelections: currSelns, isBeingEdited: false } }]
-		this._deleteOrphanedImages(removedMessages, retainedWithEdit)
+		this._deleteOrphanedImages(thread.id, removedMessages, retainedWithEdit)
 
 		// re-add the message and stream it
 		this._addUserMessageAndStreamResponse({ userMessage, _chatSelections: currSelns, threadId })
@@ -4102,8 +4112,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	/**
 	 * Delete image files referenced by the given messages but NOT referenced
 	 * by any of `retainedMessages`. Best-effort; errors are swallowed.
+	 *
+	 * Only files inside `threadId`'s own image directory are eligible. A removed
+	 * message can still point at the legacy flat `voidImages/` directory, where a
+	 * file may be shared with a duplicated thread — deleting one of those is the
+	 * bug this whole arrangement exists to prevent, and it is reachable from the
+	 * edit path as much as from delete. `thread-storage.md` §1.5 step 4 attributes
+	 * those files; until it runs they are left alone.
 	 */
-	private _deleteOrphanedImages(removedMessages: ChatMessage[], retainedMessages: ChatMessage[]) {
+	private _deleteOrphanedImages(threadId: string, removedMessages: ChatMessage[], retainedMessages: ChatMessage[]) {
+		const home = this._globalStorageHome()
 		const retainedPaths = new Set<string>()
 		for (const m of retainedMessages) {
 			if (m.role !== 'user') continue
@@ -4114,11 +4132,58 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		for (const m of removedMessages) {
 			if (m.role !== 'user') continue
 			for (const s of m.selections ?? []) {
-				if (s.type === 'Image' && !retainedPaths.has(s.uri.path)) {
-					this._fileService.del(s.uri).catch(() => { /* best-effort */ })
-				}
+				if (s.type !== 'Image') continue
+				if (retainedPaths.has(s.uri.path)) continue
+				if (!isThreadImageUri(home, threadId, s.uri)) continue
+				this._fileService.del(s.uri).catch(() => { /* best-effort */ })
 			}
 		}
+	}
+
+	/** The profile's global storage root — where per-thread stores live. */
+	private _globalStorageHome(): URI {
+		return this._userDataProfileService.currentProfile.globalStorageHome
+	}
+
+	newImageUriInCurrentThread(fileName: string): URI {
+		return threadImageUri(this._globalStorageHome(), this.state.currentThreadId, fileName)
+	}
+
+	/**
+	 * Give a duplicated thread its own copy of every image it owns.
+	 *
+	 * A duplicate's messages are deep clones, so their image uris still name files
+	 * inside the *source* thread's directory — and that directory is deleted with
+	 * the source. Sharing them would lose the copy's images the moment the user
+	 * deleted the original, which is bug 6 with one more step in it.
+	 *
+	 * Only files inside the source thread's own directory are copied. An image in
+	 * the legacy flat directory has no owner to inherit and is left shared, which
+	 * is safe precisely because no delete path touches it.
+	 */
+	private async _copyOwnedImages(sourceThreadId: string, destThreadId: string, messages: ChatMessage[]): Promise<void> {
+		const home = this._globalStorageHome()
+		const copies: Promise<void>[] = []
+		for (const m of messages) {
+			if (m.role !== 'user') continue
+			for (const s of m.selections ?? []) {
+				if (s.type !== 'Image') continue
+				if (!isThreadImageUri(home, sourceThreadId, s.uri)) continue
+				const source = s.uri
+				const dest = threadImageUri(home, destThreadId, resourceBasename(source))
+				// Repointed before the write lands, not after: if the copy fails the
+				// image is missing either way, and a duplicate still naming the
+				// source's file would be broken later by a delete that nothing here
+				// could observe.
+				s.uri = dest
+				copies.push(
+					this._fileService.readFile(source)
+						.then(async f => { await this._fileService.writeFile(dest, f.value) })
+						.catch(e => { console.error('[Image copy] Failed to copy an image into a duplicated thread:', source.path, e) }),
+				)
+			}
+		}
+		await Promise.all(copies)
 	}
 
 	private _getAllSeenFileURIs(threadId: string) {
@@ -4693,11 +4758,20 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this.clearQueuedMessages(threadId)
 		this._failedCodespanLinks.delete(threadId)
 
-		// Clean up image files owned by this thread.
-		// Load messages first so image paths are available for cleanup.
+		// Clean up image files owned by this thread. Ownership is directory-shaped,
+		// so this is one recursive delete with no reference scan. Files in the
+		// legacy flat `voidImages/` directory are deliberately untouched: they have
+		// no owner, they may be shared with a duplicated thread, and
+		// `thread-storage.md` §1.5 step 4 collects them.
 		if (deletedThread) {
+			// Still loaded first, though the image cleanup no longer needs it:
+			// `_storeThread(id, undefined)` removes message keys by walking up from
+			// index 0 and stops at the first gap, and reading the thread is what
+			// compacts the gaps a checkpoint-era thread still has. Without this the
+			// keys past the gap are orphaned rather than deleted.
 			this._ensureMessagesLoaded(threadId)
-			this._deleteOrphanedImages(this.state.allThreads[threadId]?.messages ?? [], [])
+			this._fileService.del(threadImageDir(this._globalStorageHome(), threadId), { recursive: true })
+				.catch(() => { /* no images, or the directory is already gone */ })
 		}
 
 		// delete the thread
@@ -4749,15 +4823,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._setState({ ...this.state, allThreads: newThreads, pinnedThreadIds: newPinned })
 	}
 
-	duplicateThread(threadId: string) {
+	async duplicateThread(threadId: string): Promise<string | undefined> {
 		this._ensureMessagesLoaded(threadId)
 		const { allThreads: currentThreads } = this.state
 		const threadToDuplicate = currentThreads[threadId]
-		if (!threadToDuplicate) return
+		if (!threadToDuplicate) return undefined
 		const newThread = {
 			...deepClone(threadToDuplicate),
 			id: generateUuid(),
 		}
+		// The deep clone's image uris point into the source thread's directory,
+		// which is deleted with the source — give the copy its own bytes, exactly
+		// as `copyThreadToCurrentWorkspace` does.
+		await this._copyOwnedImages(threadId, newThread.id, newThread.messages)
 		const newThreads = {
 			...currentThreads,
 			[newThread.id]: newThread,
@@ -4774,8 +4852,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		else newPinned.splice(srcIdx + 1, 0, newThread.id)
 
 		this._storeThread(newThread.id, newThread, true)
+		// The copy's messages need their own keys. `_storeThread` persists only
+		// metadata — messages live under `void.chatMsg.*` — so without this the
+		// duplicate reads back empty after a restart, and the images `_copyOwnedImages`
+		// just wrote for it are files nothing will ever reference again.
+		this._storeAllMessageKeys(newThread.id, newThread.messages)
 		this._loadedMessageThreadIds.add(newThread.id) // duplicated thread already has messages in memory
 		this._setPinsForCurrentWorkspace(newPinned, { allThreads: newThreads })
+		return newThread.id
 	}
 
 	// Phase E commit 4 — claim a foreign thread into the current workspace by
@@ -4791,7 +4875,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// expectation that "Copy" produces something they can immediately work
 	// on. Returns the new id so the caller (banner button) can follow up
 	// with UI work if needed.
-	copyThreadToCurrentWorkspace(threadId: string): string | undefined {
+	async copyThreadToCurrentWorkspace(threadId: string): Promise<string | undefined> {
 		this._ensureMessagesLoaded(threadId)
 		const source = this.state.allThreads[threadId]
 		if (!source) return undefined
@@ -4816,6 +4900,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			latestCompaction: undefined,
 			cumulativeCompactionThisThread: undefined,
 		}
+		// The clone's messages are deep copies whose image uris still point into
+		// the *source* thread's directory, and that directory is deleted with the
+		// source. Give the copy its own bytes before anything is persisted.
+		await this._copyOwnedImages(threadId, newId, cloned.messages)
+
 		const newThreads = { ...this.state.allThreads, [newId]: cloned }
 		this._storeAllMessageKeys(newId, cloned.messages)
 		this._storeThread(newId, cloned, true)

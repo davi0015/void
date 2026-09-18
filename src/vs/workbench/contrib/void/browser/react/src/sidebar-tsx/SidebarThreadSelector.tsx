@@ -295,7 +295,9 @@ const DuplicateButton = ({ threadId }: { threadId: string }) => {
 	return <IconShell1
 		Icon={Copy}
 		className='size-[11px]'
-		onClick={() => { chatThreadsService.duplicateThread(threadId); }}
+		// Async because the copy carries its own image files and its own message
+		// keys; the tab appears when it settles rather than on this click.
+		onClick={() => { void chatThreadsService.duplicateThread(threadId); }}
 		data-tooltip-id='void-tooltip'
 		data-tooltip-place='top'
 		data-tooltip-content='Duplicate thread'

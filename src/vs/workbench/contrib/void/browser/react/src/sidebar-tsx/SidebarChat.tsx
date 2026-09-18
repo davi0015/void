@@ -27,7 +27,7 @@ import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Co
 import { ChatMessage, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { generateUuid } from '../../../../../../../base/common/uuid.js';
 import { VSBuffer } from '../../../../../../../base/common/buffer.js';
-import { joinPath } from '../../../../../../../base/common/resources.js';
+
 import { approvalTypeOfBuiltinToolName, normalizeThreadPermissionMode, threadPermissionModes, ThreadPermissionMode, type ToolName } from '../../../../common/toolsServiceTypes.js';
 import { IconShell1, StatusIndicator } from '../markdown/ApplyBlockHoverButtons.js';
 import { IsRunningType, isThreadReadOnly, shouldShowOwnershipBanner } from '../../../chatThreadService.js';
@@ -743,8 +743,12 @@ const useImageAttach = (selections: StagingSelectionItem[] | undefined, setSelec
 
 	const handleImageFiles = useCallback(async (files: FileList | File[]) => {
 		if (!setSelections || !selections) return
-		const envService = accessor.get('IEnvironmentService')
-		const imageDir = joinPath(envService.userRoamingDataHome, 'voidImages')
+		// The image belongs to the thread that attached it, so it is written inside
+		// that thread's own directory under global storage — not into one flat
+		// folder shared by every thread in the roaming profile, where deleting one
+		// thread could delete an image another was still rendering. The service owns
+		// that path; see common/threadImagePaths.ts.
+		const chatThreadsService = accessor.get('IChatThreadService')
 
 		const newSelections: StagingSelectionItem[] = []
 		for (const file of files) {
@@ -755,7 +759,7 @@ const useImageAttach = (selections: StagingSelectionItem[] | undefined, setSelec
 
 			const { bytes, mimeType } = await compressImage(file, srcMime)
 			const ext = extForMime[mimeType]
-			const fileUri = joinPath(imageDir, `${id}.${ext}`)
+			const fileUri = chatThreadsService.newImageUriInCurrentThread(`${id}.${ext}`)
 
 			const blob = new Blob([bytes], { type: mimeType })
 			const blobUrl = URL.createObjectURL(blob)
@@ -1922,7 +1926,9 @@ const ReadOnlyForeignThreadBanner = ({ ownerLabel, isUnscoped, threadId }: { own
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
 
-	const onCopy = () => { chatThreadsService.copyThreadToCurrentWorkspace(threadId) }
+	// Async because the copy carries its own image files; the handler does not wait
+	// on it, since the new thread is switched to once the copy settles.
+	const onCopy = () => { void chatThreadsService.copyThreadToCurrentWorkspace(threadId) }
 	const onMove = () => { chatThreadsService.moveThreadToCurrentWorkspace(threadId) }
 
 	// Two banner variants. Foreign = "Read-only" (input is gated). Unscoped =
