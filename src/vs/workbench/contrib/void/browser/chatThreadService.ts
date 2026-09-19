@@ -2314,7 +2314,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					}
 					if (isAutoApproved) {
 						try {
-							const validated = this._toolsService.validateParams[next.name](next.rawParams, threadId)
+							const validated = this._toolsService.validateParams[next.name](next.rawParams)
 							this._fireConcurrentTerminal(threadId, { ...next, params: validated })
 							continue // immediately process next tool
 						} catch {
@@ -2878,7 +2878,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// 1. validate tool params
 			try {
 				if (isBuiltInTool) {
-					const params = this._toolsService.validateParams[toolName](opts.unvalidatedToolParams, threadId)
+					const params = this._toolsService.validateParams[toolName](opts.unvalidatedToolParams)
 					toolParams = params
 				}
 				else {
@@ -2992,7 +2992,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// 4. stringify the result to give to the LLM
 		try {
 			if (isBuiltInTool) {
-				toolResultStr = this._toolsService.stringOfResult[toolName](toolParams as any, toolResult as any, threadId)
+				toolResultStr = this._toolsService.stringOfResult[toolName](toolParams as any, toolResult as any)
 			}
 			// For MCP tools, handle the result based on its type
 			else {
@@ -3390,7 +3390,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						// `invalid_params` row when it processes this tool.
 						let validatedParams: ToolCallParams<ToolName> | undefined
 						if (isABuiltinToolName(tc.name)) {
-							try { validatedParams = this._toolsService.validateParams[tc.name](tc.rawParams, threadId) } catch { /* _runToolCall handles invalid_params */ }
+							try { validatedParams = this._toolsService.validateParams[tc.name](tc.rawParams) } catch { /* _runToolCall handles invalid_params */ }
 						}
 						this._addMessageToThread(threadId, {
 							role: 'tool',

@@ -24,7 +24,7 @@ export const searchHistoryToolCore: ToolDefinitionCore<'search_history'> = {
 		return { query, toolName, resultStatus, contextRadius }
 	},
 
-	callTool: async ({ query, toolName, resultStatus, contextRadius }, ctx) => {
+	callTool: async ({ query, toolName, resultStatus, contextRadius }, ctx, threadId) => {
 		const { IChatThreadService } = await import('../chatThreadService.js')
 		const chatThreadService = ctx.instantiationService.invokeFunction(accessor => accessor.get(IChatThreadService))
 		// The thread this call is executing for, not the one on screen. They are
@@ -33,7 +33,7 @@ export const searchHistoryToolCore: ToolDefinitionCore<'search_history'> = {
 		// would answer from someone else's conversation. `getThreadWithMessages`
 		// rather than a plain lookup: the visible thread is the only one this
 		// session is guaranteed to have loaded.
-		const thread = chatThreadService.getThreadWithMessages(ctx.threadId)
+		const thread = chatThreadService.getThreadWithMessages(threadId)
 		if (!thread) {
 			return { result: { matches: 'The thread this tool ran for no longer exists.', totalMatches: 0 } }
 		}
