@@ -8,14 +8,33 @@ npm run test-void                          # every test/void/*.test.mjs
 npm run test-void -- --only=durable        # files matching a substring
 node test/void/run.mjs --only=durable      # same, without npm in the way
 VOID_EXPECT=lost npm run test-void         # invert subject assertions (see below)
+VOID_SHOW_TEST_WINDOWS=1 npm run test-void # show the windows (see below)
 ```
 
 There is deliberately no per-test npm script. One entry point plus `--only`
 covers both "run everything" and "run this area", and per-file aliases would
 multiply with every new test file.
 
-Requires a compiled build and a downloaded Electron (`npm run compile`,
-`npm run electron`). The runner checks this up front and says so.
+**What you see while it runs.** This is not a progress view and the windows are
+not worth watching: each scenario is a fresh app that shows a landing page for the
+second before the test moves on, and the tests assert on what reached storage
+rather than on anything painted. The terminal output is what tells you what is
+running.
+
+- **By default nothing appears.** On macOS the app is launched from an accessory
+  bundle (no Dock tile, never activated) and its window is made transparent,
+  unfocusable and click-through at creation. This is the mode for running the
+  suite while you work.
+- **`VOID_SHOW_TEST_WINDOWS=1` disables all of that** and leaves the window alone,
+  so it is a normal window you can drag and click in. It takes focus, because that
+  is what an interactive window does. For when a test fails and you want to look at
+  the app.
+
+Either way there are about thirty launches — one per scenario, seven files at once
+— so the windows come and go quickly.
+
+Requires a compiled build (`npm run compile`). The runner checks this up front and
+says so.
 
 ## Where a test belongs
 

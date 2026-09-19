@@ -15,7 +15,7 @@
 // Test files import from this module; nothing here is a test itself.
 
 import { _electron } from 'playwright'
-import { existsSync, mkdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
@@ -29,12 +29,56 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // ── environment ─────────────────────────────────────────────────────────
 
+const TEST_ELECTRON_DIR = join(ROOT, '.tmp', 'void-e2e-electron')
+const TEST_ELECTRON_APP = join(TEST_ELECTRON_DIR, 'ElectronTest.app')
+
+/**
+ * A copy of Electron's bundle that macOS never gives a Dock tile to.
+ *
+ * `app.dock.hide()` is too late to stop the tile appearing: it is on screen for
+ * the moment between launch and the call, and this tier launches about thirty
+ * processes, so the developer watches the icon arrive and leave thirty times.
+ *
+ * `LSUIElement` is a property of the bundle, read before the app starts. An
+ * accessory application has no Dock tile and is never activated — which also
+ * means nothing can take focus, without anything having to catch it at run time.
+ *
+ * A distinct `CFBundleIdentifier` keeps it a separate application from the
+ * developer's own instance, which is the other half of not disturbing them.
+ *
+ * The copy is made once and reused, refreshed when Electron's bundle is newer.
+ * `cp -c` clones it on APFS, so it costs no disk and no measurable time.
+ */
+function darwinTestElectronPath() {
+	const source = join(ROOT, 'node_modules', 'electron', 'dist', 'Electron.app')
+	const sourcePlist = join(source, 'Contents', 'Info.plist')
+	const targetPlist = join(TEST_ELECTRON_APP, 'Contents', 'Info.plist')
+	const stale = !existsSync(targetPlist) || statSync(sourcePlist).mtimeMs > statSync(targetPlist).mtimeMs
+	if (stale) {
+		rmSync(TEST_ELECTRON_APP, { recursive: true, force: true })
+		mkdirSync(TEST_ELECTRON_DIR, { recursive: true })
+		execFileSync('cp', ['-Rc', source, TEST_ELECTRON_APP], { stdio: 'ignore' })
+		const plist = (command) => execFileSync('/usr/libexec/PlistBuddy', ['-c', command, targetPlist], { stdio: 'ignore' })
+		try { plist('Set :LSUIElement bool true') } catch { plist('Add :LSUIElement bool true') }
+		plist('Set :CFBundleIdentifier com.voideditor.void-e2e')
+	}
+	return join(TEST_ELECTRON_APP, 'Contents', 'MacOS', 'Electron')
+}
+
 function resolveElectronPath() {
 	const product = JSON.parse(
 		execFileSync('node', ['-p', 'JSON.stringify(require("./product.json"))'], { cwd: ROOT, encoding: 'utf8' }),
 	)
 	switch (process.platform) {
-		case 'darwin': return join(ROOT, '.build', 'electron', `${product.nameLong}.app`, 'Contents', 'MacOS', 'Electron')
+		// Not `.build/electron/<nameLong>.app`, which carries the same bundle
+		// identifier as the app a developer runs from `./scripts/code.sh`: macOS
+		// treats one identifier as one application, so launching a test instance
+		// activated *their* instance and pulled their window forward. No amount of
+		// `setFocusable(false)` inside the test process could prevent that, because
+		// the window coming forward belonged to a different process — which is why
+		// every measurement taken from inside the test app said the window never
+		// took focus while the developer watched it happen.
+		case 'darwin': return darwinTestElectronPath()
 		case 'win32': return join(ROOT, '.build', 'electron', `${product.nameShort}.exe`)
 		default: return join(ROOT, '.build', 'electron', product.applicationName)
 	}
@@ -47,7 +91,7 @@ const OUT_MAIN = join(ROOT, 'out', 'vs', 'workbench', 'workbench.desktop.main.js
 export function preflight() {
 	const problems = []
 	if (!existsSync(OUT_MAIN)) problems.push('no compiled build in out/ — run: npm run compile')
-	if (!existsSync(ELECTRON_PATH)) problems.push(`no Electron at ${ELECTRON_PATH} — run: npm run electron`)
+	if (!existsSync(ELECTRON_PATH)) problems.push(`no Electron at ${ELECTRON_PATH} — run: npm ci`)
 	if (problems.length) {
 		throw new Error('Cannot run Void end-to-end tests:\n  - ' + problems.join('\n  - '))
 	}
@@ -68,7 +112,18 @@ function electronArgs(dirs) {
 		`--logsPath=${dirs.logsPath}`,
 		'--no-sandbox',
 	]
-	if (process.platform === 'darwin') a.push('--use-gl=swiftshader')
+	if (process.platform === 'darwin') {
+		a.push(
+			'--use-gl=swiftshader',
+			// The window is hidden on this platform (see stopStealingFocus), and a
+			// hidden renderer is backgrounded: timers get clamped and rAF stops.
+			// Several scenarios here depend on timers and on storage work settling,
+			// so the renderer has to keep running as if it were on screen.
+			'--disable-background-timer-throttling',
+			'--disable-backgrounding-occluded-windows',
+			'--disable-renderer-backgrounding',
+		)
+	}
 	if (process.platform === 'linux') a.push('--disable-dev-shm-usage', '--disable-gpu')
 	return a
 }
@@ -95,6 +150,94 @@ export function createProfile(name, { fresh = true } = {}) {
 // ── launching ───────────────────────────────────────────────────────────
 
 /**
+ * Keeps the suite out of the way of whoever is running it.
+ *
+ * macOS activates every app it launches, and this tier starts one app per
+ * scenario — two for the restart ones, and seven files at once because node:test
+ * runs them in parallel — so a full run used to put about thirty windows in front
+ * of whatever the developer was doing, inside ninety seconds.
+ *
+ * By default the window is made invisible, unfocusable and click-through. None of
+ * that is a progress view — the tests assert on storage, so all a window shows is
+ * a landing page for the second before that scenario moves on. Use the terminal
+ * output for what is running.
+ *
+ * `VOID_SHOW_TEST_WINDOWS=1` is for when a test fails and you want to look at the
+ * app: the window is left completely alone, so it is a normal window you can drag
+ * and click in. It will take focus, because that is what a window you can interact
+ * with does — this mode is for looking, not for running the suite while you work.
+ *
+ * The quiet properties have to be applied at creation. Main-process control
+ * arrives about 6 ms after launch, before the app has made a window, and that is
+ * the only moment early enough. Reacting is too late: hiding on the window's
+ * `show` event leaves the developer having watched a frame, because macOS has
+ * composited it by the time the handler runs. An earlier version did exactly that
+ * and looked correct by every measurement while still flickering on screen.
+ *
+ * The window stays *shown* either way, never hidden. A hidden renderer is
+ * backgrounded, and VS Code force-shows and opens DevTools on a window that is
+ * still not visible ten seconds in, reading it as a failed launch
+ * (`windowImpl.ts`).
+ *
+ * The Dock tile is not handled here at all — it comes from the bundle, which is
+ * an accessory application (`darwinTestElectronPath`). `app.dock.hide()` was too
+ * late to stop the icon appearing, thirty times a run.
+ *
+ * Best effort throughout: a convenience for the developer running the suite must
+ * never be the reason a test fails.
+ */
+async function stopStealingFocus(app) {
+	if (process.platform !== 'darwin') return
+	const visible = process.env.VOID_SHOW_TEST_WINDOWS === '1'
+	// The first evaluate can land before the main process has a usable context and
+	// throw "Execution context was destroyed". A single attempt therefore
+	// sometimes does nothing at all, silently — and a launch that skips this is a
+	// launch whose window appears. Retried, and reported, because a quiet failure
+	// here is exactly the bug this function exists to prevent.
+	for (let attempt = 0; attempt < 100; attempt++) {
+		try {
+			await app.evaluate(({ app: electronApp, BrowserWindow }, visible) => {
+				const configure = (window) => {
+					if (visible) {
+						// A normal window — draggable, clickable, focusable — that is
+						// simply not made *key* by the app. VS Code calls `win.focus()`
+						// from several places while restoring state, and `show()`
+						// activates the window, so both are neutralised: the window is
+						// displayed with `showInactive()`, and focus is left where it
+						// was. Clicking the window still focuses it, because that goes
+						// through the window server rather than through this call.
+						try {
+							window.show = () => { try { window.showInactive() } catch { /* ignore */ } }
+							window.focus = () => { /* not made key; click it to focus */ }
+						} catch { /* already destroyed */ }
+						return
+					}
+					// Applied at creation, which is what makes it work: reacting to
+					// the window being shown is too late, because macOS has already
+					// drawn a frame by the time a handler runs.
+					try {
+						window.setFocusable(false)
+						window.setOpacity(0)
+						// A transparent window still receives clicks, and this one
+						// covers the screen — without this it would swallow them,
+						// and swallowing a click counts as taking focus.
+						window.setIgnoreMouseEvents(true)
+					} catch { /* already destroyed */ }
+				}
+
+				electronApp.on('browser-window-created', (_event, window) => configure(window))
+				for (const window of BrowserWindow.getAllWindows()) configure(window)
+			}, visible)
+			return true
+		} catch {
+			await sleep(20)
+		}
+	}
+	console.error('[harness] could not quiet the app window — it may appear on screen')
+	return false
+}
+
+/**
  * Launches the app against a profile and waits until the chat service is
  * reachable. Returns a session whose read* helpers are bound to this profile,
  * so assertions read the same storage the app just wrote.
@@ -106,6 +249,8 @@ export async function launchVoid(dirs, { readyTimeoutMs = 120000 } = {}) {
 		env: { ...process.env, NODE_ENV: 'development', VSCODE_DEV: '1', VSCODE_CLI: '1' },
 		timeout: 0,
 	})
+	// Before the app creates its window, which is the only moment early enough.
+	await stopStealingFocus(app)
 	const page = await app.firstWindow({ timeout: readyTimeoutMs })
 
 	// Lines the tests mark with [probe] are kept: they survive the renderer's
