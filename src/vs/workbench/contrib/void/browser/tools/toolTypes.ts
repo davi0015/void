@@ -33,7 +33,15 @@ import { SnakeCaseKeys } from '../../common/prompt/prompts.js'
 
 // All DI services any tool might need. Passed by the registry (built from
 // ToolsService constructor params); individual tools pick what they need.
+//
+// `threadId` is the exception to the rest of this list: every other field is a
+// service that outlives the call, while this is the thread the call is executing
+// for, and it changes per call. A tool that needs "this conversation" must use
+// it rather than asking the chat service for the current thread — the current
+// thread is the one on screen, which is a different thread as soon as two are
+// running at once.
 export type ToolCtx = {
+threadId: string
 fileService: IFileService
 workspaceContextService: IWorkspaceContextService
 searchService: ISearchService

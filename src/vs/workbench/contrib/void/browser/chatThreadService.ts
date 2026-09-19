@@ -504,6 +504,14 @@ export interface IChatThreadService {
 	clearQueuedMessages(threadId: string): void;
 
 	getCurrentThread(): ThreadType;
+
+	/**
+	 * A thread with its messages in hand, loading them if this session has not
+	 * opened it. Tools act on their executing thread, which is not necessarily
+	 * the visible one — and the visible one is the only thread guaranteed to be
+	 * loaded, because that is what opening it does.
+	 */
+	getThreadWithMessages(threadId: string): ThreadType | undefined;
 	openNewThread(): void;
 	switchToThread(threadId: string): void;
 
@@ -2306,7 +2314,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					}
 					if (isAutoApproved) {
 						try {
-							const validated = this._toolsService.validateParams[next.name](next.rawParams)
+							const validated = this._toolsService.validateParams[next.name](next.rawParams, threadId)
 							this._fireConcurrentTerminal(threadId, { ...next, params: validated })
 							continue // immediately process next tool
 						} catch {
@@ -2870,7 +2878,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// 1. validate tool params
 			try {
 				if (isBuiltInTool) {
-					const params = this._toolsService.validateParams[toolName](opts.unvalidatedToolParams)
+					const params = this._toolsService.validateParams[toolName](opts.unvalidatedToolParams, threadId)
 					toolParams = params
 				}
 				else {
@@ -2944,7 +2952,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			await timeout(0)
 
 			if (isBuiltInTool) {
-				const { result, interruptTool } = await this._toolsService.callTool[toolName](toolParams as any)
+				const { result, interruptTool } = await this._toolsService.callTool[toolName](toolParams as any, threadId)
 				const interruptor = () => { interrupted = true; interruptTool?.() }
 				resolveInterruptor(interruptor)
 
@@ -2984,7 +2992,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// 4. stringify the result to give to the LLM
 		try {
 			if (isBuiltInTool) {
-				toolResultStr = this._toolsService.stringOfResult[toolName](toolParams as any, toolResult as any)
+				toolResultStr = this._toolsService.stringOfResult[toolName](toolParams as any, toolResult as any, threadId)
 			}
 			// For MCP tools, handle the result based on its type
 			else {
@@ -3382,7 +3390,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						// `invalid_params` row when it processes this tool.
 						let validatedParams: ToolCallParams<ToolName> | undefined
 						if (isABuiltinToolName(tc.name)) {
-							try { validatedParams = this._toolsService.validateParams[tc.name](tc.rawParams) } catch { /* _runToolCall handles invalid_params */ }
+							try { validatedParams = this._toolsService.validateParams[tc.name](tc.rawParams, threadId) } catch { /* _runToolCall handles invalid_params */ }
 						}
 						this._addMessageToThread(threadId, {
 							role: 'tool',
@@ -4467,6 +4475,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const thread = state.allThreads[state.currentThreadId]
 		if (!thread) throw new Error(`Current thread should never be undefined`)
 		return thread
+	}
+
+	getThreadWithMessages(threadId: string): ThreadType | undefined {
+		this._ensureMessagesLoaded(threadId)
+		return this.state.allThreads[threadId]
 	}
 
 	getCurrentFocusedMessageIdx() {

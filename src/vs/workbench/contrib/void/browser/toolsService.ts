@@ -24,9 +24,16 @@ import type { ToolCtx } from './tools/toolTypes.js'
 import { validateURIWithRoot, validateOptionalURIWithRoot } from './tools/toolHelpers.js'
 
 // tool use for AI
-type ValidateBuiltinParams = { [T in BuiltinToolName]: (p: RawToolParamsObj) => BuiltinToolCallParams[T] }
-type CallBuiltinTool = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T]) => Promise<{ result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>, interruptTool?: () => void }> }
-type BuiltinToolResultToString = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T], result: Awaited<BuiltinToolResultType[T]>) => string }
+//
+// Every one of these takes the id of the thread the call is executing *for*.
+// A tool acts on its executing thread, not on the one the user happens to be
+// looking at, and the two only coincide while a single thread is running. The
+// thread is a required argument rather than a field of `ToolCtx`'s static half
+// so that a caller cannot forget it: omitting it is a type error, and a wrong
+// one is visible at the call site.
+type ValidateBuiltinParams = { [T in BuiltinToolName]: (p: RawToolParamsObj, threadId: string) => BuiltinToolCallParams[T] }
+type CallBuiltinTool = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T], threadId: string) => Promise<{ result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>, interruptTool?: () => void }> }
+type BuiltinToolResultToString = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T], result: Awaited<BuiltinToolResultType[T]>, threadId: string) => string }
 
 
 export interface IToolsService {
@@ -88,7 +95,9 @@ export class ToolsService implements IToolsService {
 
 		// --- Tool registry delegation ---
 		// Build ToolCtx from injected services so converted tools can access DI.
-		const toolCtx: ToolCtx = {
+		// Typed as everything-but-the-thread: this half is captured once and shared,
+		// and `ctxFor` below is the only thing that can produce a whole ToolCtx.
+		const toolCtx: Omit<ToolCtx, 'threadId'> = {
 			fileService,
 			workspaceContextService,
 			searchService,
@@ -113,15 +122,19 @@ export class ToolsService implements IToolsService {
 		// iteration (the mapped type { [T in K]: V<T> } collapses to an intersection
 		// when indexed with the full union K). The cast is on the result, not on
 		// individual values.
+		//
+		// The context is per call rather than captured once, because the thread it
+		// carries changes with every call.
+		const ctxFor = (threadId: string): ToolCtx => ({ ...toolCtx, threadId })
 		const entries = Object.entries(toolDefinitionOfToolName)
 		this.validateParams = Object.fromEntries(entries.map(([name, def]) =>
-			[name, (raw: RawToolParamsObj) => def.validateParams(raw, toolCtx)]
+			[name, (raw: RawToolParamsObj, threadId: string) => def.validateParams(raw, ctxFor(threadId))]
 		)) as ValidateBuiltinParams
 		this.callTool = Object.fromEntries(entries.map(([name, def]) =>
-			[name, (params: never) => def.callTool(params, toolCtx)]
+			[name, (params: never, threadId: string) => def.callTool(params, ctxFor(threadId))]
 		)) as CallBuiltinTool
 		this.stringOfResult = Object.fromEntries(entries.map(([name, def]) =>
-			[name, (params: never, result: never) => def.stringOfResult(params, result, toolCtx)]
+			[name, (params: never, result: never, threadId: string) => def.stringOfResult(params, result, ctxFor(threadId))]
 		)) as BuiltinToolResultToString
 
 		// The unpaginated search, sharing one implementation with the tool above.

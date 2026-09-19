@@ -27,9 +27,15 @@ export const searchHistoryToolCore: ToolDefinitionCore<'search_history'> = {
 	callTool: async ({ query, toolName, resultStatus, contextRadius }, ctx) => {
 		const { IChatThreadService } = await import('../chatThreadService.js')
 		const chatThreadService = ctx.instantiationService.invokeFunction(accessor => accessor.get(IChatThreadService))
-		const thread = chatThreadService.getCurrentThread()
+		// The thread this call is executing for, not the one on screen. They are
+		// the same thread while a single run is in flight and different the moment
+		// the user reads another thread during one — searching the visible thread
+		// would answer from someone else's conversation. `getThreadWithMessages`
+		// rather than a plain lookup: the visible thread is the only one this
+		// session is guaranteed to have loaded.
+		const thread = chatThreadService.getThreadWithMessages(ctx.threadId)
 		if (!thread) {
-			return { result: { matches: 'No active conversation thread.', totalMatches: 0 } }
+			return { result: { matches: 'The thread this tool ran for no longer exists.', totalMatches: 0 } }
 		}
 		const messages = thread.messages
 		const queryLower = query?.toLowerCase() ?? null
