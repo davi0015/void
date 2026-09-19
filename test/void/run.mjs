@@ -23,6 +23,12 @@ import { preflight } from './harness.mjs'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const only = process.argv.find((a) => a.startsWith('--only='))?.split('=')[1]
 
+// A single scenario may legitimately take half a minute — a launch, a quit, a
+// relaunch — so the per-test bound is generous. The suite bound exists only so a
+// stuck app cannot leave the run, and its Electron instances, alive indefinitely.
+const TEST_TIMEOUT_MS = 5 * 60 * 1000
+const SUITE_TIMEOUT_MS = 30 * 60 * 1000
+
 // Checked here as well as inside the test files: a throw from a node:test hook
 // reports every scenario as cancelled, which buries the actual reason.
 try {
@@ -51,5 +57,19 @@ console.log(`Running ${files.length} Void end-to-end test file(s)`
 
 // Each file runs in its own process: node:test does this anyway, and it keeps a
 // crashed app in one file from taking the rest of the suite with it.
-const result = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit' })
+//
+// Bounded in wall-clock, and per test. A launch that never becomes ready used to
+// hang the whole run with no deadline — `_electron.launch({ timeout: 0 })` waits
+// forever, so one stuck app meant a suite that never finished and Electron
+// instances left running on the developer's screen. A bound turns that into a
+// failed test that names itself.
+const result = spawnSync(process.execPath, [
+	'--test',
+	`--test-timeout=${TEST_TIMEOUT_MS}`,
+	...files,
+], { stdio: 'inherit', timeout: SUITE_TIMEOUT_MS })
+if (result.error?.code === 'ETIMEDOUT') {
+	console.error(`\nThe suite passed ${SUITE_TIMEOUT_MS / 60000} minutes and was killed.`)
+	console.error('A scenario is stuck — most likely an app that never became ready.')
+}
 process.exit(result.status ?? 1)
