@@ -24,8 +24,15 @@ import type { ToolCtx } from './tools/toolTypes.js'
 import { validateURIWithRoot, validateOptionalURIWithRoot } from './tools/toolHelpers.js'
 
 // tool use for AI
+//
+// `callTool` is the only one of these that takes the id of the thread the call is
+// executing *for*. It is the only one that acts on the world; the other two parse
+// params and format a result, and neither reads the thread. The id is a required
+// argument so a caller cannot forget it, and the caller is the agent loop, which
+// holds a thread id and nothing else — `ToolCtx` is assembled here from the
+// services this class was given, so the chat service could not build one.
 type ValidateBuiltinParams = { [T in BuiltinToolName]: (p: RawToolParamsObj) => BuiltinToolCallParams[T] }
-type CallBuiltinTool = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T]) => Promise<{ result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>, interruptTool?: () => void }> }
+type CallBuiltinTool = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T], threadId: string) => Promise<{ result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>, interruptTool?: () => void }> }
 type BuiltinToolResultToString = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T], result: Awaited<BuiltinToolResultType[T]>) => string }
 
 
@@ -88,6 +95,7 @@ export class ToolsService implements IToolsService {
 
 		// --- Tool registry delegation ---
 		// Build ToolCtx from injected services so converted tools can access DI.
+		// One context, built once and shared: nothing in it varies per call.
 		const toolCtx: ToolCtx = {
 			fileService,
 			workspaceContextService,
@@ -118,7 +126,7 @@ export class ToolsService implements IToolsService {
 			[name, (raw: RawToolParamsObj) => def.validateParams(raw, toolCtx)]
 		)) as ValidateBuiltinParams
 		this.callTool = Object.fromEntries(entries.map(([name, def]) =>
-			[name, (params: never) => def.callTool(params, toolCtx)]
+			[name, (params: never, threadId: string) => def.callTool(params, toolCtx, threadId)]
 		)) as CallBuiltinTool
 		this.stringOfResult = Object.fromEntries(entries.map(([name, def]) =>
 			[name, (params: never, result: never) => def.stringOfResult(params, result, toolCtx)]

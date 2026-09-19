@@ -504,6 +504,14 @@ export interface IChatThreadService {
 	clearQueuedMessages(threadId: string): void;
 
 	getCurrentThread(): ThreadType;
+
+	/**
+	 * A thread with its messages in hand, loading them if this session has not
+	 * opened it. Tools act on their executing thread, which is not necessarily
+	 * the visible one — and the visible one is the only thread guaranteed to be
+	 * loaded, because that is what opening it does.
+	 */
+	getThreadWithMessages(threadId: string): ThreadType | undefined;
 	openNewThread(): void;
 	switchToThread(threadId: string): void;
 
@@ -2944,7 +2952,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			await timeout(0)
 
 			if (isBuiltInTool) {
-				const { result, interruptTool } = await this._toolsService.callTool[toolName](toolParams as any)
+				const { result, interruptTool } = await this._toolsService.callTool[toolName](toolParams as any, threadId)
 				const interruptor = () => { interrupted = true; interruptTool?.() }
 				resolveInterruptor(interruptor)
 
@@ -4467,6 +4475,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const thread = state.allThreads[state.currentThreadId]
 		if (!thread) throw new Error(`Current thread should never be undefined`)
 		return thread
+	}
+
+	getThreadWithMessages(threadId: string): ThreadType | undefined {
+		this._ensureMessagesLoaded(threadId)
+		return this.state.allThreads[threadId]
 	}
 
 	getCurrentFocusedMessageIdx() {

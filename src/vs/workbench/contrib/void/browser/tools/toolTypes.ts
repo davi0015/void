@@ -33,6 +33,13 @@ import { SnakeCaseKeys } from '../../common/prompt/prompts.js'
 
 // All DI services any tool might need. Passed by the registry (built from
 // ToolsService constructor params); individual tools pick what they need.
+//
+// The thread a call executes *for* is deliberately not in here. It is the only
+// thing about a call that changes per call — everything below outlives it — and
+// only `callTool` acts on the world, so only `callTool` is told about it. A tool
+// that needs "this conversation" takes that argument rather than asking the chat
+// service for the current thread: the current thread is the one on screen, which
+// is a different thread as soon as two are running at once.
 export type ToolCtx = {
 fileService: IFileService
 workspaceContextService: IWorkspaceContextService
@@ -69,7 +76,13 @@ approvalType: ToolApprovalType | undefined
 
 // --- Backend ---
 validateParams: (raw: RawToolParamsObj, ctx: ToolCtx) => BuiltinToolCallParams[T]
-callTool: (params: BuiltinToolCallParams[T], ctx: ToolCtx) => Promise<{
+
+// `threadId` is the thread this call is executing for. Required, so a tool that
+// needs the conversation it belongs to has it in hand and cannot be tempted to
+// ask for the current thread instead — and so the registry cannot forget to pass
+// one. Only this function takes it: `validateParams` and `stringOfResult` parse
+// and format rather than act, and neither has ever needed to know the thread.
+callTool: (params: BuiltinToolCallParams[T], ctx: ToolCtx, threadId: string) => Promise<{
 result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>
 interruptTool?: () => void
 }>
