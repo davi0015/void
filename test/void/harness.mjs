@@ -189,7 +189,6 @@ export function createProfile(name, { fresh = true } = {}) {
 async function stopStealingFocus(app) {
 	if (process.platform !== 'darwin') return
 	const visible = process.env.VOID_SHOW_TEST_WINDOWS === '1'
-	if (visible) return
 	// The first evaluate can land before the main process has a usable context and
 	// throw "Execution context was destroyed". A single attempt therefore
 	// sometimes does nothing at all, silently — and a launch that skips this is a
@@ -197,11 +196,25 @@ async function stopStealingFocus(app) {
 	// here is exactly the bug this function exists to prevent.
 	for (let attempt = 0; attempt < 100; attempt++) {
 		try {
-			await app.evaluate(({ app: electronApp, BrowserWindow }) => {
-				// Applied at creation, which is what makes it work: reacting to the
-				// window being shown is too late, because macOS has already drawn a
-				// frame by the time a handler runs.
-				const quiet = (window) => {
+			await app.evaluate(({ app: electronApp, BrowserWindow }, visible) => {
+				const configure = (window) => {
+					if (visible) {
+						// A normal window — draggable, clickable, focusable — that is
+						// simply not made *key* by the app. VS Code calls `win.focus()`
+						// from several places while restoring state, and `show()`
+						// activates the window, so both are neutralised: the window is
+						// displayed with `showInactive()`, and focus is left where it
+						// was. Clicking the window still focuses it, because that goes
+						// through the window server rather than through this call.
+						try {
+							window.show = () => { try { window.showInactive() } catch { /* ignore */ } }
+							window.focus = () => { /* not made key; click it to focus */ }
+						} catch { /* already destroyed */ }
+						return
+					}
+					// Applied at creation, which is what makes it work: reacting to
+					// the window being shown is too late, because macOS has already
+					// drawn a frame by the time a handler runs.
 					try {
 						window.setFocusable(false)
 						window.setOpacity(0)
@@ -212,9 +225,9 @@ async function stopStealingFocus(app) {
 					} catch { /* already destroyed */ }
 				}
 
-				electronApp.on('browser-window-created', (_event, window) => quiet(window))
-				for (const window of BrowserWindow.getAllWindows()) quiet(window)
-			})
+				electronApp.on('browser-window-created', (_event, window) => configure(window))
+				for (const window of BrowserWindow.getAllWindows()) configure(window)
+			}, visible)
 			return true
 		} catch {
 			await sleep(20)
