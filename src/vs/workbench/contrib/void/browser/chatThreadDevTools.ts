@@ -10,6 +10,7 @@
 
 import { IChatThreadService, ThreadStreamState } from './chatThreadService.js';
 import { ChatMessage } from '../common/chatThreadServiceTypes.js';
+import { URI } from '../../../../base/common/uri.js';
 
 export type StreamCallbacks = {
 	addMessage: (threadId: string, msg: ChatMessage) => void
@@ -93,7 +94,18 @@ const userMessages = [
 	'Finally, can you summarize the key architectural decisions and tradeoffs we\'ve discussed? I want to document this for the team.',
 ]
 
-export function buildTestMessages(turns: number): ChatMessage[] {
+/**
+ * Builds a synthetic thread. A turn is a user message and an assistant reply.
+ *
+ * `toolCallsPerTurn` adds tool rows the way the real loop does when a model emits
+ * parallel calls: one assistant message followed by N `tool` rows, each with its
+ * own `id`, the `rawParamsStr` the provider would replay, and the batch
+ * index/size the UI renders as "(i/N)" (stamped only when N > 1, as
+ * `_runToolCall` does). A number applies to every turn; an array sets it per
+ * turn — that is how a test builds a thread whose tail is one long tool burst,
+ * which is the shape that makes a message-count boundary land inside a batch.
+ */
+export function buildTestMessages(turns: number, toolCallsPerTurn: number | number[] = 0): ChatMessage[] {
 	const messages: ChatMessage[] = []
 
 	for (let turn = 0; turn < turns; turn++) {
@@ -120,6 +132,28 @@ export function buildTestMessages(turns: number): ChatMessage[] {
 			reasoning,
 			anthropicReasoning: null,
 		})
+
+		const numToolCalls = typeof toolCallsPerTurn === 'number'
+			? toolCallsPerTurn
+			: (toolCallsPerTurn[turn] ?? 0)
+		for (let i = 0; i < numToolCalls; i++) {
+			const body = `// src/file${i}.ts\n` + code
+			const rawParams = { uri: `src/file${i}.ts` }
+			messages.push({
+				role: 'tool',
+				type: 'success',
+				name: 'read_file',
+				id: `call_${turn}_${i}`,
+				params: { uri: URI.file(`/tmp/void-fixture/src/file${i}.ts`), startLine: null, endLine: null, pageNumber: 1 },
+				rawParams,
+				rawParamsStr: JSON.stringify(rawParams),
+				mcpServerName: undefined,
+				result: body,
+				content: body,
+				batchIndex: numToolCalls > 1 ? i : undefined,
+				batchSize: numToolCalls > 1 ? numToolCalls : undefined,
+			} as ChatMessage)
+		}
 	}
 
 	return messages

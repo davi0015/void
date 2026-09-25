@@ -448,9 +448,16 @@ export function capturedLLMRequestCount(page) {
 	return page.evaluate(() => (globalThis.__voidLLMRequests ?? []).length)
 }
 
-/** Fills the current thread with synthetic messages via the dev hook. */
-export function seedTestThread(page, turns = 15) {
-	return page.evaluate((t) => globalThis.__voidChatThreadService._populateTestThread(t), turns)
+/**
+ * Fills the current thread with synthetic messages via the dev hook.
+ * `toolCallsPerTurn` adds tool rows per turn: a number for every turn, an array
+ * for per-turn counts (see `buildTestMessages`).
+ */
+export function seedTestThread(page, turns = 15, toolCallsPerTurn = 0) {
+	return page.evaluate(
+		({ t, n }) => globalThis.__voidChatThreadService._populateTestThread(t, n),
+		{ t: turns, n: toolCallsPerTurn },
+	)
 }
 
 /** Ensures a model selection exists so features gated on one are reachable. */
