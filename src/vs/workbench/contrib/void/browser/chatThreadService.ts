@@ -14,7 +14,7 @@ import { Emitter, Event } from '../../../../base/common/event.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { builtinToolNames, chat_userMessageContent, isABuiltinToolName, visionHelper_systemMessage, visionHelper_userMessage } from '../common/prompt/prompts.js';
 import { getModelCapabilities } from '../common/modelCapabilities.js';
-import { planCompaction, RETENTION_MIN_CHARS, RETENTION_RATIO } from '../common/compactionBoundary.js';
+import { CompactionPlan, planCompaction, RETENTION_MIN_CHARS, RETENTION_RATIO } from '../common/compactionBoundary.js';
 import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, RawToolParamsObj, ResponsesReasoningRef } from '../common/sendLLMMessageTypes.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
@@ -615,6 +615,9 @@ export interface IChatThreadService {
 	// recent user turns / messages are kept uncompacted (defaults: 3 / 10).
 	// Returns null on success, or an error message string.
 	compactCurrentThread(opts: { compactPercent: number, protectTurns?: number }): Promise<string | null>;
+	// What a compaction with these settings would keep and summarise — the
+	// dialog's preview reads the same plan the compaction runs.
+	getCompactionPlan(opts: { turns: number }): (CompactionPlan & { charsPerToken: number }) | null;
 
 	// Dev-only: populate the current thread with a large fake conversation
 	// for performance testing.
@@ -5401,6 +5404,29 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	// ── Manual compaction ────────────────────────────────────────────────
 
+	/**
+	 * What a compaction with these settings would do, for the dialog's preview.
+	 * Same call the compaction itself makes, so the numbers the user is shown
+	 * cannot drift from the numbers that run.
+	 */
+	getCompactionPlan({ turns }: { turns: number }): (CompactionPlan & { charsPerToken: number }) | null {
+		const thread = this.state.allThreads[this.state.currentThreadId]
+		const modelSelection = this._settingsService.state.modelSelectionOfFeature['Chat']
+		if (!thread || !modelSelection) return null
+		const charsPerToken = this._convertToLLMMessagesService.getCharsPerToken(modelSelection.providerName, modelSelection.modelName)
+		// The ratio rides along because only the service can calibrate it; the
+		// dialog needs it to show tokens without a second estimate of its own.
+		return { ...this._planCompaction(thread.messages, turns, modelSelection, charsPerToken), charsPerToken }
+	}
+
+	private _planCompaction(messages: ChatMessage[], turns: number, modelSelection: ModelSelection, charsPerToken: number): CompactionPlan {
+		return planCompaction({
+			messages,
+			turns,
+			retentionChars: this._retentionCharsOf(modelSelection, charsPerToken),
+		})
+	}
+
 	async compactCurrentThread({ compactPercent, protectTurns = 3 }: { compactPercent: number, protectTurns?: number }): Promise<string | null> {
 		const threadId = this.state.currentThreadId
 		const thread = this.state.allThreads[threadId]
@@ -5411,11 +5437,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		const chatMessages = thread.messages
 		const charsPerToken = this._convertToLLMMessagesService.getCharsPerToken(modelSelection.providerName, modelSelection.modelName)
-		const plan = planCompaction({
-			messages: chatMessages,
-			turns: protectTurns,
-			retentionChars: this._retentionCharsOf(modelSelection, charsPerToken),
-		})
+		const plan = this._planCompaction(chatMessages, protectTurns, modelSelection, charsPerToken)
 		if (plan.boundaryIdx <= 0) {
 			// Two ways to end up with nothing to summarise, and they need different
 			// words: the thread has fewer turns than the user asked to keep, or its

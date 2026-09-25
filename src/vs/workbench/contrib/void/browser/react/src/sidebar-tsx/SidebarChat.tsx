@@ -25,6 +25,7 @@ import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
 import { File, Check, Dot, FileIcon, ImageIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, Folder, ALargeSmall, TypeOutline, Text, RefreshCw, TerminalSquare, Lock, MoveRight, FileWarning, Scissors, AlertTriangle, Brain, Clock, ArrowUp } from 'lucide-react';
 import { ChatMessage, CompactionInfo, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
+import { CompactionPlan } from '../../../../common/compactionBoundary.js';
 import { generateUuid } from '../../../../../../../base/common/uuid.js';
 import { VSBuffer } from '../../../../../../../base/common/buffer.js';
 
@@ -1049,9 +1050,19 @@ export const ButtonStop = ({ className, ...props }: ButtonHTMLAttributes<HTMLBut
 
 
 // ── Manual compaction dialog ──────────────────────────────────────────
-const CompactDialog = ({ onConfirm, onCancel }: { onConfirm: (percent: number, protectTurns: number) => void, onCancel: () => void }) => {
+const CompactDialog = ({ onConfirm, onCancel, getPlan }: {
+	onConfirm: (percent: number, protectTurns: number) => void
+	onCancel: () => void
+	// The plan the compaction would follow, asked for the currently selected turn
+	// count. It comes from the same function the compaction runs, so the preview
+	// below cannot disagree with what the button does.
+	getPlan: (turns: number) => (CompactionPlan & { charsPerToken: number }) | null
+}) => {
 	const [percent, setPercent] = useState(70)
 	const [protectTurns, setProtectTurns] = useState(3)
+	const plan = getPlan(protectTurns)
+	const approx = (chars: number) => chars >= 1000 ? `${Math.round(chars / 1000).toLocaleString()}k` : `${chars}`
+	const turnWord = (n: number) => `${n} turn${n === 1 ? '' : 's'}`
 	return (
 		<div className='flex flex-col gap-2 p-3 rounded-md border border-void-border-1 bg-void-bg-1 text-sm'>
 			<div className='flex items-center justify-between'>
@@ -1092,6 +1103,31 @@ const CompactDialog = ({ onConfirm, onCancel }: { onConfirm: (percent: number, p
 				/>
 				<span className='text-void-fg-3 text-xs w-10 text-right'>{protectTurns} turn{protectTurns !== 1 ? 's' : ''}</span>
 			</div>
+			{plan && (
+				<div className='flex flex-col gap-0.5 text-xs'>
+					{plan.canCompact ? (
+						<>
+							<span className='text-void-fg-3'>
+								Keeps {plan.keptMessages} message{plan.keptMessages !== 1 ? 's' : ''}
+								{' '}(~{approx(plan.keptChars)} chars, ~{Math.round(plan.keptChars / plan.charsPerToken).toLocaleString()} tokens)
+								{' '}· summarises {plan.droppedMessages} (~{approx(plan.droppedChars)} chars)
+							</span>
+							{plan.cutInsideTurn && (
+								<span className='text-void-warning'>
+									The last {turnWord(protectTurns)} exceed the retention budget, so the older
+									steps of the newest turn are summarised too — the newest steps stay intact.
+								</span>
+							)}
+						</>
+					) : (
+						<span className='text-void-warning'>
+							{plan.userTurns < protectTurns
+								? `This thread has ${turnWord(plan.userTurns)}; keeping the last ${protectTurns} keeps all of it.`
+								: `Nothing to compact outside the last ${turnWord(protectTurns)}.`}
+						</span>
+					)}
+				</div>
+			)}
 			<div className='flex justify-end gap-2 mt-1'>
 				<button
 					type='button'
@@ -1102,6 +1138,7 @@ const CompactDialog = ({ onConfirm, onCancel }: { onConfirm: (percent: number, p
 				</button>
 				<button
 					type='button'
+					disabled={!plan?.canCompact}
 					onClick={() => onConfirm(percent, protectTurns)}
 					className='px-2 py-1 text-xs text-white bg-void-fg-3 hover:bg-void-fg-2 cursor-pointer rounded'
 				>
@@ -3617,6 +3654,7 @@ export const SidebarChat = () => {
 				<CompactDialog
 					onConfirm={onCompact}
 					onCancel={() => setShowCompactDialog(false)}
+					getPlan={turns => chatThreadsService.getCompactionPlan({ turns })}
 				/>
 			</div>
 		)}

@@ -195,6 +195,46 @@ describe('compaction boundary', () => {
 		})
 	})
 
+	test('the dialog’s preview is the plan the compaction runs', async (t) => {
+		// A control, not a VOID_EXPECT subject: there is no "before" state to
+		// invert, the property is simply that the two agree. The preview getter
+		// does not exist before this change, so the check is skipped when it is
+		// absent and the unpatched build is measured by the subjects above.
+		await h.withScenario('compaction-boundary/preview', async (s) => {
+			await h.ensureModelSelection(s.page)
+			await h.seedTestThread(s.page, TURNS, TOOL_CALLS_PER_TURN)
+			await h.stubLLM(s.page, 'summary text')
+
+			const result = await s.page.evaluate(async () => {
+				const svc = globalThis.__voidChatThreadService
+				if (typeof svc.getCompactionPlan !== 'function') return { skipped: true }
+				const id = svc.state.currentThreadId
+				const plan = svc.getCompactionPlan({ turns: 1 })
+				const outcome = await svc.compactCurrentThread({ compactPercent: 70, protectTurns: 1 })
+				const thread = svc.state.allThreads[id]
+				return {
+					skipped: false,
+					error: outcome === null ? null : String(outcome),
+					planBoundary: plan?.boundaryIdx,
+					planKept: plan?.keptMessages,
+					storedBoundary: thread?.compactionBoundaryIdx,
+					storedKept: thread ? thread.messages.length - thread.compactionBoundaryIdx : null,
+				}
+			})
+
+			trace(t, s)
+			if (result.skipped) {
+				t.diagnostic('preview getter absent — nothing to compare')
+				return
+			}
+			assert.equal(result.error, null, `compaction did not run: ${result.error}`)
+			assert.equal(result.planBoundary, result.storedBoundary,
+				'the previewed boundary is not the boundary the compaction stored')
+			assert.equal(result.planKept, result.storedKept,
+				'the previewed kept-message count is not what the compaction kept')
+		})
+	})
+
 	test('a chat-style thread still compacts at the turn the user asked to keep', async (t) => {
 		await h.withScenario('compaction-boundary/control', async (s) => {
 			await h.ensureModelSelection(s.page)
