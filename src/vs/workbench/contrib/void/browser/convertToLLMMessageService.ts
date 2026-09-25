@@ -9,6 +9,7 @@ import { IPathService } from '../../../services/path/common/pathService.js';
 import { IEditorService } from '../../../services/editor/common/editorService.js';
 import { ChatMessage, CompactionInfo } from '../common/chatThreadServiceTypes.js';
 import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities } from '../common/modelCapabilities.js';
+import { snapToLegalBoundary } from '../common/compactionBoundary.js';
 import { reParsedToolXMLString, chat_systemMessage, chat_volatileContext } from '../common/prompt/prompts.js';
 import { availableTools } from './tools/toolRegistry.js';
 import { AnthropicLLMChatMessage, AnthropicReasoning, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, OpenAILLMChatMessage, RawToolParamsObj, ResponsesReasoningRef } from '../common/sendLLMMessageTypes.js';
@@ -1493,8 +1494,14 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// ChatMessage boundary to the corresponding SimpleLLMMessage index.
 		let llmMessages: SimpleLLMMessage[]
 		if (manualCompaction && manualCompaction.boundaryIdx >= 0) {
+			// A boundary can be one an older build stored, when the rule was a
+			// message count that could land inside an assistant message's tool
+			// batch. Snapping it back to the requesting assistant keeps those
+			// results with the message that asked for them, instead of letting the
+			// acknowledgement below inherit their `tool_calls`.
+			const boundaryIdx = snapToLegalBoundary(chatMessages, manualCompaction.boundaryIdx)
 			let llmBoundary = 0
-			for (let ci = 0; ci < Math.min(manualCompaction.boundaryIdx, chatMessages.length); ci++) {
+			for (let ci = 0; ci < Math.min(boundaryIdx, chatMessages.length); ci++) {
 				const role = chatMessages[ci].role
 				if (role !== 'interrupted_streaming_tool') {
 					llmBoundary++

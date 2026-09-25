@@ -14,6 +14,7 @@ import { Emitter, Event } from '../../../../base/common/event.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { builtinToolNames, chat_userMessageContent, isABuiltinToolName, visionHelper_systemMessage, visionHelper_userMessage } from '../common/prompt/prompts.js';
 import { getModelCapabilities } from '../common/modelCapabilities.js';
+import { planCompaction, RETENTION_MIN_CHARS, RETENTION_RATIO } from '../common/compactionBoundary.js';
 import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, RawToolParamsObj, ResponsesReasoningRef } from '../common/sendLLMMessageTypes.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
@@ -613,7 +614,7 @@ export interface IChatThreadService {
 	// original tokens). `protectTurns` / `protectMessages` control how many
 	// recent user turns / messages are kept uncompacted (defaults: 3 / 10).
 	// Returns null on success, or an error message string.
-	compactCurrentThread(opts: { compactPercent: number, protectTurns?: number, protectMessages?: number }): Promise<string | null>;
+	compactCurrentThread(opts: { compactPercent: number, protectTurns?: number }): Promise<string | null>;
 
 	// Dev-only: populate the current thread with a large fake conversation
 	// for performance testing.
@@ -5400,7 +5401,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	// ── Manual compaction ────────────────────────────────────────────────
 
-	async compactCurrentThread({ compactPercent, protectTurns = 3, protectMessages = 10 }: { compactPercent: number, protectTurns?: number, protectMessages?: number }): Promise<string | null> {
+	async compactCurrentThread({ compactPercent, protectTurns = 3 }: { compactPercent: number, protectTurns?: number }): Promise<string | null> {
 		const threadId = this.state.currentThreadId
 		const thread = this.state.allThreads[threadId]
 		if (!thread || thread.messages.length < 10) return 'Not enough messages to compact.'
@@ -5409,31 +5410,29 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (!modelSelection) return 'No model selected for Chat.'
 
 		const chatMessages = thread.messages
-		const boundaryIdx = this._computeManualCompactionBoundary(chatMessages, protectTurns, protectMessages)
-		if (boundaryIdx <= 0) {
-			return `Not enough messages outside the protection zone (last ${protectTurns} user turns / ${protectMessages} messages).`
+		const charsPerToken = this._convertToLLMMessagesService.getCharsPerToken(modelSelection.providerName, modelSelection.modelName)
+		const plan = planCompaction({
+			messages: chatMessages,
+			turns: protectTurns,
+			retentionChars: this._retentionCharsOf(modelSelection, charsPerToken),
+		})
+		if (plan.boundaryIdx <= 0) {
+			// Two ways to end up with nothing to summarise, and they need different
+			// words: the thread has fewer turns than the user asked to keep, or its
+			// turns fit inside the protection zone.
+			return plan.userTurns < protectTurns
+				? `This thread has ${plan.userTurns} turn${plan.userTurns === 1 ? '' : 's'}; keeping the last ${protectTurns} keeps all of it.`
+				: `Nothing to compact outside the last ${protectTurns} turn${protectTurns === 1 ? '' : 's'}.`
 		}
+		const boundaryIdx = plan.boundaryIdx
 
 		const targetPercent = Math.max(1, Math.round(100 - compactPercent))
 
-		// Estimate the character count of the compactable region so we can
-		// give the LLM a concrete target length instead of a vague percentage.
-		let compactableChars = 0
-		for (let i = 0; i < boundaryIdx && i < chatMessages.length; i++) {
-			const msg = chatMessages[i]
-			if (msg.role !== 'interrupted_streaming_tool') {
-				if (msg.role === 'user') compactableChars += (msg.content?.length ?? 0)
-				else if (msg.role === 'assistant') compactableChars += (msg.displayContent?.length ?? 0) + (msg.reasoning?.length ?? 0)
-				else if (msg.role === 'tool') {
-					compactableChars += (msg.rawParamsStr?.length ?? 0)
-					const r = msg.result
-					if (typeof r === 'string') compactableChars += r.length
-					else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') compactableChars += ((r as { content: string }).content.length)
-				}
-			}
-		}
+		// The plan already counted both sides of the boundary with the same
+		// per-message accounting the prompt has always used, so the target length
+		// and the saved-token estimate below cannot disagree with it.
+		const compactableChars = plan.droppedChars
 		const targetChars = Math.max(500, Math.round(compactableChars * targetPercent / 100))
-		const charsPerToken = this._convertToLLMMessagesService.getCharsPerToken(modelSelection.providerName, modelSelection.modelName)
 		const targetTokens = Math.round(targetChars / charsPerToken)
 
 		// The conversation is already in the LLM messages (prefix-cached).
@@ -5587,21 +5586,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				// Estimate recent (post-boundary) tokens using the provider's
 				// real ratio rather than charsPerToken, so structural overhead
 				// is proportionally included.
-				const recentChars = (() => {
-					let n = 0
-					for (let i = boundaryIdx; i < chatMessages.length; i++) {
-						const m = chatMessages[i]
-						if (m.role === 'user') n += (m.content?.length ?? 0)
-						else if (m.role === 'assistant') n += (m.displayContent?.length ?? 0) + (m.reasoning?.length ?? 0)
-						else if (m.role === 'tool') {
-							n += (m.rawParamsStr?.length ?? 0)
-							const r = m.result
-							if (typeof r === 'string') n += r.length
-							else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') n += ((r as { content: string }).content.length)
-						}
-					}
-					return n
-				})()
+				const recentChars = plan.keptChars
 				// Derive the real chars→tokens ratio from the compaction request
 				// (sentChars ≈ compactableChars + recentChars + summarizationPrompt
 				// body chars). This ratio captures structural overhead that plain
@@ -5673,22 +5658,21 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 	}
 
-	private _computeManualCompactionBoundary(messages: ChatMessage[], protectTurns: number, protectMessages: number): number {
-		let userCount = 0
-		let userTurnBoundary = 0
-		for (let i = messages.length - 1; i >= 0; i--) {
-			if (messages[i].role === 'user') {
-				userCount++
-				if (userCount >= protectTurns) {
-					userTurnBoundary = i
-					break
-				}
-			}
-		}
-		if (userCount < protectTurns) userTurnBoundary = 0
-
-		const messageCountBoundary = Math.max(0, messages.length - protectMessages)
-		return Math.max(userTurnBoundary, messageCountBoundary)
+	/**
+	 * How much history stays verbatim when compaction fires: a fraction of the
+	 * model's context window, in characters. A fraction rather than a message
+	 * count, because ten entries is two chat turns or a fifth of one agent step
+	 * depending on the thread — see `common/compactionBoundary.ts`.
+	 *
+	 * The floor matters: `contextWindow` is per model and can be missing or zero
+	 * for an unrecognized route, and a zero budget would let the fallback keep
+	 * only the newest group, summarising almost everything.
+	 */
+	private _retentionCharsOf(modelSelection: ModelSelection, charsPerToken: number): number {
+		const { overridesOfModel } = this._settingsService.state
+		const { contextWindow } = getModelCapabilities(modelSelection.providerName, modelSelection.modelName, overridesOfModel)
+		const tokens = Number.isFinite(contextWindow) ? Math.max(0, contextWindow) * RETENTION_RATIO : 0
+		return Math.max(RETENTION_MIN_CHARS, Math.round(tokens * charsPerToken))
 	}
 
 	private _writeCompactionLog(opts: {
