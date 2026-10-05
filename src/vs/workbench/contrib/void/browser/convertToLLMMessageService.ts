@@ -237,11 +237,13 @@ const _computeProtectionBoundary = (messages: SimpleLLMMessage[]): number => {
 // tooltip so the user has visibility into when/why requests shrunk).
 // Pure function — does not mutate the input. `info === null` means no compaction
 // happened this request (size gate not met, or no trim-eligible messages).
-// Currently disabled — see `prepareLLMChatMessages`. Kept for future use.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
+//
+// Off by default, and only reached with `force` when the agent loop has rebuilt
+// a request the provider already rejected for size — see `overflowRelief` in
+// `prepareLLMChatMessages`.
 const _compactToolResultsForRequest = (
 	messages: SimpleLLMMessage[],
-	{ contextWindow, charsPerToken, priorContentTokens }: { contextWindow: number, charsPerToken: number, priorContentTokens?: number },
+	{ contextWindow, charsPerToken, priorContentTokens, force }: { contextWindow: number, charsPerToken: number, priorContentTokens?: number, force?: boolean },
 ): { messages: SimpleLLMMessage[], info: CompactionInfo | null } => {
 	// Gate 0 — size-based. Don't trim anything on small requests; the cache break
 	// cost would outweigh the savings. Reasoned in tokens (not chars) so the
@@ -264,7 +266,13 @@ const _compactToolResultsForRequest = (
 	const totalChars = _totalContentChars(messages)
 	const estimatedTokens = Math.max(priorContentTokens ?? 0, totalChars / charsPerToken)
 	const sizeTriggerTokens = contextWindow * COMPACTION_POLICY.sizeTriggerRatio
-	if (estimatedTokens < sizeTriggerTokens) return { messages, info: null }
+	// `force` skips Gate 0, and is only ever set for a request the provider has
+	// already rejected for exceeding the context window. The gate exists to
+	// protect a working prefix cache, and a rejected request has none: the
+	// estimate that would have to clear the gate is the very estimate that just
+	// proved too low. The protection boundary and the per-message thresholds
+	// below still apply, so the recent tail stays full-fidelity either way.
+	if (!force && estimatedTokens < sizeTriggerTokens) return { messages, info: null }
 
 	// Gate 1 — structural. Compute the protection boundary (larger of the two
 	// policies, see `_computeProtectionBoundary`). If nothing sits before the
@@ -892,7 +900,7 @@ export interface IConvertToLLMMessageService {
 	// can route the entry to the right thread file. `telemetryRequestId` in the
 	// result is the rid the caller must echo back to `IRequestTelemetryService.logResponse`
 	// so request and response lines can be paired during analysis.
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string, pendingImageBytes?: Map<string, Uint8Array>, frozenAiInstructions?: string, manualCompaction?: { summary: string, boundaryIdx: number } }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string, pendingImageBytes?: Map<string, Uint8Array>, frozenAiInstructions?: string, manualCompaction?: { summary: string, boundaryIdx: number }, overflowRelief?: boolean }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 	// Called by chat creation paths to snapshot runtime grounding (date, open files,
 	// active URI, directory listing, terminal IDs) into a user message at storage time.
@@ -1443,7 +1451,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		})
 		return { messages, separateSystemMessage };
 	}
-	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId, pendingImageBytes, frozenAiInstructions, manualCompaction }) => {
+	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId, pendingImageBytes, frozenAiInstructions, manualCompaction, overflowRelief }) => {
 		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined, compactionInfo: null, sentChars: 0 }
 
 		const { overridesOfModel } = this.voidSettingsService.state
@@ -1531,15 +1539,26 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			llmMessages = llmMessagesRaw
 		}
 
-		// Perf 2 — Light-tier history compaction DISABLED.
-		// Trimming tool result bodies breaks the provider's prefix cache at the
-		// trim point. At large context sizes (500k+) the cache miss cost far
-		// outweighs the token savings from trimming, since the entire prefix
-		// must be re-ingested.
-		const compactionInfo: CompactionInfo | null = null
+		// Light-tier history compaction. Normally off: trimming tool-result bodies
+		// breaks the provider's prefix cache at the trim point, and at large
+		// context sizes (500k+) the cache miss costs far more than the tokens
+		// saved, since the whole prefix must be re-ingested.
+		//
+		// `overflowRelief` is the one case where that trade is not a trade: the
+		// provider has already rejected this request for exceeding the context
+		// window, so there is no cache to keep warm and a smaller request is the
+		// only version of it that can succeed. The stored messages are untouched —
+		// this rewrites the request image only.
+		let llmMessagesFinal = llmMessages
+		let compactionInfo: CompactionInfo | null = null
+		if (overflowRelief) {
+			const relieved = _compactToolResultsForRequest(llmMessages, { contextWindow, charsPerToken, priorContentTokens, force: true })
+			llmMessagesFinal = relieved.messages
+			compactionInfo = relieved.info
+		}
 
 		const { messages, separateSystemMessage, emergencyInfo } = prepareMessages({
-			messages: llmMessages,
+			messages: llmMessagesFinal,
 			systemMessage,
 			aiInstructions,
 			supportsSystemMessage,
