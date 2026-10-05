@@ -637,7 +637,7 @@ export interface IChatThreadService {
 
 	// Dev-only: populate the current thread with a large fake conversation
 	// for performance testing.
-	_populateTestThread(turns?: number, toolCallsPerTurn?: number | number[]): void;
+	_populateTestThread(turns?: number, toolCallsPerTurn?: number | number[], opts?: { toolBodyRepeats?: number }): void;
 	// Dev-only: simulate a streaming LLM response through the real render
 	// pipeline. Tests streaming perf (issue #3).
 	_simulateStream(opts?: { charsPerChunk?: number, intervalMs?: number, includeReasoning?: boolean, repetitions?: number }): void;
@@ -5816,12 +5816,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}, opts)
 	}
 
-	_populateTestThread(turns: number = 15, toolCallsPerTurn: number | number[] = 0): void {
+	_populateTestThread(turns: number = 15, toolCallsPerTurn: number | number[] = 0, opts?: { toolBodyRepeats?: number }): void {
 		const threadId = this.state.currentThreadId
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
 
-		const messages = buildTestMessages(turns, toolCallsPerTurn)
+		const messages = buildTestMessages(turns, toolCallsPerTurn, opts)
 		const updatedThread = { ...thread, lastModified: new Date().toISOString(), messages }
 		const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 		this._storeThread(threadId, updatedThread)

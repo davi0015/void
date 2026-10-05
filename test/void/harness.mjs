@@ -423,9 +423,19 @@ export function pendingThreadWrites(page) {
  *
  * `hang: true` holds the request open instead of answering it, so a test can
  * press Stop mid-request or complete it later with `completeStubbedLLM`.
+ *
+ * `error` makes the transport fail instead of answering, which is how a test
+ * reaches the loop's retry policy. A string fails every request with that
+ * message; an array fails request n with entry n and succeeds once the array is
+ * exhausted (`null` is an explicit success), so `['overflow', null]` reads as
+ * "fails once, then works". The message reaches production code exactly as a
+ * provider's would: `onError({ message, fullError: null })`, the shape
+ * `sendLLMMessage.impl.ts` builds from a stringified SDK error. Not combinable
+ * with `hang` — a held-open request has no answer to fail with.
  */
-export function stubLLM(page, text, { usage, hang = false } = {}) {
-	return page.evaluate(({ text, usage, hang }) => {
+export function stubLLM(page, text, { usage, hang = false, error } = {}) {
+	return page.evaluate(({ text, usage, hang, error }) => {
+		if (hang && error !== undefined) throw new Error('stubLLM: `hang` and `error` cannot be combined')
 		// Every outgoing request is recorded so a test can assert on what the
 		// model was actually sent — the only way to check prompt construction
 		// (system message, compaction summary, history) without a provider.
@@ -434,11 +444,23 @@ export function stubLLM(page, text, { usage, hang = false } = {}) {
 		g.__voidPendingLLMRequests = []
 		const llmService = g.__voidChatThreadService._llmMessageService
 		let nextRequestNum = 0
+		let errorIdx = 0
+
+		/** The error for this request, or undefined to answer normally. */
+		const nextError = () => {
+			if (error === undefined || error === null) return undefined
+			if (typeof error === 'string') return error
+			return error[errorIdx++] ?? undefined
+		}
 
 		const complete = (opts) => {
 			const u = usage ?? { inputTokens: 1000, outputTokens: 100, totalTokens: 1100, requestCount: 1 }
 			try { opts.onText?.({ usage: u }) } catch { /* ignore */ }
 			try { opts.onFinalMessage?.({ fullText: text, usage: u }) } catch (e) { console.log('[probe] onFinalMessage threw ' + String(e)) }
+		}
+
+		const fail = (opts, message) => {
+			try { opts.onError?.({ message, fullError: null }) } catch (e) { console.log('[probe] onError threw ' + String(e)) }
 		}
 
 		/** Answers a request that `hang` held open. Returns false when none is pending. */
@@ -456,11 +478,13 @@ export function stubLLM(page, text, { usage, hang = false } = {}) {
 			llmService.llmMessageHooks.onAbort[requestId] = () => {
 				try { opts.onAbort?.() } catch (e) { console.log('[probe] onAbort threw ' + String(e)) }
 			}
+			const message = nextError()
 			if (hang) g.__voidPendingLLMRequests.push(opts)
+			else if (message !== undefined) setTimeout(() => fail(opts, message), 0)
 			else setTimeout(() => complete(opts), 0)
 			return requestId
 		}
-	}, { text, usage, hang })
+	}, { text, usage, hang, error })
 }
 
 /** Answers a request that `stubLLM(..., { hang: true })` held open. */
@@ -488,14 +512,54 @@ export function capturedLLMRequestCount(page) {
 }
 
 /**
+ * Waits for a chat run to settle, then reports how it ended.
+ *
+ * `addUserMessageAndStreamResponse` starts the agent loop without awaiting it
+ * (`_wrapRunAgentToNotify(this._runChatAgent(...), threadId)`), so awaiting a
+ * send returns as soon as the message is stored — the request may not even have
+ * gone out yet. This polls the thread's stream state instead: a run is in
+ * progress while `isRunning` is anything but `undefined` (`'LLM'`, `'tool'`,
+ * `'awaiting_user'`, `'waiting_tools'`, and `'idle'`, which the loop sets while
+ * it waits between retry attempts), and the run's last act is to set
+ * `isRunning: undefined`.
+ *
+ * Returns `started` alongside the outcome so a caller can tell "the run never
+ * began" (a setup failure) from "the run ended without doing anything".
+ */
+export function waitForRunEnd(page, { threadId, timeoutMs = 60000 } = {}) {
+	return page.evaluate(async ({ wantedThreadId, timeout }) => {
+		const svc = globalThis.__voidChatThreadService
+		const id = wantedThreadId ?? svc.state.currentThreadId
+		const t0 = Date.now()
+		let started = false
+		while (Date.now() - t0 < timeout) {
+			const state = svc.streamState[id]
+			const running = state !== undefined && state.isRunning !== undefined
+			if (running || (globalThis.__voidLLMRequests ?? []).length > 0) started = true
+			if (started && !running) break
+			await new Promise((r) => setTimeout(r, 50))
+		}
+		const state = svc.streamState[id]
+		return {
+			started,
+			elapsedMs: Date.now() - t0,
+			errorMessage: state?.error?.message ?? null,
+			isRunning: String(state?.isRunning),
+			requestCount: (globalThis.__voidLLMRequests ?? []).length,
+		}
+	}, { wantedThreadId: threadId, timeout: timeoutMs })
+}
+
+/**
  * Fills the current thread with synthetic messages via the dev hook.
  * `toolCallsPerTurn` adds tool rows per turn: a number for every turn, an array
- * for per-turn counts (see `buildTestMessages`).
+ * for per-turn counts (see `buildTestMessages`). `opts.toolBodyRepeats` grows
+ * each tool body past the compaction pruner's trim thresholds.
  */
-export function seedTestThread(page, turns = 15, toolCallsPerTurn = 0) {
+export function seedTestThread(page, turns = 15, toolCallsPerTurn = 0, opts) {
 	return page.evaluate(
-		({ t, n }) => globalThis.__voidChatThreadService._populateTestThread(t, n),
-		{ t: turns, n: toolCallsPerTurn },
+		({ t, n, o }) => globalThis.__voidChatThreadService._populateTestThread(t, n, o),
+		{ t: turns, n: toolCallsPerTurn, o: opts },
 	)
 }
 

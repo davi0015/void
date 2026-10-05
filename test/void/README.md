@@ -94,7 +94,19 @@ What it provides:
   asks specifically whether *shutdown* persists it.
 - `stubLLM` / `seedTestThread` / `ensureModelSelection` — run the real agent and
   compaction code paths with no network, no API key and no model configuration.
-  Only the transport is faked.
+  Only the transport is faked. `stubLLM(page, text, { error })` fails the request
+  instead of answering it — a string fails every request, an array fails request
+  *n* with entry *n* and succeeds once exhausted (`['overflow', null]`) — which is
+  how a test reaches the loop's retry policy. `seedTestThread(..., { toolBodyRepeats })`
+  grows the fixture's tool bodies past the compaction pruner's trim thresholds;
+  at the default size there is nothing the pruner is allowed to trim.
+- `waitForRunEnd` — waits for a chat run to settle and reports how it ended.
+  Needed because `addUserMessageAndStreamResponse` starts the agent loop without
+  awaiting it, so awaiting a send returns before the first request goes out.
+  Polls the thread's stream state instead: a run is in progress while `isRunning`
+  is anything but `undefined` (`'idle'`, which the loop sets between retry
+  attempts, counts as in progress). `started` distinguishes "never began" from
+  "ended without doing anything".
 
 Two habits worth keeping:
 
