@@ -414,24 +414,63 @@ export function pendingThreadWrites(page) {
  * Replaces the LLM transport so the real agent/compaction code paths can run
  * without a network, an API key, or a model selection. Only the transport is
  * faked: everything above it is production code.
+ *
+ * The stub mirrors the real transport in the two ways the code above it relies
+ * on: it returns a request id, and it registers that id in
+ * `llmMessageHooks.onAbort` so `abort(requestId)` — what `abortRunning`, the
+ * Stop button and Escape all go through — actually fires the request's abort
+ * hook. Without that second part a test can "stop" a run and observe nothing.
+ *
+ * `hang: true` holds the request open instead of answering it, so a test can
+ * press Stop mid-request or complete it later with `completeStubbedLLM`.
  */
-export function stubLLM(page, text, { usage } = {}) {
-	return page.evaluate(({ text, usage }) => {
+export function stubLLM(page, text, { usage, hang = false } = {}) {
+	return page.evaluate(({ text, usage, hang }) => {
 		// Every outgoing request is recorded so a test can assert on what the
 		// model was actually sent — the only way to check prompt construction
 		// (system message, compaction summary, history) without a provider.
 		const g = globalThis
 		g.__voidLLMRequests = []
-		g.__voidChatThreadService._llmMessageService.sendLLMMessage = (opts) => {
-			try { g.__voidLLMRequests.push(opts) } catch { /* ignore */ }
-			setTimeout(() => {
-				const u = usage ?? { inputTokens: 1000, outputTokens: 100, totalTokens: 1100, requestCount: 1 }
-				try { opts.onText?.({ usage: u }) } catch { /* ignore */ }
-				try { opts.onFinalMessage?.({ fullText: text, usage: u }) } catch (e) { console.log('[probe] onFinalMessage threw ' + String(e)) }
-			}, 0)
-			return { cancel: () => { /* nothing to cancel */ } }
+		g.__voidPendingLLMRequests = []
+		const llmService = g.__voidChatThreadService._llmMessageService
+		let nextRequestNum = 0
+
+		const complete = (opts) => {
+			const u = usage ?? { inputTokens: 1000, outputTokens: 100, totalTokens: 1100, requestCount: 1 }
+			try { opts.onText?.({ usage: u }) } catch { /* ignore */ }
+			try { opts.onFinalMessage?.({ fullText: text, usage: u }) } catch (e) { console.log('[probe] onFinalMessage threw ' + String(e)) }
 		}
-	}, { text, usage })
+
+		/** Answers a request that `hang` held open. Returns false when none is pending. */
+		g.__voidCompleteLLMRequest = (index = 0) => {
+			const opts = g.__voidPendingLLMRequests[index]
+			if (!opts) return false
+			g.__voidPendingLLMRequests.splice(index, 1)
+			complete(opts)
+			return true
+		}
+
+		llmService.sendLLMMessage = (opts) => {
+			try { g.__voidLLMRequests.push(opts) } catch { /* ignore */ }
+			const requestId = `stub-request-${++nextRequestNum}`
+			llmService.llmMessageHooks.onAbort[requestId] = () => {
+				try { opts.onAbort?.() } catch (e) { console.log('[probe] onAbort threw ' + String(e)) }
+			}
+			if (hang) g.__voidPendingLLMRequests.push(opts)
+			else setTimeout(() => complete(opts), 0)
+			return requestId
+		}
+	}, { text, usage, hang })
+}
+
+/** Answers a request that `stubLLM(..., { hang: true })` held open. */
+export function completeStubbedLLM(page, index = 0) {
+	return page.evaluate((i) => globalThis.__voidCompleteLLMRequest(i), index)
+}
+
+/** How many requests `stubLLM(..., { hang: true })` is still holding. */
+export function pendingStubbedLLMCount(page) {
+	return page.evaluate(() => (globalThis.__voidPendingLLMRequests ?? []).length)
 }
 
 /**

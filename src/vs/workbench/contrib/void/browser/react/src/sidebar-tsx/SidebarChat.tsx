@@ -3072,7 +3072,20 @@ const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOn
 	const currentInFlightTool = toolCallsSoFar && toolCallsSoFar.length > 0 ? toolCallsSoFar[toolCallsSoFar.length - 1] : undefined
 	const toolIsGenerating = !!currentInFlightTool && !currentInFlightTool.isDone
 
-	const streamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
+	// A compaction reuses the streaming state to hold the input, but nothing is
+	// being written into the conversation: showing the writing bubble for it is
+	// what made "is it compacting or has it finished?" unanswerable.
+	const compactingInfo = streamState?.isRunning === 'LLM' ? streamState.compacting : undefined
+	const compactingHTML = compactingInfo ? <ProseWrapper>
+		<span className='flex items-center gap-1.5 text-xs text-void-fg-3'>
+			<IconLoading className='w-3 h-3' />
+			Compacting conversation
+			{typeof compactingInfo.summarisingMessages === 'number' ? ` — summarising ${compactingInfo.summarisingMessages} messages` : ''}
+			… Stop (or Escape) cancels
+		</span>
+	</ProseWrapper> : null
+
+	const streamingMessageHTML = !compactingInfo && (reasoningSoFar || displayContentSoFar || isRunning) ?
 		<ChatBubble
 			key={streamingChatIdx}
 			chatMessage={{
@@ -3098,10 +3111,11 @@ const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOn
 		: null
 
 	return <>
+		{compactingHTML}
 		{streamingMessageHTML}
 		{generatingTool}
 
-		{isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating ? <ProseWrapper>
+		{!compactingInfo && (isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating) ? <ProseWrapper>
 			{<IconLoading className='opacity-50 text-sm' />}
 		</ProseWrapper> : null}
 
@@ -3257,18 +3271,52 @@ export const SidebarChat = () => {
 	const [showCompactDialog, setShowCompactDialog] = useState(false)
 	const [isCompacting, setIsCompacting] = useState(false)
 	const [compactError, setCompactError] = useState<string | null>(null)
+	// What it kept once it finished — the numbers the dialog previewed, now real.
+	const [compactResult, setCompactResult] = useState<null | {
+		keptMessages: number, droppedMessages: number, keptTurns: number, savedTokens: number,
+	}>(null)
+	const [compactNotice, setCompactNotice] = useState<string | null>(null)
 	const canCompact = previousMessages.length >= 10 && !isRunning && !isCurrentThreadReadOnly
 	const onCompact = useCallback(async (percent: number, protectTurns: number) => {
 		setShowCompactDialog(false)
 		setCompactError(null)
+		setCompactResult(null)
+		setCompactNotice(null)
 		setIsCompacting(true)
 		try {
-			const error = await chatThreadsService.compactCurrentThread({ compactPercent: percent, protectTurns })
-			if (error) setCompactError(error)
+			const outcome = await chatThreadsService.compactCurrentThread({ compactPercent: percent, protectTurns })
+			if (outcome.status === 'failed') {
+				setCompactError(outcome.message)
+			}
+			else if (outcome.status === 'cancelled') {
+				// Stopping is not a failure: nothing was written, so say that
+				// rather than showing the user an error they did not cause.
+				setCompactNotice('Compaction cancelled — the conversation was left as it was.')
+			}
+			else {
+				const thread = chatThreadsService.getCurrentThread()
+				const boundaryIdx = thread?.compactionBoundaryIdx
+				if (thread && boundaryIdx !== undefined) {
+					setCompactResult({
+						keptMessages: thread.messages.length - boundaryIdx,
+						droppedMessages: boundaryIdx,
+						keptTurns: thread.messages.slice(boundaryIdx).filter(m => m.role === 'user').length,
+						savedTokens: thread.compactionSavedTokens ?? 0,
+					})
+				}
+			}
 		} finally {
 			setIsCompacting(false)
 		}
 	}, [chatThreadsService])
+
+	// The completion line is information, not a log: clear it on its own so the
+	// composer row returns to normal without the user dismissing anything.
+	useEffect(() => {
+		if (!compactResult && !compactNotice) return
+		const timer = setTimeout(() => { setCompactResult(null); setCompactNotice(null) }, 12000)
+		return () => clearTimeout(timer)
+	}, [compactResult, compactNotice])
 
 	const sidebarRef = useRef<HTMLDivElement>(null)
 
@@ -3656,6 +3704,42 @@ export const SidebarChat = () => {
 					onCancel={() => setShowCompactDialog(false)}
 					getPlan={turns => chatThreadsService.getCompactionPlan({ turns })}
 				/>
+			</div>
+		)}
+		{(compactResult || compactNotice) && (
+			<div className='px-2 pb-2'>
+				<div className='flex items-center gap-1.5 text-xs min-h-[18px]'>
+					{compactResult && (
+						<>
+							<Check size={12} className='shrink-0' />
+							<span className='text-void-fg-3'>
+								Compacted · kept the last {compactResult.keptTurns} turn{compactResult.keptTurns === 1 ? '' : 's'}
+								{' '}({compactResult.keptMessages} message{compactResult.keptMessages === 1 ? '' : 's'})
+								{' '}· summarised {compactResult.droppedMessages}
+								{compactResult.savedTokens > 0 ? ` · saved ~${Math.round(compactResult.savedTokens / 1000).toLocaleString()}k tokens` : ''}
+							</span>
+							<button
+								type='button'
+								onClick={() => setCompactResult(null)}
+								className='text-void-fg-3 hover:text-void-fg-1 cursor-pointer'
+							>
+								<X size={12} />
+							</button>
+						</>
+					)}
+					{compactNotice && (
+						<>
+							<span className='text-void-fg-3'>{compactNotice}</span>
+							<button
+								type='button'
+								onClick={() => setCompactNotice(null)}
+								className='text-void-fg-3 hover:text-void-fg-1 cursor-pointer'
+							>
+								<X size={12} />
+							</button>
+						</>
+					)}
+				</div>
 			</div>
 		)}
 		{compactError && (

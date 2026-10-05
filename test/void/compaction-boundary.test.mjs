@@ -42,6 +42,18 @@ function trace(t, session) {
 }
 
 /**
+ * Reads a compaction outcome across the two shapes this branch has carried:
+ * `{ status }` after Stop/queue handling was added, and `string | null` before
+ * it. Tolerant so the pre-change build can still be measured end to end with
+ * VOID_EXPECT=lost rather than failing on the shape of a return value.
+ */
+function outcomeOf(raw) {
+	if (raw === null) return 'compacted'
+	if (typeof raw === 'string') return `failed: ${raw}`
+	return raw?.status ?? `unrecognised: ${JSON.stringify(raw)}`
+}
+
+/**
  * Locates the kept tail inside a built request: the summary user message, the
  * synthetic assistant acknowledgement the projection inserts after it, and the
  * first message that follows.
@@ -122,7 +134,7 @@ describe('compaction boundary', () => {
 				}
 
 				return {
-					error: outcome === null ? null : String(outcome),
+					outcome,
 					boundaryIdx,
 					boundaryRole: boundaryIdx === undefined ? null : messages[boundaryIdx]?.role,
 					capIdx, capRole, toolRows,
@@ -136,7 +148,7 @@ describe('compaction boundary', () => {
 
 			// Guards: the scenario depends on the tail being long enough that a
 			// ten-entry cap lands on a tool row, and on compaction having run.
-			assert.equal(result.error, null, `compaction did not run: ${result.error}`)
+			assert.equal(outcomeOf(result.outcome), 'compacted', `compaction did not run: ${outcomeOf(result.outcome)}`)
 			assert.equal(result.capRole, 'tool',
 				`fixture guard: a ${CAP}-entry cap lands on '${result.capRole}' at index ${result.capIdx}, not on a tool row`)
 			assert.ok(result.toolRows > CAP,
@@ -167,16 +179,17 @@ describe('compaction boundary', () => {
 			const outcome = await s.page.evaluate(async () => {
 				const svc = globalThis.__voidChatThreadService
 				const id = svc.state.currentThreadId
-				const result = await svc.compactCurrentThread({ compactPercent: 70, protectTurns: 1 })
-				if (result !== null) return String(result)
+				const outcome = await svc.compactCurrentThread({ compactPercent: 70, protectTurns: 1 })
+				const compacted = outcome === null || (typeof outcome === 'object' && outcome?.status === 'compacted')
+				if (!compacted) return { outcome }
 				// A real send, so the request under test is the projection of the
 				// compacted thread rather than the compaction request itself.
 				await svc.addUserMessageAndStreamResponse({ userMessage: 'and then?', threadId: id })
-				return null
+				return { outcome }
 			})
 
 			trace(t, s)
-			assert.equal(outcome, null, `compaction or send did not run: ${outcome}`)
+			assert.equal(outcomeOf(outcome.outcome), 'compacted', `compaction or send did not run: ${outcomeOf(outcome.outcome)}`)
 
 			const { request, reason } = lastChatRequest(await h.capturedLLMRequests(s.page))
 			assert.ok(request, reason)
@@ -214,7 +227,7 @@ describe('compaction boundary', () => {
 				const thread = svc.state.allThreads[id]
 				return {
 					skipped: false,
-					error: outcome === null ? null : String(outcome),
+					outcome,
 					planBoundary: plan?.boundaryIdx,
 					planKept: plan?.keptMessages,
 					storedBoundary: thread?.compactionBoundaryIdx,
@@ -227,11 +240,135 @@ describe('compaction boundary', () => {
 				t.diagnostic('preview getter absent — nothing to compare')
 				return
 			}
-			assert.equal(result.error, null, `compaction did not run: ${result.error}`)
+			assert.equal(outcomeOf(result.outcome), 'compacted', `compaction did not run: ${outcomeOf(result.outcome)}`)
 			assert.equal(result.planBoundary, result.storedBoundary,
 				'the previewed boundary is not the boundary the compaction stored')
 			assert.equal(result.planKept, result.storedKept,
 				'the previewed kept-message count is not what the compaction kept')
+		})
+	})
+
+	test('stopping a compaction leaves the thread exactly as it was', async (t) => {
+		// Compaction holds the input the way a run does, so Stop (or Escape) is
+		// available while it works. It has to mean something: abort the
+		// summarisation request, write nothing, and leave no empty assistant
+		// bubble behind — `abortRunning` appends one for a streaming reply.
+		await h.withScenario('compaction-boundary/stop', async (s) => {
+			await h.ensureModelSelection(s.page)
+			await h.seedTestThread(s.page, TURNS, TOOL_CALLS_PER_TURN)
+			await h.stubLLM(s.page, 'summary text', { hang: true })
+
+			const result = await s.page.evaluate(async () => {
+				const svc = globalThis.__voidChatThreadService
+				const id = svc.state.currentThreadId
+				const priorUsage = { inputTokens: 4321, outputTokens: 55, totalTokens: 4376, requestCount: 1 }
+				svc.state.allThreads[id].latestUsage = priorUsage
+				svc.latestUsageOfThreadId[id] = priorUsage
+
+				const before = {
+					summary: svc.state.allThreads[id].compactionSummary ?? null,
+					boundary: svc.state.allThreads[id].compactionBoundaryIdx ?? null,
+					messageCount: svc.state.allThreads[id].messages.length,
+				}
+
+				const running = svc.compactCurrentThread({ compactPercent: 70, protectTurns: 1 })
+				for (let i = 0; i < 150 && (globalThis.__voidPendingLLMRequests ?? []).length === 0; i++) {
+					await new Promise(r => setTimeout(r, 20))
+				}
+				// The marker exists only once compaction is abortable; without it
+				// this scenario cannot run and says so instead of hanging.
+				if (!svc.streamState[id]?.compacting) return { abortable: false }
+
+				await svc.abortRunning(id)
+				const outcome = await running
+				const thread = svc.state.allThreads[id]
+				return {
+					abortable: true,
+					outcome,
+					before,
+					after: {
+						summary: thread.compactionSummary ?? null,
+						boundary: thread.compactionBoundaryIdx ?? null,
+						messageCount: thread.messages.length,
+					},
+					usage: thread.latestUsage,
+					stillRunning: svc.streamState[id]?.isRunning ?? null,
+				}
+			})
+
+			trace(t, s)
+			if (!result.abortable) {
+				t.diagnostic('compaction is not abortable in this build — scenario skipped')
+				return
+			}
+
+			// Subject: Stop cancels, it does not let the compaction land.
+			const status = outcomeOf(result.outcome)
+			h.assertAbsent(
+				`a compaction that completed anyway after Stop (status: ${status})`,
+				status === 'cancelled',
+				{ subject: true },
+			)
+			// Controls: nothing was written, no bubble was added, usage is intact,
+			// and the thread is usable again.
+			assert.deepEqual(result.after, result.before, 'the cancelled compaction changed the thread')
+			assert.deepEqual(result.usage, { inputTokens: 4321, outputTokens: 55, totalTokens: 4376, requestCount: 1 },
+				'the summarisation request\'s usage was left on the thread')
+			assert.equal(result.stillRunning, null, 'the thread was left looking like it is still running')
+		})
+	})
+
+	test('a message typed during a compaction is sent when it finishes', async (t) => {
+		// Same contract as a run: Enter during compaction queues, and the queue
+		// drains once the thread is idle again instead of sitting there.
+		await h.withScenario('compaction-boundary/queued', async (s) => {
+			await h.ensureModelSelection(s.page)
+			await h.seedTestThread(s.page, TURNS, TOOL_CALLS_PER_TURN)
+			await h.stubLLM(s.page, 'summary text', { hang: true })
+
+			const result = await s.page.evaluate(async () => {
+				const svc = globalThis.__voidChatThreadService
+				const id = svc.state.currentThreadId
+				const MARKER = 'QUEUED-WHILE-COMPACTING'
+				const sent = () => svc.state.allThreads[id].messages.some(m =>
+					(m.content ?? '').includes(MARKER) || (m.displayContent ?? '').includes(MARKER))
+
+				const running = svc.compactCurrentThread({ compactPercent: 70, protectTurns: 1 })
+				for (let i = 0; i < 150 && (globalThis.__voidPendingLLMRequests ?? []).length === 0; i++) {
+					await new Promise(r => setTimeout(r, 20))
+				}
+				// What the composer does when Enter is pressed mid-run.
+				svc.queueUserMessage(id, { userMessage: MARKER, chatSelections: [], pendingImageBytes: new Map() })
+				const queuedWhileCompacting = svc.getQueuedMessages(id).length
+
+				globalThis.__voidCompleteLLMRequest(0)
+				const outcome = await running
+				for (let i = 0; i < 150 && !sent(); i++) await new Promise(r => setTimeout(r, 20))
+
+				return {
+					queuedWhileCompacting,
+					outcome,
+					sent: sent(),
+					queueAfter: svc.getQueuedMessages(id).length,
+				}
+			})
+
+			trace(t, s)
+			// Guard: it really was queued while the compaction was in flight.
+			assert.equal(result.queuedWhileCompacting, 1, 'the message was not queued during compaction')
+			const status = outcomeOf(result.outcome)
+			assert.equal(status, 'compacted', `compaction did not complete: ${status}`)
+			// Subject: the queue drains when compaction finishes.
+			h.assertAbsent(
+				`the queued message still unsent after compaction (status: ${status})`,
+				result.sent,
+				{ subject: true },
+			)
+			h.assertAbsent(
+				`the queued message still waiting in the queue (${result.queueAfter} left)`,
+				result.queueAfter === 0,
+				{ subject: true },
+			)
 		})
 	})
 
@@ -252,7 +389,7 @@ describe('compaction boundary', () => {
 				const outcome = await svc.compactCurrentThread({ compactPercent: 70, protectTurns: 1 })
 				const thread = svc.state.allThreads[id]
 				return {
-					error: outcome === null ? null : String(outcome),
+					outcome,
 					lastUserIdx,
 					boundaryIdx: thread?.compactionBoundaryIdx,
 					boundaryRole: thread?.messages?.[thread?.compactionBoundaryIdx]?.role,
@@ -262,7 +399,7 @@ describe('compaction boundary', () => {
 			trace(t, s)
 			// Control: must pass before and after the fix — a chat-style thread's
 			// boundary is already the start of the turn the slider names.
-			assert.equal(result.error, null, `compaction did not run: ${result.error}`)
+			assert.equal(outcomeOf(result.outcome), 'compacted', `compaction did not run: ${outcomeOf(result.outcome)}`)
 			assert.equal(result.boundaryIdx, result.lastUserIdx,
 				'the boundary should be the start of the last user turn')
 			assert.equal(result.boundaryRole, 'user', 'the boundary should point at a user message')

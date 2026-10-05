@@ -139,7 +139,7 @@ describe('compaction context accounting', () => {
 				const thread = svc.state.allThreads[id]
 				return {
 					id,
-					error: outcome === null ? null : String(outcome),
+					error: outcome.status === 'compacted' ? null : JSON.stringify(outcome),
 					summaryLength: thread?.compactionSummary?.length ?? 0,
 					usage: thread?.latestUsage,
 				}
