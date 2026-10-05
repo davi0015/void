@@ -11,7 +11,7 @@ Two parts, deliberately separable:
 
 ## Problem
 
-Conversation data lives in `state.vscdb` — VS Code's application-scope key-value store — under key-per-message layout. **Eighteen bugs** are catalogued in this document, numbered `bug 1` through `bug 18`. The eight sections below are the ones with a narrative and cover bugs 1–9, 15 and 16; the rest are ledger entries in [1.6 Bugs fixed in Part 1](#16-bugs-fixed-in-part-1). The first is architectural; the rest are ordinary bugs.
+Conversation data lives in `state.vscdb` — VS Code's application-scope key-value store — under key-per-message layout. **Nineteen bugs** are catalogued in this document, numbered `bug 1` through `bug 19`. The eight sections below are the ones with a narrative and cover bugs 1–9, 15 and 16; the rest are ledger entries in [1.6 Bugs fixed in Part 1](#16-bugs-fixed-in-part-1). The first is architectural; the rest are ordinary bugs.
 
 ### Bug 1 — The renderer mirrors the entire database
 
@@ -500,6 +500,7 @@ Two rules follow, and they apply to the S10 format migration rather than to the 
 | 16 | Restored post-compaction usage never written to the usage key; ring differs between live and reopened windows | Write the restored value back, or clear the thread's pending usage write before `_storeThread` |
 | 17 | A failed codespan resolution was stored as `null` and read back as a cache hit, so a span that failed once — cold language server, unready index, file not yet mentioned — stayed dead for the life of the thread; the dead entries were never reclaimed either | Failures held for the session in `_failedCodespanLinks` and never written; `common/codespanLinkCache.ts` decides what counts as a hit, and drops unresolved and out-of-range entries on write |
 | 18 | A thread duplicated from the thread selector came back **empty after a restart**. `duplicateThread` called `_storeThread`, which persists thread metadata only — messages live under their own `void.chatMsg.*` keys — and then marked the copy loaded, so the session that created it rendered the whole conversation from memory and nothing was ever read back. Unrelated to images, and not covered by S5's gate | `_storeAllMessageKeys` for the copy. Shipped on S5's branch because S5 gives that same method copy-on-duplicate image handling and copies bytes for it; see the note under the delivery table in [`multiagent-assistant.md`](./multiagent-assistant.md) |
+| 19 | Every manual compaction wrote the **full conversation transcript** to `voidRequestLogs/` under the **roaming** data home (`_writeCompactionLog`, `chatThreadService.ts:5694`), one markdown file per compaction, and nothing ever reclaims them. Same class as bugs 6–8: conversation content accumulating in a profile that syncs, growing without bound. Found while tracing the compaction boundary defect in [`multiagent-assistant.md`](./multiagent-assistant.md) §8; unrelated to it | Reclaimed and moved out of the roaming profile in S10, alongside the image migration |
 
 ---
 

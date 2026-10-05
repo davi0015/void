@@ -83,7 +83,7 @@ Anything satisfying only (2) is a speculative abstraction — building the shape
 | **Explicit thread identity on the tool call** | `search_history` reads the *visible* thread rather than the executing one (`searchHistory.tool.ts`). Verified when S6 was built: it is the only **tool** that does — the "14 sites" this row first estimated were mostly legitimate readers of the visible thread (composers, workspace normalization). The thread travels as a required argument to `callTool` alone, not as a field of `ToolCtx`: only `callTool` acts on the world, and putting it on the context meant rebuilding that context per call so two functions could carry an id they never read. The adjacent case, the approval buttons in `ToolResultComponents.tsx` resolving against `state.currentThreadId`, is unreachable until a child's prompt can be shown while the parent is on screen, so it belongs to M3 | De-multiplexing — every child tool call needs it | Low |
 | **Provenance on diff areas** (`editCodeService`) | With two threads open and pending edits to the same file, `acceptOrRejectAllDiffAreas({ uri })` accepts both | The hardest blocker for writer children | Medium |
 | **Budgets + `blocked` terminal status** | The agent loop runs until the model stops calling tools; a runaway tool loop costs real money | Fan-out is N unbounded loops without it | Low |
-| **Parameterize `_runChatAgent`** | None directly, but it reads `chatMode` and `overridesOfModel` from global settings mid-iteration (`:2949`) | Children need their own mode and model | Low |
+| **Parameterize `_runChatAgent`** | None directly, but it reads `chatMode` and `overridesOfModel` from global settings mid-iteration (`chatThreadService.ts:3050`) | Children need their own mode and model | Low |
 
 **Deliberately deferred.** These have no standalone justification, and their shape depends on how delegation actually behaves — so building them now means guessing: `attenuateAutoApproveMode` (dead code until a child exists), the result contract and `SubagentOutcome` types, the global concurrency governor, the `AgentDefinition` **file format and UX**, notification aggregation, the child tree UI, and failure-isolation semantics.
 
@@ -288,24 +288,43 @@ Exposed to the parent as:
 
 `_interruptConcurrentTools` (`:2601`) extends to cascade into children on parent abort, so cancelling the parent does not leave orphaned children burning tokens.
 
-### 8. Budgets and the blocked state
+### 8. Budgets, context pressure, and the blocked state
 
 Void's agent loop currently runs until the model stops calling tools, with no bound. Delegation multiplies exactly the quantity that makes this dangerous, so a budget is a precondition for everything else.
+
+Two kinds of limit, checked at the same point — once per loop iteration in `_runChatAgent`, before the next request is prepared:
+
+| Limit | Measured against | Outcome |
+|---|---|---|
+| Context pressure | the size of the request about to be sent | **relieve**, then continue |
+| Rounds, tokens, wall clock | spend so far in this run | **stop** as `blocked`, with the reason that tripped |
+
+Relief is a ladder, cheapest first: prune tool-result bodies (no model call, request image only, stored messages untouched), and summarise the oldest legal span only if pruning did not bring the request under the threshold. A run stops as `blocked` with reason `context` only when both rungs fail or the provider confirms a context overflow. `blocked` is distinguishable from `done` so a parent can tell "the child finished the task" from "the child stopped because it hit a bound."
 
 ```ts
 export type ThreadBudget = {
   maxRounds: number
   maxTokens: number
   maxWallClockMs: number
+  retentionTokens: number   // how much history stays verbatim
   spentRounds: number
   spentTokens: number
   startedAt: number
 }
 ```
 
-Checked once per loop iteration in `_runChatAgent`, before the next request is prepared. On exhaustion the loop stops cleanly and the thread lands in a terminal state rather than being killed mid-stream.
+`IsRunningType` (`chatThreadService.ts:358`) already contains `waiting_tools` — "parked: batch drained, background concurrent tools still running (auto-resumes, nothing to approve)" — which is precisely the parent-waiting-on-children state. What is missing is `blocked` and its reason. Status is reported through the existing notification path (`_shouldNotify('done')`, `:3652`), which must treat a blocked end as terminal but not finished: notify with the reason, mark the thread unread, and still send a message the user queued while waiting.
 
-`IsRunningType` (`:382`) already contains `waiting_tools` — "parked: batch drained, background concurrent tools still running (auto-resumes, nothing to approve)" — which is precisely the parent-waiting-on-children state. The addition needed is a `blocked` outcome distinguishable from `done`, so a parent can tell "the child finished the task" from "the child stopped because it hit a wall or a bound." Status is reported through the existing `_notifyAwaitingApproval` / `_notifyDone` notification path.
+**The reference implementation.** DeepSeek Harness checks pressure from a listener on `agent/pre-step`, so it runs before every request in the loop — a twenty-tool turn gets twenty chances to condense, though a tool already running is never interrupted. Its shipped policy (`@deepseek-ai/dsh-compaction-basic`): condense at `thresholdRatio` 0.8 of the routed model's context window and keep the newest `retainRatio` 0.16 verbatim, or an absolute `retainTokens`; per-model overrides validated at load. The free rung runs first — `dsh-compaction-tool-result-pruner` rewrites any tool result over 8,192 chars to a 4,096-char head, a marker and a 1,024-char tail, and summarisation is skipped entirely when that relieves the pressure. Then one extra condensation attempt, and a second listener on `agent/request-error` that reacts to a provider-confirmed overflow by condensing maximally and retrying once. The summarisation call replays the system prompt, tool schemas and shadowed messages verbatim, so only its trailing instruction is cache-cold. A selected span must be balanced — never splitting a step's tool-call/result pair — and never shadows the system message. Condensed content stays in the session log: condensation is a surface replacement, not a deletion, and a replayed session reproduces the exact conversation.
+
+S8 adopts the trigger point, the ladder, the overflow retry and the warm summarisation call. It does not adopt the log-as-truth model or per-model retention policies — both wait for the message store in S10 — and the pruner equivalent, `_compactToolResultsForRequest` (`convertToLLMMessageService.ts:241`), is already written and switched off with its policy table beside it.
+
+**A boundary must be a legal cut.** Compaction replaces `[0, boundaryIdx)` with a summary, so the boundary decides what the model loses. Two defects met in that one index:
+
+- `_computeManualCompactionBoundary` returned `max(turnBoundary, messages.length − protectMessages)`. The turn rule already means what the slider says — the start of the N-th-from-last user message — but a `max` on the boundary is a `min` on retention, so the fixed `protectMessages: 10` capped the verbatim tail at ten array entries whatever the user chose. In an agent thread, where one step is `1 + N` entries, that cap always won: "keep last 3 turns" delivered about one and a half steps. The dialog never passed the value; it is a copy of the trim path's protection rule (`convertToLLMMessageService.ts:206`), where trimming bodies has no such consequence.
+- Cutting by position meant the boundary could land inside an assistant message's tool batch. Half the results were summarised away together with the assistant that made the calls — its own text and reasoning included — and the survivors arrived verbatim, where the projection's synthetic acknowledgement (`convertToLLMMessageService.ts:1508`, "Understood. Continuing with the context above.") is now the nearest preceding assistant, so `prepareMessages_openai_tools` (`:411`) attached the rebuilt `tool_calls` to *it*. The request stayed well-formed, so this was never a malformed-request bug; it was a request claiming the model called tools it has no record of calling, over a summary that also described some of the same results. Measured against unpatched code: a 22-message thread whose last turn made twelve tool calls compacted to `kept 10/22`, with the kept tail opening on a tool result and ten calls declared by that acknowledgement.
+
+The boundary is therefore a legal cut by construction: the start of the N-th-from-last turn, whole turns only. When those turns exceed `retentionTokens`, a fallback fills the verbatim tail newest-first at **group** granularity — an assistant message plus the results it requested, never split — so a turn with a hundred tool calls is still compactable and its newest steps survive. `planCompaction` (`common/compactionBoundary.ts`) returns the boundary together with what it keeps and drops; the compaction, the dialog's preview and the re-planning of a stored boundary all call it, so the preview cannot drift from the outcome and boundaries already stored by the old rule are re-planned into a legal cut when they are used.
 
 ### 9. Cost rollup
 
@@ -324,7 +343,7 @@ Void's existing UI — tabs, pinned threads, unread badges, notifications, the a
 
 ## Design decisions
 
-- **A child is a `ThreadType`, not a new execution engine.** Reusing `_runChatAgent` means approvals, cancellation, compaction, telemetry, and persistence are inherited rather than reimplemented. A second loop would drift from the first within two releases. Cost: `_runChatAgent` must be parameterized — it currently reads `chatMode` and `overridesOfModel` from global settings at `:2949` — which is a contained refactor.
+- **A child is a `ThreadType`, not a new execution engine.** Reusing `_runChatAgent` means approvals, cancellation, compaction, telemetry, and persistence are inherited rather than reimplemented. A second loop would drift from the first within two releases. Cost: `_runChatAgent` must be parameterized — it currently reads `chatMode` and `overridesOfModel` from global settings at `chatThreadService.ts:3050` — which is a contained refactor.
 
 - **Two tools rather than one with a flag.** The fresh/fork distinction has opposite cost profiles and is the highest-leverage choice the model makes. A distinct verb with a distinct description gives it a better chance of choosing correctly than a boolean buried in a schema.
 
@@ -380,7 +399,7 @@ Bug numbers are canonical across both documents — see [`thread-storage.md` §1
 | **S5** | Image ownership — thread-owned image directories, copy-on-duplicate, move off the roaming profile (bugs 6, 7, 8). Governs images written from here on; the files already in `voidImages/` are left alone and migrate in S10 | Duplicate a thread with images, delete one, the other's images still render |
 | **S6** | Thread identity — tools act on the executing thread rather than the viewed one | A tool invoked on a non-visible thread reads that thread's conversation |
 | **S7** | Diff provenance — diff areas carry their originating thread; accept, reject and interrupt are scoped to it | Two threads with pending edits to one file: accepting in one leaves the other pending |
-| **S8** | Budgets, `blocked`, and loop parameterization — a run stops at a round/token/wall-clock bound and reports why; `_runChatAgent` takes mode and model as arguments rather than reading global settings mid-iteration (**includes S9**) | A synthetic unbounded loop stops at the bound and reports `blocked`; single-agent behaviour otherwise byte-identical |
+| **S8** | Budgets, `blocked`, context pressure, and loop parameterization — one check per loop iteration: pressure is *relieved* (prune tool-result bodies, then condense the oldest legal span) before any bound is *terminal* (rounds, tokens, wall clock), and either way the run ends in a stated reason; `_runChatAgent` takes mode and model as arguments rather than reading global settings mid-iteration (**includes S9**) | A synthetic unbounded loop stops at the round bound and reports `blocked`; a thread under pressure is condensed and continues; single-agent behaviour otherwise byte-identical |
 | **S9** | Loop parameterization — *ships inside S8*, listed separately only to keep this sequence aligned with the numbering used during review | Behaviour byte-identical |
 | **S10** | Message store, migration, and bounded residency — message bodies leave the mirrored database; memory scales with active threads; load cost scales with thread size; per-thread lazy migration with a read fallback; store budget; **the image migration S5 defers** — the flat `voidImages/` directory attributed to its threads and reclaimed (bugs 1, 2, 3, 10, and the legacy half of 6, 7, 8) | Renderer memory no longer scales with total message count; a 5,000-message thread opens within budget; threads created before the change still open; after a pass over a profile holding flat images, `voidImages/` holds none and every image still renders |
 | **M1** | Agent definitions and attenuation — `AgentDefinition` file format and loader; agent index injected via `aiInstructions`; `attenuateAutoApproveMode`. *Capability milestone 1 ("governed runs") arrives earlier, with S8 — which delivers budgets, `blocked`, and the loop seam* | Existing single-agent behaviour byte-identical; budget defaults non-binding |
@@ -390,6 +409,8 @@ Bug numbers are canonical across both documents — see [`thread-storage.md` §1
 | **M5** | Scoped implementation — writer children with explicit file partitioning; worktree-per-child isolation; optional JS orchestration sandbox | Deleting a parent removes children and their images; parallel writers do not lose updates |
 
 **Scope correction in S3.** S3 removes the checkpoint *writing* residue. It deliberately keeps the read and cleanup path — the two `role === 'checkpoint'` skips in the load loops, the `checkpointsBeforeBoundary` remap, and the `CHECKPOINT_KEY_PREFIX` cleanup loops — because S3's own gate requires that a thread containing legacy checkpoint records still loads, and because the remap *is* the bug-3 fix. Removing them here would load checkpoint records into the conversation, leave the compaction boundary off by the number of records in front of it, and partially undo S2. Those four sites move to S10, where the message store renumbers indices and the tolerance stops being reachable. See [`thread-storage.md`](./thread-storage.md#checkpoints-removed-not-stored).
+
+**A pre-S8 fix ships on its own branch.** The manual compaction boundary was capped at ten messages and cut by position, so it could slice an assistant message's tool batch in half: part of the batch was summarised together with the assistant's own text and reasoning, and the surviving results reached the next request attached to the projection's synthetic acknowledgement rather than to the assistant that made the calls. It is **not** an S8 deliverable — no budgets, no `blocked`, no automatic trigger — and it is not covered by S8's gate. It rides on `fix/compaction-turns-not-messages` because S8's relief ladder is built on the same primitive: a boundary that is a legal cut, planned by `planCompaction`. A reader wondering why a compaction fix appears in the multiagent sequence should find this paragraph rather than infer it from §8. See [`thread-storage.md`](./thread-storage.md) §1.6 for the log-growth defect found alongside it.
 
 **An independent defect shipped on S5's branch.** Bug 18 — the selector's Duplicate persisted no message keys, so its copies came back empty after a restart — is **not** part of image ownership and is not covered by S5's gate. It rides on S5 only because S5 hands that method the copy-on-duplicate treatment and copies image bytes for it, and bytes written for a conversation that will not survive a restart are only leaked. It is recorded as its own ledger row in [`thread-storage.md`](./thread-storage.md) §1.6, with its own acceptance scenario, and should be read and reviewed as a separate change: it alters what Duplicate persists, which no image path depends on. A reader looking for why S5's branch touches `duplicateThread` should find this paragraph rather than infer it from the row above.
 

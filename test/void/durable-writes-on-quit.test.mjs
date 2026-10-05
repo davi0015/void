@@ -111,7 +111,7 @@ describe('durable writes on quit', () => {
 				const thread = svc.state.allThreads[threadId]
 				return {
 					threadId,
-					error: outcome === null ? null : String(outcome),
+					error: outcome.status === 'compacted' ? null : JSON.stringify(outcome),
 					boundaryIdx: thread?.compactionBoundaryIdx,
 					summaryLength: thread?.compactionSummary?.length ?? 0,
 				}
@@ -141,7 +141,7 @@ describe('durable writes on quit', () => {
 				const threadId = svc.state.currentThreadId
 				const outcome = await svc.compactCurrentThread({ compactPercent: 50, protectTurns: 1, protectMessages: 2 })
 				const thread = svc.state.allThreads[threadId]
-				return { threadId, error: outcome === null ? null : String(outcome), summaryLength: thread?.compactionSummary?.length ?? 0 }
+				return { threadId, error: outcome.status === 'compacted' ? null : JSON.stringify(outcome), summaryLength: thread?.compactionSummary?.length ?? 0 }
 			})
 			assert.equal(result.error, null, `compaction did not run: ${result.error}`)
 			assert.ok(result.summaryLength > 0, 'compaction produced no summary')

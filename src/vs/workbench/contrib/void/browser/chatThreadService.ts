@@ -14,6 +14,7 @@ import { Emitter, Event } from '../../../../base/common/event.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { builtinToolNames, chat_userMessageContent, isABuiltinToolName, visionHelper_systemMessage, visionHelper_userMessage } from '../common/prompt/prompts.js';
 import { getModelCapabilities } from '../common/modelCapabilities.js';
+import { CompactionPlan, planCompaction, RETENTION_MIN_CHARS, RETENTION_RATIO } from '../common/compactionBoundary.js';
 import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, RawToolParamsObj, ResponsesReasoningRef } from '../common/sendLLMMessageTypes.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
@@ -368,6 +369,17 @@ export type IsRunningType =
 // + model override); the head auto-sends as the next turn when the run ends
 // naturally. Appends never replace — the list UI lets the user edit,
 // send-now, or delete each item.
+// The message the summarisation request rejects with when the user stops it.
+export const COMPACTION_ABORTED_MESSAGE = 'Compaction cancelled.'
+
+// What a manual compaction did. `cancelled` is deliberately not a failure: the
+// user pressed Stop (or Escape), the summarisation request was aborted, and the
+// thread was left exactly as it was — no summary, no boundary, usage intact.
+export type CompactionOutcome =
+	| { status: 'compacted' }
+	| { status: 'cancelled' }
+	| { status: 'failed', message: string }
+
 export type QueuedMessage = {
 	id: string;
 	userMessage: string;
@@ -383,9 +395,14 @@ export type ThreadStreamState = {
 		llmInfo?: undefined;
 		toolInfo?: undefined;
 		interrupt?: undefined;
-	} | { // an assistant message is being written
+	} | { // an assistant message is being written, or a compaction is summarising
 		isRunning: 'LLM';
 		error?: undefined;
+		// Set only by `compactCurrentThread`: the same busy state a run uses (so
+		// input is blocked and messages queue), but with no assistant message
+		// behind it. `abortRunning` must not append an empty assistant turn for
+		// it, and the UI shows "compacting" instead of a writing bubble.
+		compacting?: { summarisingMessages: number | null };
 		llmInfo: {
 			displayContentSoFar: string;
 			reasoningSoFar: string;
@@ -613,11 +630,14 @@ export interface IChatThreadService {
 	// original tokens). `protectTurns` / `protectMessages` control how many
 	// recent user turns / messages are kept uncompacted (defaults: 3 / 10).
 	// Returns null on success, or an error message string.
-	compactCurrentThread(opts: { compactPercent: number, protectTurns?: number, protectMessages?: number }): Promise<string | null>;
+	compactCurrentThread(opts: { compactPercent: number, protectTurns?: number }): Promise<CompactionOutcome>;
+	// What a compaction with these settings would keep and summarise — the
+	// dialog's preview reads the same plan the compaction runs.
+	getCompactionPlan(opts: { turns: number }): (CompactionPlan & { charsPerToken: number }) | null;
 
 	// Dev-only: populate the current thread with a large fake conversation
 	// for performance testing.
-	_populateTestThread(turns?: number): void;
+	_populateTestThread(turns?: number, toolCallsPerTurn?: number | number[]): void;
 	// Dev-only: simulate a streaming LLM response through the real render
 	// pipeline. Tests streaming perf (issue #3).
 	_simulateStream(opts?: { charsPerChunk?: number, intervalMs?: number, includeReasoning?: boolean, repetitions?: number }): void;
@@ -2728,8 +2748,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._queuedApprovalOfThreadId.delete(threadId)
 		this._autoApproveRestOfBatchOfThreadId.delete(threadId)
 
-		// add assistant message
-		if (this.streamState[threadId]?.isRunning === 'LLM') {
+		// add assistant message — unless this 'LLM' state is a compaction, which
+		// streams nothing into the conversation. Stopping a compaction must leave
+		// the thread exactly as it was, not an empty assistant bubble.
+		if (this.streamState[threadId]?.isRunning === 'LLM' && !this.streamState[threadId].compacting) {
 			const { displayContentSoFar, reasoningSoFar, toolCallsSoFar } = this.streamState[threadId].llmInfo
 			this._addMessageToThread(threadId, { role: 'assistant', displayContent: displayContentSoFar, reasoning: reasoningSoFar, anthropicReasoning: null })
 			// For each partially-streamed tool call interrupted mid-flight, add a decorative
@@ -5400,40 +5422,60 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	// ── Manual compaction ────────────────────────────────────────────────
 
-	async compactCurrentThread({ compactPercent, protectTurns = 3, protectMessages = 10 }: { compactPercent: number, protectTurns?: number, protectMessages?: number }): Promise<string | null> {
+	/**
+	 * What a compaction with these settings would do, for the dialog's preview.
+	 * Same call the compaction itself makes, so the numbers the user is shown
+	 * cannot drift from the numbers that run.
+	 */
+	getCompactionPlan({ turns }: { turns: number }): (CompactionPlan & { charsPerToken: number }) | null {
+		const thread = this.state.allThreads[this.state.currentThreadId]
+		const modelSelection = this._settingsService.state.modelSelectionOfFeature['Chat']
+		if (!thread || !modelSelection) return null
+		const charsPerToken = this._convertToLLMMessagesService.getCharsPerToken(modelSelection.providerName, modelSelection.modelName)
+		// The ratio rides along because only the service can calibrate it; the
+		// dialog needs it to show tokens without a second estimate of its own.
+		return { ...this._planCompaction(thread.messages, turns, modelSelection, charsPerToken), charsPerToken }
+	}
+
+	private _planCompaction(messages: ChatMessage[], turns: number, modelSelection: ModelSelection, charsPerToken: number): CompactionPlan {
+		return planCompaction({
+			messages,
+			turns,
+			retentionChars: this._retentionCharsOf(modelSelection, charsPerToken),
+		})
+	}
+
+	async compactCurrentThread({ compactPercent, protectTurns = 3 }: { compactPercent: number, protectTurns?: number }): Promise<CompactionOutcome> {
 		const threadId = this.state.currentThreadId
 		const thread = this.state.allThreads[threadId]
-		if (!thread || thread.messages.length < 10) return 'Not enough messages to compact.'
+		if (!thread || thread.messages.length < 10) return { status: 'failed', message: 'Not enough messages to compact.' }
 
 		const modelSelection = this._settingsService.state.modelSelectionOfFeature['Chat']
-		if (!modelSelection) return 'No model selected for Chat.'
+		if (!modelSelection) return { status: 'failed', message: 'No model selected for Chat.' }
 
 		const chatMessages = thread.messages
-		const boundaryIdx = this._computeManualCompactionBoundary(chatMessages, protectTurns, protectMessages)
-		if (boundaryIdx <= 0) {
-			return `Not enough messages outside the protection zone (last ${protectTurns} user turns / ${protectMessages} messages).`
+		const charsPerToken = this._convertToLLMMessagesService.getCharsPerToken(modelSelection.providerName, modelSelection.modelName)
+		const plan = this._planCompaction(chatMessages, protectTurns, modelSelection, charsPerToken)
+		if (plan.boundaryIdx <= 0) {
+			// Two ways to end up with nothing to summarise, and they need different
+			// words: the thread has fewer turns than the user asked to keep, or its
+			// turns fit inside the protection zone.
+			return {
+				status: 'failed',
+				message: plan.userTurns < protectTurns
+					? `This thread has ${plan.userTurns} turn${plan.userTurns === 1 ? '' : 's'}; keeping the last ${protectTurns} keeps all of it.`
+					: `Nothing to compact outside the last ${protectTurns} turn${protectTurns === 1 ? '' : 's'}.`,
+			}
 		}
+		const boundaryIdx = plan.boundaryIdx
 
 		const targetPercent = Math.max(1, Math.round(100 - compactPercent))
 
-		// Estimate the character count of the compactable region so we can
-		// give the LLM a concrete target length instead of a vague percentage.
-		let compactableChars = 0
-		for (let i = 0; i < boundaryIdx && i < chatMessages.length; i++) {
-			const msg = chatMessages[i]
-			if (msg.role !== 'interrupted_streaming_tool') {
-				if (msg.role === 'user') compactableChars += (msg.content?.length ?? 0)
-				else if (msg.role === 'assistant') compactableChars += (msg.displayContent?.length ?? 0) + (msg.reasoning?.length ?? 0)
-				else if (msg.role === 'tool') {
-					compactableChars += (msg.rawParamsStr?.length ?? 0)
-					const r = msg.result
-					if (typeof r === 'string') compactableChars += r.length
-					else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') compactableChars += ((r as { content: string }).content.length)
-				}
-			}
-		}
+		// The plan already counted both sides of the boundary with the same
+		// per-message accounting the prompt has always used, so the target length
+		// and the saved-token estimate below cannot disagree with it.
+		const compactableChars = plan.droppedChars
 		const targetChars = Math.max(500, Math.round(compactableChars * targetPercent / 100))
-		const charsPerToken = this._convertToLLMMessagesService.getCharsPerToken(modelSelection.providerName, modelSelection.modelName)
 		const targetTokens = Math.round(targetChars / charsPerToken)
 
 		// The conversation is already in the LLM messages (prefix-cached).
@@ -5509,6 +5551,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const modelSelectionOptions = this._settingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
 		const { chatMode } = this._settingsService.state.globalSettings
+		// The summarisation request's id, so the Stop button can abort it. A ref
+		// because the id only exists once the request is sent, which happens
+		// after the stream state below is installed.
+		const compactionRequestIdRef: { current: string | null } = { current: null }
+
 		const sendCompactionFromChatMessages = async (chatMsgs: ChatMessage[], label: string) => {
 			const { messages: msgs, separateSystemMessage: sysMsg } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages: chatMsgs,
@@ -5518,7 +5565,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				manualCompaction,
 			})
 			return new Promise<string>((resolve, reject) => {
-				this._llmMessageService.sendLLMMessage({
+				compactionRequestIdRef.current = this._llmMessageService.sendLLMMessage({
 					messagesType: 'chatMessages',
 					messages: msgs,
 					separateSystemMessage: sysMsg,
@@ -5535,14 +5582,25 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						resolve(fullText)
 					},
 					onError: (err) => { reject(new Error(err.message)) },
-					onAbort: () => { reject(new Error('Compaction aborted')) },
+					onAbort: () => { reject(new Error(COMPACTION_ABORTED_MESSAGE)) },
 					logging: { loggingName: label, loggingExtras: { threadId, compactPercent } },
 				})
 			})
 		}
 
-		// Block message input during compaction (same as running agent)
-		this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '', reasoningSoFar: '', toolCallsSoFar: [] }, interrupt: Promise.resolve(() => { }) })
+		// Block message input during compaction, the way a run does — including a
+		// Stop that cancels the request instead of only clearing the indicator.
+		// The state object is kept so the `finally` can tell "still mine" from
+		// "the user stopped me and started something else".
+		const compactionLlmInfo = { displayContentSoFar: '', reasoningSoFar: '', toolCallsSoFar: [] }
+		this._setStreamState(threadId, {
+			isRunning: 'LLM',
+			compacting: { summarisingMessages: plan.droppedMessages },
+			llmInfo: compactionLlmInfo,
+			interrupt: Promise.resolve(() => {
+				if (compactionRequestIdRef.current) this._llmMessageService.abort(compactionRequestIdRef.current)
+			}),
+		})
 
 		// Save the pre-compaction usage so we can restore it after. The
 		// compaction request's usage overwrites latestUsage, but the user's
@@ -5554,7 +5612,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const summary = await sendCompactionFromChatMessages(compactionMessages, 'Manual Compaction')
 
 			if (!summary || summary.trim().length === 0) {
-				return 'The model returned an empty summary.'
+				return { status: 'failed', message: 'The model returned an empty summary.' }
 			}
 
 			// Write compaction log for analysis
@@ -5587,21 +5645,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				// Estimate recent (post-boundary) tokens using the provider's
 				// real ratio rather than charsPerToken, so structural overhead
 				// is proportionally included.
-				const recentChars = (() => {
-					let n = 0
-					for (let i = boundaryIdx; i < chatMessages.length; i++) {
-						const m = chatMessages[i]
-						if (m.role === 'user') n += (m.content?.length ?? 0)
-						else if (m.role === 'assistant') n += (m.displayContent?.length ?? 0) + (m.reasoning?.length ?? 0)
-						else if (m.role === 'tool') {
-							n += (m.rawParamsStr?.length ?? 0)
-							const r = m.result
-							if (typeof r === 'string') n += r.length
-							else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') n += ((r as { content: string }).content.length)
-						}
-					}
-					return n
-				})()
+				const recentChars = plan.keptChars
 				// Derive the real chars→tokens ratio from the compaction request
 				// (sentChars ≈ compactableChars + recentChars + summarizationPrompt
 				// body chars). This ratio captures structural overhead that plain
@@ -5649,7 +5693,28 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// for, so losing this write silently discards it on next launch.
 			this._storeThreadDurably(threadId, updatedThread)
 			this._setState({ allThreads: newThreads })
-			return null
+
+			// Release the input lock before sending anything: the follow-up turn
+			// below must not find this thread still "running", or it would try to
+			// abort the compaction request it is replacing.
+			if (this.streamState[threadId]?.llmInfo === compactionLlmInfo) this._setStreamState(threadId, undefined)
+
+			// A message typed while compaction ran waits in the queue, exactly as
+			// it does during a run: send the head now that the thread is idle.
+			// Fire-and-forget, so the caller's completion isn't held back by it.
+			const head = this._queuedMessagesOfThreadId.get(threadId)?.[0]
+			if (head) {
+				this.removeQueuedMessage(threadId, head.id)
+				this.addUserMessageAndStreamResponse({
+					userMessage: head.userMessage,
+					_chatSelections: head.chatSelections,
+					threadId,
+					_pendingImageBytes: head.pendingImageBytes,
+					modelSelectionOptionsOverride: head.modelSelectionOptionsOverride,
+				}).catch(e => { console.error('Error while sending queued message after compaction:', e) })
+			}
+
+			return { status: 'compacted' }
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e)
 			console.error('[Compaction] Failed:', e)
@@ -5667,28 +5732,32 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					this._pendingUsageWrites.delete(threadId)
 				}
 			}
-			return msg
+			// An abort is the user's Stop, not a failure: nothing was written, so
+			// there is nothing to report as an error.
+			return msg === COMPACTION_ABORTED_MESSAGE ? { status: 'cancelled' } : { status: 'failed', message: msg }
 		} finally {
-			this._setStreamState(threadId, undefined)
+			// Only clear the state this call installed. After a Stop the state is
+			// already gone, and the user's next message may have started a run
+			// whose state this late return must not wipe.
+			if (this.streamState[threadId]?.llmInfo === compactionLlmInfo) this._setStreamState(threadId, undefined)
 		}
 	}
 
-	private _computeManualCompactionBoundary(messages: ChatMessage[], protectTurns: number, protectMessages: number): number {
-		let userCount = 0
-		let userTurnBoundary = 0
-		for (let i = messages.length - 1; i >= 0; i--) {
-			if (messages[i].role === 'user') {
-				userCount++
-				if (userCount >= protectTurns) {
-					userTurnBoundary = i
-					break
-				}
-			}
-		}
-		if (userCount < protectTurns) userTurnBoundary = 0
-
-		const messageCountBoundary = Math.max(0, messages.length - protectMessages)
-		return Math.max(userTurnBoundary, messageCountBoundary)
+	/**
+	 * How much history stays verbatim when compaction fires: a fraction of the
+	 * model's context window, in characters. A fraction rather than a message
+	 * count, because ten entries is two chat turns or a fifth of one agent step
+	 * depending on the thread — see `common/compactionBoundary.ts`.
+	 *
+	 * The floor matters: `contextWindow` is per model and can be missing or zero
+	 * for an unrecognized route, and a zero budget would let the fallback keep
+	 * only the newest group, summarising almost everything.
+	 */
+	private _retentionCharsOf(modelSelection: ModelSelection, charsPerToken: number): number {
+		const { overridesOfModel } = this._settingsService.state
+		const { contextWindow } = getModelCapabilities(modelSelection.providerName, modelSelection.modelName, overridesOfModel)
+		const tokens = Number.isFinite(contextWindow) ? Math.max(0, contextWindow) * RETENTION_RATIO : 0
+		return Math.max(RETENTION_MIN_CHARS, Math.round(tokens * charsPerToken))
 	}
 
 	private _writeCompactionLog(opts: {
@@ -5747,12 +5816,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}, opts)
 	}
 
-	_populateTestThread(turns: number = 15): void {
+	_populateTestThread(turns: number = 15, toolCallsPerTurn: number | number[] = 0): void {
 		const threadId = this.state.currentThreadId
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
 
-		const messages = buildTestMessages(turns)
+		const messages = buildTestMessages(turns, toolCallsPerTurn)
 		const updatedThread = { ...thread, lastModified: new Date().toISOString(), messages }
 		const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 		this._storeThread(threadId, updatedThread)
