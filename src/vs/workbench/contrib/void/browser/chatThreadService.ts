@@ -59,6 +59,14 @@ import { shouldAutoApprove } from '../common/terminalAutoApprove.js';
 const CHAT_RETRIES = 3
 const RETRY_DELAY = 2500
 
+// One line of a provider's error, for the retry state's `reason`. The full text
+// is kept for the terminal error; this is a preview of why the request is being
+// repeated, rendered inline in the composer, so it is capped rather than
+// wrapped over several lines.
+const RETRY_REASON_MAX_CHARS = 90
+const _shortErrorReason = (error: { message?: string } | undefined): string =>
+	(error?.message ?? '').split('\n')[0].trim().slice(0, RETRY_REASON_MAX_CHARS)
+
 const classifyToolError = (msg: string): string => {
 	if (msg.includes('appears multiple times')) return 'not_unique'
 	if (msg.includes('no match for')) return 'not_found'
@@ -402,6 +410,7 @@ export type ThreadStreamState = {
 		llmInfo?: undefined;
 		toolInfo?: undefined;
 		interrupt?: undefined;
+		retrying?: undefined;
 	} | { // an assistant message is being written, or a compaction is summarising
 		isRunning: 'LLM';
 		error?: undefined;
@@ -410,6 +419,7 @@ export type ThreadStreamState = {
 		// behind it. `abortRunning` must not append an empty assistant turn for
 		// it, and the UI shows "compacting" instead of a writing bubble.
 		compacting?: { summarisingMessages: number | null };
+		retrying?: undefined;
 		llmInfo: {
 			displayContentSoFar: string;
 			reasoningSoFar: string;
@@ -425,6 +435,7 @@ export type ThreadStreamState = {
 		isRunning: 'tool';
 		error?: undefined;
 		llmInfo?: undefined;
+		retrying?: undefined;
 		toolInfo: {
 			toolName: ToolName;
 			toolParams: ToolCallParams<ToolName>;
@@ -441,18 +452,25 @@ export type ThreadStreamState = {
 		llmInfo?: undefined;
 		toolInfo?: undefined;
 		interrupt?: undefined;
+		retrying?: undefined;
 	} | { // parked on background concurrent tools (auto-resumes, nothing actionable)
 		isRunning: 'waiting_tools';
 		error?: undefined;
 		llmInfo?: undefined;
 		toolInfo?: undefined;
 		interrupt?: undefined;
+		retrying?: undefined;
 	} | {
 		isRunning: 'idle';
 		error?: undefined;
 		llmInfo?: undefined;
 		toolInfo?: undefined;
 		interrupt: 'not_needed' | Promise<() => void>; // calling this should have no effect on state - would be too confusing. it just cancels the tool
+		// Set only while the loop waits out `RETRY_DELAY` before re-sending a
+		// request that failed transiently. The wait is ~2.5s and the run looks
+		// idle throughout, so without this the retry is invisible until it
+		// either succeeds or exhausts `CHAT_RETRIES` — see the composer line.
+		retrying?: { attempt: number, of: number, reason: string };
 	}
 }
 
@@ -3413,7 +3431,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					// or reported below.
 					if (!overflow && nAttempts < CHAT_RETRIES) {
 						shouldRetryLLM = true
-						this._setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor })
+						this._setStreamState(threadId, {
+							isRunning: 'idle',
+							interrupt: idleInterruptor,
+							retrying: { attempt: nAttempts + 1, of: CHAT_RETRIES, reason: _shortErrorReason(llmRes.error) },
+						})
 						await timeout(RETRY_DELAY)
 						if (interruptedWhenIdle) {
 							this._setStreamState(threadId, undefined)
