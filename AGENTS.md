@@ -98,6 +98,15 @@ Plain scripts (`test/void/*.mjs`), docs and `.tmp/` are not compiled at all.
 
 - **Never assume a run measured the code you just edited.** Confirm the compiled artifact, e.g.
   `grep -c _storeThreadDurably out/vs/workbench/contrib/void/browser/chatThreadService.js`.
+- **A marker count read while the watcher is writing can be a false zero.** A `grep -c` on `out/`
+  run right after a checkout has returned `0` for code that was already compiled; the next read,
+  seconds later, found the marker with a modification time *older* than the first read, which is how
+  the race was identified. If a count surprises you, wait for the mtime to settle and read again
+  before concluding anything from it.
+- **The watcher can stop without saying so.** In this environment `npm run watch-client` has been
+  observed exiting after a compile or two with `EPERM` on a path outside the repository, leaving
+  `out/` silently stale. `pgrep -fl watch-client` before trusting a build, and restart it when it
+  is gone.
 - To measure pre-fix behaviour: revert the source (`git checkout main -- <file>`), wait for the
   rebuild, and confirm the marker count in `out/` is `0` **before** running. Restore afterwards with
   `git checkout HEAD -- <file>`.
