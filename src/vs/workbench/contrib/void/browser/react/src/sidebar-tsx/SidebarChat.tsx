@@ -3085,6 +3085,19 @@ const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOn
 		</span>
 	</ProseWrapper> : null
 
+	// A request that failed transiently is re-sent after `RETRY_DELAY`, twice at
+	// most. Nothing else changes during those seconds — no bubble, no error — so
+	// without a line here a retry is indistinguishable from a hang, and the user
+	// only learns one happened when the last attempt fails.
+	const retryingInfo = streamState?.isRunning === 'idle' ? streamState.retrying : undefined
+	const retryingHTML = retryingInfo ? <ProseWrapper>
+		<span className='flex items-center gap-1.5 text-xs text-void-fg-3'>
+			<IconLoading className='w-3 h-3' />
+			Request failed — retrying (attempt {retryingInfo.attempt} of {retryingInfo.of})
+			{retryingInfo.reason ? <span className='truncate text-void-fg-4'>{retryingInfo.reason}</span> : null}
+		</span>
+	</ProseWrapper> : null
+
 	const streamingMessageHTML = !compactingInfo && (reasoningSoFar || displayContentSoFar || isRunning) ?
 		<ChatBubble
 			key={streamingChatIdx}
@@ -3112,10 +3125,11 @@ const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOn
 
 	return <>
 		{compactingHTML}
+		{retryingHTML}
 		{streamingMessageHTML}
 		{generatingTool}
 
-		{!compactingInfo && (isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating) ? <ProseWrapper>
+		{!compactingInfo && !retryingInfo && (isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating) ? <ProseWrapper>
 			{<IconLoading className='opacity-50 text-sm' />}
 		</ProseWrapper> : null}
 
