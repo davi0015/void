@@ -11,7 +11,7 @@ Two parts, deliberately separable:
 
 ## Problem
 
-Conversation data lives in `state.vscdb` — VS Code's application-scope key-value store — under key-per-message layout. **Nineteen bugs** are catalogued in this document, numbered `bug 1` through `bug 19`. The eight sections below are the ones with a narrative and cover bugs 1–9, 15 and 16; the rest are ledger entries in [1.6 Bugs fixed in Part 1](#16-bugs-fixed-in-part-1). The first is architectural; the rest are ordinary bugs.
+Conversation data lives in `state.vscdb` — VS Code's application-scope key-value store — under key-per-message layout. **Twenty bugs** are catalogued in this document, numbered `bug 1` through `bug 20`. The eight sections below are the ones with a narrative and cover bugs 1–9, 15 and 16; the rest are ledger entries in [1.6 Bugs fixed in Part 1](#16-bugs-fixed-in-part-1). The first is architectural; the rest are ordinary bugs.
 
 ### Bug 1 — The renderer mirrors the entire database
 
@@ -42,7 +42,7 @@ This is not an edge case. Agentic coding legitimately produces thousands of mess
 if (oldCompactionBoundaryIdx !== undefined && checkpointsBeforeBoundary > 0) {
 ```
 
-`checkpointsBeforeBoundary` counts only `role === 'checkpoint'` entries. For any migrated thread those are gone, so the gate is `0` and no remap happens. The boundary keeps its number and points at a different message. The code knows — the comment two lines above reads *"Already-migrated threads can't be remapped (checkpoints gone), but the LLM code clamps via Math.min."* The clamp (`convertToLLMMessageService.ts:1497`) turns a crash into a silently wrong prompt.
+`checkpointsBeforeBoundary` counts only `role === 'checkpoint'` entries. For any migrated thread those are gone, so the gate is `0` and no remap happens. The boundary keeps its number and points at a different message. The code knows — the comment two lines above reads *"Already-migrated threads can't be remapped (checkpoints gone), but the LLM code clamps via Math.min."* The clamp (`convertToLLMMessageService.ts:1512`) turns a crash into a silently wrong prompt.
 
 ### Bug 4 — Compaction can be silently dropped entirely
 
@@ -132,7 +132,7 @@ Regression test: `test/void/durable-writes-on-quit.test.mjs`, run with `npm run 
 
 ### Bug 16 — The restored usage value never reaches disk
 
-After a compaction the code deliberately restores the user's last real turn's usage, so the ring does not report the internal summarization request (`:5618-5622`):
+After a compaction the code deliberately restores the user's last real turn's usage, so the ring does not report the internal summarization request (`:5739-5742`):
 
 ```ts
 if (preCompactionLatestUsage) {
@@ -141,13 +141,15 @@ if (preCompactionLatestUsage) {
 }
 ```
 
-But that only reaches memory. Nothing writes it back to the usage key, and the flush actively prefers the other source (`:1298-1307`): when a usage write is pending for a thread, metadata is written from the thread object and the **usage key is written from `_pendingUsageWrites` instead**. That map was populated by `_setLatestUsage` during the compaction stream (`:5512`, `:5515`) with the **compaction request's** usage — the full conversation plus the summarization prompt.
+But that only reaches memory. Nothing writes it back to the usage key, and the flush actively prefers the other source (`:1421-1431`): when a usage write is pending for a thread, metadata is written from the thread object and the **usage key is written from `_pendingUsageWrites` instead**. That map was populated by `_setLatestUsage` during the compaction stream (`:5634`, `:5637`) with the **compaction request's** usage — the full conversation plus the summarization prompt.
 
 So the usage key ends up holding the compaction request's token count, while the live window displays the restored pre-compaction value. The two differ, and neither is the real post-compaction prompt size.
 
 **Symptom:** the context-length ring reports one number in the live window and a different number after a reopen — in either direction, which is what makes it read as "the context length jumped" rather than as a consistent error.
 
-**Currently display-only**, because both client-side trim paths are disabled: emergency trim is explicitly off (`convertToLLMMessageService.ts:665-669`), and the Perf 2 Light tier is dead code — `_compactToolResultsForRequest` is never called, with `:321` an explicit `void` no-op. It becomes a correctness bug the moment either is re-enabled, since `priorContentTokens` is derived from this value and feeds the size gate.
+**Fixed in S2** — the success and failure paths both drop the queued usage write (`chatThreadService.ts:5746`, `:5789`), so the flush no longer lands the compaction request's count over the restored value.
+
+Its severity until then was display-only, because both client-side trim paths are off: emergency trim is explicitly off (`convertToLLMMessageService.ts:674-678`), and the Light tier runs only under `overflowRelief` — a request the provider has already rejected for size — where its size gate is forced and this estimate is never consulted ([`multiagent-assistant.md`](./multiagent-assistant.md) §8.1). `prepareMessages` takes `priorContentTokens` and does not read it. It becomes a correctness bug the moment a trim path consults this value without forcing that gate, since `priorContentTokens` is derived from it.
 
 ---
 
@@ -371,9 +373,9 @@ shifts positions.
 
 | Residue | Location | Why it must wait |
 |---|---|---|
-| `role === 'checkpoint'` skip in the read loops | `chatThreadService.ts:1423`, `:1484` | Threads written before the removal still carry these records in their message keys. Without the skip they load as real messages and are sent to the model |
-| `checkpointsBeforeBoundary` remap | `chatThreadService.ts:1475–1519` | It needs the checkpoint records still readable to compute the shift. It is also the fix for bug 3, so removing it early re-breaks the boundary S2 corrected |
-| `CHECKPOINT_KEY_PREFIX` and the two cleanup loops that use it | `common/storageKeys.ts:37`, `chatThreadService.ts:1219–1224`, `:1505–1511` | The only thing that ever deletes `void.chatCheckpoint.*`. Removing the cleaner while keeping the reader leaves those keys orphaned forever |
+| `role === 'checkpoint'` skip in the read loops | `chatThreadService.ts:1492`, `:1551` | Threads written before the removal still carry these records in their message keys. Without the skip they load as real messages and are sent to the model |
+| `checkpointsBeforeBoundary` remap | `chatThreadService.ts:1542–1587` | It needs the checkpoint records still readable to compute the shift. It is also the fix for bug 3, so removing it early re-breaks the boundary S2 corrected |
+| `CHECKPOINT_KEY_PREFIX` and the two cleanup loops that use it | `common/storageKeys.ts:37`, `chatThreadService.ts:1322–1325`, `:1577–1580` | The only thing that ever deletes `void.chatCheckpoint.*`. Removing the cleaner while keeping the reader leaves those keys orphaned forever |
 
 The S3 acceptance gate requires that *a thread containing legacy checkpoint
 records still loads*, which is what fixes this boundary. `test/void/legacy-storage-compat.test.mjs`
@@ -500,7 +502,7 @@ Two rules follow, and they apply to the S10 format migration rather than to the 
 | 16 | Restored post-compaction usage never written to the usage key; ring differs between live and reopened windows | Write the restored value back, or clear the thread's pending usage write before `_storeThread` |
 | 17 | A failed codespan resolution was stored as `null` and read back as a cache hit, so a span that failed once — cold language server, unready index, file not yet mentioned — stayed dead for the life of the thread; the dead entries were never reclaimed either | Failures held for the session in `_failedCodespanLinks` and never written; `common/codespanLinkCache.ts` decides what counts as a hit, and drops unresolved and out-of-range entries on write |
 | 18 | A thread duplicated from the thread selector came back **empty after a restart**. `duplicateThread` called `_storeThread`, which persists thread metadata only — messages live under their own `void.chatMsg.*` keys — and then marked the copy loaded, so the session that created it rendered the whole conversation from memory and nothing was ever read back. Unrelated to images, and not covered by S5's gate | `_storeAllMessageKeys` for the copy. Shipped on S5's branch because S5 gives that same method copy-on-duplicate image handling and copies bytes for it; see the note under the delivery table in [`multiagent-assistant.md`](./multiagent-assistant.md) |
-| 19 | Every manual compaction wrote the **full conversation transcript** to `voidRequestLogs/` under the **roaming** data home (`_writeCompactionLog`, `chatThreadService.ts:5694`), one markdown file per compaction, and nothing ever reclaims them. Same class as bugs 6–8: conversation content accumulating in a profile that syncs, growing without bound. Found while tracing the compaction boundary defect in [`multiagent-assistant.md`](./multiagent-assistant.md) §8; unrelated to it | Reclaimed and moved out of the roaming profile in S10, alongside the image migration |
+| 19 | Every manual compaction wrote the **full conversation transcript** to `voidRequestLogs/` under the **roaming** data home (`_writeCompactionLog`, `chatThreadService.ts:5820`), one markdown file per compaction, and nothing ever reclaims them. Same class as bugs 6–8: conversation content accumulating in a profile that syncs, growing without bound. Found while tracing the compaction boundary defect in [`multiagent-assistant.md`](./multiagent-assistant.md) §8; unrelated to it | Reclaimed and moved out of the roaming profile in S10, alongside the image migration |
 | 20 | A request the provider rejected for exceeding the context window was retried **unchanged** `CHAT_RETRIES` (3) times, 2500 ms apart: `prepareLLMChatMessages` runs once per loop iteration, outside the retry loop, so each attempt re-sent the identical oversized request and every one failed the same way. Not a storage bug — recorded here because the symptom is a thread that outgrows its window, and this is the ledger a reader checks. Found while splitting S8, and fixed on its pressure branch, [`multiagent-assistant.md`](./multiagent-assistant.md) §8.1 | `common/contextOverflow.ts` classifies the overflow; the request is rebuilt with old tool-result bodies trimmed (request image only, nothing persisted) and retried once, or the run stops after a single attempt with an explanation instead of three identical failures |
 
 ---
@@ -622,13 +624,15 @@ This document's work maps onto that sequence as follows:
 | **S3** | Checkpoint residue; bugs 11, 12, 13, 14 (dead field, junk field, stale comments and doc) | 1 |
 | **S4** | Bug 9, caps half (value-size caps) | 1 |
 | **S5** | Bugs 6, 7, 8 (cross-thread deletion, path, location) | 1 |
-| **S10** | Bugs 1, 2, 3, 10 (the store, the load path, the reader audit); plus all of Part 2 — thread kinds, retention policy, shared residency budget, cascade deletion, pruning | 1 + 2 |
+| **S10** | Bugs 1, 2, 3, 10 (the store, the load path, the reader audit), the startup migration pass, and the flat-image attribution S5 defers | 1 |
 
 Bug numbers are canonical in both documents — see [1.6 Bugs fixed in Part 1](#16-bugs-fixed-in-part-1).
 
 S6–S9 are not storage work; they are cross-cutting preparation recorded in the program sequence.
 
-Note that Part 2 is not a separate delivery step. Its policy layer (kinds, retention, shared budget, cascade) ships inside **S10**, because the claim that Part 2 changes no format is what makes it addable there rather than a milestone of its own. If Part 2 turns out to need a format change, that is the signal this document's Part 1 design was wrong.
+Part 2 is not a separate delivery step, but it is also **not** part of S10 — the earlier revision of this table said it was, and that was wrong. Every row of its policy layer presupposes children: `kind: 'user' | 'child'` is a distinction with one value until `run_subagent` exists, child retention counts days after a child completes, eviction priority is "children first", pinned tabs exclude children, sealing happens on child completion, and the shared budget is ordered `viewed > running parent > running children > idle children`. Shipping that alongside Part 1 would mean writing branches no thread can take — the speculative abstraction the program sequence rejects by name. S10 is Part 1.
+
+The policy layer therefore lands with its consumers: `kind`, sealing and child retention with **M2**, where the first child exists; the shared residency budget, eviction priority and cascade with **M3**, where there are several. What makes that affordable is unchanged — Part 2 changes no format, so it can be added to a step that already has the store rather than needing a step of its own. If it turns out to need a format change, that is the signal Part 1's design was wrong.
 
 ## Non-goals
 
