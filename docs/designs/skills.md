@@ -77,7 +77,7 @@ Two directories, merged into one index:
 **Name collision resolution:** workspace skills override global skills with the same name. The index lists the workspace version only. `load_skill` checks workspace dir first, falls back to global.
 
 **Path resolution:**
-- Workspace: `URI.joinPath(folder.uri, '.void', 'skills')` — same pattern as `.voidrules` at `convertToLLMMessageService.ts:1003`
+- Workspace: `URI.joinPath(folder.uri, '.void', 'skills')` — same pattern as `.voidrules` at `convertToLLMMessageService.ts:1025`
 - Global: `joinPath(pathService.userHome(), '.void', 'skills')` — `userHome` is the OS home directory (`~` on macOS/Linux, `%USERPROFILE%` on Windows)
 
 ### 3. Skills index injection
@@ -92,7 +92,7 @@ AVAILABLE SKILLS (use the load_skill tool to load full instructions when relevan
 ```
 
 This means the index is automatically:
-- **Frozen on first send** via `frozenAiInstructions` on the thread (`chatThreadService.ts:1708`)
+- **Frozen on first send** via `frozenAiInstructions` on the thread (`chatThreadService.ts:3992`)
 - **Byte-identical across turns** for prefix cache stability
 - **Re-applied via the same flow** as `.voidrules` when files change (user sees the "rules changed" indicator)
 

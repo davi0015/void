@@ -123,7 +123,7 @@ const CALIBRATION_POLICY = {
 //       critical for agent-mode threads (single user message, long tool burst)
 //       where user-turn protection alone would protect nothing.
 //
-// See Perf 2 entry in mynote.md for the full rationale and deferred Heavy-tier plan.
+// See the Perf 2 entry in docs/note.md for the full rationale and deferred Heavy-tier plan.
 
 const TRIMMABLE_TOOL_NAMES: ReadonlySet<string> = new Set<string>([
 	'read_file',
@@ -646,11 +646,13 @@ const prepareOpenAIOrAnthropicMessages = ({
 	messages: AnthropicOrOpenAILLMMessage[],
 	separateSystemMessage: string | undefined,
 	// Populated only when the emergency trim loop actually truncated one or more
-	// messages (rare in practice, since Perf 2 Light-tier normally keeps us
-	// under budget). Consumed by `prepareLLMChatMessages` and merged into the
-	// returned `CompactionInfo` so the tooltip can surface a dedicated
-	// "Emergency trim: …" line. `undefined` when the destructive path didn't
-	// run, distinct from `{…count:0}` for cheaper caller checks.
+	// messages, which nothing does today: the trim below is disabled, and the
+	// Light tier no longer runs ahead of a request either — it runs only under
+	// `overflowRelief`, on a request the provider has already rejected. Consumed
+	// by `prepareLLMChatMessages` and merged into the returned `CompactionInfo`
+	// so the tooltip can surface a dedicated "Emergency trim: …" line.
+	// `undefined` when the destructive path didn't run, distinct from
+	// `{…count:0}` for cheaper caller checks.
 	emergencyInfo?: { emergencyTrimmedCount: number, emergencySavedChars: number, emergencySavedTokens: number },
 } => {
 
