@@ -4,7 +4,8 @@ Void is a VS Code fork. Read `docs/designs/` before changing storage, the chat l
 behaviour — those documents are the specification. `docs/designs/thread-storage.md` §1.6 is the
 canonical bug ledger; cite `bug N` from that table, and note that its `Problem` section is a
 narrative subset, not a second numbering. `docs/designs/multiagent-assistant.md` holds the delivery
-sequence (S1–S10, then M1–M5); work proceeds in that order, one step at a time.
+sequence (S1–S10, then M1–M5); work proceeds in that order, one step at a time. [`docs/handover.md`](docs/handover.md) is a dated snapshot of where
+the work actually stands — what shipped, what is next, and what is still unverified.
 
 ## Layout
 
