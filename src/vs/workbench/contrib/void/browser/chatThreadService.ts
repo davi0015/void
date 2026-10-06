@@ -15,6 +15,7 @@ import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { builtinToolNames, chat_userMessageContent, isABuiltinToolName, visionHelper_systemMessage, visionHelper_userMessage } from '../common/prompt/prompts.js';
 import { getModelCapabilities } from '../common/modelCapabilities.js';
 import { CompactionPlan, planCompaction, RETENTION_MIN_CHARS, RETENTION_RATIO } from '../common/compactionBoundary.js';
+import { isContextOverflowError } from '../common/contextOverflow.js';
 import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, RawToolParamsObj, ResponsesReasoningRef } from '../common/sendLLMMessageTypes.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
@@ -372,6 +373,12 @@ export type IsRunningType =
 // The message the summarisation request rejects with when the user stops it.
 export const COMPACTION_ABORTED_MESSAGE = 'Compaction cancelled.'
 
+// Prepended to a provider's context-overflow error when the loop cannot relieve
+// the request, so the error the user reads says what to do about it instead of
+// only quoting the provider. The provider's own text is kept below it: it names
+// the limits, which is what makes the failure checkable.
+export const CONTEXT_OVERFLOW_MESSAGE = 'This conversation no longer fits in the model\'s context window. Compact the thread, or start a new one to continue.'
+
 // What a manual compaction did. `cancelled` is deliberately not a failure: the
 // user pressed Stop (or Escape), the summarisation request was aborted, and the
 // thread was left exactly as it was — no summary, no boundary, usage intact.
@@ -637,7 +644,7 @@ export interface IChatThreadService {
 
 	// Dev-only: populate the current thread with a large fake conversation
 	// for performance testing.
-	_populateTestThread(turns?: number, toolCallsPerTurn?: number | number[]): void;
+	_populateTestThread(turns?: number, toolCallsPerTurn?: number | number[], opts?: { toolBodyRepeats?: number }): void;
 	// Dev-only: simulate a streaming LLM response through the real render
 	// pipeline. Tests streaming perf (issue #3).
 	_simulateStream(opts?: { charsPerChunk?: number, intervalMs?: number, includeReasoning?: boolean, repetitions?: number }): void;
@@ -3073,6 +3080,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const { overridesOfModel } = this._settingsService.state
 
 		let nMessagesSent = 0
+		// Set when the provider rejects a request for exceeding the context
+		// window. From then on this run's requests are built with tool-result
+		// bodies trimmed, and the loop stops re-discovering the same rejection.
+		let overflowRelieved = false
 		let shouldSendAnotherMessage = true
 		let isRunningWhenEnd: IsRunningType = undefined
 
@@ -3164,7 +3175,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const manualCompaction = currentThread?.compactionSummary && currentThread.compactionBoundaryIdx !== undefined
 				? { summary: currentThread.compactionSummary, boundaryIdx: currentThread.compactionBoundaryIdx }
 				: undefined
-			const { messages, separateSystemMessage, compactionInfo, sentChars, telemetryRequestId } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
+			// Rebuilds the request from the thread's current messages. Callable
+			// more than once per iteration: a request the provider rejects for
+			// size is rebuilt with `overflowRelief` (see the `llmError` branch
+			// below), which trims tool-result bodies in the request image only.
+			// Everything it needs is captured above the retry loop, so a rebuild
+			// re-plans from the same inputs rather than from a mutated array.
+			const prepareRequest = (relief?: boolean) => this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages,
 				modelSelection,
 				chatMode,
@@ -3173,7 +3190,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				pendingImageBytes,
 				frozenAiInstructions,
 				manualCompaction,
+				overflowRelief: relief,
 			})
+			// Once the provider has told us this conversation does not fit, every
+			// later request in the same run is built relieved — the history only
+			// grows within a run, so the next iteration would otherwise fail the
+			// same way and pay for the discovery again. Scoped to the run: nothing
+			// persists, and the next turn starts from an unrelieved request.
+			let { messages, separateSystemMessage, compactionInfo, sentChars, telemetryRequestId } = await prepareRequest(overflowRelieved)
 			// Images are only attached on the first user message of a turn;
 			// clear after the first prepare so subsequent tool-loop iterations
 			// don't carry stale references (the bytes are on disk by now).
@@ -3195,7 +3219,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// back into calibration on onFinalMessage below. Captured per-iteration
 			// (not lifted out of the while loop) because the agent loop fires
 			// multiple sequential requests and each one has its own sentChars.
-			const sentCharsThisRequest = sentChars
+			// Reassigned if this request is rebuilt smaller (see the error branch).
+			let sentCharsThisRequest = sentChars
 
 			if (interruptedWhenIdle) {
 				this._setStreamState(threadId, undefined)
@@ -3359,8 +3384,34 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				}
 				// llm res error
 				else if (llmRes.type === 'llmError') {
-					// error, should retry
-					if (nAttempts < CHAT_RETRIES) {
+					// A context overflow is a statement about the input, so the
+					// request that just failed cannot succeed on a second attempt:
+					// rebuilding it smaller is the only thing that can change the
+					// outcome, and if it cannot be made smaller, retrying is pure
+					// delay and three provider round trips.
+					const overflow = isContextOverflowError(llmRes.error)
+					if (overflow && !overflowRelieved) {
+						overflowRelieved = true
+						const relieved = await prepareRequest(true)
+						if (relieved.compactionInfo?.trimmedCount) {
+							messages = relieved.messages
+							separateSystemMessage = relieved.separateSystemMessage
+							compactionInfo = relieved.compactionInfo
+							sentChars = relieved.sentChars
+							sentCharsThisRequest = relieved.sentChars
+							telemetryRequestId = relieved.telemetryRequestId
+							if (telemetryRequestId) this._telemetryRidByThread.set(threadId, telemetryRequestId)
+							this._recordCompaction(threadId, compactionInfo)
+							shouldRetryLLM = true
+							continue // retry with the relieved request
+						}
+						// Nothing was trim-eligible, so the retry would be the same
+						// request again. Fall through and report the overflow.
+					}
+					// Transient failures keep the existing retry policy. An
+					// overflow never takes this path: it is either relieved above
+					// or reported below.
+					if (!overflow && nAttempts < CHAT_RETRIES) {
 						shouldRetryLLM = true
 						this._setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor })
 						await timeout(RETRY_DELAY)
@@ -3371,7 +3422,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						else
 							continue // retry
 					}
-					// error, but too many attempts
+					// error, but stopped retrying: a transient failure out of
+					// attempts, or an overflow we could not relieve
 					else {
 						const { error } = llmRes
 						const { displayContentSoFar, reasoningSoFar, toolCallsSoFar } = this.streamState[threadId].llmInfo
@@ -3382,7 +3434,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 							this._addMessageToThread(threadId, { role: 'interrupted_streaming_tool', name: tc.name, mcpServerName: this._computeMCPServerOfToolName(tc.name) })
 						}
 
-						this._setStreamState(threadId, { isRunning: undefined, error })
+						// An overflow the user can act on: say what to do, then the
+						// provider's own text (which names the actual limits).
+						const surfacedError = overflow
+							? { message: `${CONTEXT_OVERFLOW_MESSAGE}\n\n${error?.message ?? ''}`.trim(), fullError: error?.fullError ?? null }
+							: error
+						this._setStreamState(threadId, { isRunning: undefined, error: surfacedError })
 						return
 					}
 				}
@@ -5816,12 +5873,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}, opts)
 	}
 
-	_populateTestThread(turns: number = 15, toolCallsPerTurn: number | number[] = 0): void {
+	_populateTestThread(turns: number = 15, toolCallsPerTurn: number | number[] = 0, opts?: { toolBodyRepeats?: number }): void {
 		const threadId = this.state.currentThreadId
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
 
-		const messages = buildTestMessages(turns, toolCallsPerTurn)
+		const messages = buildTestMessages(turns, toolCallsPerTurn, opts)
 		const updatedThread = { ...thread, lastModified: new Date().toISOString(), messages }
 		const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 		this._storeThread(threadId, updatedThread)

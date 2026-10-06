@@ -104,9 +104,18 @@ const userMessages = [
  * `_runToolCall` does). A number applies to every turn; an array sets it per
  * turn — that is how a test builds a thread whose tail is one long tool burst,
  * which is the shape that makes a message-count boundary land inside a batch.
+ *
+ * `toolBodyRepeats` repeats the code block inside each tool body. One copy is
+ * ~1.0-1.3k chars and 35 lines, which is below both of the trim thresholds the
+ * compaction pruner applies (`minBodyCharsToTrim` 2_000, `minBodyLinesToTrim`
+ * 60 — see `COMPACTION_POLICY`), so a default fixture contains nothing the
+ * pruner is allowed to touch. Three copies clears both and makes tool-result
+ * trimming observable. Defaults to 1, which reproduces the original bodies
+ * byte-for-byte.
  */
-export function buildTestMessages(turns: number, toolCallsPerTurn: number | number[] = 0): ChatMessage[] {
+export function buildTestMessages(turns: number, toolCallsPerTurn: number | number[] = 0, opts?: { toolBodyRepeats?: number }): ChatMessage[] {
 	const messages: ChatMessage[] = []
+	const toolBodyRepeats = Math.max(1, Math.floor(opts?.toolBodyRepeats ?? 1))
 
 	for (let turn = 0; turn < turns; turn++) {
 		const userMsg = userMessages[turn % userMessages.length]
@@ -137,7 +146,7 @@ export function buildTestMessages(turns: number, toolCallsPerTurn: number | numb
 			? toolCallsPerTurn
 			: (toolCallsPerTurn[turn] ?? 0)
 		for (let i = 0; i < numToolCalls; i++) {
-			const body = `// src/file${i}.ts\n` + code
+			const body = `// src/file${i}.ts\n` + code.repeat(toolBodyRepeats)
 			const rawParams = { uri: `src/file${i}.ts` }
 			messages.push({
 				role: 'tool',
