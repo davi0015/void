@@ -186,5 +186,12 @@ Reuse it. Do not rebuild launch plumbing per test.
 - **Preparatory work has a test.** A change qualifies only if a user hits the problem today with a
   single agent *and* it removes a multiagent blocker. `AgentDefinition` is the instructive case: the
   type and the loop parameterization are safe, the file format is deferred.
+- **The end-to-end suite can hang on contention, not on a defect.** `run.mjs` hands every file to one
+  `node --test`, so with eleven files roughly ten Electron apps launch at once; a launch that needs
+  more than the harness's 120 s readiness bound fails its scenario, and enough of them exhaust the
+  runner's 30-minute suite bound, which kills the run and reports the files still in flight. One
+  such run was followed by the same file passing alone in 5.9 s and by two clean full runs. If a
+  scenario fails on "app that never became ready", re-run the file alone before reading anything
+  into it; `--test-concurrency=4` in `run.mjs` trades wall clock for reliability if it recurs.
 - Automated tests assert persistence and state, never visual quality. State plainly when the UI has
   not been checked by hand rather than implying it has.
