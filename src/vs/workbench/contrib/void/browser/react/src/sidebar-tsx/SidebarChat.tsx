@@ -1108,7 +1108,13 @@ const CompactDialog = ({ onConfirm, onCancel, getPlan }: {
 					{plan.canCompact ? (
 						<>
 							<span className='text-void-fg-3'>
-								Keeps {plan.keptMessages} message{plan.keptMessages !== 1 ? 's' : ''}
+								{/* The turn count is shown only when the turn rule won. Under
+								    `cutInsideTurn` the boundary moved inside the newest turn,
+								    so whole turns kept can be 0 while messages are still
+								    kept — and the warning below is the honest description. */}
+								{plan.cutInsideTurn
+									? `Keeps ${plan.keptMessages} message${plan.keptMessages !== 1 ? 's' : ''}`
+									: `Keeps the last ${turnWord(plan.turnsKept)} · ${plan.keptMessages} message${plan.keptMessages !== 1 ? 's' : ''}`}
 								{' '}(~{approx(plan.keptChars)} chars, ~{Math.round(plan.keptChars / plan.charsPerToken).toLocaleString()} tokens)
 								{' '}· summarises {plan.droppedMessages} (~{approx(plan.droppedChars)} chars)
 							</span>
