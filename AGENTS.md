@@ -4,7 +4,8 @@ Void is a VS Code fork. Read `docs/designs/` before changing storage, the chat l
 behaviour — those documents are the specification. `docs/designs/thread-storage.md` §1.6 is the
 canonical bug ledger; cite `bug N` from that table, and note that its `Problem` section is a
 narrative subset, not a second numbering. `docs/designs/multiagent-assistant.md` holds the delivery
-sequence (S1–S10, then M1–M5); work proceeds in that order, one step at a time.
+sequence (S1–S10, then M1–M5); work proceeds in that order, one step at a time. [`docs/handover.md`](docs/handover.md) is a dated snapshot of where
+the work actually stands — what shipped, what is next, and what is still unverified.
 
 ## Layout
 
@@ -98,6 +99,15 @@ Plain scripts (`test/void/*.mjs`), docs and `.tmp/` are not compiled at all.
 
 - **Never assume a run measured the code you just edited.** Confirm the compiled artifact, e.g.
   `grep -c _storeThreadDurably out/vs/workbench/contrib/void/browser/chatThreadService.js`.
+- **A marker count read while the watcher is writing can be a false zero.** A `grep -c` on `out/`
+  run right after a checkout has returned `0` for code that was already compiled; the next read,
+  seconds later, found the marker with a modification time *older* than the first read, which is how
+  the race was identified. If a count surprises you, wait for the mtime to settle and read again
+  before concluding anything from it.
+- **The watcher can stop without saying so.** In this environment `npm run watch-client` has been
+  observed exiting after a compile or two with `EPERM` on a path outside the repository, leaving
+  `out/` silently stale. `pgrep -fl watch-client` before trusting a build, and restart it when it
+  is gone.
 - To measure pre-fix behaviour: revert the source (`git checkout main -- <file>`), wait for the
   rebuild, and confirm the marker count in `out/` is `0` **before** running. Restore afterwards with
   `git checkout HEAD -- <file>`.
@@ -177,5 +187,12 @@ Reuse it. Do not rebuild launch plumbing per test.
 - **Preparatory work has a test.** A change qualifies only if a user hits the problem today with a
   single agent *and* it removes a multiagent blocker. `AgentDefinition` is the instructive case: the
   type and the loop parameterization are safe, the file format is deferred.
+- **The end-to-end suite can hang on contention, not on a defect.** `run.mjs` hands every file to one
+  `node --test`, so with eleven files roughly ten Electron apps launch at once; a launch that needs
+  more than the harness's 120 s readiness bound fails its scenario, and enough of them exhaust the
+  runner's 30-minute suite bound, which kills the run and reports the files still in flight. One
+  such run was followed by the same file passing alone in 5.9 s and by two clean full runs. If a
+  scenario fails on "app that never became ready", re-run the file alone before reading anything
+  into it; `--test-concurrency=4` in `run.mjs` trades wall clock for reliability if it recurs.
 - Automated tests assert persistence and state, never visual quality. State plainly when the UI has
   not been checked by hand rather than implying it has.

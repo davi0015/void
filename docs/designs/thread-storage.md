@@ -634,6 +634,21 @@ Part 2 is not a separate delivery step, but it is also **not** part of S10 — t
 
 The policy layer therefore lands with its consumers: `kind`, sealing and child retention with **M2**, where the first child exists; the shared residency budget, eviction priority and cascade with **M3**, where there are several. What makes that affordable is unchanged — Part 2 changes no format, so it can be added to a step that already has the store rather than needing a step of its own. If it turns out to need a format change, that is the signal Part 1's design was wrong.
 
+### S10 in four steps
+
+S10 is one row in the sequence and too large for one branch. The order is not arbitrary: residency is the ground the rest stands on, and the format change is the riskiest thing in the programme, so it lands last — on ground where the correctness bugs are already fixed.
+
+| Step | What ships | Why here |
+|---|---|---|
+| **S10a** | Residency — `_loadedMessageThreadIds` (`chatThreadService.ts:1173`) becomes an LRU: load on activate, evict when a thread is neither viewed nor running. **Never evict** a thread in `running`, `awaiting_user` or `waiting_tools`: the agent loop reads `state.allThreads[threadId].messages` every iteration. The step's other deliverable is the audit of every reader of `thread.messages` | No format change, and eviction is what makes reloading real rather than theoretical — so it comes first |
+| **S10b** | The per-thread message log and its offset table: message bodies leave the mirrored `void.chatMsg.*` keys | The riskiest change, so it lands after the ground is fixed. `compactionBoundaryIdx` carries across unchanged, because the log's indices are explicit |
+| **S10c** | The startup migration pass over every thread — idempotent, resumable, with a read fallback — covering checkpoint residue, `mountedInfo`, `filesWithUserChanges` and `voidRequestLogs` ([`multiagent-assistant.md`](./multiagent-assistant.md) bug 19 in the ledger), then one `VACUUM` | It has to complete without the user reopening anything. A read-path migration converges to whatever the user happens to visit: measured on a real profile, 287 checkpoint records across 23 threads and 43,691 stored codespan failures were still present, in threads last opened weeks earlier |
+| **S10d** | Flat-image attribution: files in `voidImages/` attributed to their threads by scanning messages, **copying** rather than moving when more than one thread references the same URI, and deleting the flat original only once nothing references it | It closes the two-location window S5 deliberately opened. It needs a global view, so it belongs to the startup pass rather than to any per-thread path |
+
+**One reader is already known to break.** `_getAllSeenFileURIs` (`chatThreadService.ts:4298`) reads the in-memory message array for `@`-file MRU completion and returns `[]` for a thread that is not resident — so the moment eviction exists, that feature degrades silently, with no error anywhere. The audit is S10a's deliverable, not a follow-up.
+
+**How S10a's gate is measured.** The gate above ("renderer memory no longer scales with total message count") is not assertable as written, and the measurement is part of the work. The signal is the count of message objects the renderer still retains after opening N threads, read in the page; `process.memoryUsage()`'s heap is corroboration rather than the signal, because it moves with garbage-collection timing. The red is today's shape: `_loadedMessageThreadIds` is a plain `Set` with no eviction and nothing ever removes an entry except thread deletion, so N threads opened keep N threads' messages resident for the life of the window. Build the measurement first and show it red, the way the last three changes did.
+
 ## Non-goals
 
 - **A second database.** The log plus `state.vscdb` is the whole storage layer.

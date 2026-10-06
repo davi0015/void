@@ -453,6 +453,17 @@ The `1.4.9` path matches `voidVersion` from `product.json`. When Void connects t
 
 The official Void release pipeline lives in [voideditor/void-builder](https://github.com/voideditor/void-builder) (a VSCodium fork). It handles code signing, notarization, auto-updates, and Linux/Windows builds via GitHub Actions. Use it when you actually want to publish releases. For "share with a few teammates", the local-build + create-dmg + xattr instructions above are the right tradeoff.
 
+### How this fork actually releases
+
+The releases on this repository — v1.0.0, v1.0.1, v1.1.0, v1.2.0 — do **not** use `void-builder`. They are produced by [`.github/workflows/build.yml`](../.github/workflows/build.yml), which has no push or pull-request trigger: it runs on a manual dispatch, or on a `v*` tag.
+
+1. Bump `product.json`'s `voidVersion` on a `chore/release-X.Y.Z` branch. That one line is the whole release commit: `build.yml` reads it for the artifact names. `package.json` tracks the VS Code engine version for extension compatibility and is left alone, and `voidRelease` has not moved in this fork since the upstream history. Precedents: #120 for 1.1.0, #142 for 1.2.0.
+2. Merge the PR.
+3. Tag the merge commit and push it — `git tag -a v1.2.0 -m "Void v1.2.0" && git push origin v1.2.0`. Annotated is the convention worth keeping; `v1.1.0` is annotated, `v1.0.0` and `v1.2.0` were pushed as lightweight tags and still work, because the workflow matches `v*` either way.
+4. `build.yml` then builds macOS arm64, Windows x64 and Linux x64 unsigned — roughly 20–40 minutes per platform — and attaches all three to that tag's GitHub Release permanently. Artifacts uploaded by a manual dispatch expire after 90 days; a release's assets do not.
+
+The builds are unsigned, so macOS Gatekeeper blocks the app on first launch (right-click → Open, or `xattr -cr Void.app`) and Windows shows an "unknown publisher" prompt. Signing and notarization are exactly what `void-builder` would add, and they are not wired up here.
+
 ## Benchmark
 Task 0 (intro): Can you explore the void project (about fork of vscode to support agent) and describe me how to run it?
 Task 1 (small/fast): "Add a console.log at the start of the chat_systemMessage function in prompts.ts that prints the mode"
