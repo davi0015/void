@@ -11,6 +11,10 @@ import { workspaceRelativeSearchPattern } from '../codespanSearchPattern.js';
 // silently match nothing: an absolute path, a `./` prefix, and a path outside the
 // workspace — the last of which must stay unmatched rather than fall back to a
 // basename and link to a different file.
+//
+// Both platforms are pinned explicitly rather than exercised through whatever one the
+// suite happens to run on, because the rules differ in a way that is invisible from
+// either side alone: Windows folds separators and case, POSIX must fold neither.
 
 const FOLDERS = ['/Users/me/proj', '/Users/me/proj/vendor'];
 
@@ -74,5 +78,70 @@ suite('CodespanSearchPattern', () => {
 	test('no workspace folders leaves the target unchanged', () => {
 		assert.strictEqual(workspaceRelativeSearchPattern('/Users/me/proj/a.ts', []), '/Users/me/proj/a.ts');
 		assert.strictEqual(workspaceRelativeSearchPattern('docs/a.ts', []), 'docs/a.ts');
+	});
+
+	// Windows. The folders arrive as `fsPath`s while the target is whatever the model
+	// typed, so the two disagree on separators and on the drive's case by construction
+	// — and on POSIX they never do. Every fixture above uses `/` and matches
+	// case-sensitively, which is why the absolute-path case could be broken there for
+	// as long as it was: the unit tier never saw a backslash.
+	const WIN_FOLDERS = ['c:\\Users\\me\\proj', 'c:\\Users\\me\\proj\\vendor'];
+
+	test('windows: an absolute path inside a folder becomes a relative one', () => {
+		assert.strictEqual(
+			workspaceRelativeSearchPattern('C:\\Users\\me\\proj\\docs\\prd.md', WIN_FOLDERS, { windows: true }),
+			'docs/prd.md',
+		);
+	});
+
+	test('windows: separators and case may differ between the folder and the target', () => {
+		// The drive letter and the directory casing come from different sources — a
+		// `fsPath` from the workspace service, the target from the model's reply — so
+		// neither side can be assumed to match the other.
+		assert.strictEqual(
+			workspaceRelativeSearchPattern('C:/Users/Me/Proj/Docs/Prd.md', WIN_FOLDERS, { windows: true }),
+			'Docs/Prd.md',
+		);
+	});
+
+	test('windows: the longest matching folder still wins', () => {
+		assert.strictEqual(
+			workspaceRelativeSearchPattern('C:\\Users\\me\\proj\\vendor\\lib\\a.ts', WIN_FOLDERS, { windows: true }),
+			'lib/a.ts',
+		);
+	});
+
+	test('windows: a path outside every folder is left alone', () => {
+		assert.strictEqual(
+			workspaceRelativeSearchPattern('D:\\other\\a.ts', WIN_FOLDERS, { windows: true }),
+			'D:\\other\\a.ts',
+		);
+	});
+
+	test('windows: a .\\ prefix is dropped', () => {
+		assert.strictEqual(
+			workspaceRelativeSearchPattern('.\\docs\\prd.md', WIN_FOLDERS, { windows: true }),
+			'docs/prd.md',
+		);
+	});
+
+	// The other direction, and the reason folding is platform-gated rather than
+	// unconditional: on POSIX a backslash is an ordinary filename character and `Proj`
+	// is not `proj`. Folding always would "fix Windows" by matching files that are not
+	// there.
+	test('posix: case still matters', () => {
+		assert.strictEqual(
+			workspaceRelativeSearchPattern('/Users/me/Proj/docs/a.ts', FOLDERS, { windows: false }),
+			'/Users/me/Proj/docs/a.ts',
+		);
+	});
+
+	test('posix: a backslash is a filename character, not a separator', () => {
+		// One file named `proj\docs\a.ts` sitting in `/Users/me`, not a path into the
+		// folder. Folding separators would shorten it and match the wrong file.
+		assert.strictEqual(
+			workspaceRelativeSearchPattern('/Users/me/proj\\docs\\a.ts', FOLDERS, { windows: false }),
+			'/Users/me/proj\\docs\\a.ts',
+		);
 	});
 });
