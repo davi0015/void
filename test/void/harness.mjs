@@ -332,7 +332,13 @@ function query(userDataDir, sql) {
 	const db = join(userDataDir, 'User', 'globalStorage', 'state.vscdb')
 	if (!existsSync(db)) return []
 	const out = execFileSync('sqlite3', [`file:${db}?mode=ro`, sql], { encoding: 'utf8', maxBuffer: MAX_SQLITE_OUTPUT_BYTES })
-	return out.split('\n').filter((l) => l.length > 0)
+	// The sqlite3 CLI terminates rows with the platform's line ending, so on
+	// Windows every value and key arrives with a trailing CR. `JSON.parse`
+	// tolerates that, which is why reading a whole thread never noticed — but a
+	// key comparison or an exact value check fails against the CR, and reports a
+	// missing row rather than a stray byte. Stripped here, at the one place rows
+	// are split, so no caller has to know.
+	return out.split('\n').map((l) => l.replace(/\r$/, '')).filter((l) => l.length > 0)
 }
 
 const sqlLiteral = (s) => `'${String(s).replace(/'/g, "''")}'`
@@ -350,6 +356,35 @@ export function listAppKeys(dirs, pattern) {
 /** Persisted metadata for a thread (void.chatThread.<id>). */
 export function readThreadMetadata(dirs, threadId) {
 	return readAppKey(dirs, `void.chatThread.${threadId}`)
+}
+
+/**
+ * Writes application-scope keys straight into a profile's database, in one call.
+ *
+ * The read* helpers above open the database read-only; this is the one that
+ * writes, and it exists so a test can build the profile an *older* build left
+ * behind rather than the one the current build would produce. That distinction is
+ * the whole point for a migration: the residue under test is data today's writers
+ * can no longer create, so it cannot be seeded through the app.
+ *
+ * **Only valid while the app is not running.** A live renderer holds its own copy
+ * of every value and never re-reads the database, so a write from here would be
+ * invisible to it and then overwritten by its next flush. Seed between a
+ * `close()` and the following `launchVoid()` — the shape every caller wants
+ * anyway, since the profile has to predate the launch under test.
+ *
+ * Creates the table when the profile has never been launched, using the schema
+ * the storage layer creates for itself (base/parts/storage/node/storage.ts:331).
+ */
+export function writeAppKeys(dirs, entries) {
+	const db = join(dirs.userDataDir, 'User', 'globalStorage', 'state.vscdb')
+	mkdirSync(dirname(db), { recursive: true })
+	const values = entries.map(([key, value]) => `(${sqlLiteral(key)}, ${sqlLiteral(value)})`).join(', ')
+	execFileSync('sqlite3', [
+		db,
+		'CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);'
+		+ `INSERT INTO ItemTable (key, value) VALUES ${values};`,
+	], { encoding: 'utf8', maxBuffer: MAX_SQLITE_OUTPUT_BYTES })
 }
 
 // ── in-page instrumentation ─────────────────────────────────────────────

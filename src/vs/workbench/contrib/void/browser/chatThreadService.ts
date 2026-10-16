@@ -75,6 +75,28 @@ const classifyToolError = (msg: string): string => {
 	return 'unknown'
 }
 
+// ── Startup residue sweep (S10c) ────────────────────────────────────────────
+// Record that the sweep has completed for this profile, so it runs once rather
+// than on every launch. Written only when the pass finished, so an interrupted
+// one is retried; the sweep is idempotent, which is what makes that safe.
+const RESIDUE_SWEEP_KEY = 'void.residueSweepI'
+const RESIDUE_SWEEP_VERSION = 1
+// The sweep parses message JSON, so it is deliberately off the startup path:
+// doing it during construction is the freeze the storage work exists to prevent.
+const RESIDUE_SWEEP_INITIAL_DELAY_MS = 3000
+
+// Both request-log writers put their files here, under the *roaming* data home.
+// See `_reclaimRequestLogs`.
+const REQUEST_LOG_DIR_NAME = 'voidRequestLogs'
+// Age, not "everything at startup": these are diagnostic, and the run worth
+// reading after a crash is the one immediately before this launch.
+const REQUEST_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+
+// The serialized form of a legacy checkpoint record, as `JSON.stringify` wrote
+// it. Matched as a substring against the stored value, never parsed — see
+// `_messagesCarryCheckpoints`.
+const CHECKPOINT_MESSAGE_MARKER = '"role":"checkpoint"'
+
 
 const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | undefined, newSelection: StagingSelectionItem): number | null => {
 	if (!currentSelections) return null
@@ -980,6 +1002,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}))
 
 
+		// Reclaim legacy residue for threads the user never opens. Scheduled, not
+		// run here — see `_scheduleResidueSweep` for why it cannot be synchronous.
+		this._scheduleResidueSweep()
+
 		// Flush pending writes when the window unloads, so that quitting or
 		// reloading does not lose the last 500ms of message/usage/metadata
 		// writes. Without this a reload can drop the most recent messages,
@@ -1657,6 +1683,190 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 			this._setState({ allThreads: newThreads })
 		}
+	}
+
+	// ── Startup residue sweep (S10c) ────────────────────────────────────────
+
+	/**
+	 * Reclaim legacy residue for every thread, without waiting for the user to
+	 * open it.
+	 *
+	 * The cleanup for removed features and removed fields already exists, but it
+	 * sits on the read path. `_readThread` compacts checkpoint records out of the
+	 * message keys and drops `filesWithUserChanges`, `state.mountedInfo` and
+	 * `state.currCheckpointIdx` from the metadata it parses — and it does that
+	 * work only when `loadMessages` is true, which `_ensureMessagesLoaded` passes
+	 * when a thread is opened. `_readAllThreadsSplit` passes `false` for every
+	 * thread at startup and takes an early return before any of it runs.
+	 *
+	 * So the residue survives until the user happens to visit each affected
+	 * thread. Measured on a real profile: 287 checkpoint records across 23
+	 * threads, in threads last opened weeks earlier. It is paid for on every
+	 * launch, because `Storage.init()` pulls every key over IPC with no filter —
+	 * the mechanism behind the 1.24 GB startup crash.
+	 *
+	 * Runs once per profile, off the startup path, and never makes a thread
+	 * resident: it calls `_readThread` directly rather than through
+	 * `_ensureMessagesLoaded`, so a swept thread is not added to
+	 * `_loadedMessageThreadIds` and the messages it parsed are discarded.
+	 */
+	private _scheduleResidueSweep(): void {
+		if (this._storageService.get(RESIDUE_SWEEP_KEY, StorageScope.APPLICATION) === String(RESIDUE_SWEEP_VERSION)) return
+		const scheduler = new RunOnceScheduler(() => { void this._sweepLegacyResidue() }, RESIDUE_SWEEP_INITIAL_DELAY_MS)
+		this._register(scheduler)
+		scheduler.schedule()
+	}
+
+	private async _sweepLegacyResidue(): Promise<void> {
+		// One key enumeration for the whole pass. `keys()` walks the in-memory
+		// store, so asking per thread would make this quadratic in thread count.
+		const allKeys = this._storageService.keys(StorageScope.APPLICATION, StorageTarget.USER)
+		const messageKeysByThread = new Map<string, string[]>()
+		const threadsWithCheckpointKeys = new Set<string>()
+		for (const key of allKeys) {
+			if (key.startsWith(MESSAGE_KEY_PREFIX)) {
+				const rest = key.slice(MESSAGE_KEY_PREFIX.length)
+				const dot = rest.lastIndexOf('.')
+				if (dot < 0) continue
+				const threadId = rest.slice(0, dot)
+				const existing = messageKeysByThread.get(threadId)
+				if (existing) existing.push(key)
+				else messageKeysByThread.set(threadId, [key])
+			} else if (key.startsWith(CHECKPOINT_KEY_PREFIX)) {
+				const rest = key.slice(CHECKPOINT_KEY_PREFIX.length)
+				const dot = rest.lastIndexOf('.')
+				if (dot >= 0) threadsWithCheckpointKeys.add(rest.slice(0, dot))
+			}
+		}
+
+		let reclaimed = false
+		let deferred = false
+		for (const threadId of Object.keys(this.state.allThreads)) {
+			const outcome = this._sweepThreadResidue(threadId, messageKeysByThread.get(threadId) ?? [], threadsWithCheckpointKeys.has(threadId))
+			if (outcome === 'deferred') deferred = true
+			else if (outcome === 'reclaimed') reclaimed = true
+			// Yield between threads. This is a background pass and must not hold
+			// the event loop while the user is working.
+			await timeout(0)
+		}
+
+		if (await this._reclaimRequestLogs()) reclaimed = true
+
+		// The stamp is written only when nothing was deferred. A deferred thread has
+		// a write still queued whose persisted copy is older than memory, and
+		// sweeping it now would write that stale copy back; leaving the stamp unset
+		// is what makes the next launch try again.
+		if (deferred) return
+		this._storageService.store(RESIDUE_SWEEP_KEY, String(RESIDUE_SWEEP_VERSION), StorageScope.APPLICATION, StorageTarget.USER)
+
+		// VACUUM only when something was actually removed. Deleting rows leaves the
+		// pages free *inside* the file, so the space is not returned without this —
+		// but rewriting the whole database is far too expensive to do for nothing.
+		if (reclaimed) {
+			try { await this._storageService.optimize(StorageScope.APPLICATION) }
+			catch (e) { console.error('[residue-sweep] optimize failed:', e) }
+		}
+	}
+
+	/** One thread's share of the sweep. */
+	private _sweepThreadResidue(threadId: string, messageKeys: string[], hasCheckpointKeys: boolean): 'clean' | 'reclaimed' | 'deferred' {
+		const metaRaw = this._storageService.get(THREAD_KEY_PREFIX + threadId, StorageScope.APPLICATION)
+		const metaHasJunk = metaRaw !== undefined && (
+			metaRaw.includes('filesWithUserChanges')
+			|| metaRaw.includes('mountedInfo')
+			|| metaRaw.includes('currCheckpointIdx')
+		)
+		const resident = this._loadedMessageThreadIds.has(threadId)
+		// A resident thread was migrated when it was opened — `_ensureMessagesLoaded`
+		// runs the same `_readThread(threadId, true)` — so only its metadata rewrite
+		// can still be outstanding.
+		const needsMessageMigration = !resident && (hasCheckpointKeys || this._messagesCarryCheckpoints(messageKeys))
+		if (!metaHasJunk && !needsMessageMigration) return 'clean'
+
+		// Never rewrite a thread with a write still queued. The persisted copy can
+		// be older than memory inside the 500 ms coalescing window, and both
+		// directions of that race lose data: a stale metadata write resurrects a
+		// compaction boundary the read just corrected, and compacting from a stale
+		// read drops a message that was never persisted.
+		if (this._pendingThreadWrites.has(threadId) || this._pendingMessageKeyWrites.has(threadId)) return 'deferred'
+
+		if (resident) {
+			if (metaHasJunk) {
+				// The thread in state is the copy `_readThread` already stripped when
+				// it was parsed, so writing it back is what makes the removal stick.
+				const thread = this.state.allThreads[threadId]
+				if (thread) this._storeThread(threadId, thread)
+			}
+			return 'reclaimed'
+		}
+
+		// Use what the migration produced rather than the in-memory metadata-only
+		// thread: the read remaps `compactionBoundaryIdx` past the checkpoint
+		// records it dropped and persists that, and writing the in-memory copy —
+		// parsed at startup, before the remap — would put the old index back.
+		const migrated = this._readThread(threadId, true)
+		if (!migrated) return 'clean'
+		if (metaHasJunk) this._storeThread(threadId, migrated)
+		// Propagate only the field the read corrected, for the same reason
+		// `_ensureMessagesLoaded` does: spreading the whole read over the in-memory
+		// thread would let an older persisted copy win.
+		const existing = this.state.allThreads[threadId]
+		if (existing && migrated.compactionBoundaryIdx !== undefined && existing.compactionBoundaryIdx !== migrated.compactionBoundaryIdx) {
+			this._setState({
+				allThreads: { ...this.state.allThreads, [threadId]: { ...existing, compactionBoundaryIdx: migrated.compactionBoundaryIdx } },
+			})
+		}
+		return 'reclaimed'
+	}
+
+	/**
+	 * Whether any of a thread's stored messages is a legacy checkpoint record.
+	 *
+	 * A substring test on the stored value rather than a parse: this runs across
+	 * every message of every thread, and the value is `JSON.stringify` output, so
+	 * the marker appears verbatim. Parsing here would cost far more than the sweep
+	 * is worth, and the common case is a thread with no residue at all.
+	 */
+	private _messagesCarryCheckpoints(messageKeys: string[]): boolean {
+		for (const key of messageKeys) {
+			const raw = this._storageService.get(key, StorageScope.APPLICATION)
+			if (raw !== undefined && raw.includes(CHECKPOINT_MESSAGE_MARKER)) return true
+		}
+		return false
+	}
+
+	/**
+	 * Delete request logs past the retention window.
+	 *
+	 * Both writers — `_writeCompactionLog` and `RequestTelemetryService` — write
+	 * into `voidRequestLogs/` under the **roaming** data home, which is the part of
+	 * the profile that syncs between machines, and neither bounds the directory:
+	 * compaction writes one full transcript per manual compaction, and the
+	 * telemetry log rotates per thread rather than per directory. Nothing has ever
+	 * reclaimed them (bug 19).
+	 */
+	private async _reclaimRequestLogs(): Promise<boolean> {
+		const logDir = joinPath(this._environmentService.userRoamingDataHome, REQUEST_LOG_DIR_NAME)
+		let children
+		try {
+			children = (await this._fileService.resolve(logDir, { resolveMetadata: true })).children ?? []
+		} catch {
+			return false // nothing has ever been logged in this profile
+		}
+		const cutoff = Date.now() - REQUEST_LOG_RETENTION_MS
+		let reclaimed = false
+		for (const child of children) {
+			if (child.isDirectory) continue
+			if (child.mtime === undefined || child.mtime > cutoff) continue
+			try {
+				await this._fileService.del(child.resource)
+				reclaimed = true
+			} catch {
+				// Best-effort: a log that cannot be deleted is not a reason to leave
+				// the rest of the sweep unfinished.
+			}
+		}
+		return reclaimed
 	}
 
 	private _readAllThreadsSplit(): ChatThreads | null {
@@ -5847,7 +6057,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}) {
 		const ts = new Date().toISOString().replace(/[:.]/g, '-')
 		const fileName = `compaction-${opts.threadId.slice(0, 8)}-${ts}.md`
-		const logDir = joinPath(this._environmentService.userRoamingDataHome, 'voidRequestLogs')
+		const logDir = joinPath(this._environmentService.userRoamingDataHome, REQUEST_LOG_DIR_NAME)
 		const logUri = joinPath(logDir, fileName)
 
 		const compressionActual = opts.inputChars > 0
