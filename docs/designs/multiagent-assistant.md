@@ -48,9 +48,9 @@ Every design decision below is downstream of one of these. They are stated as pr
 
 **1. Isolation.** A child's exploration never enters the parent's context. Only its bounded summary crosses back. This is the entire point — a subagent that returns its transcript is a context amplifier, not an optimization, and it would make the O(N²) problem worse rather than better.
 
-**2. Attenuation.** A child can never hold more permission than its parent. Authority only ever narrows going down the tree. There is no configuration, agent definition, or prompt that widens it.
+**2. Inheritance.** A child's authority is its parent's, copied — never more. There is no configuration, definition or prompt that widens it, and none is needed to narrow it: the only way to widen would be to create the child with a different mode than the parent's, and creation copies it. See §5.
 
-**3. Boundedness.** Every child has a round, token, and wall-clock budget and an explicit terminal status. Autonomy is always finite, and exhaustion is always distinguishable from completion.
+**3. Termination.** Every child reaches an explicit terminal status, so exhaustion is always distinguishable from completion. A bound on *spend* is deliberately not part of this reduction — §8 records why, and what it costs.
 
 ## What Void becomes
 
@@ -58,15 +58,17 @@ The migration is described in phases in the back half of this document, but the 
 
 | Milestone | The user can | The agent can | Governance that must exist first |
 |---|---|---|---|
-| **1. Governed runs** | See what a run costs and why it stopped | Hit a bound and report `blocked` instead of looping | Budgets; `blocked` as a terminal status distinct from `done` |
-| **2. Delegation** | Hand off research and get a summary | Spawn a read-only child and receive a bounded result | Attenuation; depth cap; result contract |
-| **3. Parallelism** | Watch a fan-out and steer it | Run children concurrently, message and interrupt them | Concurrency caps; approval routing; interrupt cascade |
-| **4. Context inheritance** | Ask for a review of its own reasoning | Fork a child that inherits context; route children to cheaper models | Prefix-cache discipline; per-definition model selection |
+| **1. Governed runs** | See what a run costs and why it stopped | Hit a bound and report `blocked` instead of looping | Budgets; `blocked` as a terminal status distinct from `done`. **Not scheduled** — §8 records why |
+| **2. Delegation** | Hand off work and get a summary | Spawn a child with its own capability and receive a bounded result | Inheritance (§5); depth cap; result contract; `send_message` |
+| **3. Parallelism** | Watch a fan-out and steer it | Run children concurrently, message and interrupt them | Approval routing; interrupt cascade |
+| **4. Context inheritance** | Ask for a review of its own reasoning | Fork a child that inherits context; route a child to a cheaper model | Prefix-cache discipline; an optional model argument on the spawn call |
 | **5. Scoped implementation** | Hand out parallel edits safely | Own disjoint files across children | File partitioning; worktree isolation |
 
-Milestone 1 is deliberately not a multiagent feature. It is the precondition that makes every later milestone safe, and it is useful on its own.
+Milestone 1 is deliberately not a multiagent feature — it is useful on its own — and it is also not scheduled. With spend deprioritised (§8), nothing else waits on it.
 
-**Storage prerequisite.** Milestones 2–5 assume threads scale beyond what the current store supports. Multiagent turns thread creation from a human-rate event into a per-turn fan-out, which multiplies every bug catalogued in [`thread-storage.md`](./thread-storage.md): each child's message bodies become resident in the renderer for the whole session, per-thread key layout and churn scale with children rather than conversations, and nothing bounds growth. That work is specified there in two parts and is a **dependency of Milestone 2**, not a parallel track. Milestone 1 can proceed without it.
+**Storage is not a prerequisite for the first delegation.** An earlier revision claimed Milestones 2–5 depend on [`thread-storage.md`](./thread-storage.md) Part 1. That is true at fan-out scale and false at the scale Milestone 2 ships: one delegation creates one thread, and child threads use the same storage path top-level threads already use. What the storage work buys is *churn* — children created and pruned per turn rather than per week — and the point at which that matters is Milestone 3, not the first child. Child retention (pruning completed children) does ship with Milestone 2, because without it children accumulate forever.
+
+The one storage behaviour to keep in view while delegating: every child's messages join the renderer's storage cache at startup like any other thread's, and residency is unbounded because the eviction work is parked. That is the same cost the product already pays per opened thread, multiplied by however many children persist — measurable, not yet a blocker.
 
 ## Preparatory work
 
@@ -85,9 +87,9 @@ Anything satisfying only (2) is a speculative abstraction — building the shape
 | **Budgets + `blocked` terminal status** | The agent loop runs until the model stops calling tools; a runaway tool loop costs real money | Fan-out is N unbounded loops without it | Low |
 | **Parameterize `_runChatAgent`** | None directly, but it reads `chatMode` and `overridesOfModel` from global settings mid-iteration (`chatThreadService.ts:3079`) | Children need their own mode and model | Low |
 
-**Deliberately deferred.** These have no standalone justification, and their shape depends on how delegation actually behaves — so building them now means guessing: `attenuateAutoApproveMode` (dead code until a child exists), the result contract and `SubagentOutcome` types, the global concurrency governor, the `AgentDefinition` **file format and UX**, notification aggregation, the child tree UI, and failure-isolation semantics.
+**Deliberately deferred.** These have no standalone justification, and their shape depends on how delegation actually behaves — so building them now means guessing: the result contract and `SubagentOutcome` types, the global concurrency governor, notification aggregation, the child tree UI, and failure-isolation semantics.
 
-`AgentDefinition` is the instructive case. Generalizing `ChatMode` looks like clean preparation, but its schema — allowed tools, permission ceiling, model, budgets, result format — is determined by how delegation works. Split it: the type and the loop parameterization are safe, and appear above; the file format waits.
+**Dropped, not deferred.** Agent definition files, the agent index injected through `aiInstructions`, `attenuateAutoApproveMode`, and budget enforcement. §1, §5 and §8 carry the reasoning; the short version is that the parent writes the role, the child inherits the parent's authority, and spend is cheap enough not to bound.
 
 If the preparatory work lands, Milestone 2 stops being "build child threads and the storage they need" and becomes "build child threads on substrate that already handles N."
 
@@ -101,68 +103,51 @@ Delegation is assembled from primitives that already exist. This table is load-b
 
 | Existing system | Reused as | Change |
 |---|---|---|
-| `ThreadType` (`chatThreadService.ts:123`) | child thread container | + parent linkage, agent identity, budget, result fields |
-| `_runChatAgent` (`chatThreadService.ts:3046`) | child execution loop | parameterized by an `AgentDefinition` |
+| `ThreadType` (`chatThreadService.ts:123`) | child thread container | + `kind`, parent linkage, `alias`, result fields |
+| `_runChatAgent` (`chatThreadService.ts:3046`) | child execution loop | parameterized by the child thread rather than by global settings |
 | `ThreadStreamState` / `IsRunningType` (`:403`, `:382`) | child run state | none — `waiting_tools` already models "parked, auto-resumes" |
 | `ToolDefinitionCore` (`toolTypes.ts:61`) | new delegation tools | new tool files + registry entries |
-| `ChatMode` (`voidSettingsTypes.ts:472`) | `AgentDefinition` | generalized from a closed union to a loaded definition |
-| `.void/skills` + `load_skill.tool.ts` | agent definition files | new `.void/agents/` sibling, same frontmatter pattern |
-| `ThreadPermissionMode` / `effectiveAutoApproveMode` (`toolsServiceTypes.ts:96`, `:128`) | permission inheritance | + attenuation (currently union-only) |
+| `ThreadPermissionMode` / `effectiveAutoApproveMode` (`toolsServiceTypes.ts:96`, `:128`) | permission inheritance | copy the parent's mode at creation; union then yields the parent's own answer |
 | `QueuedMessage` / `queueUserMessage` (`:395`, `:529`) | parent→child steering | reuse as-is |
 | `latestUsage` / `cumulativeUsageThisThread` (`:154`, `:162`) | cost rollup | + child→parent aggregation |
 | `workspaceUri` scoping / `isThreadReadOnly` (`:209`, `:357`) | child workspace scope | inherit from parent |
-| `frozenAiInstructions` (`:196`) | child system-prompt stability | inherit, then extend with agent role text |
+| `frozenAiInstructions` (`:196`) | child system-prompt stability | inherit unchanged — there is no definition body to append (§1) |
 
 ## Architecture
 
-### 1. Agent definitions
+### 1. Agents are prompt-scoped, not declared
 
-Today `ChatMode = 'agent' | 'gather' | 'normal'` (`voidSettingsTypes.ts:472`) is a closed union that gates tool availability in `availableTools` (`toolRegistry.ts:66`) and selects a branch of `chat_systemMessage` (`prompts.ts:287`). That is a hardcoded agent definition with three entries.
+There is no agent definition file and no catalogue for the model to choose from. A
+subagent is an agent managed by another agent: it inherits the parent's workspace,
+permission mode, model selection and frozen instructions, and its role is whatever the
+parent writes in the task. That is the whole mechanism.
 
-Generalize it into a loaded definition, stored as files exactly like skills:
+**This corrects an earlier revision**, which specified `.void/agents/<name>.md` files with
+a frontmatter tool allowlist, a `permissionCeiling` and an index injected through
+`aiInstructions`. Two things make that worse than nothing:
 
-```
-.void/agents/researcher.md          # workspace scope
-~/.void/agents/researcher.md        # global scope (workspace overrides)
-```
+- **The parent always knows more than the declaration does.** It knows what the design
+  says, what the codebase looks like, what "test this" means in this repository. No file
+  can encode that, so the parent has to write it out regardless — the declaration becomes
+  a second, staler copy of something the task text already contains.
+- **Reduced capability makes the work impossible rather than safer.** A delegation asked
+  to develop, test and review needs a terminal in all three cases. A child restricted
+  below its parent cannot do the job it was created for, and a model that wants the job
+  done routes around the restriction instead of complying with it.
 
-```markdown
----
-name: researcher
-description: Read-only investigation of a question across the codebase
-tools: read_file, ls_dir, get_dir_tree, search_for_files, search_pathnames_only,
-       search_in_file, go_to_definition, go_to_usages, semantic_search
-permissionCeiling: read_only
-model: null
-maxRounds: 30
-maxResultTokens: 2000
----
-You investigate questions about this codebase and report findings.
+The consequence is that a child's capability is **exactly the parent's**: same
+`permissionMode`, same workspace, same model. Nothing is attenuated, because nothing
+supplies a higher grant to attenuate. See §5, which is now a rule about inheritance
+rather than a helper for narrowing.
 
-You are read-only. Do not propose or make edits.
+`ChatMode = 'agent' | 'gather' | 'normal'` (`voidSettingsTypes.ts:472`) is unchanged. It
+stays the user-facing mode selector for a top-level thread, and `agent` mode simply gains
+the delegation tools.
 
-Return your findings as:
-- **Answer**: the direct answer, 1-3 sentences.
-- **Evidence**: `file_path:line_number` for each claim, with a short quoted excerpt.
-- **Uncertainty**: what you could not determine.
-```
-
-```ts
-export type AgentDefinition = {
-  name: string
-  description: string
-  systemPrompt: string                              // the body
-  tools: BuiltinToolName[] | 'all'                  // allowlist
-  permissionCeiling: ThreadPermissionMode           // 'read_only' by default
-  modelSelection: ModelSelection | null             // null = inherit parent's
-  maxRounds: number
-  maxResultTokens: number
-}
-```
-
-The index of definitions (names + one-line descriptions) is injected via the existing `aiInstructions` path, exactly as the skills index is (`docs/designs/skills.md`). It is frozen on first send via `frozenAiInstructions`, so it stays prefix-cache stable and adds no new freeze plumbing.
-
-`ChatMode` is not deleted. It remains the user-facing mode selector for the top-level thread; `agent` mode simply gains the delegation tools. Built-in definitions (`researcher`, `reviewer`, `planner`) ship as defaults; users add files to override or extend them.
+**If named roles are ever wanted** — a cheap model for research, a strong one for
+implementation — that is a model-selection concern and can land on top of this without a
+capability system: an optional `model` argument on the spawn call, chosen by the parent.
+It is not in M1 or M2.
 
 ### 2. Child threads
 
@@ -170,47 +155,74 @@ A child is a `ThreadType` with linkage fields added:
 
 ```ts
 // added to ThreadType
+kind: 'user' | 'child'           // absent on older threads; treated as 'user'
 parentThreadId?: string          // absent = top-level thread
 parentToolCallId?: string        // the run_subagent call that spawned it
-agentName?: string               // resolved AgentDefinition name
+alias?: string                   // the parent's name for it, e.g. "tester"
 delegationDepth: number          // 0 for top-level; parent.delegationDepth + 1
-budget?: ThreadBudget
 resultSummary?: string           // the bounded string returned to the parent
 resultStatus?: SubagentStatus
+budget?: ThreadBudget            // deferred — see §8
 ```
 
-`newThreadObject` (`chatThreadService.ts:469`) grows an optional `parent` argument. Child creation sets `workspaceUri` from the parent — never from ambient context, because ambient workspace resolution in a background context is a correctness hazard — copies `permissionMode` down through attenuation, and inherits `frozenAiInstructions` with the agent's `systemPrompt` appended.
+`newThreadObject` (`chatThreadService.ts:469`) grows an optional `parent` argument. Child creation **inherits** from the parent rather than consulting anything ambient: `workspaceUri` comes from the parent (ambient workspace resolution in a background context is a correctness hazard), `permissionMode` is copied unchanged, the model selection is the parent's, and `frozenAiInstructions` is inherited as-is — no definition body is appended, because there is no definition (§1).
+
+`alias` exists because a UUID is a poor thing to hold across a long conversation. The parent coins it when it spawns the child and uses it in `send_message`, and it is what the child's card shows. It is an ergonomic name, not an identity: `childThreadId` remains the key.
 
 Children are not added to `pinnedThreadIds` (a UI tab concept), but they are persisted through the existing per-thread storage path so they survive reload and are inspectable. `_isThreadMutationBlocked` and `isThreadReadOnly` apply unchanged.
 
 ### 3. The delegation tools
 
-Two tools, deliberately separate, because the semantics differ in the way that matters most — context cost.
+Three tools: spawn a child, continue one, and recover the list of what exists.
 
 **`run_subagent`** — fresh context. The child starts with an empty `messages` array and only the task text.
 
 ```ts
 'run_subagent': {
-  agent_name: string       // from the agent index
-  task: string             // the instruction; self-contained
-  context?: string         // optional supporting text the parent must hand over explicitly
+  alias: string            // a short name the parent chooses, e.g. "tester"
+  task: string             // the instruction; self-contained, and it *is* the child's role
   wait: boolean            // true = block this tool call; false = background, returns a handle
 }
 ```
 
-**`fork_subagent`** — inherits context. The child starts with a copy of the parent's `messages` up to the current index.
+There is no `agent_name`, because there is no catalogue (§1). The `task` is the role.
+
+**Hand over by file, not by paste.** A child starts empty, so the parent has to give it
+whatever it needs. When the artefact already exists — a design document, a failing test, a
+diff — the task should name the file rather than inline its contents. Pasting spends the
+parent's context re-typing work it already did, which is the opposite of the point; `task`
+is for the instruction and the short facts, a file reference is for the artefact.
+
+**`send_message`** — continue a child that already exists. Appends a user message to that
+thread and runs it again.
 
 ```ts
-'fork_subagent': {
-  agent_name: string
-  task: string
-  wait: boolean
+'send_message': {
+  childThreadId: string    // or `alias`
+  message: string
 }
 ```
 
-`fork_subagent` is the expensive verb: it duplicates the parent's entire history into a second thread, so its token cost scales with whatever the parent has accumulated. It is for review and continuation, where the child genuinely needs the parent's reasoning — not a cheaper way to write a normal delegation. Splitting them into two verbs rather than one tool with a flag is deliberate: the fresh/fork choice is the highest-leverage decision a delegating model makes, and it deserves a distinct name and description.
+This is nearly free once children are threads: a child is a conversation that already
+persists, reloads and renders like any other, so a follow-up is an ordinary turn. It is
+what makes delegation iterative rather than one-shot — a parent that asks for development
+and then asks the same child to fix what the tests found is holding one conversation in
+two parts.
 
-Both are registered in `toolDefinitionOfToolName` (`toolRegistry.ts:30`) and gated to `ChatMode === 'agent'` in `availableTools` (`toolRegistry.ts:66`). Neither is in `approvalTypeOfBuiltinToolName` — the delegation itself needs no approval; the child's own tool calls are gated by the child's attenuated permissions, which is the correct place for the decision.
+**`list_children`** — derived from `parentThreadId`. It exists because the handles have to
+survive the parent's own compaction: once a long conversation is summarised, the ids it
+learned from earlier tool results are gone. Deriving the list from stored linkage makes
+recovery always possible, so this is a correctness affordance rather than a convenience.
+
+All three are registered in `toolDefinitionOfToolName` (`toolRegistry.ts:30`) and gated to
+`ChatMode === 'agent'` in `availableTools` (`toolRegistry.ts:66`). None is in
+`approvalTypeOfBuiltinToolName` — delegating needs no approval, and the child's own tool
+calls are gated by its own permission mode, which is the parent's.
+
+**`fork_subagent`** is deferred to M4. It inherits the parent's messages, so its cost scales
+with whatever the parent accumulated; it belongs with the context-inheritance work, not
+with basic delegation. Splitting the fresh and forked verbs rather than flagging one tool
+stays deliberate: the choice is the highest-leverage decision a delegating model makes.
 
 ### 4. The result contract
 
@@ -233,48 +245,53 @@ export type SubagentOutcome = {
 
 A child that exceeds `maxResultTokens` is truncated with an explicit marker rather than silently cut, reusing the `[trimmed — ...]` convention already established for Perf 2 compaction, so the model has a known remedy: ask a narrower follow-up, or read the specific file itself.
 
-### 5. Permission attenuation
+### 5. Permissions are inherited, not attenuated
 
-This is where the existing code is actively wrong for delegation and must change.
+A child's permission mode **is** its parent's. There is no third input and no helper to
+compute a minimum, because nothing supplies a child with a higher grant than its parent
+already has — see §1, which removes the definition file that used to carry a
+`permissionCeiling`.
 
-`effectiveAutoApproveMode` (`toolsServiceTypes.ts:128`) combines the global config with a thread's `ThreadPermissionMode` via `combineAutoApproveModes` (`:121`), which returns the more permissive of the two. Union semantics are correct for a user-opened thread — a chat may grant more than config. They are exactly backwards for a child.
+`effectiveAutoApproveMode` (`toolsServiceTypes.ts:128`) combines global config with a
+thread's `ThreadPermissionMode` via `combineAutoApproveModes` (`:121`), returning the more
+permissive of the two. Union semantics are correct here and need no dual: a child holding
+the parent's mode unions to the same answer the parent unions to, so child and parent are
+neither more nor less permissive than one another. The earlier revision added an
+`attenuateAutoApproveMode` minimum of three inputs; with the ceiling gone it would compute
+that same answer, so it is not written.
 
-Add the dual:
+Three properties still have to hold, and none of them is about narrowing:
 
-```ts
-// in toolsServiceTypes.ts, mirroring combineAutoApproveModes
-export const attenuateAutoApproveMode = (parent: AutoApproveMode, child: AutoApproveMode): AutoApproveMode =>
-  _autoApproveModeRank[parent] <= _autoApproveModeRank[child] ? parent : child
-```
+- **Delegation must not widen.** A child created with a default mode instead of the
+  parent's would be the bug the helper above would have hidden. Child creation copies
+  `permissionMode` from the parent; that copy is the whole enforcement.
+- **A child never auto-approves merely because it is backgrounded.** If a child needs
+  approval while the parent runs unattended, the parent parks in `waiting_tools` and the
+  approval surfaces on the child thread through the existing notification path
+  (`_notifyAwaitingApproval`, `:3734`). If nothing can answer, the call fails closed.
+- `delegationDepth` gates nesting. Milestone 2 ships depth 1: a child may not delegate
+  further. Enforced in `validateParams`, not in prose, because prose is advisory and
+  validation is not.
 
-A child's effective mode for a tier is the minimum of three inputs:
+**The known sharp edge, stated rather than guarded.** Because a child can do anything its
+parent can, a child can write — and two children running at once can write to the same
+file. File partitioning and worktree isolation are M5. Until then the safe use is
+delegation whose work is disjoint, sequential, or read-only, and the tool description says
+so: the model does the partitioning, and it can only do that if it knows the hazard exists.
 
-```
-min( global config , parent thread grant , agent definition permissionCeiling )
-```
+### 6. Fan-out and concurrency
 
-Properties that must hold:
+Void already streams parallel tool calls and runs them concurrently (`_concurrentRunningCountOfThreadId`, `_fireConcurrentTerminal`, `_waitForConcurrentTools`). Delegation rides that machinery rather than introducing a scheduler: a model that emits three `run_subagent` calls in one assistant turn gets three children running concurrently, joined by the existing batch-drain path (`_tryDrainPendingBatch`, `:2124`). Nothing needs building for the parallel case — it is what the tool loop already does with any parallel call.
 
-- A `read_only` parent produces `read_only` children regardless of what the child's agent definition asks for. A definition can narrow permissions, never widen them.
-- `permissionCeiling: read_only` is the default for every agent definition, including user-authored ones. Escalation is opt-in per definition.
-- **A child never auto-approves merely because it is backgrounded.** If a child needs approval and the parent is running unattended, the parent parks in `waiting_tools` and the approval surfaces on the child thread in the UI through the existing notification path (`_notifyAwaitingApproval`, `:3734`). If nothing can answer, the call fails closed.
-- `delegationDepth` gates nesting. Milestone 2 ships depth 1: a child may not delegate further. Enforced in `validateParams`, not in prose, because prose is advisory and validation is not.
+**No count cap in M2.** An earlier revision specified four configurable caps here. Three were cost bounds, and cost is not worth building a limiter for (§8): a runaway is cheaper than the machinery that prevents it. The fourth, a count cap, has no measured justification either — the reference implementation this design is checked against has no run budget and no spawn limit at all, and models self-limit to a handful in practice.
 
-### 6. Fan-out, concurrency, and caps
+The one structural limit that stays is **`delegationDepth: 1`**, and it is a shape rather than a cap: nesting is where capability stops being explainable, so M2 forbids it in `validateParams`.
 
-Void already streams parallel tool calls and runs them concurrently (`_concurrentRunningCountOfThreadId`, `_fireConcurrentTerminal`, `_waitForConcurrentTools`). Delegation rides that machinery rather than introducing a scheduler: a model that emits three `run_subagent` calls in one assistant turn gets three children running concurrently, joined by the existing batch-drain path (`_tryDrainPendingBatch`, `:2124`).
+Caps get revisited with M3, where concurrency is first-class and there is something to measure — specifically the 500 ms write-coalescing window, where N children flushing at once is an IPC burst that can be *observed* rather than predicted. Measure it there; do not pre-build the limiter.
 
-Caps, all configurable, all enforced in code:
+The hazard that does need saying, because it is not about cost: **concurrent children can write to the same file.** §5 carries it, the tool description carries it, and the fix — partitioning, worktrees — is M5. Until then the model partitions by choosing disjoint work, which is exactly the judgement a delegating agent is being asked to exercise.
 
-| Cap | Default | Rationale |
-|---|---|---|
-| Concurrent children per parent | 4 | Bounds cost spike and provider rate-limit pressure |
-| Total children per parent turn | 12 | Bounds a runaway fan-out |
-| Delegation depth | 1 | Recursive delegation explodes cost with little quality gain |
-| Child rounds | 30 | Matches `maxRounds` in the definition |
-| Child result tokens | 2000 | Bounds parent context growth per child |
-
-A declarative **batch** call is the preferred way for a model to fan out, because models are unreliable at orchestrating fan-out turn by turn — they lose track of children, serialize them, or re-delegate redundantly. Milestone 3 adds a single-call form expressing "run these N tasks, join, return all results." A JS-sandboxed workflow engine is deliberately deferred (see Non-goals).
+A declarative **batch** call — "run these N tasks, join, return all results" — remains the M3 form, because models are unreliable at orchestrating fan-out turn by turn: they lose track of children, serialize them, or re-delegate redundantly. It is a convenience over the same machinery, not a second one.
 
 ### 7. Steering and lifecycle
 
@@ -294,7 +311,9 @@ Void's agent loop runs until the model stops calling tools, with no bound. Deleg
 
 **Context pressure is implemented** (§8.1). It is a live single-agent defect, it needs no decision about what a run may *spend*, and the compaction work it builds on has already landed.
 
-**Budgets and `blocked` are deferred to M2** (§8.2), and the loop parameterization with them. Their shape is decided by delegation — who sets a budget, what it is measured against, where a user sees it — which is the same reason `AgentDefinition`'s file format is deferred while its type is not. The deferral is safe only while the ordering constraint in §8.2 holds.
+**Budgets and `blocked` are deprioritised, not deferred** (§8.2). They are not in any milestone. LLM spend is low enough that a runaway loop costs less than the machinery to prevent one, and the reference implementation this design is checked against carries no run budget at all. What remains load-bearing is the *ordering constraint* in §8.2, which no longer binds anything because nothing is scheduled behind it.
+
+The consequence is worth stating plainly: **nothing bounds a run.** A delegated child inherits that, so a looping child is bounded only by its provider's own limits. That is an accepted trade rather than an oversight, and it is the first thing to revisit if spend ever becomes visible to users.
 
 #### 8.1 Context pressure relief
 
@@ -326,7 +345,7 @@ The proactive trigger point, the summarisation rung, and the log-as-truth and pe
 
 The boundary is therefore a legal cut by construction: the start of the N-th-from-last turn, whole turns only. When those turns exceed `retentionTokens`, a fallback fills the verbatim tail newest-first at **group** granularity — an assistant message plus the results it requested, never split — so a turn with a hundred tool calls is still compactable and its newest steps survive. `planCompaction` (`common/compactionBoundary.ts`) returns the boundary together with what it keeps and drops; the compaction, the dialog's preview and the re-planning of a stored boundary all call it, so the preview cannot drift from the outcome and boundaries already stored by the old rule are re-planned into a legal cut when they are used.
 
-#### 8.2 Budgets and `blocked` (deferred to M2)
+#### 8.2 Budgets and `blocked` (not scheduled)
 
 Two kinds of limit, checked at the same point — once per loop iteration in `_runChatAgent`, before the next request is prepared:
 
@@ -354,7 +373,7 @@ export type ThreadBudget = {
 
 That is evidence for deferring, not permission to skip. The plausible homes for a budget are not equivalent — a global setting caps the user's own runs, a thread property needs the user to think about limits at thread creation, and a spawn argument needs the delegation call to exist — and the reference implementation's answer (none of the above; bound the context, steer the loop, show the spend) is a design position this document has not taken yet. Two shapes worth choosing between when it does: a *hard* cap that ends a run as `blocked`, or *visible spend with an explicit stop*, which is closer to what DSH does and closer to what a user with one runaway loop actually wants.
 
-**The ordering constraint.** Nothing may spawn a child before a budget exists: N children are N loops, and today the loop has no bound of any kind. That is the failure this whole document is organised around, and the deferral is only safe while it holds — which is why M2's row lists the budget work under M1 and the spawn tools under M2, in that order.
+**The ordering constraint is retired.** It read: nothing may spawn a child before a budget exists, because N children are N loops. With budgets unscheduled, that constraint binds nothing — and reversing it deliberately is the point: the loop being unbounded is a cost exposure rather than a correctness bug, and the cost is accepted (§8). If spend ever becomes visible to users, the constraint comes back with it, and it comes back *before* fan-out, not after.
 
 ### 9. Cost rollup
 
@@ -375,15 +394,15 @@ Void's existing UI — tabs, pinned threads, unread badges, notifications, the a
 
 - **A child is a `ThreadType`, not a new execution engine.** Reusing `_runChatAgent` means approvals, cancellation, compaction, telemetry, and persistence are inherited rather than reimplemented. A second loop would drift from the first within two releases. Cost: `_runChatAgent` must be parameterized — it currently reads `chatMode` and `overridesOfModel` from global settings at `chatThreadService.ts:3079` — which is a contained refactor.
 
-- **Two tools rather than one with a flag.** The fresh/fork distinction has opposite cost profiles and is the highest-leverage choice the model makes. A distinct verb with a distinct description gives it a better chance of choosing correctly than a boolean buried in a schema.
-
 - **The result contract is bounded and structured; the transcript never crosses.** This is the difference between delegation that reduces context pressure and delegation that multiplies it. Given that `ThreadType`'s comments already document O(N²) input growth, an unbounded result contract would turn one bad property into a worse one.
 
-- **Read-only children by default; writers are opt-in.** Two independent blockers, and the second is worse than the first. `editCodeService` keys DiffZones by URI globally, so two children editing one file is a lost-update race. More seriously, diff areas carry **no thread or agent provenance**: `acceptOrRejectAllDiffAreas({ uri })` accepts or rejects every pending change at that URI regardless of which thread produced it, so with concurrent children the user cannot approve one child's work without approving another's, and `interruptURIStreaming({ uri })` can cancel a different thread's stream. Separately, the `edits` auto-approve tier justifies itself on reversibility (`toolsServiceTypes.ts:26-29` — "edit_file always revertable via checkpoint"), and checkpoints have been removed, so that premise is currently false. Milestone 2 ships read-only children only; writer children arrive in Milestone 5 and require provenance and reversibility first.
+- **Inheritance, not attenuation.** `combineAutoApproveModes`' union is correct for a child that holds its parent's mode: it lands on the same answer the parent lands on, so a child is never more permissive than its parent and no minimum helper is needed. The safety property is enforced at creation — copy `permissionMode` from the parent — and that copy is the whole of it.
 
-- **Attenuation, not union.** `combineAutoApproveModes` is correct for user-opened threads and wrong for children; a child needs the minimum of three inputs. This is a deliberate divergence from an existing helper rather than a reuse of it, and it is the single most important safety property in the design.
+- **Capability is not the safety boundary; provenance is.** A child can do what its parent can, and that is deliberate (§1). What *is* unsafe about writers is not their permission but the lack of provenance: `editCodeService` keys DiffZones by URI globally, so two children editing one file is a lost-update race, and diff areas carry no thread attribution — `acceptOrRejectAllDiffAreas({ uri })` accepts every pending change at that URI regardless of which child produced it. Separately, the `edits` auto-approve tier justifies itself on reversibility (`toolsServiceTypes.ts:26-29` — "edit_file always revertable via checkpoint") and checkpoints have been removed, so that premise is currently false. This is why **parallel writers** wait for Milestone 5, not why children are restricted: a single child writing, or several writing disjoint files, is no more dangerous than the parent doing it.
 
-- **Budgets before fan-out.** Fan-out demos well, which is exactly why it should not go first. Without a round/token cap and a `blocked` state, N children are N unbounded loops. The budget is small and unglamorous and it is Milestone 1.
+- **Spend is not bounded, deliberately.** Fan-out is N unbounded loops, and the earlier revision answered that with budgets before fan-out. LLM cost is low enough that the limiter costs more than the runaway it prevents, so budgets are unscheduled (§8) and the risk is accepted and recorded rather than mitigated.
+
+- **Distinct verbs for fresh and forked delegation.** The fresh/fork distinction has opposite cost profiles and is the highest-leverage choice the model makes, so each deserves its own name and description rather than a boolean in a schema. `fork_subagent` arrives with M4, where context inheritance is the subject.
 
 - **Declarative batch before a workflow engine.** A JS-sandboxed orchestration language captures a lot of power and a lot of surface area. A single-call declarative fan-out captures most of the practical value at a fraction of the complexity, and keeps orchestration inside the tool-call protocol the model already understands.
 
@@ -397,15 +416,13 @@ All within `src/vs/workbench/contrib/void` unless noted.
 
 | File | Change |
 |---|---|
-| `common/voidSettingsTypes.ts` | Add `AgentDefinition`, `ThreadBudget`, `SubagentStatus`, `SubagentOutcome` types |
-| `common/toolsServiceTypes.ts` | Add `run_subagent` / `fork_subagent` params + results to the two type maps; add `attenuateAutoApproveMode` |
-| `common/prompt/prompts.ts` | Add delegation tool definitions and the agent-index section to `chat_systemMessage` |
-| `browser/tools/runSubagent.tool.ts` | **New** — spawn/await a fresh-context child, enforce depth and caps |
-| `browser/tools/forkSubagent.tool.ts` | **New** — spawn a context-inheriting child |
-| `browser/tools/childSteering.tool.ts` | **New** — `send_message`, `interrupt_child`, `list_children` |
-| `browser/tools/agentDefinitionService.ts` | **New** — load/parse `.void/agents/*.md`, workspace overrides global, build the index |
+| `common/voidSettingsTypes.ts` | Add `SubagentStatus`, `SubagentOutcome` types, and the child linkage fields on `ThreadType` |
+| `common/toolsServiceTypes.ts` | Add `run_subagent`, `send_message` and `list_children` params + results to the two type maps |
+| `common/prompt/prompts.ts` | Add the delegation tool definitions to `chat_systemMessage`, including the concurrent-writer caveat (§5) |
+| `browser/tools/runSubagent.tool.ts` | **New** — spawn a fresh-context child; enforce depth 1 |
+| `browser/tools/childSteering.tool.ts` | **New** — `send_message`, `list_children` |
 | `browser/tools/toolRegistry.ts` | Register new tools; gate to `chatMode === 'agent'` in `availableTools` |
-| `browser/chatThreadService.ts` | Child-thread creation; `_runChatAgent` parameterization; budget enforcement; blocked status; usage rollup; child cascade on interrupt |
+| `browser/chatThreadService.ts` | Child-thread creation with inherited context; `_runChatAgent` parameterization; usage rollup; child cascade on interrupt; retention |
 | `browser/convertToLLMMessageService.ts` | Agent index appended to the `aiInstructions` path alongside the skills index |
 | `browser/react/src2/sidebar-tsx/` | Child thread cards, parent/child tree, transcript link, agent badge |
 | `docs/designs/multiagent-assistant.md` | This document |
@@ -432,10 +449,10 @@ Bug numbers are canonical across both documents — see [`thread-storage.md` §1
 | **S8** | Context pressure relief — a request the provider rejects for exceeding the context window is classified as an overflow rather than retried unchanged, rebuilt with old tool-result bodies trimmed (request image only), and retried once; when nothing is trimable the run stops after one attempt and says what to do. **Split by review:** budgets, `blocked` and the proactive per-iteration check moved to M2, where a spawn call decides their shape — see §8 | A thread whose request does not fit is relieved and continues; an unrelievable overflow stops once with an explanation, instead of three identical attempts |
 | **S9** | Loop parameterization — *ships inside S8*, listed separately only to keep this sequence aligned with the numbering used during review. **Deferred with the budget half**: children need a parameterized loop, nothing before them does | Behaviour byte-identical |
 | **S10** | Message store, migration, and bounded residency — message bodies leave the mirrored database; memory scales with active threads; load cost scales with thread size; per-thread lazy migration with a read fallback; **the image migration S5 defers** — the flat `voidImages/` directory attributed to its threads and reclaimed (bugs 1, 2, 3, 10, and the legacy half of 6, 7, 8) | Renderer memory no longer scales with total message count; a 5,000-message thread opens within budget; threads created before the change still open; after a pass over a profile holding flat images, `voidImages/` holds none and every image still renders |
-| **M1** | Agent definitions and attenuation — `AgentDefinition` file format and loader; agent index injected via `aiInstructions`; `attenuateAutoApproveMode`. *Capability milestone 1 ("governed runs") no longer arrives before M2: its budget half was deferred out of S8, so budgets, `blocked`, the future round bound and the loop parameterization all land here* | Existing single-agent behaviour byte-identical; budget defaults non-binding |
-| **M2** | Delegation (read-only) — `run_subagent`; child threads with linkage, attenuated permissions, depth-1 enforcement, bounded result contract, cost rollup, child rendering with a transcript link; **Part 2's thread kind, sealing and child retention**, which have no meaning until a child exists ([`thread-storage.md`](./thread-storage.md#delivery) §2.1) | A research task delegated to a child measurably reduces parent peak context versus the same task inline |
-| **M3** | Parallelism and control — batched fan-out in one call; concurrency and total-children caps; `send_message` / `interrupt_child` / `list_children`; parent→child tree UI; interrupt cascade; approval routing for non-visible children; failure isolation; aggregate status; **the shared residency budget, eviction priority and cascade** ([`thread-storage.md`](./thread-storage.md) §2.2) | A fan-out of 12 children creates, runs, seals and prunes without unbounded renderer growth; one child failing leaves siblings and the parent usable |
-| **M4** | Context inheritance and routing — `fork_subagent`; per-definition `modelSelection`; declarative pipeline and parallel stages | A fork inherits the parent's compaction state consistently, not raw pre-boundary messages |
+| **M1** | **Folded into M2.** Was agent definitions and attenuation; both are dropped (§1, §5), and what remained had no consumer before a child exists. Budgets were deferred out of S8 and are now deprioritised entirely (§8) | — |
+| **M2** | Delegation — child threads with `kind`, linkage, `alias` and full inheritance of the parent's context; `run_subagent`; `send_message` and `list_children`, so delegation is iterative and recoverable; depth-1 in `validateParams`; bounded result contract; cost rollup; child rendering with a transcript link; child retention. **No roles and no attenuated permissions** — a child's capability is its parent's (§1) | Design, develop, test and review a feature through children, and the parent's peak context stays below what doing the same work inline needs |
+| **M3** | Parallelism and control — batched fan-out in one call; `interrupt_child`; parent→child tree UI; interrupt cascade; approval routing for non-visible children; failure isolation; aggregate status; **the shared residency budget, eviction priority and cascade** ([`thread-storage.md`](./thread-storage.md) §2.2). Caps and the residency budget are measured here rather than pre-built (§6) | A fan-out of a dozen children creates, runs, seals and prunes without unbounded renderer growth; one child failing leaves siblings and the parent usable |
+| **M4** | Context inheritance and routing — `fork_subagent`; an optional model argument on the spawn call, so a parent can route a child to a cheaper model; declarative pipeline and parallel stages | A fork inherits the parent's compaction state consistently, not raw pre-boundary messages |
 | **M5** | Scoped implementation — writer children with explicit file partitioning; worktree-per-child isolation; optional JS orchestration sandbox | Deleting a parent removes children and their images; parallel writers do not lose updates |
 
 **Scope correction in S3.** S3 removes the checkpoint *writing* residue. It deliberately keeps the read and cleanup path — the two `role === 'checkpoint'` skips in the load loops, the `checkpointsBeforeBoundary` remap, and the `CHECKPOINT_KEY_PREFIX` cleanup loops — because S3's own gate requires that a thread containing legacy checkpoint records still loads, and because the remap *is* the bug-3 fix. Removing them here would load checkpoint records into the conversation, leave the compaction boundary off by the number of records in front of it, and partially undo S2. Those four sites move to S10, where the message store renumbers indices and the tolerance stops being reachable. See [`thread-storage.md`](./thread-storage.md#checkpoints-removed-not-stored).
@@ -456,15 +473,15 @@ Bug numbers are canonical across both documents — see [`thread-storage.md` §1
 
 ## Risks
 
-- **Cost amplification.** The dominant risk. Delegation turns one O(N²) loop into several. Mitigated by Milestone 1 budgets, the concurrent-children cap, the bounded result contract, and cost rollup — but the honest position is that aggressive fan-out costs more, and the UI must make that visible rather than surprising.
+- **Cost amplification.** Delegation turns one O(N²) loop into several. **Accepted rather than mitigated**: budgets are unscheduled (§8), so the remaining bounds are the bounded result contract and cost rollup — the latter only makes spend *visible*, it does not cap it. The honest position is that aggressive fan-out costs more, and the UI must show that rather than surprise anyone.
 
-- **Concurrent writes to the same file.** DiffZones are keyed by URI; two writers on one file lose updates. Mitigated by shipping Milestone 2 read-only and requiring explicit partitioning before writer children.
+- **Concurrent writes to the same file.** DiffZones are keyed by URI; two writers on one file lose updates, and diff areas carry no thread provenance, so approving one child's edits approves any other child's at the same URI. Children are not restricted below their parent (§1), so this is managed by the model partitioning its own work until Milestone 5 builds the isolation. The tool description says so explicitly.
 
 - **Weak-model orchestration.** Weaker models already show unreliable behavior with parallel reads and skills; delegation asks more of them. Consistent with existing Void philosophy (`skills.md`, "Model compliance"), the expectation is that strong models use it well and weak ones mostly won't. The failure mode is benign — a model that never delegates behaves exactly as today.
 
 - **Approval deadlock.** An unattended child that needs approval must fail closed rather than hang. Requires the parent to park in a state the UI surfaces and the notification path to fire; if neither happens, the child hangs invisibly.
 
-- **Prefix-cache disruption.** Appending agent role text to an inherited `frozenAiInstructions` changes the prefix, so a fork's first request is cache-cold. Acceptable once per child; unacceptable per request, so the freeze must happen once at child creation.
+- **Prefix-cache disruption on fork.** A forked child that appends anything to an inherited `frozenAiInstructions` changes the prefix, so its first request is cache-cold. Acceptable once per child; unacceptable per request, so any such append must happen once at child creation. Basic delegation is unaffected — a `run_subagent` child starts empty and inherits nothing.
 
 - **Persistence and migration.** New `ThreadType` fields are optional and must hydrate cleanly from existing persisted threads, following the established backward-compat convention (`emergencyTrimmedCount?`, `finishReason?`, and similar). Child threads created by an older build are top-level threads, which is a correct and harmless degradation.
 
