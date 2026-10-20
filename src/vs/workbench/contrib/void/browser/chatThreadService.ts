@@ -43,6 +43,7 @@ import { basename as resourceBasename, joinPath } from '../../../../base/common/
 import { IUserDataProfileService } from '../../../services/userDataProfile/common/userDataProfile.js';
 import { isThreadImageUri, threadImageDir, threadImageUri } from '../common/threadImagePaths.js';
 import { deepCloneWithUris } from '../common/deepCloneWithUris.js';
+import { ChildThreadSeed, SubagentStatus } from '../common/childThreadLinkage.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
 import { IHostService } from '../../../services/host/browser/host.js';
@@ -277,6 +278,39 @@ export type ThreadType = {
 	// Persisted as part of the thread blob.
 	permissionMode?: ThreadPermissionMode;
 
+	// ===== Delegation (M2) =====
+	// A child thread is an ordinary thread that another thread spawned. These six
+	// fields are its linkage; `common/childThreadLinkage.ts` owns the rules for
+	// computing them and for what the child inherits.
+	//
+	// `parentThreadId` is the *only* classification. There is no `kind` field,
+	// because "is this a child?" is exactly "does this name a parent?" — two
+	// encodings could disagree, and one disagreement is reachable (a child whose
+	// parent was deleted before the cascade). Absent on a top-level thread.
+	parentThreadId?: string;
+
+	// The `run_subagent` call in the parent that spawned this thread, so the
+	// parent's transcript can point at the child it created.
+	parentToolCallId?: string;
+
+	// The parent's name for this child, e.g. "tester". An ergonomic handle for
+	// `send_message` and for the child's card — not an identity; `id` remains the
+	// key. Unique among one parent's children, enforced where they are known.
+	alias?: string;
+
+	// 0 for a top-level thread, `parent.delegationDepth + 1` for a child. Absent on
+	// top-level threads — which is what 0 says — so threads that predate this field
+	// stay byte-identical on disk. Read it through `delegationDepthOf`, which
+	// normalizes absent to 0 and repairs a child that carries no depth.
+	delegationDepth?: number;
+
+	// Written when the child's run settles: the bounded summary the parent received
+	// back, and how the run ended. Absent while the child is running and on a child
+	// that never ran. The child's `messages` never cross back to the parent — that
+	// separation is the point of delegating.
+	resultSummary?: string;
+	resultStatus?: SubagentStatus;
+
 	// Ephemeral (not persisted) — computed during metadata-only reads by
 	// reading the first few message keys. Used by the UI as a label fallback
 	// when messages aren't loaded (lazy loading). Skipped in _splitThreadForStorage.
@@ -499,25 +533,50 @@ export type ThreadStreamState = {
 // Caller (always `chatThreadService`) is responsible for resolving workspace
 // identity from `IWorkspaceContextService` and passing it in. Kept as a free
 // function rather than promoted to a method so the construction shape stays
-// auditable in one place — the only legitimate creators are `openNewThread`
-// (and the Phase-E import flow once it lands). Both `workspaceUri` and
-// `workspaceLabel` are intentionally optional: empty-window / no-folder
-// startup leaves them undefined and the resulting thread becomes "unscoped"
-// (visible in every workspace's list until explicitly Moved). Importantly
-// we do NOT default to a string like "(no workspace)" — undefined is the
-// load-bearing signal that distinguishes "legacy / unscoped" from "tagged".
-const newThreadObject = (workspace?: { uri?: string, label?: string }) => {
+// auditable in one place — the only legitimate creators are `openNewThread`,
+// `run_subagent`'s spawn path, and the Phase-E import flow once it lands. Both
+// `workspaceUri` and `workspaceLabel` are intentionally optional: empty-window /
+// no-folder startup leaves them undefined and the resulting thread becomes
+// "unscoped" (visible in every workspace's list until explicitly Moved).
+// Importantly we do NOT default to a string like "(no workspace)" — undefined is
+// the load-bearing signal that distinguishes "legacy / unscoped" from "tagged".
+//
+// `child` is present only when a delegation is spawning this thread, and it is
+// the seed `childThreadSeedOf` computed — that function has already decided what
+// the child inherits and refused the cases it must not exist in. When it is
+// present, `workspace` is deliberately ignored: a child spawns from a background
+// run, where the ambient workspace is whatever window happens to be in front of
+// the user rather than the workspace the parent is working in.
+const newThreadObject = (workspace?: { uri?: string, label?: string }, child?: ChildThreadSeed) => {
 	const now = new Date().toISOString()
+	// Inherited fields are spread in only for a child, so a top-level thread keeps
+	// exactly the keys it had before delegation existed. `frozenAiInstructions` is
+	// added only when the parent has one: a parent that has never sent a message
+	// has not frozen its instructions yet, and the child freezes its own on its
+	// first send, the same way a new top-level thread does.
+	const linkage: Partial<ThreadType> = child ? {
+		parentThreadId: child.parentThreadId,
+		parentToolCallId: child.parentToolCallId,
+		alias: child.alias,
+		delegationDepth: child.delegationDepth,
+	} : {}
+	if (child?.frozenAiInstructions !== undefined) linkage.frozenAiInstructions = child.frozenAiInstructions
+
 	return {
 		id: generateUuid(),
 		createdAt: now,
 		lastModified: now,
 		messages: [],
-		workspaceUri: workspace?.uri,
-		workspaceLabel: workspace?.label,
+		workspaceUri: child ? child.workspaceUri : workspace?.uri,
+		workspaceLabel: child ? child.workspaceLabel : workspace?.label,
 		// grants nothing on top of global config — out-of-the-box behavior is
-		// identical to threads created before this field existed.
-		permissionMode: 'read_only',
+		// identical to threads created before this field existed. A child copies its
+		// parent's grant verbatim instead, *including* `undefined`: the field
+		// normalizes to 'read_only' on read, so copying undefined copies the parent's
+		// answer exactly, while substituting 'read_only' would narrow the child of a
+		// thread the user had granted more.
+		permissionMode: child ? child.permissionMode : 'read_only',
+		...linkage,
 		state: {
 			stagingSelections: [],
 			focusedMessageIdx: undefined,
