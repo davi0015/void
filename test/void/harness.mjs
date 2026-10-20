@@ -379,12 +379,28 @@ export function readThreadMetadata(dirs, threadId) {
 export function writeAppKeys(dirs, entries) {
 	const db = join(dirs.userDataDir, 'User', 'globalStorage', 'state.vscdb')
 	mkdirSync(dirname(db), { recursive: true })
-	const values = entries.map(([key, value]) => `(${sqlLiteral(key)}, ${sqlLiteral(value)})`).join(', ')
-	execFileSync('sqlite3', [
-		db,
-		'CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);'
-		+ `INSERT INTO ItemTable (key, value) VALUES ${values};`,
-	], { encoding: 'utf8', maxBuffer: MAX_SQLITE_OUTPUT_BYTES })
+
+	// The SQL goes through `execFileSync`, so it is an argv entry and inherits the
+	// platform's command-line limit — 32,767 characters on Windows. A realistic
+	// fixture (a few hundred messages) exceeds that as one statement, and the
+	// failure is `ENAMETOOLONG` from spawn, which reads like a missing binary
+	// rather than an oversized argument. Chunked, each statement stays well under
+	// the limit and the calls are independent: the table is created
+	// `IF NOT EXISTS` and the key is `ON CONFLICT REPLACE`, so splitting a seed
+	// across calls is the same as doing it in one.
+	const CHUNK = 25
+	const statements = [`CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);`]
+	for (let i = 0; i < entries.length; i += CHUNK) {
+		const values = entries
+			.slice(i, i + CHUNK)
+			.map(([key, value]) => `(${sqlLiteral(key)}, ${sqlLiteral(value)})`)
+			.join(', ')
+		statements.push(`INSERT INTO ItemTable (key, value) VALUES ${values};`)
+	}
+
+	for (const sql of statements) {
+		execFileSync('sqlite3', [db, sql], { encoding: 'utf8', maxBuffer: MAX_SQLITE_OUTPUT_BYTES })
+	}
 }
 
 // ── in-page instrumentation ─────────────────────────────────────────────
