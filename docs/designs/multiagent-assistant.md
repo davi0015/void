@@ -103,7 +103,7 @@ Delegation is assembled from primitives that already exist. This table is load-b
 
 | Existing system | Reused as | Change |
 |---|---|---|
-| `ThreadType` (`chatThreadService.ts:123`) | child thread container | + `kind`, parent linkage, `alias`, result fields |
+| `ThreadType` (`chatThreadService.ts:123`) | child thread container | + parent linkage, `alias`, result fields (no `kind` — §2) |
 | `_runChatAgent` (`chatThreadService.ts:3046`) | child execution loop | parameterized by the child thread rather than by global settings |
 | `ThreadStreamState` / `IsRunningType` (`:403`, `:382`) | child run state | none — `waiting_tools` already models "parked, auto-resumes" |
 | `ToolDefinitionCore` (`toolTypes.ts:61`) | new delegation tools | new tool files + registry entries |
@@ -155,8 +155,8 @@ A child is a `ThreadType` with linkage fields added:
 
 ```ts
 // added to ThreadType
-kind: 'user' | 'child'           // absent on older threads; treated as 'user'
-parentThreadId?: string          // absent = top-level thread
+parentThreadId?: string          // absent = top-level thread. This is the only
+                                 // classification — see below; there is no `kind`
 parentToolCallId?: string        // the run_subagent call that spawned it
 alias?: string                   // the parent's name for it, e.g. "tester"
 delegationDepth: number          // 0 for top-level; parent.delegationDepth + 1
@@ -165,11 +165,15 @@ resultStatus?: SubagentStatus
 budget?: ThreadBudget            // deferred — see §8
 ```
 
+**There is no `kind` field.** An earlier revision had `kind: 'user' | 'child'`, which was wrong twice over: the two values name different axes — `'user'` says whose thread it is, `'child'` says where it sits structurally — and the fact it encoded was already stored. `kind === 'child'` and `parentThreadId !== undefined` are the same statement, so two encodings could disagree, and one natural disagreement exists: a child whose parent was deleted before cascade lands. Deriving makes that state unrepresentable. "Is this a child?" is `parentThreadId !== undefined`, asked in three places — rendering, retention, and `list_children` — and answered the same way in each.
+
 `newThreadObject` (`chatThreadService.ts:469`) grows an optional `parent` argument. Child creation **inherits** from the parent rather than consulting anything ambient: `workspaceUri` comes from the parent (ambient workspace resolution in a background context is a correctness hazard), `permissionMode` is copied unchanged, the model selection is the parent's, and `frozenAiInstructions` is inherited as-is — no definition body is appended, because there is no definition (§1).
 
 `alias` exists because a UUID is a poor thing to hold across a long conversation. The parent coins it when it spawns the child and uses it in `send_message`, and it is what the child's card shows. It is an ergonomic name, not an identity: `childThreadId` remains the key.
 
 Children are not added to `pinnedThreadIds` (a UI tab concept), but they are persisted through the existing per-thread storage path so they survive reload and are inspectable. `_isThreadMutationBlocked` and `isThreadReadOnly` apply unchanged.
+
+**Nothing prunes a child.** An earlier revision gave children a retention policy — prunable N days after completion — on the reasoning that they are created at machine rate. That reasoning does not survive contact with the product: user threads already accumulate forever, that has been fine, and no measurement says otherwise. A background deleter that removes conversations the user never asked to lose is a worse default than a large database, and it would be the first destructive policy in the thread layer. Children are durable like any other thread; deleting a parent takes its children with it (later work, alongside cascade), and that is a user action rather than a policy. If thread count ever becomes a measured problem, the fix is chosen from a number, not pre-built.
 
 ### 3. The delegation tools
 
@@ -450,7 +454,7 @@ Bug numbers are canonical across both documents — see [`thread-storage.md` §1
 | **S9** | Loop parameterization — *ships inside S8*, listed separately only to keep this sequence aligned with the numbering used during review. **Deferred with the budget half**: children need a parameterized loop, nothing before them does | Behaviour byte-identical |
 | **S10** | Message store, migration, and bounded residency — message bodies leave the mirrored database; memory scales with active threads; load cost scales with thread size; per-thread lazy migration with a read fallback; **the image migration S5 defers** — the flat `voidImages/` directory attributed to its threads and reclaimed (bugs 1, 2, 3, 10, and the legacy half of 6, 7, 8) | Renderer memory no longer scales with total message count; a 5,000-message thread opens within budget; threads created before the change still open; after a pass over a profile holding flat images, `voidImages/` holds none and every image still renders |
 | **M1** | **Folded into M2.** Was agent definitions and attenuation; both are dropped (§1, §5), and what remained had no consumer before a child exists. Budgets were deferred out of S8 and are now deprioritised entirely (§8) | — |
-| **M2** | Delegation — child threads with `kind`, linkage, `alias` and full inheritance of the parent's context; `run_subagent`; `send_message` and `list_children`, so delegation is iterative and recoverable; depth-1 in `validateParams`; bounded result contract; cost rollup; child rendering with a transcript link; child retention. **No roles and no attenuated permissions** — a child's capability is its parent's (§1) | Design, develop, test and review a feature through children, and the parent's peak context stays below what doing the same work inline needs |
+| **M2** | Delegation — child threads with parent linkage, `alias` and full inheritance of the parent's context; `run_subagent`; `send_message` and `list_children`, so delegation is iterative and recoverable; depth-1 in `validateParams`; bounded result contract; cost rollup; child rendering with a transcript link. **No roles, no attenuated permissions, and nothing prunes a child** — a child's capability is its parent's and its data is as durable as a user thread's (§1, §2) | Design, develop, test and review a feature through children, and the parent's peak context stays below what doing the same work inline needs |
 | **M3** | Parallelism and control — batched fan-out in one call; `interrupt_child`; parent→child tree UI; interrupt cascade; approval routing for non-visible children; failure isolation; aggregate status; **the shared residency budget, eviction priority and cascade** ([`thread-storage.md`](./thread-storage.md) §2.2). Caps and the residency budget are measured here rather than pre-built (§6) | A fan-out of a dozen children creates, runs, seals and prunes without unbounded renderer growth; one child failing leaves siblings and the parent usable |
 | **M4** | Context inheritance and routing — `fork_subagent`; an optional model argument on the spawn call, so a parent can route a child to a cheaper model; declarative pipeline and parallel stages | A fork inherits the parent's compaction state consistently, not raw pre-boundary messages |
 | **M5** | Scoped implementation — writer children with explicit file partitioning; worktree-per-child isolation; optional JS orchestration sandbox | Deleting a parent removes children and their images; parallel writers do not lose updates |
