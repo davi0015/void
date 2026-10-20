@@ -13,7 +13,7 @@
 #   Build React bundles    buildreact             12s
 #   Hygiene                                         0s
 #
-# Three changes follow from those numbers, and each is separable:
+# Four changes follow from those numbers, and each is separable:
 #
 #   1. The typecheck step is gone. `gulp compile` compiles the same project —
 #      `compileTask('src', 'out', false)` reads `src/tsconfig.json` with
@@ -36,6 +36,16 @@
 #      compile — and still paid the full ten minutes. The job always runs and
 #      always reports success either way; it is a required check, so skipping it
 #      outright would leave the PR unmergeable rather than fast.
+#
+#   4. The node tier runs here, gated on the compile. Added after the measurements
+#      above, which are left as they were because they describe the run the rest of
+#      this file was shaped around. It reads `out/`, so a run without a compile
+#      globs zero files and passes green — worse than not running it at all. When
+#      the compile did happen it costs about 50 s, and it is the only place the
+#      POSIX side of a platform-parameterised test is executed: `codespanSearchPattern`
+#      takes `windows` as an argument, so a Linux runner exercises the Windows
+#      branch as well as its own, which is what a Windows-only test run cannot do
+#      in reverse.
 #
 # A cache that is incomplete is a compile that fails for no visible reason. The
 # first version of this file cached six globs that covered `extensions/*` and
@@ -219,6 +229,14 @@ jobs:
       - name: Compile workbench
         if: steps.scope.outputs.compile == 'true'
         run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js compile
+
+      # Gated on the compile for a reason worth stating: `test-node` globs
+      # `out/**/test/**/*.test.js`, so against a runner that never compiled it finds
+      # no files and reports zero tests passing. A required check that goes green
+      # having tested nothing is worse than one that does not run.
+      - name: Unit tests
+        if: steps.scope.outputs.compile == 'true'
+        run: npm run test-node
 
       - name: Hygiene
         if: steps.scope.outputs.run == 'true'
