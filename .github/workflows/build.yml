@@ -241,6 +241,17 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The release note is a file in the repository — `docs/releases/<tag>.md` —
+      # rather than text typed into GitHub after the tag exists. That puts it on the
+      # release branch, where it is reviewed with the version bump and versioned with
+      # the tag, instead of being written into a draft nobody reads in review.
+      #
+      # Checkout is required for it and nothing else: the rest of this job only
+      # downloads artifacts, so without this step `body_path` below would point at a
+      # file that is not in the workspace.
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -251,9 +262,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
+          # `github.ref_name` is the tag, so `v1.3.0` reads `docs/releases/v1.3.0.md`.
+          # A tag with no note file fails this step rather than publishing a release
+          # with an empty body — the note is part of the release, so a missing one is
+          # worth stopping for.
+          body_path: docs/releases/${{ github.ref_name }}.md
           # Tag pushes (e.g. from CLI) land here as drafts: review the
-          # assets, write the notes, then publish by hand. Releases
-          # published via the GitHub UI already exist, so this only
-          # attaches files to them.
+          # assets, then publish by hand. Releases published via the GitHub
+          # UI already exist, so this only attaches files to them.
           draft: true
