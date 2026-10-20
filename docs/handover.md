@@ -5,7 +5,7 @@ session, by a person or an agent. It is deliberately **not** a second specificat
 the specification, and this file repeats none of their reasoning. Update it at each step, or delete
 it once it stops being true.
 
-**Snapshot: 2026-10-19, `main` at `d72e9828`, release `v1.2.0`.**
+**Snapshot: 2026-10-19, `main` at `a99bbe71`, release `v1.2.0`.**
 
 ## Where the work stands
 
@@ -49,19 +49,18 @@ assertions are not vacuous with `VOID_EXPECT=lost`, and commit with the evidence
 
 ## Open items
 
-- **A duplicated thread loses the URIs in its messages.** `duplicateThread`
-  (`chatThreadService.ts:5156`) and `copyThreadToCurrentWorkspace` (`:5209`) build the copy with
-  `deepClone`, which rebuilds objects as plain ones and copies own properties only — `fsPath` and
-  `toJSON` are prototype getters on a `URI`, so neither survives. `_copyOwnedImages` repoints the
-  images a thread *owns* to real URIs; file selections, code selections and legacy flat images stay
-  plain. It persists, because `JSON.stringify` emits `$mid` for a real URI and nothing for the clone
-  while `_storageReviver` revives only `$mid === 1` — so the copy reads back plain forever. And
-  `SidebarChat.tsx:1447` renders a selection as `getBasename(selection.uri.fsPath)`, which throws on
-  `undefined`. **Not fixed.** The mechanism is verified in code and in a live page; whether the panel
-  visibly throws has not been checked by hand. Cross-platform — Windows only made it visible.
-- **`image-ownership`'s first scenario is red on purpose** until the above is fixed: it fails with
-  `the duplicate references an image that was never on disk: undefined`, which is that defect and not
-  a fixture problem. The other four scenarios pass on Windows as of this snapshot.
+- **Duplicated threads used to lose the URIs in their messages — fixed.** `duplicateThread`
+  (`chatThreadService.ts:5157`) and `copyThreadToCurrentWorkspace` (`:5213`) cloned with
+  `deepClone`, which rebuilds objects as plain ones and copies own properties only; `fsPath` and
+  `toJSON` are prototype getters on a `URI`, so the copy rendered as `undefined` and persisted
+  without `$mid`, which `_storageReviver` needs to revive it. Both now clone with
+  `deepCloneWithUris` ([`common/deepCloneWithUris.ts`](./../src/vs/workbench/contrib/void/common/deepCloneWithUris.ts)),
+  which shares the immutable URIs and copies everything else. **Existing profiles are not
+  repaired** — a thread duplicated before this change still holds plain objects and nothing
+  migrates them. That is deliberate: the fix stops new damage, and healing would mean widening
+  `_storageReviver` to a heuristic predicate that runs over every message at startup.
+- **The end-to-end suite is green on Windows** as of this snapshot: 39 tests, 39 passing. It was 35
+  of 39 two branches ago.
 - **Four `image-ownership` fixtures built a `uri.path` from an `fsPath`**, fixed alongside this
   snapshot. Not merely a wrong assertion: `isThreadImageUri` compares `uri.path` against
   `threadImageDir(...).path`, so the thread's own image failed its own ownership check,

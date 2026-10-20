@@ -243,6 +243,21 @@ describe('image ownership', () => {
 			assert.ok(copy.hasImageSelection, 'the duplicate carries no image selection')
 			assert.equal(copy.imagePaths.length, 1, `the duplicate references ${copy.imagePaths.length} images, expected 1`)
 
+			// Guard: the copy's selection uris are still uris. `duplicateThread` and
+			// `copyThreadToCurrentWorkspace` clone messages, and a plain `deepClone`
+			// (`base/common/objects.ts`) rebuilds objects as bare ones — `path`
+			// survives as an own property while `fsPath` and `toJSON` do not, because
+			// they are prototype getters. The next assertion would then fail with
+			// `undefined` and read as "the file is missing", which is not what went
+			// wrong; `deepCloneWithUris` is what keeps this true.
+			const urisAreReal = await s.page.evaluate((id) => {
+				const thread = globalThis.__voidChatThreadService.state.allThreads[id]
+				return (thread?.messages ?? [])
+					.flatMap(m => m.selections ?? [])
+					.every(sel => typeof sel.uri?.fsPath === 'string')
+			}, copy.threadId)
+			assert.ok(urisAreReal, 'a duplicated thread\'s selection uri lost its fsPath — the copy was not cloned with URIs preserved')
+
 			// Guard: whatever the duplicate points at must exist *before* the
 			// delete, or the subject below would fail for a fixture reason.
 			assert.ok(existsSync(copy.imagePaths[0]), `the duplicate references an image that was never on disk: ${copy.imagePaths[0]}`)

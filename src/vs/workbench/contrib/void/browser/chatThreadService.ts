@@ -38,11 +38,11 @@ import { CHECKPOINT_KEY_PREFIX, LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, MES
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { RunOnceScheduler, timeout } from '../../../../base/common/async.js';
-import { deepClone } from '../../../../base/common/objects.js';
 import { IWorkspaceContextService, toWorkspaceIdentifier } from '../../../../platform/workspace/common/workspace.js';
 import { basename as resourceBasename, joinPath } from '../../../../base/common/resources.js';
 import { IUserDataProfileService } from '../../../services/userDataProfile/common/userDataProfile.js';
 import { isThreadImageUri, threadImageDir, threadImageUri } from '../common/threadImagePaths.js';
+import { deepCloneWithUris } from '../common/deepCloneWithUris.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
 import { IHostService } from '../../../services/host/browser/host.js';
@@ -5153,12 +5153,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const threadToDuplicate = currentThreads[threadId]
 		if (!threadToDuplicate) return undefined
 		const newThread = {
-			...deepClone(threadToDuplicate),
+			// Not `deepClone`: it rebuilds objects as plain ones, which strips a URI's
+			// prototype and with it `fsPath` and `toJSON`. See `deepCloneWithUris`.
+			...deepCloneWithUris(threadToDuplicate),
 			id: generateUuid(),
 		}
-		// The deep clone's image uris point into the source thread's directory,
-		// which is deleted with the source — give the copy its own bytes, exactly
-		// as `copyThreadToCurrentWorkspace` does.
+		// The copy's image uris point into the source thread's directory, which is
+		// deleted with the source — give the copy its own bytes, exactly as
+		// `copyThreadToCurrentWorkspace` does.
 		await this._copyOwnedImages(threadId, newThread.id, newThread.messages)
 		const newThreads = {
 			...currentThreads,
@@ -5206,7 +5208,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const identity = this._getCurrentWorkspaceIdentity()
 		const newId = generateUuid()
 		const cloned: ThreadType = {
-			...deepClone(source),
+			// Not `deepClone` — see the note in `duplicateThread`.
+			...deepCloneWithUris(source),
 			id: newId,
 			workspaceUri: identity.uri,
 			workspaceLabel: identity.label,
