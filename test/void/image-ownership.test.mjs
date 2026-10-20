@@ -43,35 +43,77 @@ function trace(t, session) {
 
 // A selection's `uri` reaches storage marshalled and comes back through
 // `ChatThreadService._storageReviver`, which turns any `$mid === 1` object into
-// a real URI. Writing that shape is what the app itself persists, so a fixture
-// built this way holds exactly the URI the product would hold — `_fileService.del`
-// and `.path` both need the real thing, not a plain object.
-const marshalledFileUri = (p) => ({ $mid: 1, scheme: 'file', authority: '', path: p, query: '', fragment: '' })
+// a real URI — `_fileService.del` and the path getters both need the real thing,
+// not a plain object.
+//
+// The marshalled shape stores `uri.path`, which is *not* an `fsPath` on Windows.
+// It is `/C:/Users/...`: forward slashes, and a leading one before the drive.
+// `fsPath` is the same path in the platform's own spelling (`c:\Users\...`), and
+// it lowercases the drive letter. On POSIX the two strings are identical, which
+// is why every fixture here used to write an `fsPath` into `path` and pass.
+//
+// That was not cosmetic, and the drive letter is the sharp edge. `isThreadImageUri`
+// asks whether a uri is inside a thread's own image directory by comparing
+// `uri.path` against `threadImageDir(...).path` — a case-*sensitive* prefix test.
+// A fixture path built from an `fsPath` carries `c:` while the profile's own
+// `globalStorageHome.path` carries `C:`, so the thread's own image failed to match
+// the directory it was sitting in, `_copyOwnedImages` skipped it as unowned, and
+// the duplicate silently kept pointing at the source's file. The subject then
+// failed for a reason that had nothing to do with what it was testing.
+//
+// So a fixture must be handed a path the product would recognise as its own, and
+// the only reliable source is the product: `appPaths` returns `globalStorageHome`
+// and `userRoamingDataHome` in *both* spellings, `path` for anything that becomes
+// a uri and `fsPath` for anything Node touches. Deriving one from the other is
+// what broke.
+//
+// Every path read back out of a message below is `uri.fsPath`, because that is
+// the convention `node:path` and `existsSync` are in, on both platforms.
+const marshalledFileUri = (uriPath) => ({
+	$mid: 1, scheme: 'file', authority: '', path: uriPath, query: '', fragment: '',
+})
 
-const imageSelection = (p) => ({
+const imageSelection = (uriPath) => ({
 	type: 'Image',
-	uri: marshalledFileUri(p),
+	uri: marshalledFileUri(uriPath),
 	mimeType: 'image/webp',
 	fileName: 'shot.webp',
 	state: { wasAddedAsCurrentFile: false },
 })
 
-/** A thread's own image directory, as `thread-storage.md` §1.3 defines it. */
+/** A thread's own image directory, in `fsPath` spelling. */
 const threadImageDir = (globalStorageHome, threadId) =>
 	join(globalStorageHome, 'void', 'threads', threadId, 'images')
 
+/** The same directory in `uri.path` spelling — what a fixture must hand the product. */
+const threadImageUriDir = (globalStorageUriPath, threadId) =>
+	`${globalStorageUriPath}/void/threads/${threadId}/images`
+
 /**
- * The two directories the product writes into, as the app itself sees them.
- * `userRoamingDataHome` is on `IEnvironmentService`; `globalStorageHome` is not
- * — it sits on `IUserDataProfile`, whose default profile resolves it to
- * `<userRoamingDataHome>/globalStorage`, the same join the harness uses to find
- * `state.vscdb`. Scenarios assert that file is there rather than trusting the
- * derivation.
+ * The two directories the product writes into, as the app itself sees them, in
+ * both spellings. `userRoamingDataHome` is on `IEnvironmentService`;
+ * `globalStorageHome` is not — it sits on `IUserDataProfile`, which is where
+ * `_globalStorageHome` reads it, and it is deliberately *not* derived here as
+ * `<roamingHome>/globalStorage`: the product's own value is the one its
+ * case-sensitive ownership check compares against, so the fixture has to take it
+ * rather than reconstruct it. Scenarios still assert `state.vscdb` is there, so a
+ * wrong value is caught rather than silently trusted.
+ *
+ * `*Path` is `uri.path` spelling for fixtures that become uris; `*FsPath` is for
+ * anything Node opens.
  */
 async function appPaths(page) {
-	const roamingHome = await page.evaluate(() =>
-		globalThis.__voidChatThreadService._environmentService.userRoamingDataHome.fsPath)
-	return { roamingHome, globalStorageHome: join(roamingHome, 'globalStorage') }
+	return page.evaluate(() => {
+		const svc = globalThis.__voidChatThreadService
+		const roaming = svc._environmentService.userRoamingDataHome
+		const storage = svc._globalStorageHome()
+		return {
+			roamingHome: roaming.fsPath,
+			globalStorageHome: storage.fsPath,
+			roamingUriPath: roaming.path,
+			globalStorageUriPath: storage.path,
+		}
+	})
 }
 
 /**
@@ -94,7 +136,7 @@ async function seedThreadWithImage(page, imagePath) {
 		return {
 			threadId: id,
 			messageCount: loaded.messages.length,
-			imagePaths: loaded.messages.flatMap(m => (m.selections ?? []).filter(s => s.type === 'Image').map(s => s.uri.path)),
+			imagePaths: loaded.messages.flatMap(m => (m.selections ?? []).filter(s => s.type === 'Image').map(s => s.uri.fsPath)),
 		}
 	}, imageSelection(imagePath))
 }
@@ -109,7 +151,7 @@ async function duplicateAndReadImages(page, sourceId) {
 		const copy = svc.state.allThreads[newId]
 		return {
 			threadId: newId,
-			imagePaths: (copy?.messages ?? []).flatMap(m => (m.selections ?? []).filter(s => s.type === 'Image').map(s => s.uri.path)),
+			imagePaths: (copy?.messages ?? []).flatMap(m => (m.selections ?? []).filter(s => s.type === 'Image').map(s => s.uri.fsPath)),
 			hasImageSelection: (copy?.messages ?? []).some(m => (m.selections ?? []).some(s => s.type === 'Image')),
 		}
 	}, sourceId)
@@ -132,10 +174,11 @@ describe('image ownership', () => {
 			)
 
 			const flatPath = join(homes.roamingHome, 'voidImages', 'legacy-image.webp')
+			const flatUriPath = `${homes.roamingUriPath}/voidImages/legacy-image.webp`
 			mkdirSync(dirname(flatPath), { recursive: true })
 			writeFileSync(flatPath, Buffer.from('legacy-image-bytes'))
 
-			const seeded = await seedThreadWithImage(s.page, flatPath)
+			const seeded = await seedThreadWithImage(s.page, flatUriPath)
 
 			// Guard: the fixture must have produced a loaded thread that really
 			// references the file. Without this, "the file survived" is true for
@@ -151,7 +194,7 @@ describe('image ownership', () => {
 			assert.ok(copy.threadId, 'copyThreadToCurrentWorkspace returned no id')
 			assert.ok(copy.hasImageSelection, 'the duplicate carries no image selection')
 			assert.equal(copy.imagePaths.length, 1, `the duplicate references ${copy.imagePaths.length} images, expected 1`)
-			assert.ok(existsSync(copy.imagePaths[0]), 'the duplicate references an image that was never on disk')
+			assert.ok(existsSync(copy.imagePaths[0]), `the duplicate references an image that was never on disk: ${copy.imagePaths[0]}`)
 
 			await s.page.evaluate((id) => globalThis.__voidChatThreadService.deleteThread(id), seeded.threadId)
 			await h.sleep(1000) // _fileService.del is fire-and-forget
@@ -186,10 +229,11 @@ describe('image ownership', () => {
 			// The path depends on the thread id, so the thread has to exist first.
 			const threadId = await s.page.evaluate(() => globalThis.__voidChatThreadService.state.currentThreadId)
 			const ownedPath = join(threadImageDir(homes.globalStorageHome, threadId), 'owned-image.webp')
+			const ownedUriPath = `${threadImageUriDir(homes.globalStorageUriPath, threadId)}/owned-image.webp`
 			mkdirSync(dirname(ownedPath), { recursive: true })
 			writeFileSync(ownedPath, Buffer.from('owned-image-bytes'))
 
-			const seeded = await seedThreadWithImage(s.page, ownedPath)
+			const seeded = await seedThreadWithImage(s.page, ownedUriPath)
 			assert.equal(seeded.threadId, threadId, 'the current thread changed between fixture steps')
 			assert.equal(seeded.messageCount, 1, `the seeded message did not load (got ${seeded.messageCount} messages)`)
 			assert.ok(existsSync(ownedPath), 'fixture did not write the thread-owned image file')
@@ -201,7 +245,7 @@ describe('image ownership', () => {
 
 			// Guard: whatever the duplicate points at must exist *before* the
 			// delete, or the subject below would fail for a fixture reason.
-			assert.ok(existsSync(copy.imagePaths[0]), 'the duplicate references an image that was never on disk')
+			assert.ok(existsSync(copy.imagePaths[0]), `the duplicate references an image that was never on disk: ${copy.imagePaths[0]}`)
 
 			await s.page.evaluate((id) => globalThis.__voidChatThreadService.deleteThread(id), seeded.threadId)
 			await h.sleep(1000)
@@ -243,10 +287,11 @@ describe('image ownership', () => {
 
 			const threadId = await s.page.evaluate(() => globalThis.__voidChatThreadService.state.currentThreadId)
 			const ownedPath = join(threadImageDir(homes.globalStorageHome, threadId), 'selector-image.webp')
+			const ownedUriPath = `${threadImageUriDir(homes.globalStorageUriPath, threadId)}/selector-image.webp`
 			mkdirSync(dirname(ownedPath), { recursive: true })
 			writeFileSync(ownedPath, Buffer.from('selector-image-bytes'))
 
-			const seeded = await seedThreadWithImage(s.page, ownedPath)
+			const seeded = await seedThreadWithImage(s.page, ownedUriPath)
 			assert.equal(seeded.messageCount, 1, `the seeded message did not load (got ${seeded.messageCount} messages)`)
 			assert.deepEqual(seeded.imagePaths, [ownedPath], `the message does not reference the owned file: ${JSON.stringify(seeded.imagePaths)}`)
 
@@ -262,7 +307,7 @@ describe('image ownership', () => {
 				const thread = svc.state.allThreads[newId]
 				return {
 					threadId: newId,
-					imagePaths: (thread?.messages ?? []).flatMap(m => (m.selections ?? []).filter(s => s.type === 'Image').map(s => s.uri.path)),
+					imagePaths: (thread?.messages ?? []).flatMap(m => (m.selections ?? []).filter(s => s.type === 'Image').map(s => s.uri.fsPath)),
 					hasImageSelection: (thread?.messages ?? []).some(m => (m.selections ?? []).some(s => s.type === 'Image')),
 				}
 			}, seeded.threadId)
@@ -270,7 +315,7 @@ describe('image ownership', () => {
 			assert.ok(copy.threadId, 'duplicateThread produced no new thread')
 			assert.ok(copy.hasImageSelection, 'the duplicate carries no image selection')
 			assert.equal(copy.imagePaths.length, 1, `the duplicate references ${copy.imagePaths.length} images, expected 1`)
-			assert.ok(existsSync(copy.imagePaths[0]), 'the duplicate references an image that was never on disk')
+			assert.ok(existsSync(copy.imagePaths[0]), `the duplicate references an image that was never on disk: ${copy.imagePaths[0]}`)
 
 			await s.page.evaluate((id) => globalThis.__voidChatThreadService.deleteThread(id), seeded.threadId)
 			await h.sleep(1000)
@@ -358,6 +403,24 @@ describe('image ownership', () => {
 			// Control: it is a real file path with an extension, so the subject
 			// is not passing because the path is empty or malformed.
 			assert.match(staged, /\.(webp|png|jpe?g|gif)$/, `the staged uri is not an image path: ${staged}`)
+
+			// Guard: the two directories must be distinguishable and the staged
+			// path must be under exactly one of them, or neither assertion below
+			// means anything. Comparing across two path conventions fails both
+			// `startsWith` calls at once, which reads as "not in the flat
+			// directory" and passes the absence assertion for the wrong reason —
+			// and that is precisely what happened here on Windows, where `staged`
+			// was a `uri.path` (`/c:/...`) and both directories were `node:path`
+			// joins (`c:\...`). The subject then failed while its neighbour
+			// passed vacuously, which is the more dangerous of the two.
+			assert.ok(
+				!ownedDir.startsWith(flatDir) && !flatDir.startsWith(ownedDir),
+				`the two candidate directories are not distinguishable: ${ownedDir} / ${flatDir}`,
+			)
+			assert.ok(
+				staged.startsWith(ownedDir) || staged.startsWith(flatDir),
+				`the staged image is under neither known directory: ${staged}`,
+			)
 
 			h.assertAbsent(
 				'an attached image landing in the shared flat directory',
@@ -448,7 +511,7 @@ async function pollImageSelection(page, timeoutMs) {
 		const paths = await page.evaluate(() => {
 			const svc = globalThis.__voidChatThreadService
 			const thread = svc.state.allThreads[svc.state.currentThreadId]
-			return (thread?.state?.stagingSelections ?? []).filter(s => s.type === 'Image').map(s => s.uri.path)
+			return (thread?.state?.stagingSelections ?? []).filter(s => s.type === 'Image').map(s => s.uri.fsPath)
 		})
 		if (paths.length > 0) return paths[0]
 		if (Date.now() > deadline) return null
