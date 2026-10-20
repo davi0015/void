@@ -55,7 +55,10 @@ assertions are not vacuous with `VOID_EXPECT=lost`, and commit with the evidence
   `toJSON` are prototype getters on a `URI`, so the copy rendered as `undefined` and persisted
   without `$mid`, which `_storageReviver` needs to revive it. Both now clone with
   `deepCloneWithUris` ([`common/deepCloneWithUris.ts`](./../src/vs/workbench/contrib/void/common/deepCloneWithUris.ts)),
-  which shares the immutable URIs and copies everything else. **Existing profiles are not
+  which shares the immutable URIs and copies everything else. The duplicate scenario pins an image and
+  a file selection, and checks the copied bytes rather than their existence; code, folder and terminal
+  selections are covered by the mechanism and the unit tier, not by an integration test.
+  **Existing profiles are not
   repaired** — a thread duplicated before this change still holds plain objects and nothing
   migrates them. That is deliberate: the fix stops new damage, and healing would mean widening
   `_storageReviver` to a heuristic predicate that runs over every message at startup.
