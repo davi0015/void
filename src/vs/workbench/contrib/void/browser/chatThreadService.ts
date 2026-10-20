@@ -1583,17 +1583,30 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// migrated (check: no threads with checkpoint entries in message keys).
 		let writeIdx = 0
 		let lastIdx = -1
-		let checkpointsBeforeBoundary = 0
+		// Every key below the anchor that produces no message shifts the messages after
+		// it down by one when the survivors are compacted, so the anchor must move down
+		// with them. Two things produce no message: a checkpoint record, and a key that
+		// was deleted. Counting only the checkpoints left one unit of drift per deleted
+		// message, which pushed the message *at* the anchor out of the verbatim tail
+		// without putting it in the summary either — it vanished from the prompt with no
+		// error anywhere. See `test/void/compaction-gap.test.mjs`.
+		let droppedBeforeBoundary = 0
+		const missingBeforeBoundary: number[] = []
 		const oldCompactionBoundaryIdx = metadataParsed.compactionBoundaryIdx
 		// Old threads may have gaps in key indices (from previous deletes).
 		// Loop up to a generous limit and skip gaps instead of breaking.
 		for (let i = 0; i < 100000; i++) {
 			const msgRaw = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
-			if (msgRaw === undefined) continue
+			if (msgRaw === undefined) {
+				// A gap is only distinguishable from the end of the run once `lastIdx` is
+				// known, so interior ones are collected here and counted after the loop.
+				if (oldCompactionBoundaryIdx !== undefined && i < oldCompactionBoundaryIdx) missingBeforeBoundary.push(i)
+				continue
+			}
 			lastIdx = i
 			const msg = JSON.parse(msgRaw, ChatThreadService._storageReviver) as any
 			if (msg.role === 'checkpoint') {
-				if (oldCompactionBoundaryIdx !== undefined && i < oldCompactionBoundaryIdx) checkpointsBeforeBoundary++
+				if (oldCompactionBoundaryIdx !== undefined && i < oldCompactionBoundaryIdx) droppedBeforeBoundary++
 				continue // discard old checkpoint data
 			}
 			if (writeIdx !== i) {
@@ -1623,12 +1636,17 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._storageService.remove(checkpointKey, StorageScope.APPLICATION)
 		}
 
-		// Remap compactionBoundaryIdx — message indices shifted during compaction
-		// (checkpoints removed before the boundary). Only works for threads that
-		// still have checkpoints in storage. Already-migrated threads can't be
-		// remapped (checkpoints gone), but the LLM code clamps via Math.min.
-		if (oldCompactionBoundaryIdx !== undefined && checkpointsBeforeBoundary > 0) {
-			metadataParsed.compactionBoundaryIdx = oldCompactionBoundaryIdx - checkpointsBeforeBoundary
+		// A gap at or past the last real key shifted nothing, so only interior ones count.
+		// Without this the loop's trailing run of missing keys past the end of the thread
+		// would be counted and the anchor driven negative.
+		droppedBeforeBoundary += missingBeforeBoundary.filter(i => i < lastIdx).length
+
+		// Remap compactionBoundaryIdx — message indices shifted during compaction, by
+		// however many keys below the boundary produced no message (checkpoints removed
+		// before the boundary, and deleted keys). Threads whose keys are already
+		// contiguous drop nothing and are left alone.
+		if (oldCompactionBoundaryIdx !== undefined && droppedBeforeBoundary > 0) {
+			metadataParsed.compactionBoundaryIdx = oldCompactionBoundaryIdx - droppedBeforeBoundary
 			this._storageService.store(THREAD_KEY_PREFIX + threadId, JSON.stringify(metadataParsed), StorageScope.APPLICATION, StorageTarget.USER)
 		}
 

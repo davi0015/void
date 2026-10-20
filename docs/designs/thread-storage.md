@@ -3,7 +3,7 @@
 Two parts, deliberately separable:
 
 - **Part 1 — upgrade and migrate.** Fixes the existing store: gets message bodies out of the renderer-mirrored database, repairs the load path and the compaction anchor, fixes image ownership, and bounds growth. Delivers value on its own and can ship without multiagent.
-- **Part 2 — prepare for multiagent.** Additive policy on top of the same store: thread kinds, a shared residency budget, concurrency, cascade deletion, and pruning. Changes no format.
+- **Part 2 — prepare for multiagent.** Additive policy on top of the same store: parent linkage, a shared residency budget, concurrency, and cascade deletion. Changes no format.
 
 **Checkpoints are not part of this design.** The feature was removed, and nothing here stores checkpoint data. Checkpoints appear only as (a) the historical cause of the index drift in bugs 2 and 3 and (b) residue to delete during migration. See "Checkpoints: removed, not stored".
 
@@ -511,17 +511,19 @@ Two rules follow, and they apply to the S10 format migration rather than to the 
 
 Part 2 changes **no format**. It adds policy, fields, and lifecycle on top of Part 1's store.
 
-## 2.1 Thread kinds and the policy layer
+## 2.1 Thread linkage and the policy layer
 
-Add `kind: 'user' | 'child'` to thread metadata. The store does not care; policy does.
+There is no `kind` field. A thread is a child when `parentThreadId` is set — one stored fact, one meaning — and that is what policy reads. The store does not care either way, and a thread whose parent was deleted before cascade landed stays unambiguously a child, because the link is still there.
 
-| Concern | `user` | `child` |
+| Concern | top-level | child |
 |---|---|---|
-| Retention | Durable, no message cap | N days after completion, then prunable |
-| Eviction priority | Last | First |
+| Retention | Durable, no message cap | **Durable too** — see below |
+| Eviction priority | Last | First, once eviction exists at all |
 | Pinned tab strip | Eligible | Excluded — `pinnedThreadIds` is a UI concept |
-| Working set | Normal | Shared budget with parent |
+| Working set | Normal | Shared budget with parent, once a budget exists |
 | Sealing | On close | On completion |
+
+**Nothing prunes a child.** An earlier revision gave children a retention window — prunable N days after completion — reasoning that they are created at machine rate rather than human rate. That does not survive contact with the product: user threads already accumulate forever, that has been fine, and nothing measures otherwise. A background deleter that removes conversations the user never asked to lose is a worse default than a large database, and it would be the first destructive policy in this layer. Children are as durable as any thread. If thread count ever becomes a measured problem, the policy gets chosen from that number.
 
 ## 2.2 Shared residency budget
 
@@ -550,10 +552,10 @@ Under single-agent an eviction/GC mix-up is latent. Under multiagent it is routi
 
 Linkage fields are small scalars in `state.vscdb` metadata, which is already fully mirrored — so **no new index is needed**:
 
-- `parentThreadId`, `parentToolCallId`, `delegationDepth`, `kind`.
+- `parentThreadId`, `parentToolCallId`, `delegationDepth` — and **no `kind`**, because a child is exactly a thread with `parentThreadId` set (§2.1).
 - **Cascade deletion:** deleting a parent deletes its children's directories. Child lookup is a metadata scan, bounded by thread count.
 - **Tree traversal for the UI:** parent → children, again from metadata.
-- **Pruning sweeper:** selects children by metadata timestamps alone, without opening a single log.
+- **Pruning sweeper — not scheduled.** A sweeper could select children by metadata timestamps alone, without opening a single log, and that property is real. It is also not being built: nothing prunes a child (§2.1), so this is a description of what stays cheap if retention is ever justified by a measurement, not a piece of the plan.
 
 That metadata-only property is what keeps Part 2 cheap.
 
@@ -632,22 +634,34 @@ S6–S9 are not storage work; they are cross-cutting preparation recorded in the
 
 Part 2 is not a separate delivery step, but it is also **not** part of S10 — the earlier revision of this table said it was, and that was wrong. Every row of its policy layer presupposes children: `kind: 'user' | 'child'` is a distinction with one value until `run_subagent` exists, child retention counts days after a child completes, eviction priority is "children first", pinned tabs exclude children, sealing happens on child completion, and the shared budget is ordered `viewed > running parent > running children > idle children`. Shipping that alongside Part 1 would mean writing branches no thread can take — the speculative abstraction the program sequence rejects by name. S10 is Part 1.
 
-The policy layer therefore lands with its consumers: `kind`, sealing and child retention with **M2**, where the first child exists; the shared residency budget, eviction priority and cascade with **M3**, where there are several. What makes that affordable is unchanged — Part 2 changes no format, so it can be added to a step that already has the store rather than needing a step of its own. If it turns out to need a format change, that is the signal Part 1's design was wrong.
+The policy layer therefore lands with its consumers: linkage and sealing with **M2**, where the first child exists; the shared residency budget and eviction priority with **M3**, where there are several. Retention is not on that list — nothing prunes a child (§2.1). What makes that affordable is unchanged — Part 2 changes no format, so it can be added to a step that already has the store rather than needing a step of its own. If it turns out to need a format change, that is the signal Part 1's design was wrong.
 
 ### S10 in four steps
 
-S10 is one row in the sequence and too large for one branch. The order is not arbitrary: residency is the ground the rest stands on, and the format change is the riskiest thing in the programme, so it lands last — on ground where the correctness bugs are already fixed.
+S10 is one row in the sequence and too large for one branch. The order was chosen so that residency is the ground the rest stands on and the format change lands last, on ground where the correctness bugs are already fixed.
+
+**Status, 2026-10-19.** S10c **shipped** (#144). S10a is **parked**: the memory case for it did not survive measurement. The measurement exists and is red — `test/void/thread-residency.test.mjs`, six threads of forty messages, all 240 message objects still reachable after opening the last — but it also showed that the larger term is the raw strings in `Storage.cache`, which eviction does not touch and only S10b removes. With 500 MB hard to reach in practice, the audit S10a costs (every reader of `thread.messages`, failing silently when missed) is not worth paying for the smaller half. S10b and S10d remain open; S10b's non-memory motivation is verified live below.
 
 | Step | What ships | Why here |
 |---|---|---|
-| **S10a** | Residency — `_loadedMessageThreadIds` (`chatThreadService.ts:1173`) becomes an LRU: load on activate, evict when a thread is neither viewed nor running. **Never evict** a thread in `running`, `awaiting_user` or `waiting_tools`: the agent loop reads `state.allThreads[threadId].messages` every iteration. The step's other deliverable is the audit of every reader of `thread.messages` | No format change, and eviction is what makes reloading real rather than theoretical — so it comes first |
-| **S10b** | The per-thread message log and its offset table: message bodies leave the mirrored `void.chatMsg.*` keys | The riskiest change, so it lands after the ground is fixed. `compactionBoundaryIdx` carries across unchanged, because the log's indices are explicit |
+| **S10a** | Residency — `_loadedMessageThreadIds` (`chatThreadService.ts:1173`) becomes an LRU: load on activate, evict when a thread is neither viewed nor running. **Never evict** a thread in `running`, `awaiting_user` or `waiting_tools`: the agent loop reads `state.allThreads[threadId].messages` every iteration. The step's other deliverable is the audit of every reader of `thread.messages` | No format change, and eviction is what makes reloading real rather than theoretical — so it comes first. **Parked**, per the status above; it is the prerequisite for M3's shared residency budget rather than for anything earlier |
+| **S10b** | The per-thread message log and its offset table: message bodies leave the mirrored `void.chatMsg.*` keys | The riskiest change, so it lands after the ground is fixed. `compactionBoundaryIdx` carries across unchanged, because the log's indices are explicit. **Now optional for memory** — what remains is bug 3, and it turns out not to need this |
 | **S10c** | The startup migration pass over every thread — idempotent, resumable, with a read fallback — covering checkpoint residue, `mountedInfo`, `filesWithUserChanges` and `voidRequestLogs` ([`multiagent-assistant.md`](./multiagent-assistant.md) bug 19 in the ledger), then one `VACUUM` | It has to complete without the user reopening anything. A read-path migration converges to whatever the user happens to visit: measured on a real profile, 287 checkpoint records across 23 threads and 43,691 stored codespan failures were still present, in threads last opened weeks earlier |
 | **S10d** | Flat-image attribution: files in `voidImages/` attributed to their threads by scanning messages, **copying** rather than moving when more than one thread references the same URI, and deleting the flat original only once nothing references it | It closes the two-location window S5 deliberately opened. It needs a global view, so it belongs to the startup pass rather than to any per-thread path |
 
-**One reader is already known to break.** `_getAllSeenFileURIs` (`chatThreadService.ts:4298`) reads the in-memory message array for `@`-file MRU completion and returns `[]` for a thread that is not resident — so the moment eviction exists, that feature degrades silently, with no error anywhere. The audit is S10a's deliverable, not a follow-up.
+**Bug 3 is live, and it does not need the log.** The loader walks message keys `0..100000`, skips gaps and **rewrites keys to contiguous indices** whenever one exists (`chatThreadService.ts:1590`). `compactionBoundaryIdx` is remapped only by `checkpointsBeforeBoundary`, which counts `role === 'checkpoint'` records and nothing else — so a gap left by a deleted *real* message shifts every later message down without moving the anchor.
 
-**How S10a's gate is measured.** The gate above ("renderer memory no longer scales with total message count") is not assertable as written, and the measurement is part of the work. The signal is the count of message objects the renderer still retains after opening N threads, read in the page; `process.memoryUsage()`'s heap is corroboration rather than the signal, because it moves with garbage-collection timing. The red is today's shape: `_loadedMessageThreadIds` is a plain `Set` with no eviction and nothing ever removes an entry except thread deletion, so N threads opened keep N threads' messages resident for the life of the window. Build the measurement first and show it red, the way the last three changes did.
+Measured, `test/void/compaction-gap.test.mjs`: keys `0,1,3,4` and an anchor of `4`, meaning "keys 0–3 are summarised, key 4 is the verbatim tail". After load the messages are `[M0, M1, M3, M4]` with the anchor still `4`, so the tail message sits at index `3` — below the anchor. It is outside the verbatim tail, and the summary describes keys 0–3, so it is in neither: **a message silently disappears from the prompt.**
+
+`VOID_EXPECT=lost` passes, so the assertion tracks the behaviour rather than the fixture.
+
+The fix is to count the gap in the remap — `writeIdx` moves a message down by one for every skipped key, whatever the reason, so the anchor must move down with it. That is a few lines in the load path and a `fix/` branch, and it is strictly smaller than S10b. The log's explicit `i` removes the cause rather than the symptom, which is the better fix if S10b happens for other reasons; it is no longer the reason to have one.
+
+**One reader is already known to break.** `_getAllSeenFileURIs` (`chatThreadService.ts:4298`) reads the in-memory message array for `@`-file MRU completion and returns `[]` for a thread that is not resident — so the moment eviction exists, that feature degrades silently, with no error anywhere. The audit is S10a's deliverable, not a follow-up, and it is part of why the step is parked rather than half-done.
+
+**How S10a's gate is measured.** The gate above ("renderer memory no longer scales with total message count") is not assertable as written, and the measurement is part of the work. The signal is the count of message objects the renderer still retains after opening N threads, read in the page; `process.memoryUsage()`'s heap is corroboration rather than the signal, because it moves with garbage-collection timing. The measurement is built and red, and it is what produced the parked decision — including the finding that the strings dominate, which the gate as written does not distinguish.
+
+**If S10b is ever revived, the migration is avoidable.** Write new threads in the new format and keep the old read path for old ones: a thread's format is a property of the thread, so dual-read is a branch on a flag rather than a pass over every user's data. That turns the riskiest thing in the programme into an additive one.
 
 ## Non-goals
 
