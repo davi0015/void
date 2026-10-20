@@ -3,7 +3,7 @@
 Two parts, deliberately separable:
 
 - **Part 1 — upgrade and migrate.** Fixes the existing store: gets message bodies out of the renderer-mirrored database, repairs the load path and the compaction anchor, fixes image ownership, and bounds growth. Delivers value on its own and can ship without multiagent.
-- **Part 2 — prepare for multiagent.** Additive policy on top of the same store: thread kinds, a shared residency budget, concurrency, cascade deletion, and pruning. Changes no format.
+- **Part 2 — prepare for multiagent.** Additive policy on top of the same store: parent linkage, a shared residency budget, concurrency, and cascade deletion. Changes no format.
 
 **Checkpoints are not part of this design.** The feature was removed, and nothing here stores checkpoint data. Checkpoints appear only as (a) the historical cause of the index drift in bugs 2 and 3 and (b) residue to delete during migration. See "Checkpoints: removed, not stored".
 
@@ -511,17 +511,19 @@ Two rules follow, and they apply to the S10 format migration rather than to the 
 
 Part 2 changes **no format**. It adds policy, fields, and lifecycle on top of Part 1's store.
 
-## 2.1 Thread kinds and the policy layer
+## 2.1 Thread linkage and the policy layer
 
-Add `kind: 'user' | 'child'` to thread metadata. The store does not care; policy does.
+There is no `kind` field. A thread is a child when `parentThreadId` is set — one stored fact, one meaning — and that is what policy reads. The store does not care either way, and a thread whose parent was deleted before cascade landed stays unambiguously a child, because the link is still there.
 
-| Concern | `user` | `child` |
+| Concern | top-level | child |
 |---|---|---|
-| Retention | Durable, no message cap | N days after completion, then prunable |
-| Eviction priority | Last | First |
+| Retention | Durable, no message cap | **Durable too** — see below |
+| Eviction priority | Last | First, once eviction exists at all |
 | Pinned tab strip | Eligible | Excluded — `pinnedThreadIds` is a UI concept |
-| Working set | Normal | Shared budget with parent |
+| Working set | Normal | Shared budget with parent, once a budget exists |
 | Sealing | On close | On completion |
+
+**Nothing prunes a child.** An earlier revision gave children a retention window — prunable N days after completion — reasoning that they are created at machine rate rather than human rate. That does not survive contact with the product: user threads already accumulate forever, that has been fine, and nothing measures otherwise. A background deleter that removes conversations the user never asked to lose is a worse default than a large database, and it would be the first destructive policy in this layer. Children are as durable as any thread. If thread count ever becomes a measured problem, the policy gets chosen from that number.
 
 ## 2.2 Shared residency budget
 
@@ -550,10 +552,10 @@ Under single-agent an eviction/GC mix-up is latent. Under multiagent it is routi
 
 Linkage fields are small scalars in `state.vscdb` metadata, which is already fully mirrored — so **no new index is needed**:
 
-- `parentThreadId`, `parentToolCallId`, `delegationDepth`, `kind`.
+- `parentThreadId`, `parentToolCallId`, `delegationDepth` — and **no `kind`**, because a child is exactly a thread with `parentThreadId` set (§2.1).
 - **Cascade deletion:** deleting a parent deletes its children's directories. Child lookup is a metadata scan, bounded by thread count.
 - **Tree traversal for the UI:** parent → children, again from metadata.
-- **Pruning sweeper:** selects children by metadata timestamps alone, without opening a single log.
+- **Pruning sweeper — not scheduled.** A sweeper could select children by metadata timestamps alone, without opening a single log, and that property is real. It is also not being built: nothing prunes a child (§2.1), so this is a description of what stays cheap if retention is ever justified by a measurement, not a piece of the plan.
 
 That metadata-only property is what keeps Part 2 cheap.
 
@@ -632,7 +634,7 @@ S6–S9 are not storage work; they are cross-cutting preparation recorded in the
 
 Part 2 is not a separate delivery step, but it is also **not** part of S10 — the earlier revision of this table said it was, and that was wrong. Every row of its policy layer presupposes children: `kind: 'user' | 'child'` is a distinction with one value until `run_subagent` exists, child retention counts days after a child completes, eviction priority is "children first", pinned tabs exclude children, sealing happens on child completion, and the shared budget is ordered `viewed > running parent > running children > idle children`. Shipping that alongside Part 1 would mean writing branches no thread can take — the speculative abstraction the program sequence rejects by name. S10 is Part 1.
 
-The policy layer therefore lands with its consumers: `kind`, sealing and child retention with **M2**, where the first child exists; the shared residency budget, eviction priority and cascade with **M3**, where there are several. What makes that affordable is unchanged — Part 2 changes no format, so it can be added to a step that already has the store rather than needing a step of its own. If it turns out to need a format change, that is the signal Part 1's design was wrong.
+The policy layer therefore lands with its consumers: linkage and sealing with **M2**, where the first child exists; the shared residency budget and eviction priority with **M3**, where there are several. Retention is not on that list — nothing prunes a child (§2.1). What makes that affordable is unchanged — Part 2 changes no format, so it can be added to a step that already has the store rather than needing a step of its own. If it turns out to need a format change, that is the signal Part 1's design was wrong.
 
 ### S10 in four steps
 
