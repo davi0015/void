@@ -30,7 +30,7 @@
 
 import { describe, test, before } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import * as h from './harness.mjs'
 
@@ -81,6 +81,18 @@ const imageSelection = (uriPath) => ({
 	state: { wasAddedAsCurrentFile: false },
 })
 
+// A second kind of selection, carrying a uri the same way an image does. Every chip
+// in the sidebar renders through `getBasename(selection.uri.fsPath)` regardless of
+// type, so a fix that only kept image uris intact would still break this one — the
+// difference being that nothing copies a project file, so the duplicate must point
+// at the *same* file rather than a new one.
+const fileSelection = (uriPath) => ({
+	type: 'File',
+	uri: marshalledFileUri(uriPath),
+	language: 'python',
+	state: { wasAddedAsCurrentFile: false },
+})
+
 /** A thread's own image directory, in `fsPath` spelling. */
 const threadImageDir = (globalStorageHome, threadId) =>
 	join(globalStorageHome, 'void', 'threads', threadId, 'images')
@@ -117,16 +129,17 @@ async function appPaths(page) {
 }
 
 /**
- * Puts a user message carrying one image selection on the current thread and
- * reloads the thread so the message — and its revived URI — is in memory where
- * duplicate and delete will find it.
+ * Puts a user message carrying one image selection — and optionally other
+ * selections beside it — on the current thread, and reloads the thread so the
+ * message and its revived URIs are in memory where duplicate and delete will
+ * find them.
  */
-async function seedThreadWithImage(page, imagePath) {
-	return page.evaluate((selection) => {
+async function seedThreadWithImage(page, imagePath, extraSelections = []) {
+	return page.evaluate(({ selection, extra }) => {
 		const svc = globalThis.__voidChatThreadService
 		const id = svc.state.currentThreadId
 		svc._storeMessageKey(id, 0, {
-			role: 'user', content: 'look at this', displayContent: 'look at this', selections: [selection],
+			role: 'user', content: 'look at this', displayContent: 'look at this', selections: [selection, ...extra],
 		})
 		// _storeMessageKey only queues; the reload below reads storage.
 		svc._flushPendingThreadWrites()
@@ -137,11 +150,12 @@ async function seedThreadWithImage(page, imagePath) {
 			threadId: id,
 			messageCount: loaded.messages.length,
 			imagePaths: loaded.messages.flatMap(m => (m.selections ?? []).filter(s => s.type === 'Image').map(s => s.uri.fsPath)),
+			filePaths: loaded.messages.flatMap(m => (m.selections ?? []).filter(s => s.type === 'File').map(s => s.uri.fsPath)),
 		}
-	}, imageSelection(imagePath))
+	}, { selection: imageSelection(imagePath), extra: extraSelections })
 }
 
-/** Duplicates the thread and reports which image paths the copy now references. */
+/** Duplicates the thread and reports which selection paths the copy references. */
 async function duplicateAndReadImages(page, sourceId) {
 	return page.evaluate(async (id) => {
 		const svc = globalThis.__voidChatThreadService
@@ -152,6 +166,7 @@ async function duplicateAndReadImages(page, sourceId) {
 		return {
 			threadId: newId,
 			imagePaths: (copy?.messages ?? []).flatMap(m => (m.selections ?? []).filter(s => s.type === 'Image').map(s => s.uri.fsPath)),
+			filePaths: (copy?.messages ?? []).flatMap(m => (m.selections ?? []).filter(s => s.type === 'File').map(s => s.uri.fsPath)),
 			hasImageSelection: (copy?.messages ?? []).some(m => (m.selections ?? []).some(s => s.type === 'Image')),
 		}
 	}, sourceId)
@@ -233,15 +248,66 @@ describe('image ownership', () => {
 			mkdirSync(dirname(ownedPath), { recursive: true })
 			writeFileSync(ownedPath, Buffer.from('owned-image-bytes'))
 
-			const seeded = await seedThreadWithImage(s.page, ownedUriPath)
+			// A second selection on the same message, pointing at a project file. No
+			// code path copies one — it is the user's file — so the duplicate must end
+			// up referencing this exact path, unlike the image.
+			const projectPath = join(homes.roamingHome, 'project', 'hello_metal.py')
+			const projectUriPath = `${homes.roamingUriPath}/project/hello_metal.py`
+			mkdirSync(dirname(projectPath), { recursive: true })
+			writeFileSync(projectPath, 'print("hello metal")\n')
+
+			const seeded = await seedThreadWithImage(s.page, ownedUriPath, [fileSelection(projectUriPath)])
 			assert.equal(seeded.threadId, threadId, 'the current thread changed between fixture steps')
 			assert.equal(seeded.messageCount, 1, `the seeded message did not load (got ${seeded.messageCount} messages)`)
 			assert.ok(existsSync(ownedPath), 'fixture did not write the thread-owned image file')
 			assert.deepEqual(seeded.imagePaths, [ownedPath], `the message does not reference the owned file: ${JSON.stringify(seeded.imagePaths)}`)
+			assert.deepEqual(seeded.filePaths, [projectPath], `the message does not reference the project file: ${JSON.stringify(seeded.filePaths)}`)
 
 			const copy = await duplicateAndReadImages(s.page, seeded.threadId)
 			assert.ok(copy.hasImageSelection, 'the duplicate carries no image selection')
 			assert.equal(copy.imagePaths.length, 1, `the duplicate references ${copy.imagePaths.length} images, expected 1`)
+
+			// Guard: the copy's selection uris are still uris — both kinds. A plain
+			// `deepClone` (`base/common/objects.ts`) rebuilds objects as bare ones:
+			// `path` survives as an own property while `fsPath` and `toJSON` do not,
+			// being prototype getters. The assertions below would then fail with
+			// `undefined` and read as "the file is missing", which is not what went
+			// wrong. Image and file selections are checked together because every chip
+			// renders through `getBasename(selection.uri.fsPath)` regardless of type,
+			// and a fix aimed only at images would leave this one broken.
+			const urisAreReal = await s.page.evaluate((id) => {
+				const thread = globalThis.__voidChatThreadService.state.allThreads[id]
+				const selections = (thread?.messages ?? []).flatMap(m => m.selections ?? [])
+				return {
+					all: selections.every(sel => typeof sel.uri?.fsPath === 'string'),
+					types: selections.map(sel => sel.type),
+				}
+			}, copy.threadId)
+			assert.deepEqual(urisAreReal.types.sort(), ['File', 'Image'], 'the copy did not carry both selections — the uri guard below would be about one kind only')
+			assert.ok(urisAreReal.all, 'a duplicated thread\'s selection uri lost its fsPath — the copy was not cloned with URIs preserved')
+
+			// Guard: the duplicate owns its own copy rather than pointing at the
+			// source's file, which is the whole point of the ownership change. Without
+			// this, "the image survived the delete" could be true of a copy that was
+			// never made.
+			assert.ok(
+				copy.imagePaths[0].startsWith(threadImageDir(homes.globalStorageHome, copy.threadId)),
+				`the duplicate's image is not in its own directory: ${copy.imagePaths[0]}`,
+			)
+			assert.notEqual(copy.imagePaths[0], ownedPath, 'the duplicate references the source image instead of a copy of it')
+
+			// Guard: the copy is the same bytes, not merely a file at the right path.
+			// The copy is a read-then-write through IFileService, so existence alone
+			// would also be satisfied by an empty write.
+			assert.deepEqual(
+				readFileSync(copy.imagePaths[0]),
+				readFileSync(ownedPath),
+				'the copied image is not the same bytes as the original',
+			)
+
+			// The opposite rule for a file selection: nothing copies a project file, so
+			// the duplicate points at the same one.
+			assert.deepEqual(copy.filePaths, [projectPath], `the duplicate references a different project file: ${JSON.stringify(copy.filePaths)}`)
 
 			// Guard: whatever the duplicate points at must exist *before* the
 			// delete, or the subject below would fail for a fixture reason.
