@@ -43,8 +43,8 @@ import { basename as resourceBasename, joinPath } from '../../../../base/common/
 import { IUserDataProfileService } from '../../../services/userDataProfile/common/userDataProfile.js';
 import { isThreadImageUri, threadImageDir, threadImageUri } from '../common/threadImagePaths.js';
 import { deepCloneWithUris } from '../common/deepCloneWithUris.js';
-import { ChildThreadSeed, childThreadSeedOf, SubagentOutcome, SubagentStatus, isChildThread } from '../common/childThreadLinkage.js';
-import { IDelegationService, RunSubagentRequest, StartedSubagent } from '../common/delegationService.js';
+import { ChildThreadSeed, ChildThreadSummary, childThreadSeedOf, SubagentOutcome, SubagentStatus, isChildThread } from '../common/childThreadLinkage.js';
+import { IDelegationService, ContinueSubagentRequest, RunSubagentRequest, StartedSubagent } from '../common/delegationService.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
 import { IHostService } from '../../../services/host/browser/host.js';
@@ -721,6 +721,13 @@ export interface IChatThreadService {
 	 * `IDelegationService` adapter knows how to forward to it.
 	 */
 	startSubagent(request: RunSubagentRequest): StartedSubagent;
+	/**
+	 * Continue a child that already exists: append the message, run the same loop,
+	 * and resolve with how that turn ended.
+	 */
+	continueSubagent(request: ContinueSubagentRequest): StartedSubagent;
+	/** The children of a thread, read from their stored linkage. */
+	listChildThreads(parentThreadId: string): ChildThreadSummary[];
 	/** Stop a child's current turn. Reached from the parent's interrupt cascade. */
 	interruptSubagent(childThreadId: string): void;
 
@@ -3427,6 +3434,85 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		void this.abortRunning(childThreadId)
 	}
 
+	/**
+	 * Continue a child that already exists.
+	 *
+	 * The run half is identical to a spawn, which is the point: a follow-up is an
+	 * ordinary turn on a conversation that persists, reloads and renders like any
+	 * other. Nothing about the child is re-derived — the workspace, grant and frozen
+	 * instructions it inherited at creation still stand, and re-inheriting them from
+	 * the parent now would quietly move a running child onto a newer prompt.
+	 */
+	continueSubagent(request: ContinueSubagentRequest): StartedSubagent {
+		const parent = this.getThreadWithMessages(request.parentThreadId)
+		if (!parent) throw new Error('Cannot send a message: the thread this tool call belongs to is not loaded.')
+
+		const child = this._childOf(parent.id, request)
+		const message = request.message.trim()
+		if (!message) throw new Error('message must be the instruction for the child; it receives nothing else.')
+
+		return { childThreadId: child.id, result: this._runChildThread(child.id, message) }
+	}
+
+	/**
+	 * The children of a thread, derived from stored linkage.
+	 *
+	 * `task` is the child's first user message — the instruction — because a caller
+	 * recovering handles after a compaction needs to recognise *which* child it is
+	 * looking at, and an id is not something a model can recognise.
+	 */
+	listChildThreads(parentThreadId: string): ChildThreadSummary[] {
+		const children = this._childrenOf(parentThreadId)
+		return children.map(child => {
+			const firstUser = child.messages.find(m => m.role === 'user')
+			return {
+				childThreadId: child.id,
+				alias: child.alias ?? null,
+				running: this.streamState[child.id]?.isRunning !== undefined,
+				resultStatus: child.resultStatus,
+				task: firstUser?.role === 'user' ? (firstUser.displayContent ?? firstUser.content ?? '') : '',
+			}
+		})
+	}
+
+	/** Every child of a thread, in the order they were created. */
+	private _childrenOf(parentThreadId: string): ThreadType[] {
+		return Object.values(this.state.allThreads)
+			.filter((t): t is ThreadType => t !== undefined && t.parentThreadId === parentThreadId)
+			.sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+	}
+
+	/**
+	 * Resolve the child a `send_message` is addressed to.
+	 *
+	 * Scoped to this parent's children, which is what makes "you cannot message
+	 * another thread's child" a property of the lookup rather than a check somebody
+	 * has to remember. Resolution is by id or by alias; both failing produces the one
+	 * message the model needs, which names the children it *does* have.
+	 */
+	private _childOf(parentThreadId: string, request: { childThreadId?: string, alias?: string }): ThreadType {
+		const children = this._childrenOf(parentThreadId)
+		const available = children.length === 0
+			? 'This thread has no subagents yet. Use `run_subagent` to start one.'
+			: `Its subagents are: ${children.map(c => c.alias ?? c.id).join(', ')}.`
+
+		if (request.childThreadId) {
+			const byId = children.find(c => c.id === request.childThreadId)
+			if (!byId) throw new Error(`No subagent of this thread has the id ${request.childThreadId}. ${available}`)
+			return byId
+		}
+		if (request.alias) {
+			const byAlias = children.filter(c => c.alias === request.alias)
+			if (byAlias.length === 0) throw new Error(`No subagent of this thread is named "${request.alias}". ${available}`)
+			// Aliases are unique among one parent's children by construction (checked at
+			// spawn), so more than one here means two threads disagree about their parent
+			// rather than an ambiguous name. Refusing beats picking one.
+			if (byAlias.length > 1) throw new Error(`Several subagents are named "${request.alias}", which should not be possible. Address it by childThreadId instead.`)
+			return byAlias[0]
+		}
+		throw new Error(`send_message needs either childThreadId or alias. ${available}`)
+	}
+
 	private async _runChildThread(childThreadId: string, task: string): Promise<SubagentOutcome> {
 		let run: Promise<void> | undefined
 		try {
@@ -3536,9 +3622,48 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		return files
 	}
 
+	/**
+	 * Add a child's spend to its parent's figures.
+	 *
+	 * The parent pays for its children — a fan-out that costs four times what the
+	 * thread's own requests did must not read as one thread's worth of tokens — so
+	 * this is what keeps `TokenUsageRing` honest about delegation.
+	 *
+	 * What is added is the child's **this-turn** cumulative, not its lifetime one: a
+	 * child that has been continued several times has already been rolled up for each
+	 * earlier turn, and adding its lifetime total again would count those turns twice.
+	 * Each run on a child is one turn, because the send path resets the turn counter.
+	 *
+	 * Both *baselines* move rather than the visible totals. `_setLatestUsage`
+	 * recomputes each total as baseline + in-flight request on every stream tick, so
+	 * writing a total directly would be erased by the parent's next token.
+	 */
+	private _rollUpChildUsage(parentThreadId: string | undefined, childThreadId: string) {
+		if (!parentThreadId) return
+		const spent = this.cumulativeUsageThisTurnOfThreadId[childThreadId]
+		if (!spent) return
+
+		this._cumulativeThisThreadBaselineOfThreadId[parentThreadId] =
+			this._addUsage(this._cumulativeThisThreadBaselineOfThreadId[parentThreadId], spent)
+		this._cumulativeThisTurnBaselineOfThreadId[parentThreadId] =
+			this._addUsage(this._cumulativeThisTurnBaselineOfThreadId[parentThreadId], spent)
+
+		const inFlight = this.latestUsageOfThreadId[parentThreadId]
+		this.cumulativeUsageThisThreadOfThreadId[parentThreadId] =
+			this._addUsage(this._cumulativeThisThreadBaselineOfThreadId[parentThreadId], inFlight)
+		this.cumulativeUsageThisTurnOfThreadId[parentThreadId] =
+			this._addUsage(this._cumulativeThisTurnBaselineOfThreadId[parentThreadId], inFlight)
+
+		const parent = this.state.allThreads[parentThreadId]
+		if (parent) {
+			parent.cumulativeUsageThisThread = this.cumulativeUsageThisThreadOfThreadId[parentThreadId]
+			this._storeUsage(parentThreadId, parent)
+		}
+		this._onDidChangeStreamState.fire({ threadId: parentThreadId })
+	}
+
 	/** The tool a child is parked on, for the `blocked` message. */
-	private _pendingApprovalToolNameOf(threadId: string): string | undefined {
-		const thread = this.state.allThreads[threadId]
+	private _pendingApprovalToolNameOf(threadId: string): string | undefined {		const thread = this.state.allThreads[threadId]
 		if (!thread) return undefined
 		const pending = findLast(thread.messages, m => m.role === 'tool' && m.type === 'tool_request')
 		return pending?.role === 'tool' && pending.type === 'tool_request' ? pending.name : undefined
@@ -3571,6 +3696,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 
 		const usage = this.cumulativeUsageThisThreadOfThreadId[childThreadId] ?? thread?.cumulativeUsageThisThread ?? undefined
+		// Roll the spend up before reporting it, so the parent's ring includes the child
+		// that just finished rather than the one before it.
+		this._rollUpChildUsage(thread?.parentThreadId, childThreadId)
 		return {
 			status,
 			summary: capped,
@@ -6467,6 +6595,14 @@ class DelegationService implements IDelegationService {
 
 	startSubagent(request: RunSubagentRequest): StartedSubagent {
 		return this._chatThreadService.startSubagent(request)
+	}
+
+	continueSubagent(request: ContinueSubagentRequest): StartedSubagent {
+		return this._chatThreadService.continueSubagent(request)
+	}
+
+	listChildren(parentThreadId: string): ChildThreadSummary[] {
+		return this._chatThreadService.listChildThreads(parentThreadId)
 	}
 
 	interruptSubagent(childThreadId: string): void {

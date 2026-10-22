@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js'
-import type { SubagentOutcome } from './childThreadLinkage.js'
+import type { ChildThreadSummary, SubagentOutcome } from './childThreadLinkage.js'
 
 // The seam between the delegation *tool* and the chat loop that runs a child.
 //
@@ -31,6 +31,22 @@ export type RunSubagentRequest = {
 	task: string
 }
 
+/**
+ * Continue a child that already exists.
+ *
+ * Addressed by id or by alias, because the two fail differently. An alias is what
+ * the parent coined and can carry in prose; the id is what `list_children` returns
+ * after a compaction has eaten the alias. Exactly one must be supplied, and
+ * resolution is scoped to the delegating thread's own children — a parent cannot
+ * message somebody else's.
+ */
+export type ContinueSubagentRequest = {
+	parentThreadId: string
+	childThreadId?: string
+	alias?: string
+	message: string
+}
+
 export type StartedSubagent = {
 	/** The child thread's id, available before the run finishes. */
 	childThreadId: string
@@ -55,6 +71,29 @@ export interface IDelegationService {
 	 * returned promise.
 	 */
 	startSubagent(request: RunSubagentRequest): StartedSubagent
+
+	/**
+	 * Give an existing child another instruction and run it again.
+	 *
+	 * A child is a conversation that already persists and reloads, so a follow-up is
+	 * an ordinary turn: appending the message and driving the same loop. That is what
+	 * makes delegation iterative — a parent that asks for development and then asks
+	 * the same child to fix what the tests found is holding one conversation in two
+	 * parts, rather than starting a fresh agent with no memory of the first.
+	 *
+	 * Throws when the child cannot be resolved from this parent (unknown id or alias,
+	 * or another thread's child), so that reaches the model as an ordinary tool error.
+	 */
+	continueSubagent(request: ContinueSubagentRequest): StartedSubagent
+
+	/**
+	 * The children of a thread, derived from stored linkage.
+	 *
+	 * Read from storage-backed fields rather than from anything the caller remembers,
+	 * because the caller's memory is a conversation that may have been compacted. This
+	 * is a correctness affordance, not a convenience.
+	 */
+	listChildren(parentThreadId: string): ChildThreadSummary[]
 
 	/**
 	 * Stop a child's current turn. This is the interrupt cascade: aborting the

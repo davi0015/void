@@ -3,7 +3,7 @@ import { RawMCPToolCall } from './mcpServiceTypes.js';
 import { Edit } from './editCodeServiceTypes.js';
 import { SnakeCaseKeys } from './prompt/prompts.js';
 import { RawToolParamsObj } from './sendLLMMessageTypes.js';
-import type { SubagentOutcome } from './childThreadLinkage.js';
+import type { ChildThreadSummary, SubagentOutcome } from './childThreadLinkage.js';
 
 
 
@@ -58,7 +58,7 @@ export const toolApprovalTypes = new Set<ToolApprovalType>([
 // would otherwise pass the `gather` filter (`everything not in
 // approvalTypeOfBuiltinToolName`) and let a read-only investigation spawn a child
 // that can write. The mode is `agent`'s alone because delegation *is* acting.
-export const delegationToolNames = new Set<BuiltinToolName>(['run_subagent'])
+export const delegationToolNames = new Set<BuiltinToolName>(['run_subagent', 'send_message', 'list_children'])
 
 
 // Auto-approve mode per tier. Tri-state:
@@ -183,6 +183,11 @@ export type BuiltinToolCallParams = {
 	// so the instruction *is* the definition. `alias` is the name the parent will
 	// use to address this child again (`send_message`) and to read its card.
 	'run_subagent': { alias: string, task: string },
+	// Addressing is by id *or* alias, because the two fail differently: an alias is
+	// what the parent coined and can carry in prose, and the id is what `list_children`
+	// returns after a compaction has eaten the alias. Exactly one is required.
+	'send_message': { childThreadId: string | null, alias: string | null, message: string },
+	'list_children': {},
 }
 
 // RESULT OF TOOL CALL
@@ -222,6 +227,10 @@ export type BuiltinToolResultType = {
 	// The bounded result the parent receives. Not the child's transcript — see
 	// `SubagentOutcome`.
 	'run_subagent': SubagentOutcome,
+	// Same contract: continuing a child reports how *that* turn ended, not a
+	// different shape the parent would have to learn.
+	'send_message': SubagentOutcome,
+	'list_children': { children: ChildThreadSummary[] },
 }
 
 

@@ -26,6 +26,7 @@ import { semanticSearchToolCore } from './semanticSearch.tool.js'
 import { searchHistoryToolCore } from './searchHistory.tool.js'
 import { loadSkillToolCore } from './loadSkill.tool.js'
 import { runSubagentToolCore } from './runSubagent.tool.js'
+import { listChildrenToolCore, sendMessageToolCore } from './childSteering.tool.js'
 
 
 export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDefinitionCore<T> }> = {
@@ -53,6 +54,8 @@ export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDef
 	search_history: searchHistoryToolCore,
 	load_skill: loadSkillToolCore,
 	run_subagent: runSubagentToolCore,
+	send_message: sendMessageToolCore,
+	list_children: listChildrenToolCore,
 }
 
 

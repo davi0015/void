@@ -64,6 +64,26 @@ export type SubagentOutcome = {
 }
 
 /**
+ * One row of `list_children`.
+ *
+ * The tool exists because a parent's handles have to survive its own compaction:
+ * once a long conversation is summarised, the ids it read from earlier tool results
+ * are gone, and without this there is no way to address the child that is still
+ * sitting there half-finished. So the list is derived from stored linkage rather
+ * than remembered — and it carries `task`, the child's first instruction, because an
+ * id is not something a model can recognise and a paraphrased task is.
+ */
+export type ChildThreadSummary = {
+	childThreadId: string
+	alias: string | null
+	/** True while the child's run is going, false once it has settled or never ran. */
+	running: boolean
+	/** How the last run ended. Absent on a child that has not finished a run yet. */
+	resultStatus?: SubagentStatus
+	task: string
+}
+
+/**
  * Deepest delegation the product allows: a top-level thread may spawn children,
  * and a child may not spawn further. This is a shape rather than a cap — nesting
  * is where "a child can do what its parent can" stops being explainable — and it
