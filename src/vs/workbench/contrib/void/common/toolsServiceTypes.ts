@@ -3,6 +3,7 @@ import { RawMCPToolCall } from './mcpServiceTypes.js';
 import { Edit } from './editCodeServiceTypes.js';
 import { SnakeCaseKeys } from './prompt/prompts.js';
 import { RawToolParamsObj } from './sendLLMMessageTypes.js';
+import type { SubagentOutcome } from './childThreadLinkage.js';
 
 
 
@@ -51,6 +52,13 @@ export const toolApprovalTypes = new Set<ToolApprovalType>([
 	...Object.values(approvalTypeOfBuiltinToolName),
 	'MCP tools',
 ])
+
+// Tools that hand work to a child agent. They are `agent`-only, and that is not a
+// consequence of the approval table above: delegation needs no approval, so they
+// would otherwise pass the `gather` filter (`everything not in
+// approvalTypeOfBuiltinToolName`) and let a read-only investigation spawn a child
+// that can write. The mode is `agent`'s alone because delegation *is* acting.
+export const delegationToolNames = new Set<BuiltinToolName>(['run_subagent'])
 
 
 // Auto-approve mode per tier. Tri-state:
@@ -170,6 +178,11 @@ export type BuiltinToolCallParams = {
 	'search_history': { query: string | null, toolName: string | null, resultStatus: 'error' | 'success' | null, contextRadius: number },
 	// --- skills ---
 	'load_skill': { skillName: string },
+	// --- delegation ---
+	// `task` is the child's whole role: there is no agent catalogue to choose from,
+	// so the instruction *is* the definition. `alias` is the name the parent will
+	// use to address this child again (`send_message`) and to read its card.
+	'run_subagent': { alias: string, task: string },
 }
 
 // RESULT OF TOOL CALL
@@ -205,6 +218,10 @@ export type BuiltinToolResultType = {
 	'search_history': { matches: string, totalMatches: number },
 	// --- skills ---
 	'load_skill': { content: string },
+	// --- delegation ---
+	// The bounded result the parent receives. Not the child's transcript — see
+	// `SubagentOutcome`.
+	'run_subagent': SubagentOutcome,
 }
 
 

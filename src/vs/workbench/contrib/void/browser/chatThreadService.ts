@@ -43,7 +43,8 @@ import { basename as resourceBasename, joinPath } from '../../../../base/common/
 import { IUserDataProfileService } from '../../../services/userDataProfile/common/userDataProfile.js';
 import { isThreadImageUri, threadImageDir, threadImageUri } from '../common/threadImagePaths.js';
 import { deepCloneWithUris } from '../common/deepCloneWithUris.js';
-import { ChildThreadSeed, SubagentStatus } from '../common/childThreadLinkage.js';
+import { ChildThreadSeed, childThreadSeedOf, SubagentOutcome, SubagentStatus, isChildThread } from '../common/childThreadLinkage.js';
+import { IDelegationService, RunSubagentRequest, StartedSubagent } from '../common/delegationService.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
 import { IHostService } from '../../../services/host/browser/host.js';
@@ -711,6 +712,17 @@ export interface IChatThreadService {
 	// entry pts
 	abortRunning(threadId: string): Promise<void>;
 	dismissStreamError(threadId: string): void;
+
+	/**
+	 * Create a child thread and run it, returning the handle immediately and the
+	 * outcome as a promise. Delegation's implementation lives here rather than in
+	 * the tool because a child is a thread: creating it, giving it its first
+	 * message and driving the loop are this service's work, and only the thin
+	 * `IDelegationService` adapter knows how to forward to it.
+	 */
+	startSubagent(request: RunSubagentRequest): StartedSubagent;
+	/** Stop a child's current turn. Reached from the parent's interrupt cascade. */
+	interruptSubagent(childThreadId: string): void;
 
 	// call to edit a message
 	editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId }: { userMessage: string, messageIdx: number, threadId: string }): Promise<void>;
@@ -3286,7 +3298,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			await timeout(0)
 
 			if (isBuiltInTool) {
-				const { result, interruptTool } = await this._toolsService.callTool[toolName](toolParams as any, threadId)
+				const { result, interruptTool } = await this._toolsService.callTool[toolName](toolParams as any, threadId, toolId)
 				const interruptor = () => { interrupted = true; interruptTool?.() }
 				resolveInterruptor(interruptor)
 
@@ -3347,6 +3359,227 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 
 
+
+	// ===== Delegation (M2) =====
+	//
+	// A child is an ordinary thread, so none of this is a second execution engine:
+	// it is thread creation, one user message, and the loop the parent already runs.
+	// What is genuinely new is the waiting. `_runChatAgent` resolves when a run
+	// *pauses* as well as when it ends — awaiting approval, or parked on a detached
+	// tool that resumes itself — so the parent cannot read one invocation's return
+	// value as the child's answer. `_awaitThreadSettled` is that distinction.
+	//
+	// The other half is isolation. The parent receives `SubagentOutcome` and nothing
+	// else: no transcript, no tool results, no reasoning. Every field of it is
+	// bounded, and the summary is cut to `SUBAGENT_SUMMARY_MAX_CHARS` rather than
+	// passed through, because an unbounded child result would turn delegation from a
+	// context saving into a context amplifier.
+
+	private static readonly SUBAGENT_SUMMARY_MAX_CHARS = 12_000
+
+	private static readonly _WRITE_TOOL_NAMES = new Set<string>([
+		'edit_file', 'rewrite_file', 'create_file_or_folder', 'delete_file_or_folder', 'rename_file_or_folder',
+	])
+
+	startSubagent(request: RunSubagentRequest): StartedSubagent {
+		// The parent must be loaded: a child copies its workspace, its grant and its
+		// frozen instructions, and a delegation is called from a run, which loads the
+		// thread it belongs to.
+		const parent = this.getThreadWithMessages(request.parentThreadId)
+		if (!parent) throw new Error('Cannot delegate: the thread this tool call belongs to is not loaded.')
+
+		// Refuses depth 2, an empty alias, an over-long alias — see
+		// `childThreadSeedOf`. Thrown, not returned, so it reaches the model as a normal
+		// tool error, which it can correct.
+		const creation = childThreadSeedOf(parent, { toolCallId: request.toolCallId, alias: request.alias })
+		if (!creation.ok) throw new Error(creation.refusal)
+
+		const { seed } = creation
+		const task = request.task.trim()
+		if (!task) throw new Error('task must be the instruction for the child to carry out. The child starts with an empty context, so it receives nothing else.')
+
+		// The parent addresses a child by alias, so two children with one name would be
+		// ambiguous the moment it can talk to them. Checked here rather than in
+		// `childThreadSeedOf`, which sees one thread rather than the set of children.
+		const aliasTaken = Object.values(this.state.allThreads)
+			.some(t => t !== undefined && t.parentThreadId === parent.id && t.alias === seed.alias)
+		if (aliasTaken) {
+			throw new Error(`alias "${seed.alias}" is already used by another child of this thread. Pick a different name.`)
+		}
+
+		const child = newThreadObject(undefined, seed)
+		// Indexed like any other thread. The index is what startup reads, so a child
+		// left out of it would be persisted and unreachable on the next launch, which
+		// is not "inspectable". Not pinned: `pinnedThreadIds` is the tab strip, and a
+		// fan-out must not become a strip of tabs.
+		this._loadedMessageThreadIds.add(child.id)
+		this._storeThread(child.id, child, true)
+		this._setState({ allThreads: { ...this.state.allThreads, [child.id]: child } })
+
+		return { childThreadId: child.id, result: this._runChildThread(child.id, task) }
+	}
+
+	interruptSubagent(childThreadId: string): void {
+		// Fire and forget: the caller is a tool interruptor, which must return at once.
+		// Clearing the child's stream state is what stops its loop, and that is what
+		// resolves the promise the parent's tool call is holding — so the two sides are
+		// already coupled and nothing new is needed here.
+		void this.abortRunning(childThreadId)
+	}
+
+	private async _runChildThread(childThreadId: string, task: string): Promise<SubagentOutcome> {
+		let run: Promise<void> | undefined
+		try {
+			// The same send path a user message takes, so the child gets the directory
+			// listing, a frozen system prompt and usage accounting without a second
+			// implementation of any of it. `onRun` hands the run promise back instead of
+			// letting the send path fire a completion notification for a thread the user
+			// never opened.
+			await this._addUserMessageAndStreamResponse({
+				userMessage: task,
+				threadId: childThreadId,
+				onRun: r => { run = r },
+			})
+		} catch (error) {
+			return this._finishChild(childThreadId, 'error', getErrorMessage(error))
+		}
+		if (!run) return this._finishChild(childThreadId, 'error', 'The child thread could not be started.')
+
+		try {
+			await run
+		} catch (error) {
+			return this._finishChild(childThreadId, 'error', getErrorMessage(error))
+		}
+
+		const settled = await this._awaitThreadSettled(childThreadId)
+		if (settled.status === 'blocked') {
+			const toolName = this._pendingApprovalToolNameOf(childThreadId)
+			const what = toolName ? `\`${toolName}\`` : 'a tool'
+			return this._finishChild(childThreadId, 'blocked', `The child stopped and is waiting for permission to run ${what}. Nothing in this run could answer that, so the delegation ended here; the request is still on the child's own thread.`)
+		}
+		if (settled.status === 'error') return this._finishChild(childThreadId, 'error', settled.message)
+		if (settled.status === 'rejected') return this._finishChild(childThreadId, 'rejected', 'The child was stopped before it finished, so it produced no usable report.')
+		return this._finishChild(childThreadId, 'done', this._summaryOfChild(childThreadId))
+	}
+
+	/**
+	 * Wait until a child's run reaches a state the parent can report on.
+	 *
+	 * The first `await run` above is not enough, because `_runChatAgent` returns on
+	 * a *pause* as well as on an end. `awaiting_user` is terminal for this purpose —
+	 * nothing can answer it, so the delegation fails closed instead of hanging.
+	 * `waiting_tools` is not: a detached terminal is still running and the loop
+	 * resumes itself from an event, so the parent keeps waiting. Waiting is
+	 * subscribing to the stream-state event and re-reading, never polling.
+	 */
+	private async _awaitThreadSettled(threadId: string): Promise<{ status: 'done' | 'blocked' | 'rejected' } | { status: 'error', message: string }> {
+		for (;;) {
+			const state = this.streamState[threadId]
+			// No state object at all means the stream was cleared — an abort.
+			if (state === undefined) return { status: 'rejected' }
+			if (state.isRunning === undefined) {
+				// A present object with `isRunning: undefined` is a normal end, or an
+				// error, which the loop leaves on that same object as it clears.
+				return state.error ? { status: 'error', message: state.error.message } : { status: 'done' }
+			}
+			if (state.isRunning === 'awaiting_user') return { status: 'blocked' }
+
+			await new Promise<void>(resolve => {
+				const listener = this._onDidChangeStreamState.event(e => {
+					if (e.threadId !== threadId) return
+					listener.dispose()
+					resolve()
+				})
+			})
+		}
+	}
+
+	/** The last assistant text — the whole of what crosses back from the child. */
+	private _summaryOfChild(threadId: string): string {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return ''
+		const msg = findLast(thread.messages, m => m.role === 'assistant')
+		if (msg?.role !== 'assistant') return ''
+		return (msg.displayContent ?? '').trim()
+	}
+
+	/**
+	 * Which of the child's files it actually changed.
+	 *
+	 * Derived from the child's own *completed* write tools, never from intent: a
+	 * `rejected`, `tool_error` or `invalid_params` row changed nothing, and telling
+	 * the parent otherwise would misreport what the delegation did. Paths are
+	 * relative to the child's workspace, which is the parent's, because that is the
+	 * form the parent's own tool calls take.
+	 */
+	private _filesTouchedBy(threadId: string): string[] {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return []
+		const rootPath = thread.workspaceUri ? URI.parse(thread.workspaceUri).path : undefined
+		const seen = new Set<string>()
+		const files: string[] = []
+		for (const m of thread.messages) {
+			if (m.role !== 'tool' || m.type !== 'success') continue
+			if (!ChatThreadService._WRITE_TOOL_NAMES.has(m.name)) continue
+			const uri = (m.params as { uri?: unknown } | undefined)?.uri
+			// Duck-typed rather than `instanceof URI`: messages read back from storage
+			// carry revived uris, and the shape is what matters here.
+			const path = typeof uri === 'object' && uri !== null && typeof (uri as { path?: unknown }).path === 'string'
+				? (uri as { path: string }).path
+				: undefined
+			if (!path) continue
+			const relative = rootPath && path.startsWith(rootPath + '/') ? path.slice(rootPath.length + 1) : path
+			if (seen.has(relative)) continue
+			seen.add(relative)
+			files.push(relative)
+		}
+		return files
+	}
+
+	/** The tool a child is parked on, for the `blocked` message. */
+	private _pendingApprovalToolNameOf(threadId: string): string | undefined {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return undefined
+		const pending = findLast(thread.messages, m => m.role === 'tool' && m.type === 'tool_request')
+		return pending?.role === 'tool' && pending.type === 'tool_request' ? pending.name : undefined
+	}
+
+	/**
+	 * Record how the child ended on the child itself, and build what the parent gets.
+	 *
+	 * The write is what makes the outcome durable: after a reload the child thread
+	 * still says how it finished, which is the difference between a transcript and a
+	 * record. The returned outcome is the only channel to the parent.
+	 */
+	private _finishChild(childThreadId: string, status: SubagentStatus, summary: string): SubagentOutcome {
+		const thread = this.state.allThreads[childThreadId]
+		const trimmed = summary.trim()
+			|| (status === 'done' ? 'The child finished without reporting anything back.' : '')
+
+		// Cut with the marker the compaction path already uses, so the parent has a known
+		// remedy — ask for a narrower report — instead of a silently short answer.
+		const capped = truncate(
+			trimmed,
+			ChatThreadService.SUBAGENT_SUMMARY_MAX_CHARS,
+			'\n\n[trimmed — this is the child\'s report, cut to the length a parent may receive. Re-run the task asking for a shorter report if you need the rest.]',
+		)
+
+		if (thread) {
+			const updated: ThreadType = { ...thread, resultStatus: status, resultSummary: capped }
+			this._setState({ allThreads: { ...this.state.allThreads, [childThreadId]: updated } })
+			this._storeThread(childThreadId, updated)
+		}
+
+		const usage = this.cumulativeUsageThisThreadOfThreadId[childThreadId] ?? thread?.cumulativeUsageThisThread ?? undefined
+		return {
+			status,
+			summary: capped,
+			filesTouched: this._filesTouchedBy(childThreadId),
+			childThreadId,
+			...(usage ? { usage } : {}),
+			...(status === 'error' ? { error: capped } : {}),
+		}
+	}
 
 	private async _runChatAgent({
 		threadId,
@@ -3880,6 +4113,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	private _maybeGenerateThreadTitle(threadId: string, modelSelection: ModelSelection | null, modelSelectionOptions: ModelSelectionOptions | undefined): void {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
+		// A child's name is the alias its parent coined, and a second LLM request to
+		// invent a label for a thread the user did not open is spend with no reader.
+		if (isChildThread(thread)) return
 		if (!modelSelection) return
 		if (thread.customTitle?.trim()) return
 		if (this._titleGenInFlightOfThreadId.has(threadId)) return
@@ -4229,7 +4465,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 
-	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes, modelSelectionOptionsOverride }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array>, modelSelectionOptionsOverride?: ModelSelectionOptions }) {
+	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes, modelSelectionOptionsOverride, onRun }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array>, modelSelectionOptionsOverride?: ModelSelectionOptions, onRun?: (run: Promise<void>) => void }) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
@@ -4240,7 +4476,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// the per-workspace filter normally and stops appearing in other
 		// workspaces' lists. No-op when the thread is already tagged (any
 		// workspace) or when the window has no workspace.
-		this._claimThreadForCurrentWorkspaceIfUnscoped(threadId)
+		//
+		// A child is never claimed: its workspace was copied from its parent at
+		// creation and is the parent's for its whole life. Claiming would re-tag a
+		// background child to whatever window happens to be in front, which is the
+		// ambient-scope hazard inheritance exists to avoid.
+		if (!isChildThread(thread)) this._claimThreadForCurrentWorkspaceIfUnscoped(threadId)
 
 		// interrupt existing stream
 		if (this.streamState[threadId]?.isRunning) {
@@ -4383,10 +4624,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 		this._setThreadLastUsedModelSelection(threadId, modelProps.modelSelection)
 
-		this._wrapRunAgentToNotify(
-			this._runChatAgent({ threadId, ...modelProps, }),
-			threadId,
-		)
+		const run = this._runChatAgent({ threadId, ...modelProps, })
+		// A caller that takes the promise over owns what happens when it settles. That
+		// is how the delegation path awaits a child: it must not fire a "Void finished"
+		// notification for a thread the user never opened, and its own tool result is
+		// the answer the run produces.
+		if (onRun) {
+			onRun(run)
+			return
+		}
+		this._wrapRunAgentToNotify(run, threadId)
 	}
 
 
@@ -5121,6 +5368,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		for (const threadId in currentThreads) {
 			const t = currentThreads[threadId]
 			if (!t || t.messages.length !== 0) continue
+			// A child is not the user's chat. It is empty only between creation and
+			// the task message landing, but that window is real, and adopting the child
+			// as the new tab would hand the user a thread that reports to a parent.
+			if (isChildThread(t)) continue
 			// Skip threads whose messages haven't been loaded — they might
 			// have messages in storage that just aren't in memory yet.
 			if (!this._loadedMessageThreadIds.has(threadId)) continue
@@ -6201,3 +6452,29 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 }
 
 registerSingleton(IChatThreadService, ChatThreadService, InstantiationType.Eager);
+
+// The single implementation of `IDelegationService`, forwarding straight to the
+// chat service. It lives in this file because forwarding is all it is, and because
+// living anywhere else would mean importing `IChatThreadService` from a module
+// this one imports — `common/delegationService.ts` carries the long version.
+class DelegationService implements IDelegationService {
+
+	readonly _serviceBrand: undefined;
+
+	constructor(
+		@IChatThreadService private readonly _chatThreadService: IChatThreadService,
+	) { }
+
+	startSubagent(request: RunSubagentRequest): StartedSubagent {
+		return this._chatThreadService.startSubagent(request)
+	}
+
+	interruptSubagent(childThreadId: string): void {
+		this._chatThreadService.interruptSubagent(childThreadId)
+	}
+}
+
+// Delayed, not Eager: this one resolves `IChatThreadService`, and the tools service
+// is built eagerly with the chat service — so constructing it at startup would
+// close a dependency cycle the first delegation does not need.
+registerSingleton(IDelegationService, DelegationService, InstantiationType.Delayed);

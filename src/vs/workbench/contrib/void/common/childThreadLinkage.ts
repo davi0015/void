@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import type { ThreadPermissionMode } from './toolsServiceTypes.js'
+import type { LLMUsage } from './sendLLMMessageTypes.js'
 
 // What makes a thread a child of another thread, and what a child inherits.
 //
@@ -41,6 +42,26 @@ import type { ThreadPermissionMode } from './toolsServiceTypes.js'
  * contract the parent reads, and a status added later would be a contract change.
  */
 export type SubagentStatus = 'done' | 'blocked' | 'budget_exceeded' | 'error' | 'rejected'
+
+/**
+ * What the parent receives back from a delegation. This is where isolation is
+ * enforced, so every field is bounded and none of them is a transcript: the
+ * child's messages, tool results and reasoning never cross. `summary` is the only
+ * text, and the caller caps its length.
+ *
+ * `filesTouched` is derived from the child's *successful* write tools, so a
+ * rejected or failed edit is not reported as a change. `usage` is the child's
+ * lifetime spend, which is what the parent's cost rollup adds to its own figure —
+ * populated here even while the rollup itself is not yet wired.
+ */
+export type SubagentOutcome = {
+	status: SubagentStatus
+	summary: string
+	filesTouched: string[]
+	childThreadId: string
+	usage?: LLMUsage
+	error?: string
+}
 
 /**
  * Deepest delegation the product allows: a top-level thread may spawn children,

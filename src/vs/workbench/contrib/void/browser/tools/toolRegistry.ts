@@ -1,4 +1,4 @@
-import { BuiltinToolName, approvalTypeOfBuiltinToolName } from '../../common/toolsServiceTypes.js'
+import { BuiltinToolName, approvalTypeOfBuiltinToolName, delegationToolNames } from '../../common/toolsServiceTypes.js'
 import { InternalToolInfo, builtinToolNames } from '../../common/prompt/prompts.js'
 import { ChatMode } from '../../common/voidSettingsTypes.js'
 import { ToolDefinitionCore } from './toolTypes.js'
@@ -25,6 +25,7 @@ import { fetchUrlToolCore } from './fetchUrl.tool.js'
 import { semanticSearchToolCore } from './semanticSearch.tool.js'
 import { searchHistoryToolCore } from './searchHistory.tool.js'
 import { loadSkillToolCore } from './loadSkill.tool.js'
+import { runSubagentToolCore } from './runSubagent.tool.js'
 
 
 export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDefinitionCore<T> }> = {
@@ -51,6 +52,7 @@ export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDef
 	semantic_search: semanticSearchToolCore,
 	search_history: searchHistoryToolCore,
 	load_skill: loadSkillToolCore,
+	run_subagent: runSubagentToolCore,
 }
 
 
@@ -63,9 +65,14 @@ export const isConvertedTool = (toolName: BuiltinToolName): boolean => {
 // (name, description, params) is sourced from the per-file registry — no more
 // duplicated descriptions in prompts.ts. MCP tools are only included in agent
 // mode.
+//
+// `gather` keeps everything that needs no approval, which is what makes it a
+// read-only mode — but delegation needs no approval either and is *not* read-only,
+// because a child may write. `delegationToolNames` is therefore excluded
+// explicitly rather than left to fall through the approval filter.
 export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined): InternalToolInfo[] | undefined => {
 	const builtinNames: BuiltinToolName[] | undefined = chatMode === 'normal' ? undefined
-		: chatMode === 'gather' ? builtinToolNames.filter(toolName => !(toolName in approvalTypeOfBuiltinToolName))
+		: chatMode === 'gather' ? builtinToolNames.filter(toolName => !(toolName in approvalTypeOfBuiltinToolName) && !delegationToolNames.has(toolName))
 			: chatMode === 'agent' ? builtinToolNames
 				: undefined
 
