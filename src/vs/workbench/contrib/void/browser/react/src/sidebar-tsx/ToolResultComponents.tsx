@@ -564,6 +564,17 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 				desc1Info: toolParams.line !== null ? `${filePart}:${toolParams.line}` : filePart,
 			}
 		},
+		'run_subagent': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['run_subagent']
+			// The alias is what the parent called the child, so it is the useful thing on
+			// the row. The task follows as secondary text, cut because it is a paragraph
+			// and this line is not.
+			const task = toolParams.task ?? ''
+			return {
+				desc1: `"${toolParams.alias}"`,
+				desc1Info: task.length > 120 ? `${task.slice(0, 120)}…` : task,
+			}
+		},
 	}
 
 	try {
@@ -1877,6 +1888,50 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 					<SmallProseWrapper>
 						<ChatMarkdownRender string={preview} chatMessageLocation={undefined} isApplyEnabled={false} />
 					</SmallProseWrapper>
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		},
+	},
+	'run_subagent': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const title = getTitle(toolMessage)
+			const icon = null
+
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
+
+			const result = toolMessage.type === 'success' ? toolMessage.result : undefined
+
+			// A delegation whose run completed but whose child did not *finish* — blocked on
+			// approval, errored, stopped — is not a success to the reader, even though the
+			// tool call itself returned a result. Colouring it like the other tool errors is
+			// what makes "that one stopped" visible without opening the row.
+			const isError = toolMessage.type === 'tool_error' || (result !== undefined && result.status !== 'done')
+			const isRejected = toolMessage.type === 'rejected'
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (result) {
+				// The child's own thread is not linked from here yet: opening a child as a
+				// thread is the rendering step, and a link to a thread the sidebar cannot
+				// show would be a dead end. The report itself is what the row is for.
+				const filesLine = result.filesTouched.length > 0
+					? `Changed: ${result.filesTouched.join(', ')}`
+					: undefined
+				componentParams.bottomChildren = <BottomChildren title='Subagent report'>
+					<div className='flex flex-col gap-1'>
+						{result.status !== 'done' && (
+							<div className='text-xs text-void-warning'>Stopped: {result.status}</div>
+						)}
+						<SmallProseWrapper>
+							<ChatMarkdownRender string={result.summary} chatMessageLocation={undefined} isApplyEnabled={false} />
+						</SmallProseWrapper>
+						{filesLine && <div className='text-xs text-void-fg-4'>{filesLine}</div>}
+					</div>
 				</BottomChildren>
 			}
 
