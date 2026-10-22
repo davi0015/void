@@ -77,12 +77,18 @@ approvalType: ToolApprovalType | undefined
 // --- Backend ---
 validateParams: (raw: RawToolParamsObj, ctx: ToolCtx) => BuiltinToolCallParams[T]
 
-// `threadId` is the thread this call is executing for. Required, so a tool that
-// needs the conversation it belongs to has it in hand and cannot be tempted to
-// ask for the current thread instead — and so the registry cannot forget to pass
-// one. Only this function takes it: `validateParams` and `stringOfResult` parse
-// and format rather than act, and neither has ever needed to know the thread.
-callTool: (params: BuiltinToolCallParams[T], ctx: ToolCtx, threadId: string) => Promise<{
+// `threadId` is the thread this call is executing for; `toolCallId` is this call's
+// own id. Both are required arguments rather than fields of `ToolCtx`, for the
+// same reason: each varies per call while everything in the context outlives it.
+// `threadId` exists so a tool that needs the conversation it belongs to has it in
+// hand and cannot be tempted to ask for the current thread instead (the current
+// thread is the one on screen, which is a different thread as soon as two are
+// running at once). `toolCallId` exists so a tool that creates something the
+// parent must be able to link back — `run_subagent` records it on the child thread
+// — does not have to guess it. Only `callTool` takes either: `validateParams` and
+// `stringOfResult` parse and format rather than act, and neither has ever needed
+// to know the thread.
+callTool: (params: BuiltinToolCallParams[T], ctx: ToolCtx, threadId: string, toolCallId: string) => Promise<{
 result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>
 interruptTool?: () => void
 }>

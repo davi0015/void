@@ -26,13 +26,14 @@ import { validateURIWithRoot, validateOptionalURIWithRoot } from './tools/toolHe
 // tool use for AI
 //
 // `callTool` is the only one of these that takes the id of the thread the call is
-// executing *for*. It is the only one that acts on the world; the other two parse
-// params and format a result, and neither reads the thread. The id is a required
-// argument so a caller cannot forget it, and the caller is the agent loop, which
-// holds a thread id and nothing else — `ToolCtx` is assembled here from the
-// services this class was given, so the chat service could not build one.
+// executing *for*, and the id of the call itself. It is the only one that acts on
+// the world; the other two parse params and format a result, and neither reads the
+// thread. Both are required arguments so a caller cannot forget them, and the
+// caller is the agent loop, which holds a thread id and a tool id and nothing
+// else — `ToolCtx` is assembled here from the services this class was given, so
+// the chat service could not build one.
 type ValidateBuiltinParams = { [T in BuiltinToolName]: (p: RawToolParamsObj) => BuiltinToolCallParams[T] }
-type CallBuiltinTool = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T], threadId: string) => Promise<{ result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>, interruptTool?: () => void }> }
+type CallBuiltinTool = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T], threadId: string, toolCallId: string) => Promise<{ result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>, interruptTool?: () => void }> }
 type BuiltinToolResultToString = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T], result: Awaited<BuiltinToolResultType[T]>) => string }
 
 
@@ -126,7 +127,7 @@ export class ToolsService implements IToolsService {
 			[name, (raw: RawToolParamsObj) => def.validateParams(raw, toolCtx)]
 		)) as ValidateBuiltinParams
 		this.callTool = Object.fromEntries(entries.map(([name, def]) =>
-			[name, (params: never, threadId: string) => def.callTool(params, toolCtx, threadId)]
+			[name, (params: never, threadId: string, toolCallId: string) => def.callTool(params, toolCtx, threadId, toolCallId)]
 		)) as CallBuiltinTool
 		this.stringOfResult = Object.fromEntries(entries.map(([name, def]) =>
 			[name, (params: never, result: never) => def.stringOfResult(params, result, toolCtx)]
