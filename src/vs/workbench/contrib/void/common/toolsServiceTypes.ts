@@ -60,6 +60,27 @@ export const toolApprovalTypes = new Set<ToolApprovalType>([
 // that can write. The mode is `agent`'s alone because delegation *is* acting.
 export const delegationToolNames = new Set<BuiltinToolName>(['run_subagent', 'send_message', 'list_children'])
 
+/**
+ * Whether a chat mode may use one builtin tool.
+ *
+ * Pure and here rather than beside `availableTools` in `browser/`, because it is the
+ * one rule in tool selection that can be wrong in a way nobody sees: `gather` is
+ * read-only by construction — it keeps every tool that needs no approval — and
+ * delegation needs no approval, so a child spawned from `gather` would hand a
+ * read-only mode the ability to write. A rule that decides that has to be testable
+ * without a running workbench.
+ *
+ * `normal` has no tools at all: it is the chat-only mode.
+ */
+export const isToolAvailableInChatMode = (
+	toolName: BuiltinToolName,
+	chatMode: 'agent' | 'gather' | 'normal',
+): boolean => {
+	if (chatMode === 'agent') return true
+	if (chatMode === 'normal') return false
+	return !(toolName in approvalTypeOfBuiltinToolName) && !delegationToolNames.has(toolName)
+}
+
 
 // Auto-approve mode per tier. Tri-state:
 //   'off'       — always prompt

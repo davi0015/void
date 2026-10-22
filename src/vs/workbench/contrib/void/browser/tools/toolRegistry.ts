@@ -1,4 +1,4 @@
-import { BuiltinToolName, approvalTypeOfBuiltinToolName, delegationToolNames } from '../../common/toolsServiceTypes.js'
+import { BuiltinToolName, isToolAvailableInChatMode } from '../../common/toolsServiceTypes.js'
 import { InternalToolInfo, builtinToolNames } from '../../common/prompt/prompts.js'
 import { ChatMode } from '../../common/voidSettingsTypes.js'
 import { ToolDefinitionCore } from './toolTypes.js'
@@ -69,15 +69,17 @@ export const isConvertedTool = (toolName: BuiltinToolName): boolean => {
 // duplicated descriptions in prompts.ts. MCP tools are only included in agent
 // mode.
 //
-// `gather` keeps everything that needs no approval, which is what makes it a
-// read-only mode — but delegation needs no approval either and is *not* read-only,
-// because a child may write. `delegationToolNames` is therefore excluded
-// explicitly rather than left to fall through the approval filter.
+// Which names a mode may use is `isToolAvailableInChatMode` (in `common/`, because
+// it is a rule rather than a lookup and the node tier covers it). This function is
+// only the part that needs the registry: turning names into definitions.
 export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined): InternalToolInfo[] | undefined => {
-	const builtinNames: BuiltinToolName[] | undefined = chatMode === 'normal' ? undefined
-		: chatMode === 'gather' ? builtinToolNames.filter(toolName => !(toolName in approvalTypeOfBuiltinToolName) && !delegationToolNames.has(toolName))
-			: chatMode === 'agent' ? builtinToolNames
-				: undefined
+	const availableNames = chatMode === null
+		? undefined
+		: builtinToolNames.filter(toolName => isToolAvailableInChatMode(toolName, chatMode))
+	// "This mode has no tools" is `undefined` to the rest of the pipeline, and `normal`
+	// filters down to nothing — so normalise empty to absent rather than handing on an
+	// empty array that reads as a mode with a tool list.
+	const builtinNames: BuiltinToolName[] | undefined = availableNames && availableNames.length > 0 ? availableNames : undefined
 
 	const effectiveBuiltinTools = builtinNames?.map(name => {
 		const def = toolDefinitionOfToolName[name]!
