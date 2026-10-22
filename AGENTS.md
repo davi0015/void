@@ -187,6 +187,19 @@ Reuse it. Do not rebuild launch plumbing per test.
   check `git status` — if the React change is real, the only tracked file that moves is under
   `react/src/`. A comment-only React edit should leave `out/` byte-identical; that is a cheap way to
   prove the edit was inert.
+- **`npm run buildreact` alone does not put the UI into the running app.** The app imports
+  `./react/out/sidebar-tsx/index.js` relative to the compiled file, so it loads the *copy* under
+  `out/vs/workbench/contrib/void/browser/react/out/`, which `gulp compile` made when it last ran.
+  Rebuild the bundles and the app still runs the previous ones, silently — the test then asserts on UI
+  that no longer exists. Copy `src/.../react/out/` over `out/.../react/out/` (or recompile) after
+  `buildreact`, and confirm with `grep -c run_subagent out/.../react/out/sidebar-tsx/index.js`. This
+  cost two end-to-end runs before it was spotted.
+- **A new tool name needs a UI entry, and nothing will tell you.** `builtinToolNameToComponent` and
+  `toolNameToDesc` (`ToolResultComponents.tsx`) are exhaustive over `BuiltinToolName`, but `.tsx` is
+  outside `src/tsconfig.json`'s `include`, so neither `gulp compile` nor CI type-checks them.
+  `SidebarChat.tsx` reads the map with `?.`, so a missing entry renders **nothing** rather than
+  failing: the tool call vanishes from the transcript and every test still passes. Add the entry, and
+  assert the row renders.
 - **Preparatory work has a test.** A change qualifies only if a user hits the problem today with a
   single agent *and* it removes a multiagent blocker. `AgentDefinition` is the instructive case: the
   type and the loop parameterization are safe, the file format is deferred.

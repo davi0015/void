@@ -170,6 +170,27 @@ describe('subagent delegation', () => {
 			// rather than a transcript the parent happens to have dropped.
 			assert.equal(child.resultStatus, 'done')
 			assert.ok(child.resultSummary?.includes('CHILD-REPORT'), 'the child did not persist its own result summary')
+
+			// And the row has to render at all. `builtinToolNameToComponent` is exhaustive
+			// over builtin tool names, and a name with no entry renders nothing — leaving a
+			// hole in the transcript exactly where the delegation happened. This asserts
+			// presence, not appearance: the harness has no opinion on how it looks.
+			const dom = await s.page.evaluate((alias) => {
+				const text = document.body.textContent ?? ''
+				return {
+					hasParentMarker: text.includes('PARENT-MARKER'),
+					hasDelegated: text.includes('Delegated'),
+					hasAlias: text.includes(alias),
+					tail: text.slice(-900).replace(/\s+/g, ' '),
+				}
+			}, ALIAS)
+			t.diagnostic(`DOM: parentMarker=${dom.hasParentMarker} delegated=${dom.hasDelegated} alias=${dom.hasAlias}; tail: ${dom.tail}`)
+
+			// Guard: the transcript is rendered at all, so a missing row is about the row and
+			// not about the chat never having painted.
+			assert.ok(dom.hasParentMarker, 'the transcript itself is not in the DOM — the fixture never painted')
+			assert.ok(dom.hasDelegated, 'the delegation row did not render in the chat')
+			assert.ok(dom.hasAlias, 'the delegation row did not show the child\'s alias')
 		})
 	})
 
