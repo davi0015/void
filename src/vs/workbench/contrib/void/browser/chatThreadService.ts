@@ -4512,6 +4512,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const clean = (s: string) => truncate(s.replace(/\s+/g, ' ').trim(), 60, '...')
 		const customTitle = thread.customTitle?.trim()
 		if (customTitle) return clean(customTitle)
+		// A child is named by its parent: its first user message is the task, which is a
+		// paragraph, and the notification already carries the first eighty characters of
+		// the *parent's* question on its subtitle line.
+		if (thread.alias) return clean(thread.alias)
 		const firstUser = thread.messages.find(m => m.role === 'user')
 		if (firstUser?.role === 'user' && firstUser.displayContent) return clean(firstUser.displayContent)
 		return thread.title ? clean(thread.title) : 'New Chat'

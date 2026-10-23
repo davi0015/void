@@ -1061,19 +1061,34 @@ export type ResultWrapper<T extends ToolName> = (props: WrapperProps<T>) => Reac
  * by the caller: the tool call succeeded, but "the child stopped to ask for
  * permission" is not a success to the reader.
  */
-const SubagentReportChildren = ({ result }: { result: SubagentOutcome }) => (
-	<div className='flex flex-col gap-1'>
-		{result.status !== 'done' && (
-			<div className='text-xs text-void-warning'>Stopped: {result.status}</div>
-		)}
-		<SmallProseWrapper>
-			<ChatMarkdownRender string={result.summary} chatMessageLocation={undefined} isApplyEnabled={false} />
-		</SmallProseWrapper>
-		{result.filesTouched.length > 0 && (
-			<div className='text-xs text-void-fg-4'>Changed: {result.filesTouched.join(', ')}</div>
-		)}
-	</div>
-)
+const SubagentReportChildren = ({ result }: { result: SubagentOutcome }) => {
+	const accessor = useAccessor()
+	const chatThreadsService = accessor.get('IChatThreadService')
+
+	return (
+		<div className='flex flex-col gap-1'>
+			{result.status !== 'done' && (
+				<div className='text-xs text-void-warning'>Stopped: {result.status}</div>
+			)}
+			<SmallProseWrapper>
+				<ChatMarkdownRender string={result.summary} chatMessageLocation={undefined} isApplyEnabled={false} />
+			</SmallProseWrapper>
+			{result.filesTouched.length > 0 && (
+				<div className='text-xs text-void-fg-4'>Changed: {result.filesTouched.join(', ')}</div>
+			)}
+			{/* The child's conversation is a real thread, stored like any other — the row's
+			    value is that a reader can check *why* the child concluded what it did
+			    without that reasoning having to sit in the parent's context. */}
+			<button
+				className='self-start text-xs text-void-fg-4 underline decoration-dotted hover:text-void-fg-1'
+				onClick={() => chatThreadsService.switchToThread(result.childThreadId)}
+				title={"Open the subagent's own conversation. It is a normal thread; your context never saw it."}
+			>
+				Open transcript
+			</button>
+		</div>
+	)
+}
 
 export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: ResultWrapper<T>, } } = {
 	'read_file': {

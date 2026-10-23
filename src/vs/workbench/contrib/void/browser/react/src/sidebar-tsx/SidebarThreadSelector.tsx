@@ -11,6 +11,7 @@ import { StatusIndicator } from '../markdown/ApplyBlockHoverButtons.js';
 import { Check, ChevronDown, ChevronRight, Copy, Globe, Icon, LoaderCircle, Lock, Plus, Trash2, UserCheck, X } from 'lucide-react';
 import { isThreadReadOnly, IsRunningType, ThreadType } from '../../../chatThreadService.js';
 import { Separator } from '../../../../../../../base/common/actions.js';
+import { threadLabelOf } from './sidebarChatHelpers.js';
 
 
 const numInitialThreads = 3
@@ -64,6 +65,10 @@ const partitionThreadsByWorkspaceScope = (
 		.filter(id => {
 			const t = allThreads[id]
 			if (!t) return false
+			// A subagent's thread is not a conversation the user started, so listing it
+			// beside their own makes the list lie about what they did — and it is reached
+			// from the tool row that spawned it, which is where it belongs.
+			if (t.parentThreadId !== undefined) return false
 			// With lazy message loading, non-active threads have messages: []
 			// in memory. Use lastModified vs createdAt to detect used threads.
 			if (t.messages.length > 0) return true // messages loaded — has content
@@ -384,25 +389,11 @@ const PastThreadElement = ({ pastThread, idx, hoveredIdx, setHoveredIdx, isRunni
 	// 	toolTipName={`Copy As Void Chat`}
 	// />
 
-	// Same label cascade as the tab strip: user-set custom title beats the
-	// auto-derived first-user-message text. Keeps the two surfaces in sync
-	// when the user renames a tab — the history entry follows.
-	let firstMsg = null;
-	const customTitle = pastThread.customTitle?.trim();
-	if (customTitle) {
-		firstMsg = customTitle;
-	} else {
-		const firstUserMsgIdx = pastThread.messages.findIndex((msg) => msg.role === 'user');
-		if (firstUserMsgIdx !== -1) {
-			const firsUsertMsgObj = pastThread.messages[firstUserMsgIdx];
-			firstMsg = firsUsertMsgObj.role === 'user' && firsUsertMsgObj.displayContent || '';
-		} else if (pastThread.title) {
-			// Messages not loaded (lazy loading) — use ephemeral title
-			firstMsg = pastThread.title;
-		} else {
-			firstMsg = '""';
-		}
-	}
+	// Same precedence as the tab strip, from one place rather than two copies that had
+	// already drifted: a rename, then a child's alias, then the first user message. With
+	// lazy loading an unopened thread has no messages in memory, which is why the
+	// ephemeral metadata title is the last fallback rather than the first.
+	const firstMsg = threadLabelOf(pastThread)
 
 	// With lazy loading, non-active threads have messages: []. Don't show
 	// a misleading "0" — hide the count until messages are loaded.
@@ -895,12 +886,9 @@ export const SidebarThreadTabs = React.memo(() => {
 					// otherwise "New Chat" so empty threads aren't blank. The
 					// custom title is editable via double-click or right-click →
 					// Rename. Whitespace-only customTitle resets to default.
-					const customTitle = t.customTitle?.trim()
-					const firstUser = t.messages.find(m => m.role === 'user')
-					const firstMsgLabel = firstUser && firstUser.role === 'user' && firstUser.displayContent
-						? firstUser.displayContent
-						: (t.title || 'New Chat')
-					const label = customTitle || firstMsgLabel
+					// One order of precedence for every surface that names a thread; see
+					// `threadLabelOf`. A rename wins, then a child's alias, then the first message.
+					const label = threadLabelOf(t)
 					const isEditingThis = editingThreadId === id
 
 					// Truncate the tooltip body. The visible tab label is already clipped

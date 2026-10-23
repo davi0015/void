@@ -6,7 +6,41 @@
 import React, { useEffect, useState } from 'react';
 import { URI } from '../../../../../../../base/common/uri.js';
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
-import { useAccessor } from '../util/services.js';
+import { useAccessor } from '../util/services.js';/**
+ * What to call a thread in a tab, a history row, or a notification.
+ *
+ * A child thread's name is the alias its parent coined: "tester" says *which*
+ * delegate this is, where the task text repeats a paragraph the user has already
+ * read in the parent's transcript. A `customTitle` still wins, because a rename is
+ * deliberate.
+ *
+ * Structural rather than `ThreadType`, and in this file rather than in either list,
+ * because the tab strip, the history list and the notification title each had their
+ * own copy of the cascade and had already drifted once.
+ */
+export const threadLabelOf = (thread: {
+	customTitle?: string,
+	alias?: string,
+	title?: string,
+	messages?: readonly { role: string, displayContent?: string }[],
+} | undefined): string => {
+	if (!thread) return 'New Chat'
+
+	const customTitle = thread.customTitle?.trim()
+	if (customTitle) return customTitle
+
+	// Children are named by their parent, not by their first message. Before the
+	// fallbacks: a child's task is usually a paragraph, and a tab is ~110px wide.
+	if (thread.alias) return thread.alias
+
+	const firstUser = thread.messages?.find(m => m.role === 'user')
+	if (firstUser?.displayContent) return firstUser.displayContent
+
+	// Messages not loaded (lazy loading) — the ephemeral title is all there is.
+	return thread.title || 'New Chat'
+}
+
+
 
 
 export const IconLoading = ({ className = '' }: { className?: string }) => {

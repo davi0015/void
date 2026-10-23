@@ -31,10 +31,10 @@ import { VSBuffer } from '../../../../../../../base/common/buffer.js';
 
 import { approvalTypeOfBuiltinToolName, normalizeThreadPermissionMode, threadPermissionModes, ThreadPermissionMode, type ToolName } from '../../../../common/toolsServiceTypes.js';
 import { IconShell1, StatusIndicator } from '../markdown/ApplyBlockHoverButtons.js';
-import { IsRunningType, isThreadReadOnly, shouldShowOwnershipBanner } from '../../../chatThreadService.js';
+import { IsRunningType, isThreadReadOnly, shouldShowOwnershipBanner, ThreadType } from '../../../chatThreadService.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
 import { isABuiltinToolName } from '../../../../common/prompt/prompts.js';
-import { getBasename, getFolderName, getRelative, voidOpenFileFn, IconLoading, SmallProseWrapper } from './sidebarChatHelpers.js';
+import { getBasename, getFolderName, getRelative, voidOpenFileFn, IconLoading, SmallProseWrapper, threadLabelOf } from './sidebarChatHelpers.js';
 import { toolDefinitionOfToolName } from '../../../tools/toolRegistry.js';
 import { type LLMUsage, RawToolCallObj } from '../../../../common/sendLLMMessageTypes.js';
 import ErrorBoundary from './ErrorBoundary.js';
@@ -1965,6 +1965,40 @@ const ReasoningWrapper = ({ isDoneReasoning, isStreaming, children }: { isDoneRe
 // Until they choose, every mutation entry on the service is gated
 // (commit 3) — the banner is the explicit user-facing path out of
 // read-only mode.
+/**
+ * The banner above a subagent's conversation.
+ *
+ * A child thread is a real thread — it opens, reloads, and can be read later — and the
+ * one thing it cannot say for itself is where it came from. Without this, a user who
+ * followed "Open transcript" lands in a conversation with no visible parent and no way
+ * back except the tab strip, and every later read repeats that.
+ *
+ * It deliberately does not offer to message the child: that is the parent agent's job,
+ * and a user typing here is talking to the child directly, which the input already does.
+ */
+const ChildThreadBanner = ({ thread, parentLabel }: { thread: ThreadType, parentLabel: string }) => {
+	const accessor = useAccessor()
+	const chatThreadsService = accessor.get('IChatThreadService')
+	const parentThreadId = thread.parentThreadId
+
+	if (!parentThreadId) return null
+
+	return (
+		<div className='mx-3 my-2 px-3 py-2 rounded border border-void-stroke-1 bg-void-bg-3 text-xs flex items-center gap-2 text-void-fg-3'>
+			<Brain size={12} className='flex-shrink-0' />
+			<span className='truncate'>
+				Subagent <span className='opacity-90 font-medium'>{thread.alias ?? '(unnamed)'}</span> — a separate conversation, started by an agent
+			</span>
+			<button
+				className='ml-auto flex-shrink-0 underline decoration-dotted hover:text-void-fg-1'
+				onClick={() => chatThreadsService.switchToThread(parentThreadId)}
+				title={`Back to ${parentLabel}`}
+			>
+				Back to parent
+			</button>
+		</div>
+	)
+}
 const ReadOnlyForeignThreadBanner = ({ ownerLabel, isUnscoped, threadId }: { ownerLabel: string, isUnscoped: boolean, threadId: string }) => {
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
@@ -3822,7 +3856,9 @@ export const SidebarChat = () => {
 			{landingPageInput}
 		</ErrorBoundary>
 
-		{Object.keys(chatThreadsState.allThreads).length > 1 ? // show if there are threads
+		{/* Children are not listed here, so they must not encourage the list either: one
+		    of the user's own threads plus a subagent is still the first-run case. */}
+		{Object.values(chatThreadsState.allThreads).filter(t => !!t && t.parentThreadId === undefined).length > 1 ? // show if there are threads
 			<ErrorBoundary>
 				<div className='pt-8 mb-2 text-void-fg-3 text-root select-none pointer-events-none'>Previous Threads</div>
 				<PastThreadsList />
@@ -3874,6 +3910,15 @@ export const SidebarChat = () => {
 		/>
 	) : null
 
+	// A child thread says where it came from, because nothing else in the UI does. The
+	// parent's label is the tab/history label, so the two agree.
+	const childThreadBanner = (currentThread?.parentThreadId && currentThread) ? (
+		<ChildThreadBanner
+			thread={currentThread}
+			parentLabel={threadLabelOf(chatThreadsState.allThreads[currentThread.parentThreadId])}
+		/>
+	) : null
+
 	const threadPageContent = <div
 		ref={sidebarRef}
 		className='w-full h-full flex flex-col overflow-hidden'
@@ -3884,6 +3929,11 @@ export const SidebarChat = () => {
 		{readOnlyBanner && (
 			<ErrorBoundary>
 				{readOnlyBanner}
+			</ErrorBoundary>
+		)}
+		{childThreadBanner && (
+			<ErrorBoundary>
+				{childThreadBanner}
 			</ErrorBoundary>
 		)}
 		<ErrorBoundary>

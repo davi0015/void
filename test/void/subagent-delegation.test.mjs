@@ -402,6 +402,53 @@ describe('subagent delegation', () => {
 		})
 	})
 
+	test('a subagent\'s conversation opens from the row and says where it came from', async (t) => {
+		await h.withScenario('subagent/transcript', async (s) => {
+			const parent = await scenario(s.page)
+			const out = await delegateFrom(s.page, { threadId: parent.id, alias: ALIAS, task: CHILD_MARKER, toolId: 'call-open-1' })
+			assert.equal(out.children.length, 1, 'the fixture did not create a child')
+			const childId = out.children[0].id
+
+			// The way in exists. Asserted on the DOM because a missing UI entry renders
+			// nothing at all, and every state assertion above would still pass.
+			assert.ok(await domHas(s.page, 'Open transcript'), 'the delegation row has no transcript link')
+
+			// Guard: spawning is the agent's act, so a child must not arrive as a tab. A
+			// fan-out that pinned every child is the "strip of tabs" collapse.
+			const before = await s.page.evaluate(() => [...globalThis.__voidChatThreadService.state.pinnedThreadIds])
+			assert.equal(before.includes(childId), false, 'the child was pinned at spawn')
+
+			// Exactly what the row's link does: `switchToThread`, which is the
+			// user-initiated path and therefore pins.
+			const opened = await s.page.evaluate((id) => {
+				const svc = globalThis.__voidChatThreadService
+				svc.switchToThread(id)
+				return { currentThreadId: svc.state.currentThreadId, pinned: [...svc.state.pinnedThreadIds] }
+			}, childId)
+
+			assert.equal(opened.currentThreadId, childId, 'the link did not switch to the child')
+			assert.equal(opened.pinned.includes(childId), true, 'the opened child has no tab — there would be no way back')
+
+			// The banner: a badge, the name the parent coined, and a way back.
+			assert.ok(await domHas(s.page, 'Subagent'), 'the child banner did not render')
+			assert.ok(await domHas(s.page, ALIAS), 'the child banner did not name the subagent')
+			assert.ok(await domHas(s.page, 'Back to parent'), 'the child banner has no way back')
+
+			// And the conversation itself — the thing the whole feature exists to let you
+			// audit without costing the parent any context.
+			assert.ok(await domHas(s.page, CHILD_REPORT), 'the child\'s own conversation did not render')
+
+			// Back to the parent, the way the banner does it.
+			const back = await s.page.evaluate((id) => {
+				const svc = globalThis.__voidChatThreadService
+				svc.switchToThread(id)
+				return svc.state.currentThreadId
+			}, parent.id)
+			assert.equal(back, parent.id, 'could not return to the parent')
+			assert.equal(await domHas(s.page, 'Back to parent'), false, 'the child banner still renders on the parent thread')
+		})
+	})
+
 	test('a child thread and its linkage survive a restart', async (t) => {
 		// Two sessions on one profile: the point is that the child is durable like any
 		// other thread, because a delegation whose result cannot be read again is not a
