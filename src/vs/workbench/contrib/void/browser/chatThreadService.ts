@@ -43,7 +43,7 @@ import { basename as resourceBasename, joinPath } from '../../../../base/common/
 import { IUserDataProfileService } from '../../../services/userDataProfile/common/userDataProfile.js';
 import { isThreadImageUri, threadImageDir, threadImageUri } from '../common/threadImagePaths.js';
 import { deepCloneWithUris } from '../common/deepCloneWithUris.js';
-import { ChildThreadSeed, ChildThreadSummary, childThreadSeedOf, SubagentOutcome, SubagentStatus, isChildThread } from '../common/childThreadLinkage.js';
+import { ChildThreadSeed, ChildThreadSummary, childThreadSeedOf, SubagentOutcome, SubagentStatus, isChildThread, withSubagentPreamble } from '../common/childThreadLinkage.js';
 import { IDelegationService, ContinueSubagentRequest, RunSubagentRequest, StartedSubagent } from '../common/delegationService.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
@@ -561,7 +561,12 @@ const newThreadObject = (workspace?: { uri?: string, label?: string }, child?: C
 		alias: child.alias,
 		delegationDepth: child.delegationDepth,
 	} : {}
-	if (child?.frozenAiInstructions !== undefined) linkage.frozenAiInstructions = child.frozenAiInstructions
+	// The child's copy of the prompt ends with the subagent framing — who is reading
+	// this — either here, when the parent had already frozen its own, or at freeze time
+	// below when it had not. Either way it is appended exactly once.
+	if (child?.frozenAiInstructions !== undefined) {
+		linkage.frozenAiInstructions = withSubagentPreamble(child.frozenAiInstructions, child.alias)
+	}
 
 	return {
 		id: generateUuid(),
@@ -3584,9 +3589,17 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	private _summaryOfChild(threadId: string): string {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return ''
-		const msg = findLast(thread.messages, m => m.role === 'assistant')
-		if (msg?.role !== 'assistant') return ''
-		return (msg.displayContent ?? '').trim()
+		// The child's **final message with text**, not literally its last message. A run can
+		// end on a tool-only step — an assistant turn whose text is empty because it only
+		// called a tool — and taking that row would hand the parent a blank report for a
+		// child that had answered a step earlier.
+		for (let i = thread.messages.length - 1; i >= 0; i--) {
+			const msg = thread.messages[i]
+			if (msg?.role !== 'assistant') continue
+			const text = (msg.displayContent ?? '').trim()
+			if (text) return text
+		}
+		return ''
 	}
 
 	/**
@@ -4671,7 +4684,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// `read_file .voidrules`.
 		if (thread.frozenAiInstructions === undefined) {
 			const combined = await this._convertToLLMMessagesService.getCombinedAIInstructionsAsync()
-			this._setThreadFrozenAiInstructions(threadId, combined)
+			// A child freezes its own first prompt like any thread, plus the framing that
+			// tells it its final message is the whole result. `newThreadObject` appends the
+			// same text when it inherits a frozen parent, so a child is told once, not twice.
+			const instructions = isChildThread(thread)
+				? withSubagentPreamble(combined, thread.alias)
+				: combined
+			this._setThreadFrozenAiInstructions(threadId, instructions)
 		}
 
 		// Add the user message immediately so the chat bubble appears right away.
@@ -5269,6 +5288,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	switchToThread(threadId: string) {
+		// A child is a preview, not a place: opening one must not add a tab to the strip,
+		// because the strip is the user's own list of threads and a fan-out would fill it
+		// with the agent's conversations. It is reached from the tool row that spawned it
+		// and leaves by the banner's "Back to parent". The workspace's "where I left off"
+		// also stays on the parent, for the same reason.
+		const asChild = this.state.allThreads[threadId]
+		if (isChildThread(asChild)) {
+			this._landOnThread(threadId, { remember: false })
+			return
+		}
 		// User-initiated switch (tab click, history click, etc). Auto-pins
 		// into the *current workspace's* bucket so the thread surfaces in
 		// THIS workspace's tab strip — and only this one. A foreign thread
@@ -5294,17 +5323,17 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// "every refresh adds a new tab" behavior reported during commit-2
 	// testing. Same lastActive + model-restore side-effects as
 	// `switchToThread` so a reload-landing thread still gets remembered.
-	private _landOnThread(threadId: string): void {
+	private _landOnThread(threadId: string, opts?: { remember?: boolean }): void {
 		if (!this.state.allThreads[threadId]) return
 		this._ensureMessagesLoaded(threadId)
 		this._setState({ currentThreadId: threadId })
-		this._afterCurrentThreadChanged(threadId)
+		this._afterCurrentThreadChanged(threadId, opts)
 	}
 
 	// Shared post-switch side-effects for both the pinning and non-pinning
 	// landing paths above. Updates the per-workspace last-active map and
 	// reapplies the saved per-thread model selection.
-	private _afterCurrentThreadChanged(threadId: string): void {
+	private _afterCurrentThreadChanged(threadId: string, opts?: { remember?: boolean }): void {
 		// Visiting a thread marks it read (clears the green unread dot).
 		this.markThreadRead(threadId)
 		// Phase E — remember "last thread looked at in this workspace" so the
@@ -5314,7 +5343,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// thread viewed in read-only mode shouldn't be remembered as the
 		// landing thread for *its* workspace from this window.
 		const wsUri = this.state.currentWorkspaceUri
-		if (wsUri) {
+		if (wsUri && opts?.remember !== false) {
 			if (this._lastActiveThreadIdByWorkspace[wsUri] !== threadId) {
 				this._lastActiveThreadIdByWorkspace[wsUri] = threadId
 				this._storeLastActiveThreadIdByWorkspace()

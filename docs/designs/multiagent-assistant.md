@@ -175,11 +175,13 @@ and the most restrictive reading under the cap.
 
 **There is no `kind` field.** An earlier revision had `kind: 'user' | 'child'`, which was wrong twice over: the two values name different axes — `'user'` says whose thread it is, `'child'` says where it sits structurally — and the fact it encoded was already stored. `kind === 'child'` and `parentThreadId !== undefined` are the same statement, so two encodings could disagree, and one natural disagreement exists: a child whose parent was deleted before cascade lands. Deriving makes that state unrepresentable. "Is this a child?" is `parentThreadId !== undefined`, asked in three places — rendering, retention, and `list_children` — and answered the same way in each.
 
-`newThreadObject` (`chatThreadService.ts:469`) grows an optional `parent` argument. Child creation **inherits** from the parent rather than consulting anything ambient: `workspaceUri` comes from the parent (ambient workspace resolution in a background context is a correctness hazard), `permissionMode` is copied unchanged, the model selection is the parent's, and `frozenAiInstructions` is inherited as-is — no definition body is appended, because there is no definition (§1).
+`newThreadObject` (`chatThreadService.ts`) grows an optional `parent` argument. Child creation **inherits** from the parent rather than consulting anything ambient: `workspaceUri` comes from the parent (ambient workspace resolution in a background context is a correctness hazard), `permissionMode` is copied unchanged, the model selection is the parent's, and `frozenAiInstructions` is inherited — **and then has one paragraph appended** (`subagentPreambleOf`, `common/childThreadLinkage.ts`).
 
-`alias` exists because a UUID is a poor thing to hold across a long conversation. The parent coins it when it spawns the child and uses it in `send_message`, and it is what the child's card shows. It is an ergonomic name, not an identity: `childThreadId` remains the key.
+That paragraph is the one place delegation departs from "the child's system prompt is the parent's", and it is not a role. §1 removed the definition file that would have carried a role; this says who is *reading*. A child is not a second user — its entire output is one message read by an agent that cannot see any of its work — and nothing in the inherited prompt says so. The failure modes of leaving it implicit are quiet and specific: the child writes a plan and stops (the parent reads a plan as a result), or asks a clarifying question (nobody answers, and the question becomes the report), or ends on a tool call and reports nothing. So the framing says all three things — an agent is reading, it sees only your final message, do not ask questions — and asks for a report. It is appended once, at creation or at the child's first freeze, and a continuation does not repeat it.
 
-Children are not added to `pinnedThreadIds` (a UI tab concept), but they are persisted through the existing per-thread storage path so they survive reload and are inspectable. `_isThreadMutationBlocked` and `isThreadReadOnly` apply unchanged.
+`alias` exists because a UUID is a poor thing to hold across a long conversation. The parent coins it when it spawns the child and uses it in `send_message`, and it is what the child's card shows. It is an ergonomic name, not an identity: `childThreadId` remains the key. The framing names it too, which is how a child reading its own prompt knows which delegate it is.
+
+**A child is never a tab.** It is not added to `pinnedThreadIds`, and that is enforced where the decision is made rather than left to callers: `switchToThread` detects a child and takes the non-pinning path, so opening one from its parent's row shows it without adding a strip entry, and the strip keeps the *parent* as the active tab while the preview is on screen. The workspace's "where I left off" stays on the parent for the same reason — a preview is not a place. Children are persisted through the existing per-thread storage path so they survive reload and are inspectable from the row that spawned them, and they are filtered out of the history list: the list is a record of what the user started, and a fan-out is not that. `_isThreadMutationBlocked` and `isThreadReadOnly` apply unchanged.
 
 **Nothing prunes a child.** An earlier revision gave children a retention policy — prunable N days after completion — on the reasoning that they are created at machine rate. That reasoning does not survive contact with the product: user threads already accumulate forever, that has been fine, and no measurement says otherwise. A background deleter that removes conversations the user never asked to lose is a worse default than a large database, and it would be the first destructive policy in the thread layer. Children are durable like any other thread; deleting a parent takes its children with it (later work, alongside cascade), and that is a user action rather than a policy. If thread count ever becomes a measured problem, the fix is chosen from a number, not pre-built.
 
@@ -271,17 +273,24 @@ export type SubagentStatus = 'done' | 'blocked' | 'budget_exceeded' | 'error' | 
 
 export type SubagentOutcome = {
   status: SubagentStatus
-  summary: string           // the ONLY text the parent sees — hard-capped at maxResultTokens
-  filesTouched: string[]    // workspace-relative paths
+  summary: string           // the child's FINAL message — the only text the parent sees,
+                            // hard-capped (12,000 chars, with the `[trimmed — ...]` marker)
+  filesTouched: string[]    // workspace-relative paths, from completed write tools only
   childThreadId: string     // for the UI's "open transcript" link
-  usage: LLMUsage           // rolled up into the parent
+  usage?: LLMUsage          // the child's lifetime spend; the parent's figure gets this turn's
   error?: string
 }
 ```
 
 `stringOfResult` renders this as compact text — Void's convention, where `stringOfResult` returns LLM-facing prose rather than JSON. The parent never receives the child's `messages`, tool results, or reasoning.
 
-A child that exceeds `maxResultTokens` is truncated with an explicit marker rather than silently cut, reusing the `[trimmed — ...]` convention already established for Perf 2 compaction, so the model has a known remedy: ask a narrower follow-up, or read the specific file itself.
+**`summary` is the child's last message that says something**, not literally its last row. An
+agent run can end on a tool-only step — an assistant turn whose text is empty because it only
+called a tool — and taking that row would hand the parent a blank report for a child that had
+answered a step earlier. The framing in §2 is what makes the final message *be* a report
+rather than whatever the child happened to be doing when it stopped.
+
+A child that exceeds the cap is truncated with an explicit marker rather than silently cut, reusing the `[trimmed — ...]` convention already established for Perf 2 compaction, so the model has a known remedy: ask a narrower follow-up, or read the specific file itself.
 
 ### 5. Permissions are inherited, not attenuated
 
