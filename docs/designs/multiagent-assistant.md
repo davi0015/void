@@ -273,8 +273,8 @@ export type SubagentStatus = 'done' | 'blocked' | 'budget_exceeded' | 'error' | 
 
 export type SubagentOutcome = {
   status: SubagentStatus
-  summary: string           // the child's FINAL message — the only text the parent sees,
-                            // hard-capped (12,000 chars, with the `[trimmed — ...]` marker)
+  summary: string           // what the child filed via `report_to_parent`, else its final
+                            // message with text. Verbatim: nothing trims it
   filesTouched: string[]    // workspace-relative paths, from completed write tools only
   childThreadId: string     // for the UI's "open transcript" link
   usage?: LLMUsage          // the child's lifetime spend; the parent's figure gets this turn's
@@ -284,11 +284,13 @@ export type SubagentOutcome = {
 
 `stringOfResult` renders this as compact text — Void's convention, where `stringOfResult` returns LLM-facing prose rather than JSON. The parent never receives the child's `messages`, tool results, or reasoning.
 
-**`summary` is the child's last message that says something**, not literally its last row. An
-agent run can end on a tool-only step — an assistant turn whose text is empty because it only
-called a tool — and taking that row would hand the parent a blank report for a child that had
-answered a step earlier. The framing in §2 is what makes the final message *be* a report
-rather than whatever the child happened to be doing when it stopped.
+**The report is filed, not derived.** A child is offered one tool its parent is not: `report_to_parent({ summary })`, and its argument is what the parent reads. That is the difference between a summary and a digest. Deriving it from the child's last message is wrong in both directions — too much when the child spent the turn thinking out loud and the parent receives its working, too little when the run ends on a tool-only step whose text is empty and a child that answered a step earlier reports nothing. Falling back to the last message *with text* is the safety net for a child that never called the tool, not the mechanism.
+
+**Nothing trims it.** An earlier revision capped the summary at 12,000 characters with the Perf 2 `[trimmed — ...]` marker, on the argument that an unbounded child result multiplies the O(N²) problem. That argument is about paying for a transcript on every turn, and a filed report is not a transcript: the child writes it for the parent, and the tool description asks for exactly what that reader needs. Trimming it would mean the child's deliberate answer is silently cut — worse than a long answer, because the parent cannot tell what it lost. The cost is real and accepted: whatever the child files is re-sent on each of the parent's later turns.
+
+The filed report lives in memory for the run that filed it (`_pendingReportOfThreadId`) rather than on the thread, because a report answers *that* turn: persisting it would let turn one's summary answer turn two's question. The composed outcome is still recorded on the child as `resultSummary`/`resultStatus`, which is what a reader sees after a reload.
+
+A run that did not finish leads with why — `blocked`, `error`, `rejected` — and the child's own words follow it, so a delegation that stopped cannot read as one that completed.
 
 A child that exceeds the cap is truncated with an explicit marker rather than silently cut, reusing the `[trimmed — ...]` convention already established for Perf 2 compaction, so the model has a known remedy: ask a narrower follow-up, or read the specific file itself.
 
