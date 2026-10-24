@@ -27,7 +27,6 @@ import { searchHistoryToolCore } from './searchHistory.tool.js'
 import { loadSkillToolCore } from './loadSkill.tool.js'
 import { runSubagentToolCore } from './runSubagent.tool.js'
 import { listChildrenToolCore, sendMessageToolCore } from './childSteering.tool.js'
-import { reportToParentToolCore } from './reportToParent.tool.js'
 
 
 export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDefinitionCore<T> }> = {
@@ -57,7 +56,6 @@ export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDef
 	run_subagent: runSubagentToolCore,
 	send_message: sendMessageToolCore,
 	list_children: listChildrenToolCore,
-	report_to_parent: reportToParentToolCore,
 }
 
 
@@ -74,11 +72,10 @@ export const isConvertedTool = (toolName: BuiltinToolName): boolean => {
 // Which names a mode may use is `isToolAvailableInChatMode` (in `common/`, because
 // it is a rule rather than a lookup and the node tier covers it). This function is
 // only the part that needs the registry: turning names into definitions.
-export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, isSubagentThread = false): InternalToolInfo[] | undefined => {
+export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined): InternalToolInfo[] | undefined => {
 	const availableNames = chatMode === null
 		? undefined
-		// `isSubagentThread` decides the tools only a child has; see `subagentOnlyToolNames`.
-		: builtinToolNames.filter(toolName => isToolAvailableInChatMode(toolName, chatMode, isSubagentThread))
+		: builtinToolNames.filter(toolName => isToolAvailableInChatMode(toolName, chatMode))
 	// "This mode has no tools" is `undefined` to the rest of the pipeline, and `normal`
 	// filters down to nothing — so normalise empty to absent rather than handing on an
 	// empty array that reads as a mode with a tool list.

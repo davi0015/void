@@ -89,9 +89,41 @@ That agent cannot see this conversation, and you cannot see its conversation, it
 
 So do the work, then end with a report. Say what you found or changed, where, and anything the delegating agent must know before acting on it: file paths, command names, the exact error text. Answer the question that was asked, in the form it can be used.
 
-Call \`report_to_parent\` with your report when you have what was asked for, and make that text say what the delegating agent should know: what you found or changed, where, and what it needs before acting on it. Keep it to what a reader who has not seen your work needs — it is passed through verbatim, and it is not trimmed. If you never call it, your last message is sent instead.
+End your final message with the report it will read, inside a block exactly like this:
+
+<report>
+What you found or changed, where, and anything the delegating agent needs before acting on it.
+</report>
+
+Everything inside that block is passed on verbatim and is not trimmed; anything outside it is not read. If you leave the block out, your whole final message is passed on instead. Keep it to what a reader who has not seen your work needs.
 
 Do not ask questions expecting a reply — there is no one to answer mid-task. If you cannot proceed, say why in the report and stop; that report is the result.`
+}
+
+/** The delimiters of the report block the child is asked to end with. */
+export const REPORT_OPEN = '<report>'
+export const REPORT_CLOSE = '</report>'
+
+/**
+ * The part of a child's final message it asked to be passed on.
+ *
+ * The format is the whole contract between a child and its parent, so it lives here as a
+ * pure function rather than inside the run: the last `<report>` block wins (a child that
+ * corrects itself is heard once, in its final words), and a message with no block — or an
+ * empty one — is passed on whole. Falling back rather than failing is deliberate: a child
+ * that ignored the format produced *something*, and dropping it would turn a formatting
+ * slip into a delegation that reported nothing.
+ */
+export const reportedSummaryOf = (finalMessage: string): string => {
+	const close = finalMessage.lastIndexOf(REPORT_CLOSE)
+	if (close >= 0) {
+		const open = finalMessage.lastIndexOf(REPORT_OPEN, close)
+		if (open >= 0) {
+			const inside = finalMessage.slice(open + REPORT_OPEN.length, close).trim()
+			if (inside) return inside
+		}
+	}
+	return finalMessage.trim()
 }
 
 /** Appends the subagent framing to a set of frozen instructions. */

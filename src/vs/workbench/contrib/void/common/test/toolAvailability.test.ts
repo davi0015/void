@@ -5,7 +5,7 @@
 
 import assert from 'assert';
 import { builtinToolNames } from '../prompt/prompts.js';
-import { BuiltinToolName, approvalTypeOfBuiltinToolName, delegationToolNames, isToolAvailableInChatMode, subagentOnlyToolNames } from '../toolsServiceTypes.js';
+import { BuiltinToolName, approvalTypeOfBuiltinToolName, delegationToolNames, isToolAvailableInChatMode } from '../toolsServiceTypes.js';
 
 // Which builtin tools a chat mode may use.
 //
@@ -55,20 +55,6 @@ suite('ToolAvailability', () => {
 		}
 	});
 
-	test('the report tool belongs to a child, and to nobody else', () => {
-		assert.ok(subagentOnlyToolNames.size > 0, 'the set is empty, so this test would prove nothing');
-
-		for (const toolName of subagentOnlyToolNames) {
-			// The child half of the result contract: without it the parent's report is
-			// whatever the child happened to say last.
-			assert.strictEqual(isToolAvailableInChatMode(toolName, 'agent', true), true, `${toolName} is not offered to a subagent`);
-			// A top-level thread has no parent to report to, so the tool is absent rather than
-			// present and refusing — an affordance a model cannot use is one it will misuse.
-			assert.strictEqual(isToolAvailableInChatMode(toolName, 'agent', false), false, `${toolName} is offered to a top-level thread`);
-			assert.strictEqual(isToolAvailableInChatMode(toolName, 'gather', true), false, `${toolName} is reachable in gather mode`);
-			assert.strictEqual(isToolAvailableInChatMode(toolName, 'normal', true), false, `${toolName} is reachable in normal mode`);
-		}
-	});
 
 	test('normal mode has no builtin tools at all', () => {
 		// `normal` is the chat-only mode; a tool list there would be a regression no test
@@ -87,11 +73,7 @@ suite('ToolAvailability', () => {
 				const available = isToolAvailableInChatMode(toolName, mode);
 				assert.strictEqual(typeof available, 'boolean', `${toolName} in ${mode} produced ${available}`);
 			}
-			// Agent mode is the whole list, except the tools only a child has. Stating it
-			// against the set rather than as a bare `true` is what keeps this test honest when
-			// a tool is added to either side.
-			const expected = !subagentOnlyToolNames.has(toolName);
-			assert.strictEqual(isToolAvailableInChatMode(toolName, 'agent'), expected, `${toolName} availability in agent mode disagrees with the sets`);
+			assert.strictEqual(isToolAvailableInChatMode(toolName, 'agent'), true, `${toolName} is missing from agent mode`);
 		}
 	});
 });

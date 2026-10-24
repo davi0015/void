@@ -43,7 +43,7 @@ import { basename as resourceBasename, joinPath } from '../../../../base/common/
 import { IUserDataProfileService } from '../../../services/userDataProfile/common/userDataProfile.js';
 import { isThreadImageUri, threadImageDir, threadImageUri } from '../common/threadImagePaths.js';
 import { deepCloneWithUris } from '../common/deepCloneWithUris.js';
-import { ChildThreadSeed, ChildThreadSummary, childThreadSeedOf, SubagentOutcome, SubagentStatus, isChildThread, withSubagentPreamble } from '../common/childThreadLinkage.js';
+import { ChildThreadSeed, ChildThreadSummary, childThreadSeedOf, reportedSummaryOf, SubagentOutcome, SubagentStatus, isChildThread, withSubagentPreamble } from '../common/childThreadLinkage.js';
 import { IDelegationService, ContinueSubagentRequest, RunSubagentRequest, StartedSubagent } from '../common/delegationService.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
@@ -733,11 +733,7 @@ export interface IChatThreadService {
 	continueSubagent(request: ContinueSubagentRequest): StartedSubagent;
 	/** The children of a thread, read from their stored linkage. */
 	listChildThreads(parentThreadId: string): ChildThreadSummary[];
-	/**
-	 * Record what a child wants its parent to know. The child half of the result
-	 * contract; see `reportToParent` on the class.
-	 */
-	reportToParent(childThreadId: string, summary: string): void;
+
 	/** Stop a child's current turn. Reached from the parent's interrupt cascade. */
 	interruptSubagent(childThreadId: string): void;
 
@@ -3392,10 +3388,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// passed through, because an unbounded child result would turn delegation from a
 	// context saving into a context amplifier.
 
-	// Where a child's filed report waits between `report_to_parent` and the outcome being
-	// built. In memory, not on the thread: a report belongs to the turn that filed it, and
-	// persisting it would let turn 1's summary answer turn 2's question.
-	private readonly _pendingReportOfThreadId = new Map<string, string>()
 
 	private static readonly _WRITE_TOOL_NAMES = new Set<string>([
 		'edit_file', 'rewrite_file', 'create_file_or_folder', 'delete_file_or_folder', 'rename_file_or_folder',
@@ -3467,25 +3459,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		return { childThreadId: child.id, result: this._runChildThread(child.id, message) }
 	}
 
-	/**
-	 * Record what a child wants its parent to know.
-	 *
-	 * This is the child half of the result contract: the parent's outcome carries this
-	 * text verbatim, not a digest of it, so nothing is trimmed on the way out. It is held
-	 * for the run that filed it — a later turn on the same child must not inherit the
-	 * previous answer, which is why it lives in memory rather than on the thread.
-	 */
-	reportToParent(childThreadId: string, summary: string): void {
-		const thread = this.state.allThreads[childThreadId]
-		if (!thread || !isChildThread(thread)) {
-			throw new Error('report_to_parent is only available to a subagent: this thread has no parent to report to.')
-		}
-		const text = summary.trim()
-		if (!text) throw new Error('summary must say what the parent should know; an empty report is worse than none.')
-		// The latest report wins: a child that corrects itself mid-run should be heard once,
-		// in its final words.
-		this._pendingReportOfThreadId.set(childThreadId, text)
-	}
 
 	/**
 	 * The children of a thread, derived from stored linkage.
@@ -3720,13 +3693,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	private _finishChild(childThreadId: string, status: SubagentStatus, explanation: string): SubagentOutcome {
 		const thread = this.state.allThreads[childThreadId]
 
-		// What the child chose to convey, if it filed a report, otherwise what it said last.
-		// The filed report wins because it is deliberate: the child wrote it *for* the parent,
-		// where its final message may have been written for itself — a summary of the work,
-		// not the last tool call it happened to make.
-		const filed = this._pendingReportOfThreadId.get(childThreadId)
-		this._pendingReportOfThreadId.delete(childThreadId)
-		const conveyed = (filed ?? (status === 'done' ? this._summaryOfChild(childThreadId) : '')).trim()
+		// What the child said it wanted to convey, or its whole final message when it did not
+		// use the format. `reportedSummaryOf` is the contract: a `<report>` block is passed on
+		// verbatim, and a child that ignores the block is heard rather than dropped.
+		const conveyed = status === 'done' ? reportedSummaryOf(this._summaryOfChild(childThreadId)) : ''
 
 		// A run that did not finish leads with why, so a blocked or failed delegation cannot
 		// read as a completed one. The child's own words follow when it produced any.
@@ -3902,10 +3872,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				frozenAiInstructions,
 				manualCompaction,
 				overflowRelief: relief,
-				// A child is the only thread with a parent to report to, so only it is offered
-				// `report_to_parent`. Both paths carry it: this one embeds tools in the system
-				// prompt, and `sendLLMMessage` below hands the native tool list to the provider.
-				isSubagentThread: isChildThread(this.state.allThreads[threadId]),
 			})
 			// Once the provider has told us this conversation does not fit, every
 			// later request in the same run is built relieved — the history only
@@ -3968,7 +3934,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					modelSelection,
 					modelSelectionOptions,
 					overridesOfModel,
-					isSubagentThread: isChildThread(this.state.allThreads[threadId]),
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
 					separateSystemMessage: separateSystemMessage,
 					onText: ({ fullText, fullReasoning, toolCalls, usage }) => {
@@ -6675,9 +6640,6 @@ class DelegationService implements IDelegationService {
 		return this._chatThreadService.listChildThreads(parentThreadId)
 	}
 
-	reportToParent(childThreadId: string, summary: string): void {
-		this._chatThreadService.reportToParent(childThreadId, summary)
-	}
 
 	interruptSubagent(childThreadId: string): void {
 		this._chatThreadService.interruptSubagent(childThreadId)

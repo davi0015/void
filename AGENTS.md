@@ -102,6 +102,11 @@ Plain scripts (`test/void/*.mjs`), docs and `.tmp/` are not compiled at all.
 
 - **Never assume a run measured the code you just edited.** Confirm the compiled artifact, e.g.
   `grep -c _storeThreadDurably out/vs/workbench/contrib/void/browser/chatThreadService.js`.
+- **A compile can fail and still emit.** `gulp compile` writes JavaScript even when TypeScript
+  reports errors, so `out/` can hold code that does not typecheck and a test run will exercise
+  it — a scenario failed with `ReferenceError: reportedSummaryOf is not defined` because an
+  import was missing from the source and the build had emitted anyway. Read the watcher's last
+  line (`0 errors`) before trusting a run, not merely the presence of fresh output.
 - **A marker count read while the watcher is writing can be a false zero.** A `grep -c` on `out/`
   run right after a checkout has returned `0` for code that was already compiled; the next read,
   seconds later, found the marker with a modification time *older* than the first read, which is how

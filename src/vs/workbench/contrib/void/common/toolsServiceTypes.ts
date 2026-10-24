@@ -60,12 +60,6 @@ export const toolApprovalTypes = new Set<ToolApprovalType>([
 // that can write. The mode is `agent`'s alone because delegation *is* acting.
 export const delegationToolNames = new Set<BuiltinToolName>(['run_subagent', 'send_message', 'list_children'])
 
-// Tools only a *child* may use. `report_to_parent` is the child's half of the result
-// contract: the parent's outcome carries what the child chose to convey, not the last
-// thing it happened to type. A top-level thread has no parent to report to, so the tool
-// is not in its list at all — an affordance a model cannot use is one it will misuse.
-export const subagentOnlyToolNames = new Set<BuiltinToolName>(['report_to_parent'])
-
 /**
  * Whether a chat mode may use one builtin tool.
  *
@@ -81,12 +75,7 @@ export const subagentOnlyToolNames = new Set<BuiltinToolName>(['report_to_parent
 export const isToolAvailableInChatMode = (
 	toolName: BuiltinToolName,
 	chatMode: 'agent' | 'gather' | 'normal',
-	isSubagentThread = false,
 ): boolean => {
-	// Subagent-only tools answer a different question than the mode does: *who is
-	// running*. A parent has no parent to report to, so the tool is absent from its list
-	// rather than present and refusing.
-	if (subagentOnlyToolNames.has(toolName)) return isSubagentThread && chatMode === 'agent'
 	if (chatMode === 'agent') return true
 	if (chatMode === 'normal') return false
 	return !(toolName in approvalTypeOfBuiltinToolName) && !delegationToolNames.has(toolName)
@@ -220,9 +209,6 @@ export type BuiltinToolCallParams = {
 	// returns after a compaction has eaten the alias. Exactly one is required.
 	'send_message': { childThreadId: string | null, alias: string | null, message: string },
 	'list_children': {},
-	// The child's own verb. Its argument is what the parent receives, which is why it is a
-	// deliberate summary rather than whatever the child happened to say last.
-	'report_to_parent': { summary: string },
 }
 
 // RESULT OF TOOL CALL
@@ -266,7 +252,6 @@ export type BuiltinToolResultType = {
 	// different shape the parent would have to learn.
 	'send_message': SubagentOutcome,
 	'list_children': { children: ChildThreadSummary[] },
-	'report_to_parent': { received: true },
 }
 
 

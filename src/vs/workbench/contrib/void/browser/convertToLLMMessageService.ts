@@ -902,7 +902,7 @@ export interface IConvertToLLMMessageService {
 	// can route the entry to the right thread file. `telemetryRequestId` in the
 	// result is the rid the caller must echo back to `IRequestTelemetryService.logResponse`
 	// so request and response lines can be paired during analysis.
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string, pendingImageBytes?: Map<string, Uint8Array>, frozenAiInstructions?: string, manualCompaction?: { summary: string, boundaryIdx: number }, overflowRelief?: boolean, isSubagentThread?: boolean }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string, pendingImageBytes?: Map<string, Uint8Array>, frozenAiInstructions?: string, manualCompaction?: { summary: string, boundaryIdx: number }, overflowRelief?: boolean }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 	// Called by chat creation paths to snapshot runtime grounding (date, open files,
 	// active URI, directory listing, terminal IDs) into a user message at storage time.
@@ -1273,12 +1273,12 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	// `generateChatVolatileContext` and baked into the user message at storage time
 	// by the chat thread creation path — that keeps historical turns byte-identical
 	// across requests so the provider's prefix cache stays warm.
-	private _generateChatSystemMessage = (chatMode: ChatMode, specialToolFormat: 'openai-style' | 'anthropic-style' | 'gemini-style' | undefined, isSubagentThread = false) => {
+	private _generateChatSystemMessage = (chatMode: ChatMode, specialToolFormat: 'openai-style' | 'anthropic-style' | 'gemini-style' | undefined) => {
 		const mcpTools = this.mcpService.getMCPTools()
 		// When the provider supports native tool calling (specialToolFormat set),
 		// tools are sent via the provider's API and should NOT be embedded in the
 		// system prompt. Otherwise, tool definitions are embedded as XML.
-		const tools = specialToolFormat ? undefined : availableTools(chatMode, mcpTools, isSubagentThread)
+		const tools = specialToolFormat ? undefined : availableTools(chatMode, mcpTools)
 		return chat_systemMessage({ chatMode, tools })
 	}
 
@@ -1453,7 +1453,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		})
 		return { messages, separateSystemMessage };
 	}
-	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId, pendingImageBytes, frozenAiInstructions, manualCompaction, overflowRelief, isSubagentThread }) => {
+	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId, pendingImageBytes, frozenAiInstructions, manualCompaction, overflowRelief }) => {
 		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined, compactionInfo: null, sentChars: 0 }
 
 		const { overridesOfModel } = this.voidSettingsService.state
@@ -1468,7 +1468,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
 		const { disableSystemMessage } = this.voidSettingsService.state.globalSettings;
-		const fullSystemMessage = this._generateChatSystemMessage(chatMode, specialToolFormat, isSubagentThread === true)
+		const fullSystemMessage = this._generateChatSystemMessage(chatMode, specialToolFormat)
 		const systemMessage = disableSystemMessage ? '' : fullSystemMessage;
 
 		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
