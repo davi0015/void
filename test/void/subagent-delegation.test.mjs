@@ -486,6 +486,21 @@ describe('subagent delegation', () => {
 			// nothing at all, and every state assertion above would still pass.
 			assert.ok(await domHas(s.page, 'Open transcript'), 'the delegation row has no transcript link')
 
+			// And the report is *showing*, not merely in the DOM: every tool body is a
+			// collapsible that renders its children and hides them with `max-h-0`, so text
+			// presence alone would pass for a body the reader has to expand to find — including
+			// the transcript link, which lives inside it.
+			const bodyHeight = await s.page.evaluate(() => {
+				const button = [...document.querySelectorAll('button')]
+					.find(b => (b.textContent ?? '').includes('Open transcript'))
+				if (!button) return -1
+				let el = button.parentElement
+				while (el && !(el.className ?? '').includes('transition-all')) el = el.parentElement
+				return el ? Math.round(el.getBoundingClientRect().height) : -1
+			})
+			t.diagnostic(`delegation body height: ${bodyHeight}px`)
+			assert.ok(bodyHeight > 0, `the delegation body is collapsed (${bodyHeight}px) — the report and its link are hidden`)
+
 			// Guard: spawning is the agent's act, so a child must not arrive as a tab. A
 			// fan-out that pinned every child is the "strip of tabs" collapse.
 			const before = await s.page.evaluate(() => [...globalThis.__voidChatThreadService.state.pinnedThreadIds])

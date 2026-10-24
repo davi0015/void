@@ -3547,7 +3547,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (settled.status === 'blocked') {
 			const toolName = this._pendingApprovalToolNameOf(childThreadId)
 			const what = toolName ? `\`${toolName}\`` : 'a tool'
-			return this._finishChild(childThreadId, 'blocked', `The child stopped and is waiting for permission to run ${what}. Nothing in this run could answer that, so the delegation ended here; the request is still on the child's own thread.`)
+			return this._finishChild(childThreadId, 'blocked', `The child stopped and is waiting for permission to run ${what}. Nothing in this run could answer that, so this call has returned without its result. Open the subagent's transcript from this row and approve it there — the child continues on its own thread, but the outcome will not come back here.`)
 		}
 		if (settled.status === 'error') return this._finishChild(childThreadId, 'error', settled.message)
 		if (settled.status === 'rejected') return this._finishChild(childThreadId, 'rejected', 'The child was stopped before it finished, so it produced no usable report.')
