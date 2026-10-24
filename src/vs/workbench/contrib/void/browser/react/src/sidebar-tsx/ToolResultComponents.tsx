@@ -862,8 +862,12 @@ const LintErrorChildren = ({ lintErrors }: { lintErrors: LintErrorItem[] }) => {
 	</div>
 }
 
-const BottomChildren = ({ children, title }: { children: React.ReactNode, title: string }) => {
-	const [isOpen, setIsOpen] = useState(false);
+const BottomChildren = ({ children, title, defaultOpen = false }: { children: React.ReactNode, title: string, defaultOpen?: boolean }) => {
+	// Collapsed is the right default for most tools — the body is supplementary detail, and a
+	// file's contents or a command's output would push the conversation off the screen. A
+	// delegation is the exception: its body is the report the user asked for, and the only
+	// route to the child's transcript, so hiding it hides the result.
+	const [isOpen, setIsOpen] = useState(defaultOpen);
 	if (!children) return null;
 	return (
 		<div className="w-full px-2 mt-0.5">
@@ -1968,7 +1972,7 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 				// The child's own thread is not linked from here yet: opening a child as a
 				// thread is the rendering step, and a link to a thread the sidebar cannot
 				// show would be a dead end. The report itself is what the row is for.
-				componentParams.bottomChildren = <BottomChildren title='Subagent report'>
+				componentParams.bottomChildren = <BottomChildren title='Subagent report' defaultOpen>
 					<SubagentReportChildren result={result} />
 				</BottomChildren>
 			}
@@ -1993,7 +1997,7 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
 
 			if (result) {
-				componentParams.bottomChildren = <BottomChildren title='Subagent reply'>
+				componentParams.bottomChildren = <BottomChildren title='Subagent reply' defaultOpen>
 					<SubagentReportChildren result={result} />
 				</BottomChildren>
 			}
@@ -2018,7 +2022,7 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 
 			if (toolMessage.type === 'success') {
 				const { children } = toolMessage.result
-				componentParams.bottomChildren = <BottomChildren title={`Subagents (${children.length})`}>
+				componentParams.bottomChildren = <BottomChildren title={`Subagents (${children.length})`} defaultOpen>
 					<div className='flex flex-col gap-0.5 text-xs'>
 						{children.length === 0 && (
 							<div className='text-void-fg-4'>This thread has not started any.</div>

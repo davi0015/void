@@ -1983,11 +1983,15 @@ const ChildThreadBanner = ({ thread, parentLabel }: { thread: ThreadType, parent
 
 	if (!parentThreadId) return null
 
+	// The parent's own label can be a whole first message; a banner is one line, and the
+	// button beside it must stay visible.
+	const parentLabelText = parentLabel.length > 48 ? `${parentLabel.slice(0, 48)}…` : parentLabel
+
 	return (
 		<div className='mx-3 my-2 px-3 py-2 rounded border border-void-stroke-1 bg-void-bg-3 text-xs flex items-center gap-2 text-void-fg-3'>
 			<Brain size={12} className='flex-shrink-0' />
 			<span className='truncate'>
-				Subagent <span className='opacity-90 font-medium'>{thread.alias ?? '(unnamed)'}</span> — a separate conversation, started by an agent
+				Subagent <span className='opacity-90 font-medium'>{thread.alias ?? '(unnamed)'}</span> — started by {parentLabelText}
 			</span>
 			<button
 				className='ml-auto flex-shrink-0 underline decoration-dotted hover:text-void-fg-1'
