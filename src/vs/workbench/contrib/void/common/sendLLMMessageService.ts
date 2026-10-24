@@ -138,7 +138,9 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		// Resolve the tool list here so electron-main stays tool-agnostic — it just
 		// formats whatever InternalToolInfo[] it receives into provider schemas.
 		const mcpTools = this.mcpService.getMCPTools()
-		const tools = availableTools(chatMode ?? null, mcpTools)
+		// `isSubagentThread` is about *who is running*, not about the mode: a child is the
+		// only thread with a parent to report to, so only it is offered `report_to_parent`.
+		const tools = availableTools(chatMode ?? null, mcpTools, params.isSubagentThread === true)
 
 		// add state for request id
 		const requestId = generateUuid();

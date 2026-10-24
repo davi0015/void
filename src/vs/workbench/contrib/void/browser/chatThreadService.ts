@@ -733,6 +733,11 @@ export interface IChatThreadService {
 	continueSubagent(request: ContinueSubagentRequest): StartedSubagent;
 	/** The children of a thread, read from their stored linkage. */
 	listChildThreads(parentThreadId: string): ChildThreadSummary[];
+	/**
+	 * Record what a child wants its parent to know. The child half of the result
+	 * contract; see `reportToParent` on the class.
+	 */
+	reportToParent(childThreadId: string, summary: string): void;
 	/** Stop a child's current turn. Reached from the parent's interrupt cascade. */
 	interruptSubagent(childThreadId: string): void;
 
@@ -3387,7 +3392,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// passed through, because an unbounded child result would turn delegation from a
 	// context saving into a context amplifier.
 
-	private static readonly SUBAGENT_SUMMARY_MAX_CHARS = 12_000
+	// Where a child's filed report waits between `report_to_parent` and the outcome being
+	// built. In memory, not on the thread: a report belongs to the turn that filed it, and
+	// persisting it would let turn 1's summary answer turn 2's question.
+	private readonly _pendingReportOfThreadId = new Map<string, string>()
 
 	private static readonly _WRITE_TOOL_NAMES = new Set<string>([
 		'edit_file', 'rewrite_file', 'create_file_or_folder', 'delete_file_or_folder', 'rename_file_or_folder',
@@ -3457,6 +3465,26 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (!message) throw new Error('message must be the instruction for the child; it receives nothing else.')
 
 		return { childThreadId: child.id, result: this._runChildThread(child.id, message) }
+	}
+
+	/**
+	 * Record what a child wants its parent to know.
+	 *
+	 * This is the child half of the result contract: the parent's outcome carries this
+	 * text verbatim, not a digest of it, so nothing is trimmed on the way out. It is held
+	 * for the run that filed it — a later turn on the same child must not inherit the
+	 * previous answer, which is why it lives in memory rather than on the thread.
+	 */
+	reportToParent(childThreadId: string, summary: string): void {
+		const thread = this.state.allThreads[childThreadId]
+		if (!thread || !isChildThread(thread)) {
+			throw new Error('report_to_parent is only available to a subagent: this thread has no parent to report to.')
+		}
+		const text = summary.trim()
+		if (!text) throw new Error('summary must say what the parent should know; an empty report is worse than none.')
+		// The latest report wins: a child that corrects itself mid-run should be heard once,
+		// in its final words.
+		this._pendingReportOfThreadId.set(childThreadId, text)
 	}
 
 	/**
@@ -3689,21 +3717,25 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	 * still says how it finished, which is the difference between a transcript and a
 	 * record. The returned outcome is the only channel to the parent.
 	 */
-	private _finishChild(childThreadId: string, status: SubagentStatus, summary: string): SubagentOutcome {
+	private _finishChild(childThreadId: string, status: SubagentStatus, explanation: string): SubagentOutcome {
 		const thread = this.state.allThreads[childThreadId]
-		const trimmed = summary.trim()
-			|| (status === 'done' ? 'The child finished without reporting anything back.' : '')
 
-		// Cut with the marker the compaction path already uses, so the parent has a known
-		// remedy — ask for a narrower report — instead of a silently short answer.
-		const capped = truncate(
-			trimmed,
-			ChatThreadService.SUBAGENT_SUMMARY_MAX_CHARS,
-			'\n\n[trimmed — this is the child\'s report, cut to the length a parent may receive. Re-run the task asking for a shorter report if you need the rest.]',
-		)
+		// What the child chose to convey, if it filed a report, otherwise what it said last.
+		// The filed report wins because it is deliberate: the child wrote it *for* the parent,
+		// where its final message may have been written for itself — a summary of the work,
+		// not the last tool call it happened to make.
+		const filed = this._pendingReportOfThreadId.get(childThreadId)
+		this._pendingReportOfThreadId.delete(childThreadId)
+		const conveyed = (filed ?? (status === 'done' ? this._summaryOfChild(childThreadId) : '')).trim()
+
+		// A run that did not finish leads with why, so a blocked or failed delegation cannot
+		// read as a completed one. The child's own words follow when it produced any.
+		const head = status === 'done' ? '' : explanation.trim()
+		const summary = [head, conveyed].filter(part => part.length > 0).join('\n\n')
+			|| 'The child finished without reporting anything back.'
 
 		if (thread) {
-			const updated: ThreadType = { ...thread, resultStatus: status, resultSummary: capped }
+			const updated: ThreadType = { ...thread, resultStatus: status, resultSummary: summary }
 			this._setState({ allThreads: { ...this.state.allThreads, [childThreadId]: updated } })
 			this._storeThread(childThreadId, updated)
 		}
@@ -3714,11 +3746,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._rollUpChildUsage(thread?.parentThreadId, childThreadId)
 		return {
 			status,
-			summary: capped,
+			summary,
 			filesTouched: this._filesTouchedBy(childThreadId),
 			childThreadId,
 			...(usage ? { usage } : {}),
-			...(status === 'error' ? { error: capped } : {}),
+			...(status === 'error' ? { error: summary } : {}),
 		}
 	}
 
@@ -3870,6 +3902,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				frozenAiInstructions,
 				manualCompaction,
 				overflowRelief: relief,
+				// A child is the only thread with a parent to report to, so only it is offered
+				// `report_to_parent`. Both paths carry it: this one embeds tools in the system
+				// prompt, and `sendLLMMessage` below hands the native tool list to the provider.
+				isSubagentThread: isChildThread(this.state.allThreads[threadId]),
 			})
 			// Once the provider has told us this conversation does not fit, every
 			// later request in the same run is built relieved — the history only
@@ -3932,6 +3968,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					modelSelection,
 					modelSelectionOptions,
 					overridesOfModel,
+					isSubagentThread: isChildThread(this.state.allThreads[threadId]),
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
 					separateSystemMessage: separateSystemMessage,
 					onText: ({ fullText, fullReasoning, toolCalls, usage }) => {
@@ -6636,6 +6673,10 @@ class DelegationService implements IDelegationService {
 
 	listChildren(parentThreadId: string): ChildThreadSummary[] {
 		return this._chatThreadService.listChildThreads(parentThreadId)
+	}
+
+	reportToParent(childThreadId: string, summary: string): void {
+		this._chatThreadService.reportToParent(childThreadId, summary)
 	}
 
 	interruptSubagent(childThreadId: string): void {

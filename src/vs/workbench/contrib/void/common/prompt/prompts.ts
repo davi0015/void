@@ -169,7 +169,7 @@ export const builtinToolNames: BuiltinToolName[] = [
 	'edit_file', 'rewrite_file',
 	'run_command', 'run_persistent_command', 'open_persistent_terminal', 'kill_persistent_terminal', 'read_terminal',
 	'fetch_url', 'semantic_search', 'search_history', 'load_skill',
-	'run_subagent', 'send_message', 'list_children',
+	'run_subagent', 'send_message', 'list_children', 'report_to_parent',
 ]
 const toolNamesSet = new Set<string>(builtinToolNames)
 export const isABuiltinToolName = (toolName: string): toolName is BuiltinToolName => {

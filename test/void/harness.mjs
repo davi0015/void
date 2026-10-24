@@ -484,8 +484,8 @@ export function pendingThreadWrites(page) {
  * `sendLLMMessage.impl.ts` builds from a stringified SDK error. Not combinable
  * with `hang` — a held-open request has no answer to fail with.
  */
-export function stubLLM(page, text, { usage, hang = false, error } = {}) {
-	return page.evaluate(({ text, usage, hang, error }) => {
+export function stubLLM(page, text, { usage, hang = false, error, toolCalls } = {}) {
+	return page.evaluate(({ text, usage, hang, error, toolCalls }) => {
 		if (hang && error !== undefined) throw new Error('stubLLM: `hang` and `error` cannot be combined')
 		// Every outgoing request is recorded so a test can assert on what the
 		// model was actually sent — the only way to check prompt construction
@@ -504,10 +504,23 @@ export function stubLLM(page, text, { usage, hang = false, error } = {}) {
 			return error[errorIdx++] ?? undefined
 		}
 
-		const complete = (opts) => {
+		/**
+		 * `toolCalls` given to `stubLLM`, in the shape the loop parses. `doneParams` mirrors
+		 * what a provider reports for a completed call, and `rawParamsStr` is the serialized
+		 * arguments — both are what the request replay reads.
+		 */
+		const builtToolCalls = (spec) => (spec ?? []).map((tc, i) => ({
+			name: tc.name,
+			rawParams: tc.rawParams ?? {},
+			rawParamsStr: tc.rawParamsStr ?? JSON.stringify(tc.rawParams ?? {}),
+			doneParams: Object.keys(tc.rawParams ?? {}),
+			id: tc.id ?? `stub-toolcall-${i}`,
+		}))
+
+		const complete = (opts, calls) => {
 			const u = usage ?? { inputTokens: 1000, outputTokens: 100, totalTokens: 1100, requestCount: 1 }
-			try { opts.onText?.({ usage: u }) } catch { /* ignore */ }
-			try { opts.onFinalMessage?.({ fullText: text, usage: u }) } catch (e) { console.log('[probe] onFinalMessage threw ' + String(e)) }
+			try { opts.onText?.({ usage: u, toolCalls: builtToolCalls(calls) }) } catch { /* ignore */ }
+			try { opts.onFinalMessage?.({ fullText: text, fullReasoning: '', anthropicReasoning: null, usage: u, toolCalls: builtToolCalls(calls) }) } catch (e) { console.log('[probe] onFinalMessage threw ' + String(e)) }
 		}
 
 		const fail = (opts, message) => {
@@ -529,13 +542,17 @@ export function stubLLM(page, text, { usage, hang = false, error } = {}) {
 			llmService.llmMessageHooks.onAbort[requestId] = () => {
 				try { opts.onAbort?.() } catch (e) { console.log('[probe] onAbort threw ' + String(e)) }
 			}
+			// Tool calls are answered on the *first* request only. A model that calls a tool and
+			// then answers is the ordinary shape; a stub that re-emitted the call on every
+			// request would loop the agent until something else stopped it.
+			const calls = nextRequestNum === 1 ? toolCalls : undefined
 			const message = nextError()
 			if (hang) g.__voidPendingLLMRequests.push(opts)
 			else if (message !== undefined) setTimeout(() => fail(opts, message), 0)
-			else setTimeout(() => complete(opts), 0)
+			else setTimeout(() => complete(opts, calls), 0)
 			return requestId
 		}
-	}, { text, usage, hang, error })
+	}, { text, usage, hang, error, toolCalls })
 }
 
 /** Answers a request that `stubLLM(..., { hang: true })` held open. */

@@ -27,7 +27,7 @@ The child is a separate agent with a **fresh, empty context**: it does not see t
 
 Use it when the work is self-contained and its intermediate steps would crowd your context: investigating a subsystem and reporting findings, running the tests and reporting failures, searching for every call site, reviewing a diff you just wrote. Do NOT use it for work that needs the conversation you are in — the child starts blind.
 
-Write \`task\` as a complete brief for a competent engineer who has not seen this conversation: what to do, where to look, and what to report back. **Name files instead of pasting their contents** — a reference is cheap, and pasting re-spends the context you delegated to save. The summary the child returns is hard-capped, so ask for findings rather than a transcript.
+Write \`task\` as a complete brief for a competent engineer who has not seen this conversation: what to do, where to look, and what to report back. **Name files instead of pasting their contents** — a reference is cheap, and pasting re-spends the context you delegated to save. The report it sends back is its own — written through report_to_parent, or its final message if it never called that — and it is not trimmed on the way, so ask for findings rather than a transcript: everything it sends is re-sent on every one of your later turns.
 
 \`alias\` names the child (e.g. "tester", "reviewer"); it must be unique among the children you have already spawned.
 

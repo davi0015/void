@@ -176,11 +176,15 @@ type SendLLMType = {
 	messages: LLMChatMessage[]; // the type of raw chat messages that we send to Anthropic, OAI, etc
 	separateSystemMessage: string | undefined;
 	chatMode: ChatMode | null;
+	// True when the thread this request belongs to is a subagent, which changes the tool
+	// list rather than the mode. Optional: FIM and non-chat requests never set it.
+	isSubagentThread?: boolean;
 } | {
 	messagesType: 'FIMMessage';
 	messages: LLMFIMMessage;
 	separateSystemMessage?: undefined;
 	chatMode?: undefined;
+	isSubagentThread?: undefined;
 }
 export type ServiceSendLLMMessageParams = {
 	onText: OnText;

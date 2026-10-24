@@ -412,6 +412,66 @@ describe('subagent delegation', () => {
 		})
 	})
 
+	test('the parent gets the report the child filed, not its last words, and it is not trimmed', async (t) => {
+		await h.withScenario('subagent/report', async (s) => {
+			const parent = await scenario(s.page)
+
+			// Longer than the old 12,000-character cap on purpose: "not trimmed" is the claim,
+			// so a report that would have been cut is the fixture that proves it.
+			const REPORT = `REPORT-MARKER ${'x'.repeat(13_000)}`
+			const AFTERWARDS = 'AFTERWARDS-MARKER anything else?'
+
+			// The child files its report on the first request and keeps talking afterwards, so
+			// the last thing it says is deliberately *not* what it decided to convey.
+			await h.stubLLM(s.page, AFTERWARDS, {
+				usage: STUB_USAGE,
+				toolCalls: [{ name: 'report_to_parent', rawParams: { summary: REPORT } }],
+			})
+
+			const out = await delegateFrom(s.page, { threadId: parent.id, alias: ALIAS, task: CHILD_MARKER, toolId: 'call-report-1' })
+			for (const line of s.log.slice(-5)) t.diagnostic(line)
+
+			assert.equal(out.toolRowType, 'success', `the delegation failed: ${out.toolRowContent.slice(0, 300)}`)
+			assert.equal(out.children.length, 1, 'the fixture did not create a child')
+			const child = out.children[0]
+
+			// Guards: the tool call actually ran, and the child did keep talking afterwards.
+			// Without both, "the report won" would be the trivial case of the only message.
+			const reportRowType = await s.page.evaluate((id) => {
+				const svc = globalThis.__voidChatThreadService
+				const row = svc.state.allThreads[id]?.messages.find(m => m.role === 'tool' && m.name === 'report_to_parent')
+				return row?.type ?? null
+			}, child.id)
+			t.diagnostic(`report row: ${reportRowType}`)
+			assert.equal(reportRowType, 'success', 'the child never filed a report, so nothing is being tested')
+			assert.ok(child.text.includes('AFTERWARDS-MARKER'), 'the child stopped after reporting — the report/message distinction is untested')
+
+			const result = out.toolRowResult
+			assert.equal(result.summary, REPORT, 'the parent did not receive the report the child filed')
+			assert.ok(result.summary.length > 12_000, `the report was trimmed to ${result.summary.length} characters`)
+			assert.equal(result.summary.includes('AFTERWARDS-MARKER'), false, "the child's last words leaked into the report")
+		})
+	})
+
+	test('report_to_parent refuses a thread that has no parent', async (t) => {
+		await h.withScenario('subagent/report-refused', async (s) => {
+			const parent = await scenario(s.page)
+
+			// The tool is not in a top-level thread's list, but the service refuses it too: the
+			// tool list is a prompt, and a prompt is not a guard.
+			const refused = await delegateFrom(s.page, {
+				threadId: parent.id,
+				name: 'report_to_parent',
+				rawParams: { summary: 'nothing to report' },
+				toolId: 'call-refused-1',
+			})
+			t.diagnostic(`top-level report: ${refused.toolRowType}: ${refused.toolRowContent.slice(0, 200)}`)
+
+			assert.equal(refused.toolRowType, 'tool_error', 'a top-level thread was allowed to report to a parent')
+			assert.match(refused.toolRowContent, /subagent/i, `the refusal did not say why: ${refused.toolRowContent.slice(0, 300)}`)
+		})
+	})
+
 	test('a subagent\'s conversation opens from the row and says where it came from', async (t) => {
 		await h.withScenario('subagent/transcript', async (s) => {
 			const parent = await scenario(s.page)
