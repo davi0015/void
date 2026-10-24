@@ -12,6 +12,9 @@ import {
 	delegationDepthOf,
 	isChildThread,
 	MAX_DELEGATION_DEPTH,
+	reportedSummaryOf,
+	REPORT_CLOSE,
+	REPORT_OPEN,
 	subagentPreambleOf,
 	withSubagentPreamble,
 } from '../childThreadLinkage.js';
@@ -136,6 +139,36 @@ suite('ChildThreadLinkage', () => {
 		assert.strictEqual(combined.startsWith('BASE INSTRUCTIONS'), true, 'the inherited prompt must stay first');
 		assert.strictEqual(combined.split('You are a subagent').length, 2, 'the framing must appear exactly once');
 		assert.strictEqual(combined.includes('"tester"'), true);
+	});
+	test('the report block is what the parent reads, and nothing around it', () => {
+		// The contract between a child and its parent, in one function: everything inside the
+		// block is passed on, everything outside it is the child thinking.
+		const message = `thinking out loud\n${REPORT_OPEN}\nThe answer is 25.\n${REPORT_CLOSE}\nanything else?`;
+		assert.strictEqual(reportedSummaryOf(message), 'The answer is 25.');
+	});
+
+	test('the last block wins, so a child that corrects itself is heard once', () => {
+		const message = `<report>first draft</report>\nmore work\n<report>final answer</report>`;
+		assert.strictEqual(reportedSummaryOf(message), 'final answer');
+	});
+
+	test('a message without a block is passed on whole rather than dropped', () => {
+		// Deliberate: a child that ignored the format still produced something, and refusing it
+		// would turn a formatting slip into a delegation that reported nothing.
+		assert.strictEqual(reportedSummaryOf('  just an answer  '), 'just an answer');
+		// An empty block is not a report either.
+		assert.strictEqual(reportedSummaryOf(`<report>   </report>`), `${REPORT_OPEN}   ${REPORT_CLOSE}`);
+		// An unclosed block cannot be trusted to end where the child meant it to.
+		assert.strictEqual(reportedSummaryOf(`${REPORT_OPEN}\nno close`), `${REPORT_OPEN}\nno close`);
+	});
+
+	test('the framing tells the child the format it will be read by', () => {
+		// The prompt and the extractor are one contract; a prompt that described a different
+		// marker would leave the block unread and the parent with the child's whole message.
+		const preamble = subagentPreambleOf('tester');
+		assert.strictEqual(preamble.includes(REPORT_OPEN), true, 'the framing never shows the opening delimiter');
+		assert.strictEqual(preamble.includes(REPORT_CLOSE), true, 'the framing never shows the closing delimiter');
+		assert.strictEqual(/not trimmed/i.test(preamble), true, 'the framing must say the report is not cut');
 	});
 	test('the alias is trimmed and its internal whitespace collapsed', () => {
 		const seed = seedOf(childThreadSeedOf(thread(), { toolCallId: 'call-1', alias: '  release   checker  ' }));

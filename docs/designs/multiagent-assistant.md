@@ -273,7 +273,7 @@ export type SubagentStatus = 'done' | 'blocked' | 'budget_exceeded' | 'error' | 
 
 export type SubagentOutcome = {
   status: SubagentStatus
-  summary: string           // what the child filed via `report_to_parent`, else its final
+  summary: string           // the content of the child's `<report>` block, else its final
                             // message with text. Verbatim: nothing trims it
   filesTouched: string[]    // workspace-relative paths, from completed write tools only
   childThreadId: string     // for the UI's "open transcript" link
@@ -284,15 +284,17 @@ export type SubagentOutcome = {
 
 `stringOfResult` renders this as compact text — Void's convention, where `stringOfResult` returns LLM-facing prose rather than JSON. The parent never receives the child's `messages`, tool results, or reasoning.
 
-**The report is filed, not derived.** A child is offered one tool its parent is not: `report_to_parent({ summary })`, and its argument is what the parent reads. That is the difference between a summary and a digest. Deriving it from the child's last message is wrong in both directions — too much when the child spent the turn thinking out loud and the parent receives its working, too little when the run ends on a tool-only step whose text is empty and a child that answered a step earlier reports nothing. Falling back to the last message *with text* is the safety net for a child that never called the tool, not the mechanism.
+**The report is a format, not a derivation.** The child is told, in its system prompt, to end its final message with a `<report>` block, and that block is what the parent reads (`reportedSummaryOf`, `common/childThreadLinkage.ts`). Deriving the summary from "the last thing the child said" is wrong in both directions: too much when the child spent the turn thinking out loud and the parent receives its working, too little when the run ends on a tool-only step whose text is empty and a child that answered a step earlier reports nothing. A block says what to send, where a truncation could only say how much.
 
-**Nothing trims it.** An earlier revision capped the summary at 12,000 characters with the Perf 2 `[trimmed — ...]` marker, on the argument that an unbounded child result multiplies the O(N²) problem. That argument is about paying for a transcript on every turn, and a filed report is not a transcript: the child writes it for the parent, and the tool description asks for exactly what that reader needs. Trimming it would mean the child's deliberate answer is silently cut — worse than a long answer, because the parent cannot tell what it lost. The cost is real and accepted: whatever the child files is re-sent on each of the parent's later turns.
+A tool (`report_to_parent`) was tried first and removed: it costs an extra request per delegation, because the loop continues after a tool call, and it adds a verb, a permission story and a tool-list gate to buy a structure that a delimiter gives for free. The format is also the cheaper contract to hold — the extractor is a pure function the node tier tests, where a tool needed a running workbench.
 
-The filed report lives in memory for the run that filed it (`_pendingReportOfThreadId`) rather than on the thread, because a report answers *that* turn: persisting it would let turn one's summary answer turn two's question. The composed outcome is still recorded on the child as `resultSummary`/`resultStatus`, which is what a reader sees after a reload.
+**Nothing trims it.** An earlier revision capped the summary at 12,000 characters with the Perf 2 `[trimmed — ...]` marker, on the argument that an unbounded child result multiplies the O(N²) problem. That argument is about paying for a transcript on every turn, and a report is not a transcript: the child writes it for the parent, and the framing asks for exactly what that reader needs. Trimming it would mean a deliberate answer is silently cut — worse than a long one, because the parent cannot tell what it lost. The cost is real and accepted: whatever the child reports is re-sent on each of the parent's later turns.
+
+Falling back is deliberate: a child that omits the block, or leaves it empty, has its whole final message passed on rather than nothing. A formatting slip should not become a delegation that reported nothing.
+
+The composed outcome is recorded on the child as `resultSummary`/`resultStatus`, which is what a reader sees after a reload. Nothing is held in memory between the run and the outcome, because the report *is* the run's last message.
 
 A run that did not finish leads with why — `blocked`, `error`, `rejected` — and the child's own words follow it, so a delegation that stopped cannot read as one that completed.
-
-A child that exceeds the cap is truncated with an explicit marker rather than silently cut, reusing the `[trimmed — ...]` convention already established for Perf 2 compaction, so the model has a known remedy: ask a narrower follow-up, or read the specific file itself.
 
 ### 5. Permissions are inherited, not attenuated
 

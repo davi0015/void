@@ -2042,32 +2042,4 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			return <ToolHeaderWrapper {...componentParams} />
 		},
 	},
-	'report_to_parent': {
-		resultWrapper: ({ toolMessage }) => {
-			const accessor = useAccessor()
-			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
-			const title = getTitle(toolMessage)
-			const icon = null
-
-			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
-				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
-			}
-
-			const isError = toolMessage.type === 'tool_error'
-			const isRejected = toolMessage.type === 'rejected'
-			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
-
-			// The child's own copy of what it told the parent, kept here rather than only in
-			// the parent's row: this is the record of what was said, and a reader auditing a
-			// delegation reads it on the child's side.
-			if (toolMessage.type === 'success') {
-				componentParams.bottomChildren = <BottomChildren title='Report to parent'>
-					<SmallProseWrapper>
-						<ChatMarkdownRender string={toolMessage.params.summary} chatMessageLocation={undefined} isApplyEnabled={false} />
-					</SmallProseWrapper>
-				</BottomChildren>
-			}
-
-			return <ToolHeaderWrapper {...componentParams} />
-		},
-	},};
+};

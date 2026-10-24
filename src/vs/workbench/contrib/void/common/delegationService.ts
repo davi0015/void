@@ -95,17 +95,6 @@ export interface IDelegationService {
 	 */
 	listChildren(parentThreadId: string): ChildThreadSummary[]
 
-	/**
-	 * Record what a child wants its parent to know.
-	 *
-	 * The child half of the result contract: the parent's outcome carries this text, so
-	 * nothing trims it on the way out. Held for the run that filed it rather than persisted,
-	 * because a later turn on the same child must not inherit the previous answer.
-	 *
-	 * Throws when the thread has no parent, which reaches the model as an ordinary tool
-	 * error rather than a silent no-op.
-	 */
-	reportToParent(childThreadId: string, summary: string): void
 
 	/**
 	 * Stop a child's current turn. This is the interrupt cascade: aborting the
