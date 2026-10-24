@@ -64,6 +64,39 @@ export type SubagentOutcome = {
 }
 
 /**
+ * What a child is told about being a child, appended to its frozen instructions.
+ *
+ * A child is not a second user: it is a delegate whose entire output is one message,
+ * read by an agent that cannot see any of its work. Nothing in the inherited system
+ * prompt says that — it describes how to work, not who is reading — and the failure
+ * modes of leaving it implicit are specific and quiet: the child writes a plan and
+ * stops (the parent reads a plan as if it were a result), or asks a clarifying
+ * question (nobody answers, and the question becomes the report), or ends on a tool
+ * call and reports nothing at all.
+ *
+ * It goes into the *system* prompt rather than onto the task, because it is a
+ * standing property of this agent rather than part of any one instruction — and
+ * because a continuation (`send_message`) must not have to repeat it. It is the one
+ * place delegation breaks "the child's system prompt is the parent's": §1 of the
+ * design removes the definition file that would have carried a role, and this is not
+ * a role. It is who is reading.
+ */
+export const subagentPreambleOf = (alias: string | undefined): string => {
+	const named = alias ? ` named "${alias}"` : ''
+	return `You are a subagent${named}, working on a task delegated by another agent.
+
+That agent cannot see this conversation, and you cannot see its conversation, its reasoning or its tool results. It receives one thing from you: your **final message**, verbatim, up to a length limit. Nothing else crosses back — not your intermediate steps, not the files you read, not your tool output.
+
+So do the work, then end with a report. Say what you found or changed, where, and anything the delegating agent must know before acting on it: file paths, command names, the exact error text. Answer the question that was asked, in the form it can be used.
+
+Do not ask questions expecting a reply — there is no one to answer mid-task. If you cannot proceed, say why in the report and stop; that report is the result.`
+}
+
+/** Appends the subagent framing to a set of frozen instructions. */
+export const withSubagentPreamble = (frozenAiInstructions: string, alias: string | undefined): string =>
+	`${frozenAiInstructions}\n\n${subagentPreambleOf(alias)}`
+
+/**
  * One row of `list_children`.
  *
  * The tool exists because a parent's handles have to survive its own compaction:

@@ -12,6 +12,8 @@ import {
 	delegationDepthOf,
 	isChildThread,
 	MAX_DELEGATION_DEPTH,
+	subagentPreambleOf,
+	withSubagentPreamble,
 } from '../childThreadLinkage.js';
 
 // What a child thread is, and what it inherits from the thread that spawned it.
@@ -107,6 +109,34 @@ suite('ChildThreadLinkage', () => {
 		assert.ok(!creation.ok && /cannot create subagents/.test(creation.refusal), `the refusal must say why: ${creation.ok ? '' : creation.refusal}`);
 	});
 
+	test('a child is told it is a child, and what the delegating agent receives', () => {
+		const preamble = subagentPreambleOf('tester');
+
+		// The three facts nothing in the inherited prompt conveys, and whose absence is
+		// silent: an agent is reading, it sees only this message, and it is not the user.
+		assert.strictEqual(/subagent/i.test(preamble), true, 'the framing must name what the child is');
+		assert.strictEqual(preamble.includes('"tester"'), true, 'the framing must name this child');
+		assert.strictEqual(/final message/i.test(preamble), true, 'the framing must say what crosses back');
+		assert.strictEqual(/cannot see/i.test(preamble), true, 'the framing must say the parent is out of reach');
+		// And the remedy, because "report back" without saying what to report is how a child
+		// hands over a plan as if it were a result.
+		assert.strictEqual(/report/i.test(preamble), true, 'the framing must ask for a report');
+	});
+
+	test('an unnamed child is still told what it is', () => {
+		// `alias` is optional on the thread type, and a restored child could lack one.
+		const preamble = subagentPreambleOf(undefined);
+		assert.strictEqual(/subagent/i.test(preamble), true);
+		assert.strictEqual(preamble.includes('named'), false, 'an unnamed child must not be given an empty name');
+	});
+
+	test('the framing is appended after the inherited instructions, exactly once', () => {
+		const combined = withSubagentPreamble('BASE INSTRUCTIONS', 'tester');
+
+		assert.strictEqual(combined.startsWith('BASE INSTRUCTIONS'), true, 'the inherited prompt must stay first');
+		assert.strictEqual(combined.split('You are a subagent').length, 2, 'the framing must appear exactly once');
+		assert.strictEqual(combined.includes('"tester"'), true);
+	});
 	test('the alias is trimmed and its internal whitespace collapsed', () => {
 		const seed = seedOf(childThreadSeedOf(thread(), { toolCallId: 'call-1', alias: '  release   checker  ' }));
 		assert.strictEqual(seed.alias, 'release checker', 'a pasted name still becomes one name');

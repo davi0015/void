@@ -121,6 +121,7 @@ async function delegateFrom(page, { threadId, name = 'run_subagent', rawParams, 
 				permissionMode: c.permissionMode,
 				resultStatus: c.resultStatus,
 				resultSummary: c.resultSummary,
+				frozenAiInstructions: c.frozenAiInstructions,
 				totalTokens: svc.cumulativeUsageThisThreadOfThreadId[c.id]?.totalTokens ?? 0,
 				roles: c.messages.map(m => m.role),
 				text: c.messages.map(textOf).join('\n'),
@@ -167,10 +168,19 @@ describe('subagent delegation', () => {
 			assert.equal(child.workspaceUri, out.delegatingWorkspaceUri, 'the child resolved a different workspace than its parent')
 			assert.equal(child.permissionMode, out.delegatingPermissionMode, 'the child changed permission grant')
 
+			// The child knows what it is. Nothing else in the inherited prompt says the reader
+			// is an agent that sees only the final message, and a child that believes it is
+			// talking to a user writes a plan and stops, or asks a question nobody answers.
+			assert.ok(child.frozenAiInstructions, 'the child has no frozen prompt to carry the framing')
+			assert.match(child.frozenAiInstructions, /subagent/i, 'the child was never told it is a subagent')
+			assert.ok(child.frozenAiInstructions.includes(ALIAS), 'the child was not told its own name')
+
 			// The result contract: bounded fields only.
 			assert.equal(result?.status, 'done', `the outcome status was ${result?.status}`)
 			assert.equal(result?.childThreadId, child.id)
-			assert.ok(result.summary.includes('CHILD-REPORT'), `the summary did not carry the child's report: ${result.summary.slice(0, 300)}`)
+			// Exactly the child's final message, not a concatenation of its turns: what the
+			// parent receives is one report, and the whole of it is the last thing the child said.
+			assert.equal(result.summary, CHILD_REPORT, `the summary is not the child's final message: ${result.summary.slice(0, 300)}`)
 			assert.ok(Array.isArray(result.filesTouched), 'filesTouched is not an array')
 
 			// The child really did receive and answer the task, so "the parent never saw
@@ -418,8 +428,9 @@ describe('subagent delegation', () => {
 			const before = await s.page.evaluate(() => [...globalThis.__voidChatThreadService.state.pinnedThreadIds])
 			assert.equal(before.includes(childId), false, 'the child was pinned at spawn')
 
-			// Exactly what the row's link does: `switchToThread`, which is the
-			// user-initiated path and therefore pins.
+			// Exactly what the row's link does. It must *not* pin: the strip is the user's own
+			// list of threads, and a preview of the agent's delegate does not belong in it —
+			// that is the supervision collapse, one tab per child.
 			const opened = await s.page.evaluate((id) => {
 				const svc = globalThis.__voidChatThreadService
 				svc.switchToThread(id)
@@ -427,7 +438,10 @@ describe('subagent delegation', () => {
 			}, childId)
 
 			assert.equal(opened.currentThreadId, childId, 'the link did not switch to the child')
-			assert.equal(opened.pinned.includes(childId), true, 'the opened child has no tab — there would be no way back')
+			assert.equal(opened.pinned.includes(childId), false, 'opening a child pinned it — it would sit in the tab strip for good')
+			// Guard: the parent keeps its tab, so "the child is not in the strip" is not the
+			// uninteresting case of a strip with nothing in it.
+			assert.equal(opened.pinned.includes(parent.id), true, 'the parent lost its tab')
 
 			// The banner: a badge, the name the parent coined, and a way back.
 			assert.ok(await domHas(s.page, 'Subagent'), 'the child banner did not render')

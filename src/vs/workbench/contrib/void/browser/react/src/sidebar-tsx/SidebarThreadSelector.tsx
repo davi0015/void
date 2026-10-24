@@ -492,6 +492,12 @@ export const SidebarThreadTabs = React.memo(() => {
 	const tabs = (pinnedThreadIds ?? [])
 		.filter(id => !!allThreads[id])
 
+	// A child thread is viewed *through* its parent: `switchToThread` refuses to pin one,
+	// so while a subagent's conversation is on screen the parent's tab is the active one.
+	// Without this the strip would look empty, and a fan-out would be a strip of the
+	// agent's own conversations — the supervision collapse the design names.
+	const activeTabId = allThreads[currentThreadId]?.parentThreadId ?? currentThreadId
+
 	// Keep the active tab in view when threads are switched from outside the
 	// strip (e.g. landing-page history click), otherwise long tab rows can
 	// silently hide the current selection offscreen.
@@ -852,7 +858,7 @@ export const SidebarThreadTabs = React.memo(() => {
 			>
 				{showNothing ? null : renderedTabs.map(id => {
 					const t = allThreads[id]!
-					const isActive = id === currentThreadId
+					const isActive = id === activeTabId
 					const isRunning = runningThreadIds[id]
 
 					// Phase E commit 5 — workspace provenance indicator. The icon
