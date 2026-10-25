@@ -140,9 +140,22 @@ The consequence is that a child's capability is **exactly the parent's**: same
 supplies a higher grant to attenuate. See §5, which is now a rule about inheritance
 rather than a helper for narrowing.
 
-`ChatMode = 'agent' | 'gather' | 'normal'` (`voidSettingsTypes.ts:472`) is unchanged. It
-stays the user-facing mode selector for a top-level thread, and `agent` mode simply gains
-the delegation tools.
+Delegation landed on a fourth rung instead of widening `agent`. `ChatMode` is now
+`'normal' | 'gather' | 'agent' | 'orchestrator'`: `agent` keeps every builtin tool *except*
+the three delegation tools, and `orchestrator` — the only rung that can start or steer a
+child — is the full list (`levelOfChatMode` and `levelOfBuiltinToolName` in
+`common/toolsServiceTypes.ts`). What that buys is measured: the three delegation
+descriptions are 4,546 characters, about 1.1k tokens, and they sat in the system message of
+*every* agent request, where they read as an instruction to delegate even when the request
+was a one-line question.
+
+The ladder also made the gate a single comparison. `gather` ⊂ `agent` ⊂ `orchestrator` is
+monotonic, so "delegation needs no approval but can write" falls out of two levels instead
+of an exclusion list — the shape that had already gone wrong once, when `run_subagent`
+first met the `gather` filter.
+
+A child runs one rung down: `chatModeOfChildThread` steps the parent's mode to `agent` and
+never above it, so an orchestrator's child can act but cannot delegate again (§5).
 
 **If named roles are ever wanted** — a cheap model for research, a strong one for
 implementation — that is a model-selection concern and can land on top of this without a
@@ -252,12 +265,12 @@ Each row carries the child's id, its alias, whether it is running, how its last 
 and **its first instruction** — `task` is in the row because an id is not something a model
 can recognise, and a paraphrased task is. It takes no arguments and never waits.
 
-All three are registered in `toolDefinitionOfToolName` (`toolRegistry.ts`) and gated to
-`ChatMode === 'agent'`. The gate is not the approval table: delegation needs no approval,
-so `gather` would have kept it by falling through that filter, and `gather` is read-only
-while a child can write. `delegationToolNames` excludes them, and
-`isToolAvailableInChatMode` (`common/toolsServiceTypes.ts`) is that rule in one tested
-place rather than an expression inside `availableTools`.
+All three are registered in `toolDefinitionOfToolName` (`toolRegistry.ts`) and gated to the
+`orchestrator` rung — level 3 in `levelOfBuiltinToolName` (`common/toolsServiceTypes.ts`).
+The level is not derived from the approval table: delegation needs no approval, so graded by
+approval it would sit with the read-only tools and let `gather` start a child that can write
+(§2). A level says what a tool *does*; `isToolAvailableInChatMode` compares it to the mode's
+level in one tested place rather than an expression inside `availableTools`.
 
 **`fork_subagent`** is deferred to M4. It inherits the parent's messages, so its cost scales
 with whatever the parent accumulated; it belongs with the context-inheritance work, not
@@ -316,6 +329,12 @@ Three properties still have to hold, and none of them is about narrowing:
 - **Delegation must not widen.** A child created with a default mode instead of the
   parent's would be the bug the helper above would have hidden. Child creation copies
   `permissionMode` from the parent; that copy is the whole enforcement.
+- **A child runs one rung down.** `chatModeOfChildThread` (`common/toolsServiceTypes.ts`)
+  steps the parent's mode to `agent` and no further, so the fourth rung does not inherit:
+  an orchestrator's child can act but cannot delegate again. It is the one thing delegation
+  deliberately does not copy from its parent, and because it narrows rather than widens it
+  does not weaken the rule above. The depth cap in `callTool` (§7) is the second lock on
+  the same door.
 - **A child never auto-approves merely because it is backgrounded.** If a child needs
   approval while the parent runs unattended, the parent parks in `waiting_tools` and the
   approval surfaces on the child thread through the existing notification path
@@ -513,12 +532,12 @@ predictions are quietly overwritten stops being evidence of anything.
 | File | Change |
 |---|---|
 | `common/voidSettingsTypes.ts` | Add `SubagentStatus`, `SubagentOutcome` types, and the child linkage fields on `ThreadType`. **Landed elsewhere**: the types live in `common/childThreadLinkage.ts`, beside the rules that compute them, and the `ThreadType` fields are on the type where it is declared, in `browser/chatThreadService.ts` |
-| `common/toolsServiceTypes.ts` | Add `run_subagent`, `send_message` and `list_children` params + results to the two type maps — **plus `delegationToolNames` and `isToolAvailableInChatMode`**, because `gather` must not delegate and that rule needed to be testable without a workbench |
+| `common/toolsServiceTypes.ts` | Add `run_subagent`, `send_message` and `list_children` params + results to the two type maps — **plus `delegationToolNames` and `isToolAvailableInChatMode`**, because `gather` must not delegate and that rule needed to be testable without a workbench. **Later**: the rule became a ladder (`levelOfBuiltinToolName`, `levelOfChatMode`, `chatModeOfChildThread`) when delegation moved to its own mode (§2) |
 | `common/prompt/prompts.ts` | Add the delegation tool definitions to `chat_systemMessage`, including the concurrent-writer caveat (§5). **Not needed**: descriptions come from each tool's own file via the registry, so the only change here is three names in `builtinToolNames` |
 | `browser/tools/runSubagent.tool.ts` | **New** — spawn a fresh-context child; enforce depth 1. Depth is checked in `callTool` (see §5) |
 | `browser/tools/childSteering.tool.ts` | **New** — `send_message`, `list_children` |
-| `browser/tools/toolRegistry.ts` | Register new tools; gate to `chatMode === 'agent'` in `availableTools`. Done by delegating the rule to `isToolAvailableInChatMode` |
-| `browser/chatThreadService.ts` | Child-thread creation with inherited context; `_runChatAgent` parameterization; usage rollup; child cascade on interrupt; retention. **Three corrections**: the loop needed no parameterization (it already takes `modelSelection`, and `chatMode` is global — a child inheriting its parent's resolves to the same value); the cascade is the tool's `interruptTool` calling `abortRunning`, not a rework of `_interruptConcurrentTools`; **nothing retains or prunes a child**, which §2 already decided |
+| `browser/tools/toolRegistry.ts` | Register new tools; gate them in `availableTools`. Done by delegating the rule to `isToolAvailableInChatMode`, and **later** by the rung comparison — which also moved the MCP gate from `=== 'agent'` to "at or above `agent`" |
+| `browser/chatThreadService.ts` | Child-thread creation with inherited context; `_runChatAgent` parameterization; usage rollup; child cascade on interrupt; retention. **Four corrections**: the loop needed no parameterization for the model (it already takes `modelSelection`), and once `orchestrator` existed the mode needed one line at the top of the loop rather than a parameter on every call; the cascade is the tool's `interruptTool` calling `abortRunning`, not a rework of `_interruptConcurrentTools`; **nothing retains or prunes a child**, which §2 already decided; and the mode is the one thing a child does not inherit |
 | `browser/convertToLLMMessageService.ts` | Agent index appended to the `aiInstructions` path alongside the skills index. **Dropped** with agent definitions (§1) |
 | `browser/react/src2/sidebar-tsx/` | Child thread cards, parent/child tree, transcript link, agent badge. **Landed in `react/src/`**, not `src2/` (which is generated), and only partly: transcript link and badge yes, tree and live status are M3 (§10) |
 | `common/childThreadLinkage.ts` | **New, unplanned** — the linkage and inheritance rules, extracted so the node tier can test them (a rule in `browser/` cannot be tested at all) |
@@ -548,12 +567,12 @@ Bug numbers are canonical across both documents — see [`thread-storage.md` §1
 | **S9** | Loop parameterization — *ships inside S8*, listed separately only to keep this sequence aligned with the numbering used during review. **Deferred with the budget half**: children need a parameterized loop, nothing before them does | Behaviour byte-identical |
 | **S10** | Message store, migration, and bounded residency — message bodies leave the mirrored database; memory scales with active threads; load cost scales with thread size; per-thread lazy migration with a read fallback; **the image migration S5 defers** — the flat `voidImages/` directory attributed to its threads and reclaimed (bugs 1, 2, 3, 10, and the legacy half of 6, 7, 8) | Renderer memory no longer scales with total message count; a 5,000-message thread opens within budget; threads created before the change still open; after a pass over a profile holding flat images, `voidImages/` holds none and every image still renders |
 | **M1** | **Folded into M2.** Was agent definitions and attenuation; both are dropped (§1, §5), and what remained had no consumer before a child exists. Budgets were deferred out of S8 and are now deprioritised entirely (§8) | — |
-| **M2** | Delegation — child threads with parent linkage, `alias` and full inheritance of the parent's context; `run_subagent`; `send_message` and `list_children`, so delegation is iterative and recoverable; depth-1 in `validateParams`; bounded result contract; cost rollup; child rendering with a transcript link. **No roles, no attenuated permissions, and nothing prunes a child** — a child's capability is its parent's and its data is as durable as a user thread's (§1, §2). **Shipped** — see the note below for the four deviations | Design, develop, test and review a feature through children, and the parent's peak context stays below what doing the same work inline needs |
+| **M2** | Delegation — child threads with parent linkage, `alias` and full inheritance of the parent's context; `run_subagent`; `send_message` and `list_children`, so delegation is iterative and recoverable; depth-1 in `validateParams`; bounded result contract; cost rollup; child rendering with a transcript link. **No roles, no attenuated permissions, and nothing prunes a child** — a child's capability is its parent's and its data is as durable as a user thread's (§1, §2). **Shipped** — see the note below for the five deviations | Design, develop, test and review a feature through children, and the parent's peak context stays below what doing the same work inline needs |
 | **M3** | Parallelism and control — batched fan-out in one call; `interrupt_child`; parent→child tree UI; interrupt cascade; approval routing for non-visible children; failure isolation; aggregate status; **the shared residency budget, eviction priority and cascade** ([`thread-storage.md`](./thread-storage.md) §2.2). Caps and the residency budget are measured here rather than pre-built (§6) | A fan-out of a dozen children creates, runs, seals and prunes without unbounded renderer growth; one child failing leaves siblings and the parent usable |
 | **M4** | Context inheritance and routing — `fork_subagent`; an optional model argument on the spawn call, so a parent can route a child to a cheaper model; declarative pipeline and parallel stages | A fork inherits the parent's compaction state consistently, not raw pre-boundary messages |
 | **M5** | Scoped implementation — writer children with explicit file partitioning; worktree-per-child isolation; optional JS orchestration sandbox | Deleting a parent removes children and their images; parallel writers do not lose updates |
 
-**M2 shipped, with four deviations.** None of them changes the capability; each is a place
+**M2 shipped, with five deviations.** None of them changes the capability; each is a place
 the plan was wrong about how the capability would be built.
 
 1. **No `wait`.** The call always blocks (§3). Background delegation needs a parent that can
@@ -562,12 +581,18 @@ the plan was wrong about how the capability would be built.
 2. **Depth is checked in `callTool`, not `validateParams`** (§5), because `validateParams`
    is never given the executing thread and therefore cannot see the parent's depth.
 3. **The loop needed no parameterization.** The plan budgeted a refactor so a child could
-   run with its own mode and model. It already takes `modelSelection` as an argument, and
-   `chatMode` is global — a child that inherits its parent's resolves to the same value — so
-   the refactor had nothing left to do.
+   run with its own mode and model. It already takes `modelSelection` as an argument, so
+   that half was done, and the mode needed one line at the top of the loop rather than a
+   parameter on every call. When this shipped, `chatMode` was global and a child's copy
+   resolved to the same value — the fourth rung is what made the step-down necessary (§2).
 4. **`send_message` cannot steer a running child**, and `interrupt_child` shipped as an
    internal cascade rather than a tool (§7), for the same reason as (1): nothing runs
    concurrently, so there is nothing to steer and nothing to interrupt while a tool waits.
+5. **A fourth mode.** `agent` lost the delegation tools to a new top rung, `orchestrator`,
+   after the milestone had shipped: 4,546 characters of delegation description — about
+   1.1k tokens — were going into the system message of every agent request, where they read
+   as an instruction to delegate. The capability is unchanged; only the rung it sits on is,
+   and the gate became a level comparison as it moved (§2, §3).
 
 Two smaller ones are recorded where they belong: the badge/indicator/transcript link shipped
 but the live status, nested card and tree did not (§10), and the agent-index injection
