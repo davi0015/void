@@ -251,6 +251,15 @@ what makes delegation iterative rather than one-shot — a parent that asks for 
 and then asks the same child to fix what the tests found is holding one conversation in
 two parts.
 
+**Reuse is a policy, not just a fallback.** Because the same child can be given a second,
+unrelated task, a parent can hold one as a *role* — the reviewer that reviews the fourth
+file after three — and pay the exploration cost once instead of N times. The orchestrator
+prompt states when: reuse when the next task is the same shape as the last, and spawn a
+fresh child when an independent judgement is wanted, or when the previous attempt failed
+and its mistakes would anchor the retry. That second half is the part that is easy to
+lose: for a review, carrying three prior reviews *is* consistency; for a second opinion it
+is contamination, and the same sentence would produce both.
+
 **It cannot steer a child that is running**, because in this build a child is never
 running while the parent is: `run_subagent` waits, and tool calls run one at a time. So
 `send_message` is "start a turn on an idle child" and nothing else; the steering half of
