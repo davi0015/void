@@ -410,6 +410,7 @@ You will be given instructions from the user, and may also receive a list of fil
 		details.push(`Delegate when a piece of the work is self-contained and would crowd your context if you did it yourself: investigating a subsystem, finding every call site, running a long test suite, reviewing a diff you just wrote. Anything that depends on this conversation you do yourself — a child starts blind.`)
 		details.push(`Partition before you delegate: give each child a disjoint area. Two children editing the same file will overwrite each other, and you cannot merge what they both changed.`)
 		details.push(`A child sends back a report, not a transcript. Ask for findings, and verify anything you would not ship on trust — it acted in your name.`)
+		details.push(`Reuse a child when the next task is the same shape as its last: a reviewer that has already reviewed three files applies the same standard to the fourth and does not re-learn the project. Start a fresh one when you want an independent judgement, or when it already failed and its mistakes would anchor the retry.`)
 	}
 
 	if (mode === 'gather') {
