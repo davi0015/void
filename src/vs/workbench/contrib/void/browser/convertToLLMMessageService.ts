@@ -20,7 +20,7 @@ import { ITerminalToolService } from './terminalToolService.js';
 import { IVoidModelService } from '../common/voidModelService.js';
 import { URI } from '../../../../base/common/uri.js';
 import { EndOfLinePreference } from '../../../../editor/common/model.js';
-import { ToolName } from '../common/toolsServiceTypes.js';
+import { levelOfChatMode, ToolName } from '../common/toolsServiceTypes.js';
 import { IMCPService } from '../common/mcpService.js';
 import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -1326,7 +1326,9 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 
 		if (includeDirectoryListing) {
 			directoryStr = await this.directoryStrService.getAllDirectoriesStr({
-				cutOffMessage: chatMode === 'agent' || chatMode === 'gather' ?
+				// A mode with tools is told to use them; `normal` has none, so it is told to
+				// ask. The ladder answers this rather than a list of mode names.
+				cutOffMessage: levelOfChatMode[chatMode] >= levelOfChatMode['gather'] ?
 					`...Directories string cut off, use tools to read more...`
 					: `...Directories string cut off, ask user for more if necessary...`
 			})

@@ -1,4 +1,4 @@
-import { BuiltinToolName, isToolAvailableInChatMode } from '../../common/toolsServiceTypes.js'
+import { BuiltinToolName, isToolAvailableInChatMode, levelOfChatMode } from '../../common/toolsServiceTypes.js'
 import { InternalToolInfo, builtinToolNames } from '../../common/prompt/prompts.js'
 import { ChatMode } from '../../common/voidSettingsTypes.js'
 import { ToolDefinitionCore } from './toolTypes.js'
@@ -66,8 +66,9 @@ export const isConvertedTool = (toolName: BuiltinToolName): boolean => {
 
 // Resolve the effective tool list for a given chat mode. Builtin tool info
 // (name, description, params) is sourced from the per-file registry — no more
-// duplicated descriptions in prompts.ts. MCP tools are only included in agent
-// mode.
+// duplicated descriptions in prompts.ts. MCP tools are included from `agent` up:
+// below it a mode is not allowed to act on the world, and an MCP tool is an
+// arbitrary one.
 //
 // Which names a mode may use is `isToolAvailableInChatMode` (in `common/`, because
 // it is a rule rather than a lookup and the node tier covers it). This function is
@@ -90,7 +91,7 @@ export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalTool
 		}
 	}) ?? undefined
 
-	const effectiveMCPTools = chatMode === 'agent' ? mcpTools : undefined
+	const effectiveMCPTools = chatMode !== null && levelOfChatMode[chatMode] >= levelOfChatMode['agent'] ? mcpTools : undefined
 
 	const tools: InternalToolInfo[] | undefined = !(builtinNames || mcpTools) ? undefined
 		: [

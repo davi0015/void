@@ -20,7 +20,7 @@ import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, Raw
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
-import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, effectiveAutoApproveMode, normalizeThreadPermissionMode, ThreadPermissionMode, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
+import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, chatModeOfChildThread, effectiveAutoApproveMode, normalizeThreadPermissionMode, ThreadPermissionMode, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { IToolsService } from './toolsService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
@@ -3757,7 +3757,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 
 		// above just defines helpers, below starts the actual function
-		const { chatMode } = this._settingsService.state.globalSettings // should not change as we loop even if user changes it, so it goes here
+		// Read once per run, so a mode change mid-loop cannot switch the tool list under
+		// it. A child runs one rung down — never above its parent, never above `agent` —
+		// because delegation does not inherit (§5 of the multiagent design).
+		const { chatMode: globalChatMode } = this._settingsService.state.globalSettings
+		const chatMode = this.state.allThreads[threadId]?.parentThreadId !== undefined
+			? chatModeOfChildThread(globalChatMode)
+			: globalChatMode
 		const { overridesOfModel } = this._settingsService.state
 
 		let nMessagesSent = 0

@@ -23,7 +23,7 @@ export const runSubagentToolCore: ToolDefinitionCore<'run_subagent'> = {
 	name: 'run_subagent',
 	description: `Hand a self-contained task to a child agent and wait for its report.
 
-The child is a separate agent with a **fresh, empty context**: it does not see this conversation, your reasoning, or your tool results. Everything it knows is the \`task\` you write. It works in the same workspace, with the same model and the same permissions you have, so it can read, edit, run commands and search exactly as you can.
+The child is a separate agent with a **fresh, empty context**: it does not see this conversation, your reasoning, or your tool results. Everything it knows is the \`task\` you write. It works in the same workspace, with the same model and the same permissions you have, so it can read, edit, run commands and search exactly as you can — but it cannot delegate further. The subagents are yours.
 
 Use it when the work is self-contained and its intermediate steps would crowd your context: investigating a subsystem and reporting findings, running the tests and reporting failures, searching for every call site, reviewing a diff you just wrote. Do NOT use it for work that needs the conversation you are in — the child starts blind.
 

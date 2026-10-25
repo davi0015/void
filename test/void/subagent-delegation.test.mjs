@@ -130,9 +130,24 @@ async function delegateFrom(page, { threadId, name = 'run_subagent', rawParams, 
 	}, { threadIdArg: threadId, toolName: name, params: rawParams ?? { alias, task }, id: toolId })
 }
 
-/** A launched app with a model selected and a stubbed transport, plus one parent message. */
+/**
+ * A launched app with a model selected and a stubbed transport, plus one parent message.
+ *
+ * The parent is put in `orchestrator` mode first: that is the only mode whose tool list
+ * contains delegation — `agent` is every builtin tool *except* `run_subagent` and its two
+ * companions — and these scenarios drive the tool by hand, so without this the product
+ * would sit in a mode where a user could never reach what the test exercises. Whether the
+ * gate itself is right is the node tier's job (`ToolAvailability`); this only makes the
+ * app's state match the feature under test.
+ */
 async function scenario(page, { report = CHILD_REPORT } = {}) {
 	await h.ensureModelSelection(page)
+	const mode = await page.evaluate(async () => {
+		const svc = globalThis.__voidChatThreadService
+		await svc._settingsService.setGlobalSetting('chatMode', 'orchestrator')
+		return svc._settingsService.state.globalSettings.chatMode
+	})
+	assert.equal(mode, 'orchestrator', `the app is in "${mode}" mode, so delegation would not be offered to a user`)
 	await h.stubLLM(page, report, { usage: STUB_USAGE })
 	const parent = await seedCurrentThread(page, PARENT_MARKER)
 	assert.equal(parent.messageCount, 1, `the parent thread did not take its message (${parent.messageCount})`)

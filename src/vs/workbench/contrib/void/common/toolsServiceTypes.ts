@@ -4,6 +4,10 @@ import { Edit } from './editCodeServiceTypes.js';
 import { SnakeCaseKeys } from './prompt/prompts.js';
 import { RawToolParamsObj } from './sendLLMMessageTypes.js';
 import type { ChildThreadSummary, SubagentOutcome } from './childThreadLinkage.js';
+// Type-only: `voidSettingsTypes` imports the approval types from here, so a value
+// import would close a runtime cycle. Erased at compile time, and `ChatMode` is a
+// string union, so nothing about this file is worse for it.
+import type { ChatMode } from './voidSettingsTypes.js';
 
 
 
@@ -53,33 +57,78 @@ export const toolApprovalTypes = new Set<ToolApprovalType>([
 	'MCP tools',
 ])
 
-// Tools that hand work to a child agent. They are `agent`-only, and that is not a
-// consequence of the approval table above: delegation needs no approval, so they
-// would otherwise pass the `gather` filter (`everything not in
-// approvalTypeOfBuiltinToolName`) and let a read-only investigation spawn a child
-// that can write. The mode is `agent`'s alone because delegation *is* acting.
+// Tools that hand work to a child agent. They sit on the top rung below, and that is
+// not a consequence of the approval table above: delegation needs no approval, so
+// graded by approval alone it would land with the read-only tools and let a `gather`
+// investigation spawn a child that can write. What separates them is what they *do*.
 export const delegationToolNames = new Set<BuiltinToolName>(['run_subagent', 'send_message', 'list_children'])
+
+
+// ===== Rungs: which tools a mode is offered =====
+//
+// A chat mode is a rung and a tool sits on one; a mode gets a tool when the tool's
+// rung is at or below the mode's. That is the whole rule, and it is one comparison
+// rather than a branch per mode.
+//
+// The rung says what a tool does to the world, *not* whether a call is prompted.
+// Those were the same question until delegation arrived: `gather` used to be
+// "everything not in the approval table", which is right until a tool needs no
+// approval and can still write. Keeping the two apart is why this table exists
+// separately from `approvalTypeOfBuiltinToolName` — approval answers prompting, this
+// answers effect — and the test beside it asserts they agree today for every tool
+// except delegation, so a change to either has to be deliberate rather than silent.
+//
+// 1 observes, 2 changes the workspace, 3 spends another agent.
+export type ToolLevel = 1 | 2 | 3
+
+export const levelOfBuiltinToolName: { [T in BuiltinToolName]: ToolLevel } = {
+	// --- 1: cannot change the workspace ---
+	'read_file': 1, 'ls_dir': 1, 'get_dir_tree': 1,
+	'search_pathnames_only': 1, 'search_for_files': 1, 'search_in_file': 1,
+	'go_to_definition': 1, 'go_to_usages': 1, 'read_lint_errors': 1,
+	'read_terminal': 1, 'fetch_url': 1, 'semantic_search': 1, 'search_history': 1, 'load_skill': 1,
+	// --- 2: writes files or runs commands, so the mode has to be allowed to act ---
+	'create_file_or_folder': 2, 'delete_file_or_folder': 2, 'rename_file_or_folder': 2,
+	'rewrite_file': 2, 'edit_file': 2,
+	'run_command': 2, 'run_persistent_command': 2, 'open_persistent_terminal': 2, 'kill_persistent_terminal': 2,
+	// --- 3: starts or steers another agent ---
+	'run_subagent': 3, 'send_message': 3, 'list_children': 3,
+}
+
+// Same scale for modes. `normal` is below every tool on purpose: it has none. Total
+// over `ChatMode`, so a mode added to the union does not compile until it is placed
+// on the ladder — the alternative is a mode that silently inherits no tools.
+export const levelOfChatMode: { [mode in ChatMode]: number } = {
+	'normal': 0,
+	'gather': 1,
+	'agent': 2,
+	'orchestrator': 3,
+}
 
 /**
  * Whether a chat mode may use one builtin tool.
  *
  * Pure and here rather than beside `availableTools` in `browser/`, because it is the
- * one rule in tool selection that can be wrong in a way nobody sees: `gather` is
- * read-only by construction — it keeps every tool that needs no approval — and
- * delegation needs no approval, so a child spawned from `gather` would hand a
- * read-only mode the ability to write. A rule that decides that has to be testable
- * without a running workbench.
- *
- * `normal` has no tools at all: it is the chat-only mode.
+ * one rule in tool selection that can be wrong in a way nobody sees: the wrong answer
+ * offers a writer to a read-only mode, or silently takes delegation away from the
+ * mode built for it. A rule that decides that has to be testable without a running
+ * workbench.
  */
-export const isToolAvailableInChatMode = (
-	toolName: BuiltinToolName,
-	chatMode: 'agent' | 'gather' | 'normal',
-): boolean => {
-	if (chatMode === 'agent') return true
-	if (chatMode === 'normal') return false
-	return !(toolName in approvalTypeOfBuiltinToolName) && !delegationToolNames.has(toolName)
-}
+export const isToolAvailableInChatMode = (toolName: BuiltinToolName, chatMode: ChatMode): boolean =>
+	levelOfBuiltinToolName[toolName] <= levelOfChatMode[chatMode]
+
+/**
+ * The mode a child thread runs in, given the mode its parent was in.
+ *
+ * A child is never above its parent and never above `agent`: delegation does not
+ * inherit, so an orchestrator's child can act but cannot delegate again. Computed
+ * from the parent at run time rather than stored on the child, so a stored thread
+ * cannot start out privileged and the depth cap has one expression instead of one
+ * per call site. A parent below `agent` cannot delegate at all, so in practice this
+ * only ever steps orchestrator down.
+ */
+export const chatModeOfChildThread = (parentMode: ChatMode): ChatMode =>
+	levelOfChatMode[parentMode] > levelOfChatMode['agent'] ? 'agent' : parentMode
 
 
 // Auto-approve mode per tier. Tri-state:

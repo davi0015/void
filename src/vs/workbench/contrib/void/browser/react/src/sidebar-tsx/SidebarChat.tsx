@@ -261,12 +261,14 @@ const nameOfChatMode = {
 	'normal': 'Chat',
 	'gather': 'Gather',
 	'agent': 'Agent',
+	'orchestrator': 'Orchestrator',
 }
 
 const detailOfChatMode = {
 	'normal': 'Normal chat',
 	'gather': 'Reads files, but can\'t edit',
 	'agent': 'Edits files and uses tools',
+	'orchestrator': 'Edits files, and delegates to subagents',
 }
 
 
@@ -276,7 +278,7 @@ const ChatModeDropdown = ({ className }: { className: string }) => {
 	const voidSettingsService = accessor.get('IVoidSettingsService')
 	const settingsState = useSettingsState()
 
-	const options: ChatMode[] = useMemo(() => ['normal', 'gather', 'agent'], [])
+	const options: ChatMode[] = useMemo(() => ['normal', 'gather', 'agent', 'orchestrator'], [])
 
 	const onChangeOption = useCallback((newVal: ChatMode) => {
 		voidSettingsService.setGlobalSetting('chatMode', newVal)

@@ -9,7 +9,7 @@ import { IDirectoryStrService } from '../directoryStrService.js';
 import { StagingSelectionItem } from '../chatThreadServiceTypes.js';
 import { os } from '../helpers/systemInfo.js';
 import { RawToolParamsObj } from '../sendLLMMessageTypes.js';
-import { approvalTypeOfBuiltinToolName, BuiltinToolName, ToolName } from '../toolsServiceTypes.js';
+import { approvalTypeOfBuiltinToolName, BuiltinToolName, levelOfChatMode, ToolName } from '../toolsServiceTypes.js';
 import { ChatMode } from '../voidSettingsTypes.js';
 
 // Triple backtick wrapper used throughout the prompts for code blocks
@@ -243,7 +243,7 @@ export type ChatPromptContext = {
 // than embed it in the system message — keeping it out of the system message lets
 // the stable prefix and the full conversation history be prefix-cached across turns.
 export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode: mode, includeDirectoryListing = true, directoryDiff }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'allTerminals' | 'chatMode'> & { includeDirectoryListing?: boolean, directoryDiff?: string | null }) => {
-	const terminalBlock = mode === 'agent' && allTerminals.length > 0
+	const terminalBlock = modeCanAct(mode) && allTerminals.length > 0
 		? allTerminals.map(t => {
 			const cmd = t.lastCommand ? ` — ${t.lastCommand}` : ''
 			return `  - ${t.name}: ${t.status}${cmd}`
@@ -285,12 +285,25 @@ ${sysInfo}${fsInfo ? `\n\n${fsInfo}` : ''}${diffInfo ? `\n\n${diffInfo}` : ''}
 }
 
 
+// What each mode is *for*, in the model's own words. One line each: the blocks
+// below carry the rest, and this is the sentence that tells a mode it is not the
+// other modes.
+const chatModePersona: { [mode in ChatMode]: string } = {
+	'normal': ` You answer questions and suggest edits, describing code changes precisely in code blocks.`,
+	'gather': ` You research the codebase — find, read, and synthesize code to give grounded answers.`,
+	'agent': ` You work autonomously — investigate, implement, and verify without waiting for permission on each step.`,
+	'orchestrator': ` You work autonomously, and you have subagents: split independent work, hand each part to a child, and integrate what they report.`,
+}
+
+// "Has tools" and "can act" are ladder questions, asked of the ladder rather than
+// written out per mode, so a mode added to it inherits both answers.
+const modeHasTools = (mode: ChatMode) => levelOfChatMode[mode] >= levelOfChatMode['gather']
+const modeCanAct = (mode: ChatMode) => levelOfChatMode[mode] >= levelOfChatMode['agent']
+
+
 export const chat_systemMessage = ({ chatMode: mode, tools }: Pick<ChatPromptContext, 'chatMode' | 'tools'>) => {
 	const header = (`You are a pragmatic senior software engineer working as the user's pair-programmer in a code editor.\
-${mode === 'agent' ? ` You work autonomously — investigate, implement, and verify without waiting for permission on each step.`
-			: mode === 'gather' ? ` You research the codebase — find, read, and synthesize code to give grounded answers.`
-				: mode === 'normal' ? ` You answer questions and suggest edits, describing code changes precisely in code blocks.`
-					: ''}
+${chatModePersona[mode]}
 You own the problems you're given end-to-end: you investigate, decide, act, and verify your work. You commit to solutions instead of handing back lists of options for the user to choose from. You match the directness and judgment of an experienced engineer who knows when to gather more information and when to act on what they already have.
 Be direct — don't open with filler like "Got it", "Great question!", or "Sure!". Prioritize technical accuracy over agreeing with the user; if their approach has problems, state your concern and propose an alternative. Match the user's level of detail — terse question, terse answer.
 
@@ -310,7 +323,7 @@ You will be given instructions from the user, and may also receive a list of fil
 	details.push(`Act, don't describe. If you can answer a question yourself by reading a file or running a tool, do that instead of asking the user.`)
 	details.push(`When you finish a task, briefly state what you did and what you verified. Do not pad responses with offers like "let me know if you'd like me to...".`)
 
-	if (mode === 'agent' || mode === 'gather') {
+	if (modeHasTools(mode)) {
 		details.push(`Only call tools if they help you accomplish the user's goal. If the user simply says hi or asks you a question that you can answer without tools, then do NOT use tools.`)
 		details.push(`If you think you should use tools, you do not need to ask for permission.`)
 		// Parallel tool calls are OK (and encouraged) when the operations are independent
@@ -340,7 +353,7 @@ You will be given instructions from the user, and may also receive a list of fil
 		details.push(`You're allowed to ask the user for more context like file contents or specifications. If this comes up, tell them to reference files and folders by typing @.`)
 	}
 
-	if (mode === 'agent') {
+	if (modeCanAct(mode)) {
 		// A3 — Agent loop framing. Explicit phase structure the model can
 		// self-check against, instead of the implicit "do everything in some
 		// order" shape. Helps weaker models (Nemotron) not skip steps and gives
@@ -390,6 +403,15 @@ You will be given instructions from the user, and may also receive a list of fil
 		details.push(`If you notice unexpected file changes you did not make, continue with your task — do not revert changes made by the user or other processes.`)
 	}
 
+	if (mode === 'orchestrator') {
+		// The mode exists to make fan-out a posture rather than a per-turn decision, so
+		// these rules are about *dividing* the work — which no tool description can say,
+		// because a description explains one call and this explains the shape of many.
+		details.push(`Delegate when a piece of the work is self-contained and would crowd your context if you did it yourself: investigating a subsystem, finding every call site, running a long test suite, reviewing a diff you just wrote. Anything that depends on this conversation you do yourself — a child starts blind.`)
+		details.push(`Partition before you delegate: give each child a disjoint area. Two children editing the same file will overwrite each other, and you cannot merge what they both changed.`)
+		details.push(`A child sends back a report, not a transcript. Ask for findings, and verify anything you would not ship on trust — it acted in your name.`)
+	}
+
 	if (mode === 'gather') {
 		details.push(`You are in Gather mode, so you MUST use tools to gather information, files, and context to help the user answer their query.`)
 		// Softened from "extensively read ... gathering full context" — that
@@ -402,7 +424,7 @@ You will be given instructions from the user, and may also receive a list of fil
 		details.push(`On each question: understand what the user is actually asking → investigate the relevant code → form a grounded answer. Use this as a self-check that you're answering the question, not just dumping context.`)
 	}
 
-	if (mode === 'agent') {
+	if (modeCanAct(mode)) {
 		// Trimmed from the universal format rule: "FULL PATH as first line" +
 		// "contents of the file should proceed as usual" describe the shape of
 		// an edit-via-code-block, which is only meaningful in gather/normal
