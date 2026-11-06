@@ -42,10 +42,14 @@ export const editFileToolCore: ToolDefinitionCore<'edit_file'> = {
 		if (!(await ctx.fileService.exists(uri))) {
 			throw new Error(`File not found at ${uri.fsPath}. edit_file requires an existing file to apply search/replace blocks against. Use rewrite_file to create a new file with full contents, or create_file_or_folder first then edit_file.`)
 		}
-		await ctx.voidModelService.initializeModel(uri)
+		// Check stream state BEFORE initializeModel — initializeModel pins a strong
+		// model reference in voidModelService's map that is only released through
+		// the diff lifecycle, so initializing and then throwing here (every blocked
+		// edit on a streaming file) would pin the model forever.
 		if (ctx.commandBarService.getStreamState(uri) === 'streaming') {
 			throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
 		}
+		await ctx.voidModelService.initializeModel(uri)
 		await ctx.editCodeService.callBeforeApplyOrEdit(uri)
 
 		ctx.editCodeService.instantlyApplyEdits({ uri, edits })

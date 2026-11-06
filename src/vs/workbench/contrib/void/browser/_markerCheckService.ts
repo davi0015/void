@@ -44,10 +44,11 @@ class MarkerCheckService extends Disposable implements IMarkerCheckService {
 					try {
 						// Get the text model for the file
 						const modelReference = await this._textModelService.createModelReference(error.resource);
-						const model = modelReference.object.textEditorModel;
+						try {
+							const model = modelReference.object.textEditorModel;
 
-						// Create a range from the marker
-						const range = new Range(
+							// Create a range from the marker
+							const range = new Range(
 							error.startLineNumber,
 							error.startColumn,
 							error.endLineNumber,
@@ -89,8 +90,13 @@ class MarkerCheckService extends Disposable implements IMarkerCheckService {
 							}
 						}
 
-						// Dispose the model reference
-						modelReference.dispose();
+						} finally {
+							// Dispose the model reference even when a provider throws —
+							// previously any exception between createModelReference and this
+							// line leaked the reference (and its model) for the window's
+							// lifetime, once per erroring file per 5s tick.
+							modelReference.dispose();
+						}
 					} catch (e) {
 						console.error('Error getting quick fixes:', e);
 					}
