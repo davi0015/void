@@ -352,6 +352,10 @@ type InputBox2Props = {
 	// inside the box (the textarea is `overflow-y-auto` by default). Used by
 	// the chat input so typing doesn't resize the chat area.
 	fixedHeight?: boolean;
+	// Marks the chat input so the terminal tools can give it back the focus a
+	// panel reveal takes away: the element is re-created by the layout change, so
+	// remembering the node is not enough — the replacement has to be findable.
+	chatInput?: boolean;
 	fnsRef?: { current: null | TextAreaFns };
 	className?: string;
 	onChangeText?: (value: string) => void;
@@ -361,7 +365,7 @@ type InputBox2Props = {
 	onBlur?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
 	onChangeHeight?: (newHeight: number) => void;
 }
-export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(function X({ initValue, placeholder, multiline, enableAtToMention, fixedHeight, fnsRef, className, onKeyDown, onPaste, onFocus, onBlur, onChangeText }, ref) {
+export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(function X({ initValue, placeholder, multiline, enableAtToMention, fixedHeight, chatInput, fnsRef, className, onKeyDown, onPaste, onFocus, onBlur, onChangeText }, ref) {
 
 
 	// mirrors whatever is in ref
@@ -747,6 +751,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 	return <>
 		<textarea
 			autoFocus={false}
+			data-void-chat-input={chatInput ? 'true' : undefined}
 			ref={useCallback((r: HTMLTextAreaElement | null) => {
 				if (fnsRef)
 					fnsRef.current = fns

@@ -241,13 +241,16 @@ export type ChatPromptContext = {
 // should prepend this to the latest user message (Phase B caching layout) rather
 // than embed it in the system message — keeping it out of the system message lets
 // the stable prefix and the full conversation history be prefix-cached across turns.
-export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode: mode, includeDirectoryListing = true, directoryDiff }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'allTerminals' | 'chatMode'> & { includeDirectoryListing?: boolean, directoryDiff?: string | null }) => {
+export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode: mode, includeDirectoryListing = true, directoryDiff, defaultShell }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'allTerminals' | 'chatMode'> & { includeDirectoryListing?: boolean, directoryDiff?: string | null, defaultShell?: string }) => {
 	const terminalBlock = mode === 'agent' && allTerminals.length > 0
 		? allTerminals.map(t => {
 			const cmd = t.lastCommand ? ` — ${t.lastCommand}` : ''
 			return `  - ${t.name}: ${t.status}${cmd}`
 		}).join('\n')
 		: null
+	// `unknown` is what a shell without integration reports, and without this line
+	// the model reads it as "still running" and waits instead of using the terminal.
+	const terminalNote = terminalBlock ? `\n  (status "unknown" means the shell cannot report command completion — no shell integration — so a command there settles on inactivity)` : ''
 	const sysInfo = (`Here is the user's system information:
 <system_info>
 - ${os}
@@ -259,10 +262,10 @@ ${workspaceFolders.join('\n') || 'NO FOLDERS OPEN'}
 ${activeURI}
 
 - Open files:
-${openedURIs.join('\n') || 'NO OPENED FILES'}${terminalBlock ? `
+${openedURIs.join('\n') || 'NO OPENED FILES'}${defaultShell ? `\n\n- Default shell for new terminals: ${defaultShell}` : ''}${terminalBlock ? `
 
 - Terminals:
-${terminalBlock}` : ''}
+${terminalBlock}${terminalNote}` : ''}
 </system_info>`)
 
 
