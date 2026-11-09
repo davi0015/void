@@ -12,11 +12,12 @@ import { createDecorator } from '../../../../platform/instantiation/common/insta
 import { TerminalLocation } from '../../../../platform/terminal/common/terminal.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
-import { ITerminalService, ITerminalInstance, ICreateTerminalOptions } from '../../../../workbench/contrib/terminal/browser/terminal.js';
+import { ITerminalService, ITerminalInstance, ICreateTerminalOptions, ITerminalGroupService } from '../../../../workbench/contrib/terminal/browser/terminal.js';
 import { MAX_TERMINAL_CHARS, MAX_TERMINAL_TIMEOUT_SECONDS } from '../common/prompt/prompts.js';
 import { TerminalResolveReason } from '../common/toolsServiceTypes.js';
 import { TERMINAL_AUTO_APPROVE_KEY } from '../common/storageKeys.js';
 import { timeout } from '../../../../base/common/async.js';
+import { mainWindow } from '../../../../base/browser/window.js';
 
 
 
@@ -81,6 +82,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 	constructor(
 		@ITerminalService private readonly terminalService: ITerminalService,
+		@ITerminalGroupService private readonly terminalGroupService: ITerminalGroupService,
 		@IWorkspaceContextService private readonly workspaceContextService: IWorkspaceContextService,
 		@IStorageService private readonly storageService: IStorageService,
 	) {
@@ -155,10 +157,11 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		const exitCode = terminal.exitCode
 		if (exitCode !== undefined) return `exited (code ${exitCode})`
 		// Use CommandDetection to distinguish idle (shell at prompt) from
-		// running (command executing). Falls back to 'running' when shell
-		// integration is not available.
+		// running (command executing). Without shell integration there is no
+		// capability and no way to know, so say so: a cmd terminal used to report
+		// 'running' forever, which the model reads as "wait" rather than "free".
 		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection)
-		if (!cmdCap) return 'running'
+		if (!cmdCap) return 'unknown'
 		if (cmdCap.executingCommand) {
 			const cmd = cmdCap.executingCommand
 			return `running: ${cmd.length > 60 ? cmd.slice(0, 57) + '...' : cmd}`
@@ -213,7 +216,31 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 			skipContributedProfileCheck: true,
 		};
 
+		// Creating a panel terminal opens the panel, and the workbench takes the
+		// caret out of whatever had it — in practice the chat input the user is
+		// typing in. The element survives (it is blurred, not replaced), so
+		// remembering it and giving it back after the panel settles is enough.
+		// `hidden` terminals never open the panel, so they cannot cause this.
+		// Creating a panel terminal opens the panel, and the workbench takes the
+		// caret out of whatever had it — in practice the chat input the user is
+		// typing in. The element does not survive either: the layout change
+		// re-creates it, so the replacement is found by attribute rather than by
+		// remembering the node. hidden terminals never open the panel.
+		const hadChatFocus = !hidden && !!mainWindow.document.activeElement?.closest?.('[data-void-chat-input]')
 		const terminal = await this.terminalService.createTerminal(options)
+		if (hadChatFocus) {
+			// The panel opens after this call resolves, so a single check would see
+			// nothing wrong and stop. Re-assert for a short window, and yield to the
+			// user the moment they focus something of their own.
+			for (let attempt = 0; attempt < 12; attempt++) {
+				await timeout(25)
+				const active = mainWindow.document.activeElement as HTMLElement | null
+				const activeIsTerminal = !!active && !!active.closest?.('.xterm')
+				const activeIsSomeoneElses = !!active && active !== mainWindow.document.body && !activeIsTerminal && !active.closest?.('[data-void-chat-input]')
+				if (activeIsSomeoneElses) break
+				;(mainWindow.document.querySelector('[data-void-chat-input]') as HTMLElement | null)?.focus()
+			}
+		}
 
 		// // when a new terminal is created, there is an initial command that gets run which is empty, wait for it to end before returning
 		// const disposables: IDisposable[] = []
@@ -490,9 +517,16 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		const waitForResult = async () => {
 			try {
 				if (isPersistent) {
-					// focus the terminal about to run
-					this.terminalService.setActiveInstance(terminal)
-					await this.terminalService.focusActiveInstance()
+					// Reveal the terminal so its xterm and command detection exist before we
+					// write to it — but never focus it. `sendText` does not need focus, and
+					// the user is usually typing in the chat box when a command starts.
+					//
+					// Focus must not be taken and then handed back, either: the focus call
+					// inside the reveal is deferred (`showPanel` waits a macrotask and then
+					// `focusWhenReady`), so a restore races it, and the chat input is
+					// re-rendered by the layout change in the meantime, which is why
+					// restoring it afterwards had no effect.
+					// (reveal removed for the experiment)
 				}
 				let result: string = ''
 				let resolveReason: TerminalResolveReason | undefined
