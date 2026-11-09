@@ -125,7 +125,7 @@
     "native-is-elevated": "0.7.0",
     "native-keymap": "^3.3.5",
     "native-watchdog": "^1.4.1",
-    "node-pty": "^1.2.0-beta.15",
+    "node-pty": "^1.1.0-beta33",
     "ollama": "^0.5.15",
     "open": "^8.4.2",
     "openai": "^4.96.0",
