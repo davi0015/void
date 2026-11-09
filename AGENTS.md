@@ -199,3 +199,13 @@ Reuse it. Do not rebuild launch plumbing per test.
   into it; `--test-concurrency=4` in `run.mjs` trades wall clock for reliability if it recurs.
 - Automated tests assert persistence and state, never visual quality. State plainly when the UI has
   not been checked by hand rather than implying it has.
+- **`node-pty` 1.2.0 cannot read input on Windows, and nothing will tell you.** Bumping it
+  (#121, which fixed macOS fd leaks) leaves every terminal open with output flowing and every
+  keystroke silently dropped: with 1.2.0 the pty host utility process never heartbeats
+  ("No ptyHost heartbeat after 12 seconds") and exits 0. `test/void/terminal-input.test.mjs` is
+  the guard — it types a command into a terminal and checks the shell ran it. Do not re-upgrade
+  without running that on Windows.
+- **The macOS fd workaround in `terminalProcess.ts` must stay gated to `darwin`.** It writes
+  input with `fs.write(ptyProcess.fd, ...)`, and on Windows `fd` is a console handle rather than
+  a file descriptor, so an un-gated workaround writes keystrokes where nothing reads them. The
+  terminal looks alive and takes no input.
