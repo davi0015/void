@@ -141,6 +141,23 @@ describe('terminal tooling', () => {
 			})
 			t.diagnostic(`run: ${ran.rowType} interrupted=${ran.interrupted}`)
 
+			// What the agent reads about this terminal on its next turn. A finished
+			// command must leave a state the model can act on: idle, or a running-
+			// prefixed line while one executes; unknown tells it nothing about
+			// whether the terminal is free.
+			await h.ensureModelSelection(page)
+			await h.stubLLM(page, 'ok')
+			await send(page, 'what terminals do you see?')
+			await h.waitForRunEnd(page)
+			const reqs = await h.capturedLLMRequests(page)
+			const at = reqs.indexOf('- Terminals:')
+			const block = at < 0 ? '' : reqs.slice(at, at + 200)
+			t.diagnostic('terminals block: ' + (block || 'NOT PRESENT'))
+			assert.ok(block, 'the prompt does not list the terminal at all')
+			assert.ok(
+				!/Void Agent: unknown/.test(block),
+				'a terminal that just ran a command is reported as unknown, so the model cannot tell whether it is free',
+			)
 			const afterRun = await focusIsInChatInput(page)
 			t.diagnostic(`focus in the chat after run: ${afterRun}`)
 			assert.ok(
