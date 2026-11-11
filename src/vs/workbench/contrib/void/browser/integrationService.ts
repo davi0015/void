@@ -26,6 +26,7 @@ import { Disposable } from '../../../../base/common/lifecycle.js'
 import { Emitter, Event } from '../../../../base/common/event.js'
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js'
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js'
+import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js'
 import { IChannel } from '../../../../base/parts/ipc/common/ipc.js'
 import { IMainProcessService } from '../../../../platform/ipc/common/mainProcessService.js'
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js'
@@ -405,6 +406,11 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		const short = (uri: URI): string => this._chatThreadService.getRelativeStr(uri) ?? uri.path
 		const trunc = (s: string): string => s.length > SUMMARY_MAX_COMMAND_LEN ? s.slice(0, SUMMARY_MAX_COMMAND_LEN - 1) + '…' : s
 
+		// TerminalResolveReason is a discriminated union, not a string — without
+		// this helper it stringifies as "[object Object]".
+		const terminalReason = (r: { type: 'timeout', reason: string } | { type: 'done', exitCode: number }) =>
+			r.type === 'done' ? `exit ${r.exitCode}` : `timeout (${r.reason})`
+
 		// REDACTION BOUNDARY — none of these may format result *bodies*
 		// (file contents, terminal output, match text) into the summary.
 		// Only uris, counts, sizes and resolve reasons.
@@ -425,9 +431,9 @@ class IntegrationService extends Disposable implements IIntegrationService {
 			'create_file_or_folder': (p) => `create${p.isFolder ? 'Folder' : 'File'} ${short(p.uri)}`,
 			'delete_file_or_folder': (p) => `delete${p.isFolder ? 'Folder' : 'File'} ${short(p.uri)}`,
 			'rename_file_or_folder': (p) => `rename ${short(p.sourceUri)} → ${short(p.targetUri)}`,
-			'run_command': (p, r) => `runCommand ${trunc(p.command)}${r ? ` · ${r.resolveReason}` : ''}`,
+			'run_command': (p, r) => `runCommand ${trunc(p.command)}${r ? ` · ${terminalReason(r.resolveReason)}` : ''}`,
 			'open_persistent_terminal': (p) => `openTerminal${p.cwd ? ` in ${p.cwd}` : ''}`,
-			'run_persistent_command': (p, r) => `runCommand ${trunc(p.command)}${r ? ` · ${r.resolveReason}` : ''}`,
+			'run_persistent_command': (p, r) => `runCommand ${trunc(p.command)}${r ? ` · ${terminalReason(r.resolveReason)}` : ''}`,
 			'kill_persistent_terminal': () => `killTerminal`,
 			'read_terminal': (p) => `readTerminal ${p.terminalName}`,
 			'fetch_url': (p, r) => `fetchUrl ${p.url}${r ? ` (${r.content.length} chars)` : ''}`,
@@ -480,3 +486,14 @@ class IntegrationService extends Disposable implements IIntegrationService {
 
 
 registerSingleton(IIntegrationService, IntegrationService, InstantiationType.Eager);
+
+// The service has no UI yet — this contribution's only job is to instantiate
+// the singleton at startup, so the localhost server is listening (and the
+// pairing token is persisted) without any user action. Same pattern as
+// metricsPollService. Injecting the service into the constructor is what
+// forces instantiation; registerSingleton alone never constructs anything.
+class IntegrationServiceStarter {
+	static readonly ID = 'voidIntegrationServiceStarter'
+	constructor(@IIntegrationService _integrationService: IIntegrationService) { }
+}
+registerWorkbenchContribution2(IntegrationServiceStarter.ID, IntegrationServiceStarter, WorkbenchPhase.AfterRestored);
