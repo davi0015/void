@@ -248,9 +248,11 @@ export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, 
 			return `  - ${t.name}: ${t.status}${cmd}`
 		}).join('\n')
 		: null
-	// `unknown` is what a shell without integration reports, and without this line
-	// the model reads it as "still running" and waits instead of using the terminal.
-	const terminalNote = terminalBlock ? `\n  (status "unknown" means the shell cannot report command completion — no shell integration — so a command there settles on inactivity)` : ''
+	// `unknown` is what a shell reports when nothing has confirmed what it is
+	// doing: no shell integration, and no command of ours has finished there yet.
+	// Without this line the model reads it as "still running" and waits instead of
+	// using the terminal.
+	const terminalNote = terminalBlock ? `\n  (status "unknown" means nothing has confirmed what that shell is doing — no shell integration, and no command of yours has finished there yet. A command you run there settles on its exit-code marker, or on inactivity when the command text could not carry one)` : ''
 	const sysInfo = (`Here is the user's system information:
 <system_info>
 - ${os}
