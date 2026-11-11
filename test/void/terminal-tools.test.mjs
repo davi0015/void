@@ -251,6 +251,31 @@ describe('terminal tooling', () => {
 
 			await check('cmd', '71', 8)
 
+			// A command that times out is still running. It must not read idle just
+			// because an earlier command in the same terminal completed — the state a
+			// long-running `sleep` used to be reported in.
+			const slow = await page.evaluate(async () => {
+				const tts = globalThis.__voidChatThreadService._terminalToolService
+				const { resPromise } = await tts.runCommand('ping -n 6 127.0.0.1 >nul', { type: 'persistent', persistentTerminalId: '71', timeoutSeconds: 1 })
+				const res = await resPromise
+				const term = tts.persistentTerminalInstanceOfId['71']
+				const running = tts._getTerminalStatus(term)
+				// Ctrl+C is input, and input means we can no longer say anything.
+				await term.sendText('\x03', false)
+				await new Promise(r => setTimeout(r, 400))
+				return { reason: res.resolveReason, running, afterInput: tts._getTerminalStatus(term) }
+			})
+			t.diagnostic('slow command: ' + JSON.stringify(slow))
+			assert.equal(slow.reason.type, 'timeout', 'the fixture did not produce a timeout, so the scenario proves nothing')
+			assert.equal(
+				slow.running === 'running: ping -n 6 127.0.0.1 >nul',
+				wanted,
+				`cmd: ${wanted ? 'a command that timed out while still running must read running' : 'without a marker a timed-out command cannot be reported as running'} (VOID_EXPECT=${process.env.VOID_EXPECT ?? 'present'})`,
+			)
+			// Control: on code with no marker at all this is already unknown, so it
+			// passes in both directions — it guards against the fix inventing state.
+			assert.equal(slow.afterInput, 'unknown', 'typing into the terminal must leave nothing claimed about it')
+
 			if (setup.hasWsl) await check('wsl', '73', 12)
 			else t.diagnostic('wsl: no WSL profile in this build — the cmd subject still covers completion, but not the POSIX marker')
 		})
