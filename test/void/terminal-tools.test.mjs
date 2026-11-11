@@ -17,10 +17,10 @@
 //     the terminal has to be attached for its xterm and command detection to exist
 //     — but the focus is not.
 //
-// The third — a terminal with no shell integration reporting its status as
-// "running" while idle — has no assertion here: it needs a shell the integration
-// cannot attach to (cmd on this machine), and the change is one string out of one
-// function.
+//  3. A shell VS Code cannot inject shell integration into (cmd, wsl) had no
+//     completion signal at all: every command resolved only by the inactivity
+//     timeout, and status was unknown forever. The tool now appends an exit-code
+//     marker to the command line. The last scenario covers that path.
 //
 // The focus scenario drives the *chat input* rather than a synthetic element.
 // That matters: the reveal re-renders the sidebar, so a probe element survives a
@@ -165,6 +165,94 @@ describe('terminal tooling', () => {
 				'running a command moved keyboard focus into the terminal, so a user typing in the chat box ' +
 				'loses their caret mid-sentence',
 			)
+		})
+	})
+
+	/**
+	 * Completion in a shell VS Code cannot inject shell integration into.
+	 *
+	 * cmd and wsl never get a CommandDetection capability, so `onCommandFinished`
+	 * never fires and a command used to resolve only when the inactivity timeout
+	 * expired: an `echo` cost the whole `timeout_seconds` and came back as
+	 * unanswered. The tool appends an exit-code marker to the command line
+	 * (`& call echo ...` for cmd, `; echo "...:$?"` for a POSIX shell) and
+	 * resolves on it, which also gives the terminal a status again.
+	 */
+	test('a shell without shell integration still reports completion', async (t) => {
+		await h.withScenario('terminal-tools/sentinel-' + Date.now(), async (s) => {
+			const page = s.page
+
+			const setup = await page.evaluate(async () => {
+				const tts = globalThis.__voidChatThreadService._terminalToolService
+				const termService = tts.terminalService
+				const profileService = termService._terminalProfileService
+				await profileService.profilesReady
+				const find = (re) => profileService.availableProfiles.find(p => re.test(p.profileName))
+				const cmdProfile = find(/^Command Prompt$/)
+				if (!cmdProfile) return { error: 'no Command Prompt profile in this build' }
+				// WSL profiles come from `wsl.exe -l -q`, which is given one second and
+				// times out on a loaded machine. Retry instead of quietly dropping the
+				// POSIX subject — a skipped subject proves nothing.
+				let wslProfile = find(/\(WSL\)$/)
+				for (let attempt = 0; !wslProfile && attempt < 3; attempt++) {
+					profileService.refreshAvailableProfiles()
+					await new Promise(r => setTimeout(r, 2000))
+					wslProfile = find(/\(WSL\)$/)
+				}
+				const cmd = await termService.createTerminal({ config: cmdProfile })
+				const undriven = await termService.createTerminal({ config: cmdProfile })
+				const wsl = wslProfile ? await termService.createTerminal({ config: wslProfile }) : undefined
+				tts.persistentTerminalInstanceOfId['71'] = cmd
+				tts.persistentTerminalInstanceOfId['72'] = undriven
+				if (wsl) tts.persistentTerminalInstanceOfId['73'] = wsl
+				// Let the shells reach their prompt before the tool writes to them.
+				await new Promise(r => setTimeout(r, 4000))
+				return {
+					hasWsl: !!wsl,
+					undriven: tts._getTerminalStatus(undriven),
+					cmd: tts._getTerminalStatus(cmd),
+				}
+			})
+			t.diagnostic('setup: ' + JSON.stringify(setup))
+			assert.ok(!setup.error, setup.error)
+
+			// Controls: a shell we have never driven has nothing to report, and must
+			// keep saying so. They pass whatever the marker does.
+			assert.equal(setup.undriven, 'unknown', 'a terminal that has never run a command must not claim a state')
+			assert.equal(setup.cmd, 'unknown', 'a fresh cmd terminal has no completion to report either')
+
+			const run = (terminalId, command, timeoutSeconds) => page.evaluate(async ({ id, cmd, timeout }) => {
+				const tts = globalThis.__voidChatThreadService._terminalToolService
+				const started = Date.now()
+				const { resPromise } = await tts.runCommand(cmd, { type: 'persistent', persistentTerminalId: id, timeoutSeconds: timeout })
+				const res = await resPromise
+				return {
+					ms: Date.now() - started,
+					reason: res.resolveReason,
+					result: String(res.result),
+					status: tts._getTerminalStatus(tts.persistentTerminalInstanceOfId[id]),
+				}
+			}, { id: terminalId, cmd: command, timeout: timeoutSeconds })
+
+			const wanted = h.expectedPersistence()
+			const check = async (label, terminalId, timeoutSeconds) => {
+				const out = await run(terminalId, 'echo sentinel-probe', timeoutSeconds)
+				t.diagnostic(`${label}: ${out.ms}ms reason=${JSON.stringify(out.reason)} status=${out.status} result=${JSON.stringify(out.result.slice(-120))}`)
+				// True in both directions: the command's output reached the model and
+				// the marker itself did not.
+				assert.ok(out.result.includes('sentinel-probe'), `${label}: the output of the command is missing`)
+				assert.ok(!out.result.includes('__VOID_DONE_'), `${label}: the completion marker leaked into the result`)
+				assert.equal(
+					out.reason.type === 'done' && out.status === 'idle',
+					wanted,
+					`${label}: ${wanted ? 'the command must report completion and leave the terminal idle' : 'with no marker the command can only fall back to the timeout'} (VOID_EXPECT=${process.env.VOID_EXPECT ?? 'present'})`,
+				)
+			}
+
+			await check('cmd', '71', 8)
+
+			if (setup.hasWsl) await check('wsl', '73', 12)
+			else t.diagnostic('wsl: no WSL profile in this build — the cmd subject still covers completion, but not the POSIX marker')
 		})
 	})
 })

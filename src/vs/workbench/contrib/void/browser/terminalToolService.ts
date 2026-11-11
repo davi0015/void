@@ -18,6 +18,80 @@ import { TerminalResolveReason } from '../common/toolsServiceTypes.js';
 import { TERMINAL_AUTO_APPROVE_KEY } from '../common/storageKeys.js';
 import { timeout } from '../../../../base/common/async.js';
 import { mainWindow } from '../../../../base/browser/window.js';
+import { isWindows } from '../../../../base/common/platform.js';
+
+// --- command sentinels -------------------------------------------------------
+//
+// VS Code injects shell integration only for a fixed set of shells (see
+// getShellIntegrationInjection in platform/terminal/node/terminalEnvironment.ts:
+// pwsh, powershell and Git Bash on Windows). A terminal running anything else —
+// cmd, wsl, a custom profile — never gets the CommandDetection capability, so
+// onCommandFinished never fires and a command can only be resolved by the
+// inactivity timeout: a one-second `echo` costs the whole `timeout_seconds` and
+// comes back unanswered.
+//
+// For those shells we append an `echo` of a unique marker to the command line
+// and resolve on it. The marker carries the shell's exit code, so the result is
+// structured exactly like the capability path's.
+
+/** Shells VS Code can inject shell integration into, per platform. */
+const injectableShells = isWindows
+	? ['powershell', 'pwsh', 'bash']
+	: ['bash', 'zsh', 'fish', 'pwsh']
+
+/** Basename of a shell executable, lowercased and without `.exe`. */
+function shellNameOf(executable: string | undefined): string {
+	return (executable ?? '').replace(/^.*[\\/]/, '').toLowerCase().replace(/\.exe$/, '')
+}
+
+function hasInjectableShellIntegration(executable: string | undefined): boolean {
+	return injectableShells.includes(shellNameOf(executable))
+}
+
+let commandSentinelSequence = 0
+
+/**
+ * The command line plus an `echo` of a unique marker, for a shell whose
+ * completion cannot be observed any other way. Returns undefined for a shell we
+ * cannot mark, and for command text where the append would change what runs: a
+ * multi-line command (heredocs, `if` blocks) or a continued line.
+ */
+function withCommandSentinel(command: string, executable: string | undefined): { marker: string, command: string } | undefined {
+	if (/[\r\n]/.test(command) || command.trimEnd().endsWith('\\')) return undefined
+	const shell = shellNameOf(executable)
+	const marker = `__VOID_DONE_${++commandSentinelSequence}__`
+	// cmd expands %ERRORLEVEL% when the line is parsed, so `& echo M:%ERRORLEVEL%`
+	// reports the *previous* command's code; `call` re-parses the line and makes
+	// the expansion happen after the command has run.
+	if (shell === 'cmd') return { marker, command: `${command} & call echo ${marker}:%^ERRORLEVEL%` }
+	// fish and nu do not expand `$?`; the marker then never arrives and the call
+	// falls back to the inactivity timeout, which is what it did before.
+	if (shell === 'powershell' || shell === 'pwsh') return { marker, command: `${command} ; echo "${marker}:$LASTEXITCODE"` }
+	if (['bash', 'zsh', 'sh', 'dash', 'wsl'].includes(shell)) return { marker, command: `${command} ; echo "${marker}:$?"` }
+	return undefined
+}
+
+/** Drops the marker's own echo lines; the rest of the command's output is kept. */
+function withoutSentinelLines(text: string, marker: string): string {
+	if (!text.includes(marker)) return text
+	return text.split('\n').filter(line => !line.includes(marker)).join('\n')
+}
+
+function shrinkText(text: string, max: number): string {
+	return text.length > max ? text.slice(0, max - 3) + '...' : text
+}
+
+/**
+ * What we know about a terminal we drove ourselves, when it has no command
+ * detection to ask. `pendingCommand` is set while waiting for its marker and
+ * cleared when the wait times out — a command we never saw finish leaves the
+ * terminal unknown rather than claiming either state.
+ */
+interface ISentinelState {
+	pendingCommand: string | null
+	lastCommand: string | null
+	hasCompleted: boolean
+}
 
 
 
@@ -80,6 +154,13 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 	private persistentTerminalInstanceOfId: Record<string, ITerminalInstance> = {}
 	private temporaryTerminalInstanceOfId: Record<string, ITerminalInstance> = {}
 
+	/**
+	 * Marker state per terminal instance, for shells that have no command
+	 * detection. Keyed by instance id so a new terminal does not inherit an
+	 * earlier one's history.
+	 */
+	private readonly _sentinelOfInstanceId = new Map<number, ISentinelState>()
+
 	constructor(
 		@ITerminalService private readonly terminalService: ITerminalService,
 		@ITerminalGroupService private readonly terminalGroupService: ITerminalGroupService,
@@ -94,6 +175,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 			const d = terminal.onExit(() => {
 				const terminalId = idOfPersistentTerminalName(terminal.title)
 				if (terminalId !== null && (terminalId in this.persistentTerminalInstanceOfId)) delete this.persistentTerminalInstanceOfId[terminalId]
+				this._sentinelOfInstanceId.delete(terminal.instanceId)
 				d.dispose()
 			})
 		}
@@ -146,7 +228,8 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 	private _getLastCommand(terminal: ITerminalInstance): string {
 		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection)
-		if (!cmdCap) return ''
+		// No command detection: report the last command we sent and saw finish.
+		if (!cmdCap) return this._sentinelOfInstanceId.get(terminal.instanceId)?.lastCommand ?? ''
 		const lastCmd = cmdCap.commands.at(-1)
 		if (!lastCmd?.command) return ''
 		const cmd = lastCmd.command
@@ -161,7 +244,15 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		// capability and no way to know, so say so: a cmd terminal used to report
 		// 'running' forever, which the model reads as "wait" rather than "free".
 		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection)
-		if (!cmdCap) return 'unknown'
+		if (!cmdCap) {
+			// Without shell integration the only completion we can observe is our
+			// own marker. A command that timed out leaves nothing to report: the
+			// terminal reads unknown again rather than claiming it is free.
+			const sentinel = this._sentinelOfInstanceId.get(terminal.instanceId)
+			if (sentinel?.pendingCommand) return `running: ${shrinkText(sentinel.pendingCommand, 60)}`
+			if (sentinel?.hasCompleted) return 'idle'
+			return 'unknown'
+		}
 		if (cmdCap.executingCommand) {
 			const cmd = cmdCap.executingCommand
 			return `running: ${cmd.length > 60 ? cmd.slice(0, 57) + '...' : cmd}`
@@ -443,6 +534,15 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		return { output, status, commands }
 	}
 
+	private _sentinelState(terminal: ITerminalInstance): ISentinelState {
+		let state = this._sentinelOfInstanceId.get(terminal.instanceId)
+		if (!state) {
+			state = { pendingCommand: null, lastCommand: null, hasCompleted: false }
+			this._sentinelOfInstanceId.set(terminal.instanceId, state)
+		}
+		return state
+	}
+
 	private async _waitForCommandDetectionCapability(terminal: ITerminalInstance) {
 		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection);
 		if (cmdCap) return cmdCap
@@ -532,7 +632,13 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 				let resolveReason: TerminalResolveReason | undefined
 
 
-				const cmdCap = await this._waitForCommandDetectionCapability(terminal)
+				// Waiting the full ten seconds for a capability that injection can
+				// never attach is most of what a command in cmd or wsl used to cost.
+				const executable = terminal.shellLaunchConfig?.executable
+				const cmdCap = hasInjectableShellIntegration(executable)
+					? await this._waitForCommandDetectionCapability(terminal)
+					: terminal.capabilities.get(TerminalCapability.CommandDetection)
+				const sentinel = cmdCap ? undefined : withCommandSentinel(command, executable)
 				// if (!cmdCap) throw new Error(`There was an error using the terminal: CommandDetection capability did not mount yet. Please try again in a few seconds or report this to the Void team.`)
 
 				// Register a marker before sending the command. It tracks its line
@@ -559,6 +665,44 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 						resolve()
 					})
 					disposables.push(l)
+				})
+
+				// Marker completion, for a shell that has no command detection: the
+				// marker's echo is the only completion signal there is. The listener
+				// is attached before sendText, so a marker printed in the same chunk
+				// as the output cannot be missed.
+				const waitUntilMarker = new Promise<void>(resolve => {
+					if (!sentinel) return
+					const markerPattern = new RegExp(`${sentinel.marker}:(\\d+)`)
+					// Match each chunk together with the tail of the previous one, so a
+					// marker split across a chunk boundary is still found. The tail is
+					// sized by the marker, not by a fixed window: wsl prints the echoed
+					// command, its output and the next prompt in one chunk of several
+					// hundred characters, and a fixed tail drops the marker before it is
+					// ever compared.
+					let overlap = ''
+					let streamed = ''
+					const d = terminal.onData(data => {
+						if (resolveReason) return
+						streamed = (streamed + data).slice(-200_000)
+						const candidate = overlap + data
+						overlap = candidate.slice(-(sentinel.marker.length + 16))
+						const match = markerPattern.exec(candidate)
+						if (!match) return
+						const exitCode = Number(match[1])
+						const state = this._sentinelState(terminal)
+						state.pendingCommand = null
+						state.lastCommand = shrinkText(command, 80)
+						state.hasCompleted = true
+						// The result is what the pty sent for this command. The scrollback
+						// buffer is deliberately not read here: when the prompt wraps, the
+						// buffer line the read starts on can begin inside the marker, and
+						// the fragment left behind matches no filter.
+						result = withoutSentinelLines(streamed, sentinel.marker).replace(/\r\n/g, '\n').replace(/\r/g, '')
+						resolveReason = { type: 'done', exitCode }
+						resolve()
+					})
+					disposables.push(d)
 				})
 
 				// [VOID] Fail fast when the shell dies or fails to launch (e.g. pty
@@ -597,7 +741,8 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 
 				// send the command now that listeners are attached
-				await terminal.sendText(command, true)
+				if (sentinel) this._sentinelState(terminal).pendingCommand = command
+				await terminal.sendText(sentinel?.command ?? command, true)
 				commandSent = true
 
 				const waitUntilInterrupt =
@@ -637,7 +782,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 					})
 
 				// wait for result
-				await Promise.any([waitUntilDone, waitUntilInterrupt, waitUntilUserInterrupt, waitUntilShellExit])
+				await Promise.any([waitUntilDone, waitUntilMarker, waitUntilInterrupt, waitUntilUserInterrupt, waitUntilShellExit])
 
 				// The user stopped the run while a persistent command is still
 				// going: leave it running and settle with the output so far.
@@ -673,6 +818,13 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 						const fromLine = startMarker?.line ?? 0
 						result = await this.readTerminalFromLine(terminalId, fromLine)
 					}
+				}
+
+				if (sentinel) {
+					// We stopped waiting without seeing the marker: the command may
+					// still be running, so the terminal reads unknown again, not idle.
+					const state = this._sentinelState(terminal)
+					if (state.pendingCommand === command) state.pendingCommand = null
 				}
 
 				// Dispose all listeners now that we have the result
