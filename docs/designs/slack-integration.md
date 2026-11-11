@@ -60,7 +60,7 @@ Defined in `common/integrationTypes.ts`. Two message families:
 ```typescript
 // proxy → void
 export type IntegrationInbound =
-	| { type: 'userMessage'; conversationKey: string; text: string; author: string }
+	| { type: 'userMessage'; conversationKey: string; text: string; author: string; threadId?: string }
 	| { type: 'approvalResponse'; requestId: string; approved: boolean }
 	| { type: 'interrupt'; conversationKey: string }
 	| { type: 'newThread'; conversationKey: string; workspaceHint?: string }
@@ -72,7 +72,10 @@ export type IntegrationOutbound =
 	| { type: 'approvalRequest'; requestId: string; conversationKey: string; toolName: ToolName; paramsSummary: string }
 	| { type: 'final'; conversationKey: string; text: string; usage?: LLMUsage }
 	| { type: 'error'; conversationKey: string; message: string }
+	| { type: 'bound'; conversationKey: string; threadId: string }
 ```
+
+`userMessage.threadId` (optional) is the proxy's remembered binding; `bound` is Void's notification whenever a binding is (re)established — together they make the durable `voidThreadIdOfConversationKey` map survive Void restarts: the proxy sends what it remembers, Void adopts it or creates a new thread and tells the proxy which.
 
 - `conversationKey` is an opaque string chosen by the proxy (for the Slack adapter: the `(channel_id, thread_ts)` pair, stable for the lifetime of a Slack thread). Void never parses it.
 - `streamDelta` is throttled to ~1/sec by the proxy before calling `chat.update` (Slack rate limits); Void can emit freely.

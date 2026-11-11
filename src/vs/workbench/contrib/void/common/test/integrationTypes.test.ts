@@ -28,6 +28,7 @@ const outboundPayloads = [
 	{ type: 'approvalRequest', requestId: 'r1', conversationKey: 'root-1', toolName: 'edit_file', mcpServerName: undefined, paramsSummary: 'editFile src/foo.ts' },
 	{ type: 'final', conversationKey: 'root-1', text: 'done', usage: undefined },
 	{ type: 'error', conversationKey: 'root-1', message: 'boom' },
+	{ type: 'bound', conversationKey: 'root-1', threadId: 't1' },
 ];
 
 suite('IntegrationProtocol', () => {

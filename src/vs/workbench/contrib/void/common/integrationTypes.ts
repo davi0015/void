@@ -51,8 +51,11 @@ export type IntegrationInbound =
 	// decided which conversation this belongs to — `conversationKey` is an
 	// opaque string chosen by the proxy (Teams: root message id; Slack:
 	// (channel_id, thread_ts)) and stable for the lifetime of the external
-	// conversation. Void never parses it.
-	| { type: 'userMessage'; conversationKey: string; text: string; author: string }
+	// conversation. Void never parses it. `threadId` is the proxy's remembered
+	// binding (it owns the durable map); Void adopts it when its own
+	// session-local mirror has no entry — this is how bindings survive Void
+	// restarts.
+	| { type: 'userMessage'; conversationKey: string; text: string; author: string; threadId?: string }
 
 	// Response to an outstanding approvalRequest. `requestId` is the id Void
 	// sent in the approvalRequest.
@@ -94,6 +97,12 @@ export type IntegrationOutbound =
 
 	// The turn is complete. `text` is the final assistant text (markdown).
 	| { type: 'final'; conversationKey: string; text: string; usage?: LLMUsage }
+
+	// Void (re)bound a conversation to a thread — on thread creation, or on
+	// adopting the proxy's remembered threadId. The proxy persists
+	// voidThreadIdOfConversationKey from this; it is the durable half of a
+	// binding whose Void-side mirror is session-local.
+	| { type: 'bound'; conversationKey: string; threadId: string }
 
 	// The turn failed (LLM error, abort, etc).
 	| { type: 'error'; conversationKey: string; message: string }

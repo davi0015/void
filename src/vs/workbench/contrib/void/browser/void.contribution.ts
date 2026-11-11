@@ -40,6 +40,9 @@ import './terminalToolService.js'
 // register Thread History
 import './chatThreadService.js'
 
+// register external chat integration (Teams/Slack via a local proxy)
+import './integrationService.js'
+
 // ping
 import './metricsPollService.js'
 
