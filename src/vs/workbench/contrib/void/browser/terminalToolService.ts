@@ -12,7 +12,7 @@ import { createDecorator } from '../../../../platform/instantiation/common/insta
 import { TerminalLocation } from '../../../../platform/terminal/common/terminal.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
-import { ITerminalService, ITerminalInstance, ICreateTerminalOptions, ITerminalGroupService } from '../../../../workbench/contrib/terminal/browser/terminal.js';
+import { ITerminalService, ITerminalInstance, ICreateTerminalOptions } from '../../../../workbench/contrib/terminal/browser/terminal.js';
 import { MAX_TERMINAL_CHARS, MAX_TERMINAL_TIMEOUT_SECONDS } from '../common/prompt/prompts.js';
 import { TerminalResolveReason } from '../common/toolsServiceTypes.js';
 import { TERMINAL_AUTO_APPROVE_KEY } from '../common/storageKeys.js';
@@ -161,9 +161,14 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 	 */
 	private readonly _sentinelOfInstanceId = new Map<number, ISentinelState>()
 
+	/**
+	 * Terminals we are inside `sendText` for. Our own write raises the same input
+	 * event a keystroke does, and must not be read as the user taking over.
+	 */
+	private readonly _writingOfInstanceId = new Set<number>()
+
 	constructor(
 		@ITerminalService private readonly terminalService: ITerminalService,
-		@ITerminalGroupService private readonly terminalGroupService: ITerminalGroupService,
 		@IWorkspaceContextService private readonly workspaceContextService: IWorkspaceContextService,
 		@IStorageService private readonly storageService: IStorageService,
 	) {
@@ -176,7 +181,18 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 				const terminalId = idOfPersistentTerminalName(terminal.title)
 				if (terminalId !== null && (terminalId in this.persistentTerminalInstanceOfId)) delete this.persistentTerminalInstanceOfId[terminalId]
 				this._sentinelOfInstanceId.delete(terminal.instanceId)
+				dInput.dispose()
 				d.dispose()
+			})
+
+			// Anything typed into this shell is outside our observation: a command we
+			// watched finish says nothing about what the shell is doing now, and a
+			// command of ours that was still running may have been interrupted. Drop
+			// what the marker established. Our own writes raise this event too, so
+			// they are flagged in _writingOfInstanceId and ignored.
+			const dInput = terminal.onDidInputData(() => {
+				if (this._writingOfInstanceId.has(terminal.instanceId)) return
+				this._sentinelOfInstanceId.delete(terminal.instanceId)
 			})
 		}
 
@@ -601,6 +617,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 		const interrupt = () => {
 			if (!isPersistent) {
+				this._sentinelOfInstanceId.delete(terminal.instanceId)
 				terminal.dispose()
 				delete this.temporaryTerminalInstanceOfId[params.terminalId]
 				return
@@ -742,7 +759,12 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 				// send the command now that listeners are attached
 				if (sentinel) this._sentinelState(terminal).pendingCommand = command
-				await terminal.sendText(sentinel?.command ?? command, true)
+				this._writingOfInstanceId.add(terminal.instanceId)
+				try {
+					await terminal.sendText(sentinel?.command ?? command, true)
+				} finally {
+					this._writingOfInstanceId.delete(terminal.instanceId)
+				}
 				commandSent = true
 
 				const waitUntilInterrupt =
@@ -820,12 +842,11 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 					}
 				}
 
-				if (sentinel) {
-					// We stopped waiting without seeing the marker: the command may
-					// still be running, so the terminal reads unknown again, not idle.
-					const state = this._sentinelState(terminal)
-					if (state.pendingCommand === command) state.pendingCommand = null
-				}
+				// A command that timed out keeps its pending marker: we never saw it
+				// finish, and for a dev server or a long sleep it is in fact still
+				// running. It stops being pending when the user types into that
+				// terminal (the input handler above drops the state) or when the next
+				// command of ours replaces it.
 
 				// Dispose all listeners now that we have the result
 				disposables.forEach(d => d.dispose())
