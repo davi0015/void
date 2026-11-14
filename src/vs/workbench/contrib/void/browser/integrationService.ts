@@ -384,12 +384,31 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	private _postFinal(threadId: string, conversationKey: string): void {
 		const thread = this._chatThreadService.getThreadWithMessages(threadId)
 		if (!thread) return
-		const lastAssistant = [...thread.messages].reverse().find(m => m.role === 'assistant')
+
+		// The agent loop creates ONE assistant message per LLM request — so a
+		// multi-step turn has its narration split across several assistant
+		// messages, interleaved with tool results. The user message that started
+		// this turn is the last 'user' message (queued follow-ups aren't appended
+		// until their own turn starts). Everything the model said this turn is
+		// the answer — sending only the last assistant message silently drops
+		// intermediate narration (e.g. "File 1: …" before reading File 2).
+		const messages = thread.messages
+		const lastUserIdx = messages.map(m => m.role).lastIndexOf('user')
+		const parts: string[] = []
+		for (let i = lastUserIdx + 1; i < messages.length; i++) {
+			const m = messages[i]
+			if (m.role === 'assistant' && m.displayContent.trim() !== '')
+				parts.push(m.displayContent)
+		}
+		const text = parts.length > 0
+			? parts.join('\n\n')
+			: ([...messages].reverse().find(m => m.role === 'assistant')?.displayContent ?? '')
+
 		const usage: LLMUsage | undefined = this._chatThreadService.latestUsageOfThreadId[threadId]
 		this._postOutbound({
 			type: 'final',
 			conversationKey,
-			text: lastAssistant?.displayContent ?? '',
+			text,
 			usage,
 		})
 	}
