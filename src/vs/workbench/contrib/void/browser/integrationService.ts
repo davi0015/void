@@ -45,10 +45,20 @@ import {
 } from '../common/integrationTypes.js'
 
 
-// The localhost port the proxy connects to. Fixed for v1 — a single
-// user-owned proxy on the same machine. Make configurable via settings if a
-// second proxy ever needs to run alongside.
-const INTEGRATION_PORT = 4757
+// One workspace = one port = one proxy connection. The port is derived
+// deterministically from the window's workspace URI, and the daemon
+// computes the SAME port from the workspace path in its channel config —
+// this is how a proxy reaches a specific workspace's window. Unscoped
+// windows (no folder open) keep the base port.
+// The daemon must implement the identical hash (see .tmp/teams-daemon/daemon.mjs).
+const workspacePortOf = (workspaceUri: string | undefined): number => {
+	const base = 4757
+	if (!workspaceUri) return base
+	let h = 0
+	for (let i = 0; i < workspaceUri.length; i++)
+		h = (h * 31 + workspaceUri.charCodeAt(i)) | 0
+	return base + (Math.abs(h) % 1000)
+}
 
 const PAIRING_TOKEN_STORAGE_KEY = 'void.integration.pairingToken'
 
@@ -164,8 +174,15 @@ class IntegrationService extends Disposable implements IIntegrationService {
 			catch (e) { console.error('integration service: stream state handler failed:', e) }
 		}))
 
+		// the workspace-derived port this window serves (see workspacePortOf) —
+		// computed here, not as a field initializer, because it reads an injected
+		// service whose parameter property is assigned in this constructor
+		this._port = workspacePortOf(this._chatThreadService.state.currentWorkspaceUri)
+
 		this.start().catch(e => console.error('integration service: failed to start:', e))
 	}
+
+	private readonly _port: number
 
 
 	get state(): IntegrationChannelState & { pairingToken: string } {
@@ -174,7 +191,7 @@ class IntegrationService extends Disposable implements IIntegrationService {
 
 	async start(): Promise<void> {
 		this._channelState = await this.channel.call<IntegrationChannelState>('start',
-			{ port: INTEGRATION_PORT, pairingToken: this._pairingToken } satisfies IntegrationChannelStartParams)
+			{ port: this._port, pairingToken: this._pairingToken } satisfies IntegrationChannelStartParams)
 		this._onDidChangeState.fire()
 	}
 

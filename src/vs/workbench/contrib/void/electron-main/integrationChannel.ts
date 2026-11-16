@@ -6,15 +6,21 @@
 // registered in app.ts (channel name: 'void-channel-integration')
 // same pattern as mcpChannel.ts — can't make a service responsible for this
 // because it needs to run in the main process with node dependencies.
-
+//
 // This channel has two hats:
-//   1. The IServerChannel half — how the browser-side integrationService
-//      (renderer) starts/stops the socket server and relays protocol messages,
-//      via normal VS Code IPC.
-//   2. The localhost server half — a net.Server speaking the Void Integration
-//      Protocol (newline-delimited JSON) with the external proxy process.
-//      See common/integrationTypes.ts for the protocol and
+//   1. The IServerChannel half — how each window's browser-side
+//      integrationService (renderer) starts/stops its socket server and
+//      relays protocol messages, via normal VS Code IPC.
+//   2. The localhost server half — a net.Server per WINDOW, speaking the
+//      Void Integration Protocol (newline-delimited JSON) with an external
+//      proxy process. See common/integrationTypes.ts for the protocol and
 //      docs/designs/slack-integration.md for the design.
+//
+// ONE WORKSPACE = ONE PORT = ONE SERVER. Each window derives its port from
+// its workspace (see integrationService.ts), so a proxy reaches a specific
+// workspace's window by connecting to that port. The IPC `ctx` (the calling
+// window's connection) is what routes messages between a window and its
+// server — two windows never see each other's conversations.
 //
 // The channel deliberately knows nothing about chat, threads, or tools — it
 // relays envelopes. All intelligence (routing, redaction) lives in the
@@ -45,58 +51,76 @@ type ProxyConnection = {
 	buffer: string
 }
 
+// Per-window state: the server that window started (on its workspace's
+// port), its authenticated proxy connections, and the emitters that window
+// listens on. A window that never successfully started has server: null and
+// simply never receives events.
+type ChannelClient = {
+	server: net.Server | null
+	port: number | undefined
+	pairingToken: string | undefined
+	connections: Set<ProxyConnection>
+	nextOutboundEnvelopeId: number
+
+	onProxyConnected: Emitter<void>
+	onProxyDisconnected: Emitter<void>
+	onInbound: Emitter<IntegrationInbound>
+}
+
 export class IntegrationChannel implements IServerChannel {
 
-	private _server: net.Server | null = null
-	private _port: number | undefined
+	// one entry per window (renderer) that has ever called into this channel,
+	// keyed by the IPC caller context
+	private readonly _clientOfCtx = new Map<unknown, ChannelClient>()
+	// port → the ctx that owns it. A window reload creates a NEW ctx for the
+	// same workspace port; the old entry is stale and gets evicted when the
+	// port is reclaimed (otherwise the reload's start() would EADDRINUSE).
+	private readonly _ctxOfPort = new Map<number, unknown>()
 
-	// the token the proxy must present in its hello. owned/persisted by the
-	// browser service; passed in on start().
-	private _pairingToken: string | undefined
 
-	// currently authenticated proxy connections (typically 0 or 1)
-	private readonly _connections = new Set<ProxyConnection>()
-
-	// next id for outbound envelopes (monotonic across the session)
-	private _nextOutboundEnvelopeId = 1
-
-	// ---- events → browser
-
-	private readonly _onProxyConnected = new Emitter<void>()
-	public readonly onProxyConnected = this._onProxyConnected.event
-
-	private readonly _onProxyDisconnected = new Emitter<void>()
-	public readonly onProxyDisconnected = this._onProxyDisconnected.event
-
-	// inbound protocol messages (already envelope-unwrapped + acked by this
-	// channel; ack-on-receipt is fine for the v1 local transport)
-	private readonly _onInbound = new Emitter<IntegrationInbound>()
-	public readonly onInbound = this._onInbound.event
+	private _clientOf(ctx: unknown): ChannelClient {
+		let client = this._clientOfCtx.get(ctx)
+		if (!client) {
+			client = {
+				server: null,
+				port: undefined,
+				pairingToken: undefined,
+				connections: new Set(),
+				nextOutboundEnvelopeId: 1,
+				onProxyConnected: new Emitter<void>(),
+				onProxyDisconnected: new Emitter<void>(),
+				onInbound: new Emitter<IntegrationInbound>(),
+			}
+			this._clientOfCtx.set(ctx, client)
+		}
+		return client
+	}
 
 
 	// browser uses this to listen for changes
-	listen(_: unknown, event: string): Event<any> {
-		if (event === 'onProxyConnected') return this.onProxyConnected
-		else if (event === 'onProxyDisconnected') return this.onProxyDisconnected
-		else if (event === 'onInbound') return this.onInbound
+	listen(ctx: unknown, event: string): Event<any> {
+		const client = this._clientOf(ctx)
+		if (event === 'onProxyConnected') return client.onProxyConnected.event
+		else if (event === 'onProxyDisconnected') return client.onProxyDisconnected.event
+		else if (event === 'onInbound') return client.onInbound.event
 		else throw new Error(`Event not found: ${event}`)
 	}
 
 	// browser uses this to call (see integrationService.ts for all usages)
-	async call(_: unknown, command: string, params: any): Promise<any> {
+	async call(ctx: unknown, command: string, params: any): Promise<any> {
 		try {
 			if (command === 'start') {
-				return await this._start(params as IntegrationChannelStartParams)
+				return await this._start(ctx, params as IntegrationChannelStartParams)
 			}
 			else if (command === 'stop') {
-				this._stop()
-				return this._getState()
+				this._stop(ctx)
+				return this._getState(ctx)
 			}
 			else if (command === 'getState') {
-				return this._getState()
+				return this._getState(ctx)
 			}
 			else if (command === 'postOutbound') {
-				return this._postOutbound(params as IntegrationOutbound)
+				return this._postOutbound(ctx, params as IntegrationOutbound)
 			}
 			else {
 				throw new Error(`Void integration: command "${command}" not recognized.`)
@@ -109,23 +133,31 @@ export class IntegrationChannel implements IServerChannel {
 	}
 
 
-	// ---- localhost server
+	// ---- localhost server (per window)
 
-	private async _start(params: IntegrationChannelStartParams): Promise<IntegrationChannelState> {
-		if (this._server) {
-			// already running — restart so a changed pairing token takes effect
-			this._stop()
+	private async _start(ctx: unknown, params: IntegrationChannelStartParams): Promise<IntegrationChannelState> {
+		const client = this._clientOf(ctx)
+
+		// reclaim the port from a stale owner — the previous window for this
+		// same workspace (a reload made its ctx stale)
+		const prevCtx = this._ctxOfPort.get(params.port)
+		if (prevCtx !== undefined && prevCtx !== ctx) {
+			const prev = this._clientOfCtx.get(prevCtx)
+			if (prev) this._teardownServer(prev)
 		}
 
-		this._pairingToken = params.pairingToken
+		// restart (also the changed-pairing-token path)
+		this._teardownServer(client)
 
-		const server = this._server = net.createServer(socket => {
-			this._onConnection(socket)
+		client.pairingToken = params.pairingToken
+
+		const server = client.server = net.createServer(socket => {
+			this._onConnection(client, socket)
 		})
 
 		server.on('error', err => {
 			console.error('integration channel: server error:', err)
-			this._teardownServer()
+			this._teardownServer(client)
 		})
 
 		await new Promise<void>((resolve, reject) => {
@@ -134,30 +166,33 @@ export class IntegrationChannel implements IServerChannel {
 			server.listen(params.port, '127.0.0.1', () => resolve())
 		})
 
-		this._port = (server.address() as net.AddressInfo).port
-		console.log(`integration channel: listening on 127.0.0.1:${this._port}`)
+		client.port = (server.address() as net.AddressInfo).port
+		this._ctxOfPort.set(client.port, ctx)
+		console.log(`integration channel: listening on 127.0.0.1:${client.port}`)
 
-		return this._getState()
+		return this._getState(ctx)
 	}
 
-	private _stop() {
+	private _stop(ctx: unknown) {
+		const client = this._clientOf(ctx)
 		// close all proxy connections first so their handlers don't race the
 		// server teardown
-		for (const conn of [...this._connections]) {
+		for (const conn of [...client.connections]) {
 			this._closeConnection(conn)
 		}
-		this._teardownServer()
+		this._teardownServer(client)
 	}
 
-	private _teardownServer() {
-		if (this._server) {
-			try { this._server.close() } catch { /* already closed */ }
-			this._server = null
+	private _teardownServer(client: ChannelClient) {
+		if (client.server) {
+			try { client.server.close() } catch { /* already closed */ }
+			if (client.port !== undefined) this._ctxOfPort.delete(client.port)
+			client.server = null
 		}
-		this._port = undefined
+		client.port = undefined
 	}
 
-	private _onConnection(socket: net.Socket) {
+	private _onConnection(client: ChannelClient, socket: net.Socket) {
 		const conn: ProxyConnection = { socket, buffer: '' }
 		let authenticated = false
 
@@ -185,11 +220,11 @@ export class IntegrationChannel implements IServerChannel {
 
 				if (!authenticated) {
 					// the first message must be a hello
-					const ok = this._handleHello(conn, msg)
+					const ok = this._handleHello(client, conn, msg)
 					if (!ok) return
 					authenticated = true
-					this._connections.add(conn)
-					this._onProxyConnected.fire()
+					client.connections.add(conn)
+					client.onProxyConnected.fire()
 					continue
 				}
 
@@ -199,7 +234,7 @@ export class IntegrationChannel implements IServerChannel {
 					const ack: IntegrationAck = { type: 'ack', id: envelope.id }
 					this._send(conn, ack)
 					if (isInboundPayload(envelope.payload)) {
-						this._onInbound.fire(envelope.payload)
+						client.onInbound.fire(envelope.payload)
 					}
 					else {
 						// a proxy echoing our own outbound payloads back at us — ignore it
@@ -218,13 +253,13 @@ export class IntegrationChannel implements IServerChannel {
 		})
 
 		socket.on('close', () => {
-			if (authenticated && this._connections.delete(conn)) {
-				this._onProxyDisconnected.fire()
+			if (authenticated && client.connections.delete(conn)) {
+				client.onProxyDisconnected.fire()
 			}
 		})
 	}
 
-	private _handleHello(conn: ProxyConnection, msg: IntegrationMessage): boolean {
+	private _handleHello(client: ChannelClient, conn: ProxyConnection, msg: IntegrationMessage): boolean {
 		if ((msg as IntegrationHello).type !== 'hello') {
 			this._send(conn, { type: 'denied', reason: 'expected hello first' } satisfies IntegrationWelcome)
 			this._closeConnection(conn)
@@ -239,7 +274,7 @@ export class IntegrationChannel implements IServerChannel {
 			return false
 		}
 
-		if (hello.pairingToken !== this._pairingToken) {
+		if (hello.pairingToken !== client.pairingToken) {
 			// deliberately vague — don't leak which part was wrong
 			this._send(conn, { type: 'denied', reason: 'unauthorized' } satisfies IntegrationWelcome)
 			this._closeConnection(conn)
@@ -250,10 +285,11 @@ export class IntegrationChannel implements IServerChannel {
 		return true
 	}
 
-	private _postOutbound(payload: IntegrationOutbound): { envelopeId: number } {
-		const envelope: IntegrationEnvelope = { id: this._nextOutboundEnvelopeId++, payload }
+	private _postOutbound(ctx: unknown, payload: IntegrationOutbound): { envelopeId: number } {
+		const client = this._clientOf(ctx)
+		const envelope: IntegrationEnvelope = { id: client.nextOutboundEnvelopeId++, payload }
 		const line = JSON.stringify(envelope) + '\n'
-		for (const conn of [...this._connections]) {
+		for (const conn of [...client.connections]) {
 			conn.socket.write(line)
 		}
 		return { envelopeId: envelope.id }
@@ -267,11 +303,12 @@ export class IntegrationChannel implements IServerChannel {
 		try { conn.socket.destroy() } catch { /* already closed */ }
 	}
 
-	private _getState(): IntegrationChannelState {
+	private _getState(ctx: unknown): IntegrationChannelState {
+		const client = this._clientOf(ctx)
 		return {
-			running: this._server !== null,
-			port: this._port,
-			nConnections: this._connections.size,
+			running: client.server !== null,
+			port: client.port,
+			nConnections: client.connections.size,
 		}
 	}
 }
