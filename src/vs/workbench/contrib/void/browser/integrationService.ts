@@ -30,6 +30,10 @@ import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/
 import { IChannel } from '../../../../base/parts/ipc/common/ipc.js'
 import { IMainProcessService } from '../../../../platform/ipc/common/mainProcessService.js'
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js'
+import { Action2, registerAction2 } from '../../../../platform/actions/common/actions.js'
+import { ServicesAccessor } from '../../../../editor/browser/editorExtensions.js'
+import { localize2 } from '../../../../nls.js'
+import { INotificationService } from '../../../../platform/notification/common/notification.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
 import { URI } from '../../../../base/common/uri.js'
 
@@ -88,6 +92,14 @@ export interface IIntegrationService {
 	stop(): Promise<void>
 	/** Mints a new pairing token, persists it, and restarts the server with it. */
 	regeneratePairingToken(): Promise<void>
+	/**
+	 * Ask the proxy to create a new external conversation mirroring the
+	 * CURRENT chat — the editor-initiated direction of the binding. The
+	 * current chat's replies/events start flowing to the new conversation
+	 * once the proxy confirms with conversationBound. No-op (with a
+	 * notification) if the chat is already mirrored or nothing is open.
+	 */
+	mirrorCurrentChat(): Promise<void>
 }
 
 export const IIntegrationService = createDecorator<IIntegrationService>('voidIntegrationService')
@@ -149,6 +161,7 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		@IChatThreadService private readonly _chatThreadService: IChatThreadService,
 		@IMainProcessService mainProcessService: IMainProcessService,
 		@IStorageService private readonly _storageService: IStorageService,
+		@INotificationService private readonly _notificationService: INotificationService,
 	) {
 		super()
 		this.channel = mainProcessService.getChannel('void-channel-integration')
@@ -258,6 +271,16 @@ class IntegrationService extends Disposable implements IIntegrationService {
 					await this._chatThreadService.abortRunning(threadId)
 				return
 			}
+			case 'conversationBound': {
+				// the proxy created a new external conversation for an existing
+				// thread (in response to createConversation) — fill the session
+				// mirror so the thread's events start flowing to it
+				this._threadIdOfConversationKey.set(p.conversationKey, p.threadId)
+				this._conversationKeyOfThreadId.set(p.threadId, p.conversationKey)
+				console.log(`[integration] mirrored thread ${p.threadId} to conversation ${p.conversationKey}`)
+				this._notificationService.info('Chat mirrored — replies in the external thread now reach this chat')
+				return
+			}
 			case 'setThreadPermissionMode': {
 				// a per-channel re-grant of trust from the proxy's config — only
 				// applies to threads this conversation is bound to. The proxy
@@ -310,6 +333,32 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		this._threadIdOfConversationKey.set(conversationKey, threadId)
 		this._conversationKeyOfThreadId.set(threadId, conversationKey)
 		this._postOutbound({ type: 'bound', conversationKey, threadId })
+	}
+
+	async mirrorCurrentChat(): Promise<void> {
+		const thread = this._chatThreadService.getCurrentThread()
+		if (!thread) {
+			this._notificationService.info('No chat is currently open to mirror')
+				return
+		}
+		if (this._conversationKeyOfThreadId.has(thread.id)) {
+			this._notificationService.info('This chat is already mirrored to an external conversation')
+				return
+		}
+
+		// a human-readable label for the anchor message the proxy will post
+		let title: string | undefined = thread.customTitle?.trim() || undefined
+		if (title === undefined) {
+			const withMessages = this._chatThreadService.getThreadWithMessages(thread.id)
+			const firstUser = withMessages?.messages.find(m => m.role === 'user')
+			if (firstUser && firstUser.role === 'user' && firstUser.displayContent.trim() !== '')
+				title = firstUser.displayContent.slice(0, 80)
+		}
+
+		this._postOutbound({ type: 'createConversation', threadId: thread.id, title })
+		// conversationBound (from the proxy) completes the mirroring; events
+		// for this thread are dropped until it arrives — mirroring effectively
+		// starts with the next turn
 	}
 
 
@@ -544,6 +593,25 @@ class IntegrationService extends Disposable implements IIntegrationService {
 
 
 registerSingleton(IIntegrationService, IntegrationService, InstantiationType.Eager);
+
+
+// Mirror the CURRENT chat to a new external conversation — the explicit,
+// editor-initiated direction of the binding (createConversation →
+// conversationBound handshake with the proxy).
+export const VOID_MIRROR_CHAT_ACTION_ID = 'void.integration.mirrorCurrentChat'
+registerAction2(class extends Action2 {
+	constructor() {
+		super({
+			id: VOID_MIRROR_CHAT_ACTION_ID,
+			title: localize2('voidMirrorCurrentChat', 'Void: Mirror Current Chat to an External Chat'),
+			f1: true,
+		})
+	}
+	override async run(accessor: ServicesAccessor): Promise<void> {
+		const integrationService = accessor.get(IIntegrationService)
+		await integrationService.mirrorCurrentChat()
+	}
+});
 
 // The service has no UI yet — this contribution's only job is to instantiate
 // the singleton at startup, so the localhost server is listening (and the

@@ -21,6 +21,7 @@ const inboundPayloads = [
 	{ type: 'interrupt', conversationKey: 'root-1' },
 	{ type: 'newThread', conversationKey: 'root-9' },
 	{ type: 'setThreadPermissionMode', conversationKey: 'root-1', threadId: 't1', permissionMode: 'full_access' },
+	{ type: 'conversationBound', conversationKey: 'root-42', threadId: 't2' },
 ];
 
 const outboundPayloads = [
@@ -30,6 +31,7 @@ const outboundPayloads = [
 	{ type: 'final', conversationKey: 'root-1', text: 'done', usage: undefined },
 	{ type: 'error', conversationKey: 'root-1', message: 'boom' },
 	{ type: 'bound', conversationKey: 'root-1', threadId: 't1' },
+	{ type: 'createConversation', threadId: 't2', title: 'some task' },
 ];
 
 suite('IntegrationProtocol', () => {
@@ -64,8 +66,8 @@ suite('IntegrationProtocol', () => {
 		for (const t of inboundTypes) {
 			assert.strictEqual(outboundTypes.has(t), false, `type is both directions: ${t}`);
 		}
-		// 5 distinct types: userMessage, approvalResponse (both approved values),
-		// interrupt, newThread, setThreadPermissionMode
-		assert.strictEqual(inboundTypes.size, 5, 'a new inbound type was added — extend isInboundPayload and this test');
+		// 6 distinct types: userMessage, approvalResponse (both approved values),
+		// interrupt, newThread, setThreadPermissionMode, conversationBound
+		assert.strictEqual(inboundTypes.size, 6, 'a new inbound type was added — extend isInboundPayload and this test');
 	});
 });

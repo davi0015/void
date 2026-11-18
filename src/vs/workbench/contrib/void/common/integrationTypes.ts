@@ -74,6 +74,12 @@ export type IntegrationInbound =
 	// when creating the thread.
 	| { type: 'newThread'; conversationKey: string; workspaceHint?: string }
 
+	// The proxy created a new external conversation for an existing Void
+	// thread (in response to createConversation). Fills Void's session
+	// mirror — from here on, the thread's events flow to the new
+	// conversation and replies in it route back to the thread.
+	| { type: 'conversationBound'; conversationKey: string; threadId: string }
+
 	// Ask Void to set the permission mode of the thread this conversation is
 	// bound to. Used by proxies whose channel config explicitly grants a
 	// stronger mode (e.g. full access, so a remote agent doesn't pause for
@@ -117,6 +123,12 @@ export type IntegrationOutbound =
 	// binding whose Void-side mirror is session-local.
 	| { type: 'bound'; conversationKey: string; threadId: string }
 
+	// Ask the proxy to create a NEW external conversation (e.g. a Teams
+	// thread) mirroring an EXISTING Void thread — the editor-initiated
+	// direction of the binding. `title` is a human-readable label for the
+	// anchor message (thread title / first-message excerpt).
+	| { type: 'createConversation'; threadId: string; title?: string }
+
 	// The turn failed (LLM error, abort, etc).
 	| { type: 'error'; conversationKey: string; message: string }
 
@@ -148,7 +160,7 @@ export type IntegrationEnvelope =
 export const isInboundPayload = (payload: { type: string }): payload is IntegrationInbound =>
 	payload.type === 'userMessage' || payload.type === 'approvalResponse'
 	|| payload.type === 'interrupt' || payload.type === 'newThread'
-	|| payload.type === 'setThreadPermissionMode'
+	|| payload.type === 'setThreadPermissionMode' || payload.type === 'conversationBound'
 
 // Acknowledges receipt of an inbound envelope with the given id.
 export type IntegrationAck = {
