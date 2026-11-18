@@ -241,6 +241,10 @@ export class IntegrationChannel implements IServerChannel {
 						console.error('integration channel: unexpected outbound payload from proxy, ignoring')
 					}
 				}
+				else if ((msg as IntegrationAck).type === 'ack') {
+					// the proxy acknowledging receipt of one of our outbound
+					// envelopes — postOutbound is fire-and-forget, nothing to do
+				}
 				else {
 					console.error('integration channel: unexpected non-envelope message from proxy, ignoring')
 				}
