@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { ToolName } from './toolsServiceTypes.js'
+import { ThreadPermissionMode, ToolName } from './toolsServiceTypes.js'
 import { LLMUsage } from './sendLLMMessageTypes.js'
 
 
@@ -54,8 +54,12 @@ export type IntegrationInbound =
 	// conversation. Void never parses it. `threadId` is the proxy's remembered
 	// binding (it owns the durable map); Void adopts it when its own
 	// session-local mirror has no entry — this is how bindings survive Void
-	// restarts.
-	| { type: 'userMessage'; conversationKey: string; text: string; author: string; threadId?: string }
+	// restarts. `permissionMode` is the channel's configured grant, applied
+	// BEFORE the turn starts — carrying it here (rather than as a separate
+	// setThreadPermissionMode message) avoids a race where the turn's own
+	// state snapshot, taken before a separate grant lands, reverts the mode
+	// to read_only mid-flight.
+	| { type: 'userMessage'; conversationKey: string; text: string; author: string; threadId?: string; permissionMode?: ThreadPermissionMode }
 
 	// Response to an outstanding approvalRequest. `requestId` is the id Void
 	// sent in the approvalRequest.
@@ -69,6 +73,15 @@ export type IntegrationInbound =
 	// label the proxy was configured with; Void resolves it to a workspace
 	// when creating the thread.
 	| { type: 'newThread'; conversationKey: string; workspaceHint?: string }
+
+	// Ask Void to set the permission mode of the thread this conversation is
+	// bound to. Used by proxies whose channel config explicitly grants a
+	// stronger mode (e.g. full access, so a remote agent doesn't pause for
+	// an in-chat approval on every step) — a deliberate, per-channel
+	// re-grant of trust, recorded in the proxy's config. `threadId` is the
+	// proxy's remembered binding, adopted when Void's session mirror is
+	// empty (e.g. right after an app restart, on the pre-warm path).
+	| { type: 'setThreadPermissionMode'; conversationKey: string; threadId: string; permissionMode: ThreadPermissionMode }
 
 
 // --- void → proxy ----------------------------------------------------------
@@ -135,6 +148,7 @@ export type IntegrationEnvelope =
 export const isInboundPayload = (payload: { type: string }): payload is IntegrationInbound =>
 	payload.type === 'userMessage' || payload.type === 'approvalResponse'
 	|| payload.type === 'interrupt' || payload.type === 'newThread'
+	|| payload.type === 'setThreadPermissionMode'
 
 // Acknowledges receipt of an inbound envelope with the given id.
 export type IntegrationAck = {

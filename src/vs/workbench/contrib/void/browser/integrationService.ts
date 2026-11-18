@@ -220,6 +220,11 @@ class IntegrationService extends Disposable implements IIntegrationService {
 			case 'userMessage': {
 				const threadId = this._resolveThread(p.conversationKey, p.threadId)
 				if (threadId === undefined) return // createThread failed — nothing more to do
+				// apply the channel's permission grant BEFORE dispatching — the
+				// turn's own state snapshot happens after this, so the mode is
+				// already in effect when any tool approval gate runs
+				if (p.permissionMode !== undefined)
+					this._chatThreadService.setThreadPermissionMode(threadId, p.permissionMode)
 				const s = this._chatThreadService.streamState[threadId]
 				if (s?.isRunning !== undefined) {
 					// a run is in flight — the message queues and auto-sends
@@ -251,6 +256,23 @@ class IntegrationService extends Disposable implements IIntegrationService {
 				const threadId = this._threadIdOfConversationKey.get(p.conversationKey)
 				if (threadId !== undefined)
 					await this._chatThreadService.abortRunning(threadId)
+				return
+			}
+			case 'setThreadPermissionMode': {
+				// a per-channel re-grant of trust from the proxy's config — only
+				// applies to threads this conversation is bound to. The proxy
+				// carries its remembered threadId so this works right after an app
+				// restart, when the session mirror is empty (pre-warm path).
+				let threadId = this._threadIdOfConversationKey.get(p.conversationKey)
+				if (threadId === undefined
+					&& this._chatThreadService.state.allThreads[p.threadId] !== undefined) {
+					// adopt the proxy's durable binding
+					threadId = p.threadId
+					this._bind(p.conversationKey, threadId)
+				}
+				console.log(`[integration] setThreadPermissionMode ${p.permissionMode} on ${p.conversationKey}: threadId=${threadId ?? 'NO BINDING'}`)
+				if (threadId !== undefined)
+					this._chatThreadService.setThreadPermissionMode(threadId, p.permissionMode)
 				return
 			}
 		}
