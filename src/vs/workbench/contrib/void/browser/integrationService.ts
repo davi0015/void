@@ -34,6 +34,8 @@ import { Action2, registerAction2 } from '../../../../platform/actions/common/ac
 import { ServicesAccessor } from '../../../../editor/browser/editorExtensions.js'
 import { localize2 } from '../../../../nls.js'
 import { INotificationService } from '../../../../platform/notification/common/notification.js'
+import { IEnvironmentService } from '../../../../platform/environment/common/environment.js'
+import { IClipboardService } from '../../../../platform/clipboard/common/clipboardService.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
 import { URI } from '../../../../base/common/uri.js'
 
@@ -54,9 +56,18 @@ import {
 // computes the SAME port from the workspace path in its channel config —
 // this is how a proxy reaches a specific workspace's window. Unscoped
 // windows (no folder open) keep the base port.
-// The daemon must implement the identical hash (see .tmp/teams-daemon/daemon.mjs).
-const workspacePortOf = (workspaceUri: string | undefined): number => {
-	const base = 4757
+//
+// DEV vs RELEASED builds use different bases: a workspace open in BOTH
+// the dev app and the installed app would otherwise contend for one
+// port (first binder wins, the other never serves). With split bases
+// the two apps serve different ports for the same workspace, and the
+// proxy's channel config picks which app to reach via `portBase`. The
+// pairing token (per-installation storage) still refuses accidental
+// cross-talk. The daemon must implement the identical scheme.
+const PORT_BASE_RELEASE = 4757
+const PORT_BASE_DEV = 5757
+
+const workspacePortOf = (workspaceUri: string | undefined, base: number): number => {
 	if (!workspaceUri) return base
 	let h = 0
 	for (let i = 0; i < workspaceUri.length; i++)
@@ -162,6 +173,7 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		@IMainProcessService mainProcessService: IMainProcessService,
 		@IStorageService private readonly _storageService: IStorageService,
 		@INotificationService private readonly _notificationService: INotificationService,
+		@IEnvironmentService private readonly _environmentService: IEnvironmentService,
 	) {
 		super()
 		this.channel = mainProcessService.getChannel('void-channel-integration')
@@ -187,10 +199,12 @@ class IntegrationService extends Disposable implements IIntegrationService {
 			catch (e) { console.error('integration service: stream state handler failed:', e) }
 		}))
 
-		// the workspace-derived port this window serves (see workspacePortOf) —
-		// computed here, not as a field initializer, because it reads an injected
-		// service whose parameter property is assigned in this constructor
-		this._port = workspacePortOf(this._chatThreadService.state.currentWorkspaceUri)
+		// the workspace-derived port this window serves (see workspacePortOf)
+		// — computed here, not as a field initializer, because it reads an
+		// injected service whose parameter property is assigned in this
+		// constructor. Dev builds serve a different base than released ones.
+		this._port = workspacePortOf(this._chatThreadService.state.currentWorkspaceUri,
+			this._environmentService.isBuilt ? PORT_BASE_RELEASE : PORT_BASE_DEV)
 
 		this.start().catch(e => console.error('integration service: failed to start:', e))
 	}
@@ -610,6 +624,29 @@ registerAction2(class extends Action2 {
 	override async run(accessor: ServicesAccessor): Promise<void> {
 		const integrationService = accessor.get(IIntegrationService)
 		await integrationService.mirrorCurrentChat()
+	}
+});
+
+// Show this installation's pairing token — the one manual step of
+// configuring a proxy: copy it into the proxy's config. Tokens are
+// per-installation (application storage), so this is how you get the
+// token for whichever app (dev or released) you intend the proxy to talk to.
+export const VOID_SHOW_INTEGRATION_TOKEN_ACTION_ID = 'void.integration.showPairingToken'
+registerAction2(class extends Action2 {
+	constructor() {
+		super({
+			id: VOID_SHOW_INTEGRATION_TOKEN_ACTION_ID,
+			title: localize2('voidShowIntegrationToken', 'Void: Show External Chat Pairing Token'),
+			f1: true,
+		})
+	}
+	override async run(accessor: ServicesAccessor): Promise<void> {
+		const integrationService = accessor.get(IIntegrationService)
+		const clipboardService = accessor.get(IClipboardService)
+		const notificationService = accessor.get(INotificationService)
+		const token = integrationService.state.pairingToken
+		await clipboardService.writeText(token)
+		notificationService.info(`Pairing token copied to clipboard: ${token}`)
 	}
 });
 
