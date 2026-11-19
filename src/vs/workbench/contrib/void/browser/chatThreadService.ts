@@ -577,6 +577,12 @@ export interface IChatThreadService {
 	 */
 	getThreadWithMessages(threadId: string): ThreadType | undefined;
 	openNewThread(): void;
+	// Creates a new thread in the current workspace WITHOUT switching to it or
+	// pinning it. For programmatic callers (the integration service) that manage
+	// their own thread lifecycle and must not yank the user's visible thread
+	// selection or tab strip. The thread appears in thread history like any
+	// other. Returns the new thread's id.
+	createThread(): string;
 	switchToThread(threadId: string): void;
 
 	// thread selector
@@ -5089,6 +5095,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._storeThread(newThread.id, newThread, true)
 		this._loadedMessageThreadIds.add(newThread.id) // new threads start empty — no need to load
 		this._setPinsForCurrentWorkspace(newPinned, { allThreads: newThreads, currentThreadId: newThread.id })
+	}
+
+	// Create a thread without switching to it or pinning it. `openNewThread` is
+	// the user-facing version (switches + auto-pins); this is the programmatic
+	// one — callers that never render the thread themselves (the integration
+	// channel's remote conversations) must not touch currentThreadId or the
+	// tab strip. The thread shows up in thread history like any other.
+	createThread(): string {
+		const newThread = newThreadObject(this._getCurrentWorkspaceIdentity())
+		this._storeThread(newThread.id, newThread, true)
+		this._loadedMessageThreadIds.add(newThread.id) // new threads start empty — no need to load
+		this._setState({ allThreads: { ...this.state.allThreads, [newThread.id]: newThread } })
+		return newThread.id
 	}
 
 

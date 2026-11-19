@@ -135,6 +135,7 @@ import { IVoidSCMService } from '../../workbench/contrib/void/common/voidSCMType
 import { MCPChannel } from '../../workbench/contrib/void/electron-main/mcpChannel.js';
 import { FetchUrlChannel } from '../../workbench/contrib/void/electron-main/fetchUrlChannel.js';
 import { EmbeddingChannel } from '../../workbench/contrib/void/electron-main/embeddingChannel.js';
+import { IntegrationChannel } from '../../workbench/contrib/void/electron-main/integrationChannel.js';
 /**
  * The main VS Code application. There will only ever be one instance,
  * even if the user starts many instances (e.g. from the command line).
@@ -1259,6 +1260,10 @@ export class CodeApplication extends Disposable {
 		// Void added this
 		const fetchUrlChannel = new FetchUrlChannel();
 		mainProcessElectronServer.registerChannel('void-channel-fetchUrl', fetchUrlChannel);
+
+		// Void added this
+		const integrationChannel = new IntegrationChannel();
+		mainProcessElectronServer.registerChannel('void-channel-integration', integrationChannel);
 
 		// Void added this
 		const embeddingChannel = new EmbeddingChannel();
