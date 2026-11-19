@@ -380,27 +380,32 @@ export function writeAppKeys(dirs, entries) {
 	const db = join(dirs.userDataDir, 'User', 'globalStorage', 'state.vscdb')
 	mkdirSync(dirname(db), { recursive: true })
 
-	// The SQL goes through `execFileSync`, so it is an argv entry and inherits the
-	// platform's command-line limit — 32,767 characters on Windows. A realistic
-	// fixture (a few hundred messages) exceeds that as one statement, and the
-	// failure is `ENAMETOOLONG` from spawn, which reads like a missing binary
-	// rather than an oversized argument. Chunked, each statement stays well under
-	// the limit and the calls are independent: the table is created
-	// `IF NOT EXISTS` and the key is `ON CONFLICT REPLACE`, so splitting a seed
-	// across calls is the same as doing it in one.
-	const CHUNK = 25
-	const statements = [`CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);`]
-	for (let i = 0; i < entries.length; i += CHUNK) {
-		const values = entries
-			.slice(i, i + CHUNK)
-			.map(([key, value]) => `(${sqlLiteral(key)}, ${sqlLiteral(value)})`)
-			.join(', ')
-		statements.push(`INSERT INTO ItemTable (key, value) VALUES ${values};`)
+	// The SQL goes to sqlite3 on **stdin**, not as an argv entry. As an argument it
+	// inherits the platform's command-line limit — 32,767 characters on Windows —
+	// and the failure is `ENAMETOOLONG` from spawn, which reads like a missing
+	// binary rather than an oversized argument. Splitting by entry count only
+	// bounds the statement while the values are small: 25 message-sized values blew
+	// past the limit, and a 10,000-row seed took 62 s in 2,000 sqawns. On stdin
+	// there is no limit, so batching is now only about memory, and each batch is
+	// one transaction, which is also what makes the insert pass fast.
+	const MAX_BATCH_CHARS = 8_000_000
+	const run = (sql) => execFileSync('sqlite3', [db], { input: sql, encoding: 'utf8', maxBuffer: MAX_SQLITE_OUTPUT_BYTES })
+	run(`CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);`)
+	let batch = []
+	let batchChars = 0
+	const flush = () => {
+		if (batch.length === 0) return
+		run(`BEGIN;INSERT INTO ItemTable (key, value) VALUES ${batch.join(', ')};COMMIT;`)
+		batch = []
+		batchChars = 0
 	}
-
-	for (const sql of statements) {
-		execFileSync('sqlite3', [db, sql], { encoding: 'utf8', maxBuffer: MAX_SQLITE_OUTPUT_BYTES })
+	for (const [key, value] of entries) {
+		const tuple = `(${sqlLiteral(key)}, ${sqlLiteral(value)})`
+		if (batch.length > 0 && batchChars + tuple.length > MAX_BATCH_CHARS) flush()
+		batch.push(tuple)
+		batchChars += tuple.length
 	}
+	flush()
 }
 
 // ── in-page instrumentation ─────────────────────────────────────────────
