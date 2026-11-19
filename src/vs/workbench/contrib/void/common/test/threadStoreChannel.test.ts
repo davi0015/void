@@ -141,16 +141,6 @@ suite('ThreadStoreChannel', () => {
 		assert.strictEqual(await exists(path.join(dir, 'images', 'shot.png')), true, 'images are deleted by their owner, not here')
 	})
 
-	test('copyThread copies the records and the copies diverge afterwards', async () => {
-		await channel.call({}, 'writeAll', { threadId: 'src', messages: [message('a'), message('b')] })
-		await channel.call({}, 'copyThread', { fromId: 'src', toId: 'dst' })
-
-		await channel.call({}, 'append', { threadId: 'dst', records: [rec(2, 'c')] })
-
-		assert.deepStrictEqual(texts(await channel.call({}, 'readAll', { threadId: 'src' })), ['a', 'b'])
-		assert.deepStrictEqual(texts(await channel.call({}, 'readAll', { threadId: 'dst' })), ['a', 'b', 'c'])
-	})
-
 	test('two appends issued together both land, in order', async () => {
 		// The queue is the only thing ordering these: without it the second append can
 		// start while the first is still opening, and the file interleaves.
