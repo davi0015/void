@@ -326,7 +326,19 @@ export class SQLiteStorageDatabase implements IStorageDatabase {
 						// The following exec() statement serves two purposes:
 						// - create the DB if it does not exist yet
 						// - validate that the DB is not corrupt (the open() call does not throw otherwise)
+						//
+						// `busy_timeout` first: every window owns a connection to the same
+						// database, and without it a statement that meets another writer's
+						// lock fails immediately with SQLITE_BUSY. On the read path that is
+						// a rejected `getItems()` at startup; on the write path the error
+						// arrives on the statement's `error` event, the connection is marked
+						// erroneous, and `END TRANSACTION` still commits — the write is
+						// dropped while `flush()` reports success. Measured on a 575 MB
+						// profile with a second process holding the write lock: the value
+						// never reached the table and nothing was thrown. With the timeout
+						// set, SQLite waits for the lock instead of failing.
 						return this.exec(connection, [
+							'PRAGMA busy_timeout = 10000;',
 							'PRAGMA user_version = 1;',
 							'CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)'
 						].join('')).then(() => {
