@@ -37,7 +37,7 @@ import { ChatMessage } from '../common/chatThreadServiceTypes.js';
 import { threadStoreDir } from '../common/threadImagePaths.js';
 import { decodeLog, encodeRecord, foldRecords, threadMessageLogFile, truncateFrom } from '../common/threadLog.js';
 import {
-	ThreadStoreAppendParams, ThreadStoreAppendResult, ThreadStoreCopyParams, ThreadStoreDeleteParams,
+	ThreadStoreAppendParams, ThreadStoreAppendResult, ThreadStoreDeleteParams,
 	ThreadStoreReadParams, ThreadStoreReadResult, ThreadStoreTruncateParams, ThreadStoreTruncateResult,
 	ThreadStoreWriteParams, ThreadStoreWriteResult,
 } from '../common/threadStoreTypes.js';
@@ -63,7 +63,6 @@ export class ThreadStoreChannel implements IServerChannel {
 			case 'writeAll': return this._writeAll(params as ThreadStoreWriteParams)
 			case 'truncateFrom': return this._truncateFrom(params as ThreadStoreTruncateParams)
 			case 'deleteThread': return this._deleteThread(params as ThreadStoreDeleteParams)
-			case 'copyThread': return this._copyThread(params as ThreadStoreCopyParams)
 			default: throw new Error(`Void thread store: command "${command}" not recognized.`)
 		}
 	}
@@ -128,18 +127,6 @@ export class ThreadStoreChannel implements IServerChannel {
 			// Only when the log was the last thing in the directory: a thread's images are
 			// deleted by the image code, which is the code that owns them.
 			await fs.rmdir(path.dirname(file)).catch(() => undefined)
-		})
-	}
-
-	private _copyThread({ fromId, toId }: ThreadStoreCopyParams): Promise<void> {
-		return this._perThread(toId, async () => {
-			const from = this._logFile(validatedId(fromId))
-			const to = this._logFile(validatedId(toId))
-			// Repair first: a fragment must not be copied forward into a new thread.
-			await this._repairTail(from)
-			await fs.mkdir(path.dirname(to), { recursive: true })
-			if (await exists(from)) await fs.copyFile(from, to)
-			else await this._writeAtomic(to, '')
 		})
 	}
 
@@ -255,14 +242,6 @@ function validatedId(threadId: unknown): string {
 		throw new Error(`Void thread store: invalid thread id ${JSON.stringify(threadId)}`)
 	}
 	return threadId
-}
-
-async function exists(file: string): Promise<boolean> {
-	try { await fs.stat(file); return true }
-	catch (error) {
-		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
-		throw error
-	}
 }
 
 async function readTextIfPresent(file: string): Promise<string | undefined> {

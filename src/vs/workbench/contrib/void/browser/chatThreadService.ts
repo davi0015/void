@@ -53,6 +53,10 @@ import { IFileService } from '../../../../platform/files/common/files.js';
 import { IMCPService } from '../common/mcpService.js';
 import { RawMCPToolCall } from '../common/mcpServiceTypes.js';
 import { shouldAutoApprove } from '../common/terminalAutoApprove.js';
+import { IMainProcessService } from '../../../../platform/ipc/common/mainProcessService.js';
+import { IChannel } from '../../../../base/parts/ipc/common/ipc.js';
+import { THREAD_STORE_FORMAT_LOG } from '../common/threadLog.js';
+import { THREAD_STORE_CHANNEL_NAME, ThreadStoreAppendParams, ThreadStoreReadResult, ThreadStoreTruncateParams, ThreadStoreWriteParams } from '../common/threadStoreTypes.js';
 
 
 // related to retrying when LLM message has error
@@ -276,6 +280,12 @@ export type ThreadType = {
 	// normalizes to 'read_only' so legacy behavior is unchanged.
 	// Persisted as part of the thread blob.
 	permissionMode?: ThreadPermissionMode;
+
+	// Which store this thread's messages are in. `THREAD_STORE_FORMAT_LOG` means
+	// `threads/<id>/messages.jsonl`; absent means the mirrored `void.chatMsg.*` keys,
+	// which is every thread written before S10b. A thread's format is a property of the
+	// thread, so the two coexist and the read path is a branch rather than a migration.
+	storeFormatVersion?: number;
 
 	// Ephemeral (not persisted) — computed during metadata-only reads by
 	// reading the first few message keys. Used by the UI as a label fallback
@@ -513,6 +523,10 @@ const newThreadObject = (workspace?: { uri?: string, label?: string }) => {
 		createdAt: now,
 		lastModified: now,
 		messages: [],
+		// New threads are born in the log format. Threads written before S10b have no
+		// `storeFormatVersion` and keep reading their `void.chatMsg.*` keys until the
+		// startup pass converts them.
+		storeFormatVersion: THREAD_STORE_FORMAT_LOG,
 		workspaceUri: workspace?.uri,
 		workspaceLabel: workspace?.label,
 		// grants nothing on top of global config — out-of-the-box behavior is
@@ -583,7 +597,7 @@ export interface IChatThreadService {
 	// selection or tab strip. The thread appears in thread history like any
 	// other. Returns the new thread's id.
 	createThread(): string;
-	switchToThread(threadId: string): void;
+	switchToThread(threadId: string): Promise<void>;
 
 	// thread selector
 	deleteThread(threadId: string): void;
@@ -822,8 +836,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@ITerminalToolService private readonly _terminalToolService: ITerminalToolService,
 		@IHostService private readonly _hostService: IHostService,
 		@INativeHostService private readonly _nativeHostService: INativeHostService,
+		@IMainProcessService private readonly _mainProcessService: IMainProcessService,
 	) {
 		super()
+		this._threadStore = this._mainProcessService.getChannel(THREAD_STORE_CHANNEL_NAME)
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string, pinnedThreadIds: [] } // default state
 
 		const readThreads = this._loadAllThreads() || {}
@@ -1073,7 +1089,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this.rejectLatestToolRequest(threadId)
 		} else if (action === 'view') {
 			this._hostService.focus({ force: false } as any).catch(() => { })
-			this.switchToThread(threadId)
+			void this.switchToThread(threadId)
 		} else if (action === 'reply') {
 			// reply:<threadId>:<encodeURIComponent'd text> — sent from the
 			// notification's reply input. addUserMessageAndStreamResponse wraps
@@ -1199,6 +1215,17 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	private _pendingUsageWrites = new Map<string, object>()       // usage stats
 	private _pendingMessageKeyWrites = new Map<string, ChatMessage>() // individual msg keys
+	// The main-process channel that owns a log thread's file. A thread whose
+	// `storeFormatVersion` is `THREAD_STORE_FORMAT_LOG` never touches
+	// `_pendingMessageKeyWrites`; its messages are appended to
+	// `threads/<id>/messages.jsonl` instead. See the helpers below.
+	private readonly _threadStore: IChannel
+	// Log loads in flight, so two callers of `_ensureMessagesLoaded` share one read
+	// rather than racing two.
+	private readonly _threadLoads = new Map<string, Promise<void>>()
+	// Bumped by every `switchToThread`, so a switch whose log read resolves late cannot
+	// land on top of a newer one.
+	private _switchGeneration = 0
 	// Tracks which threads have their messages loaded into memory.
 	// At startup, only metadata is loaded for all threads; messages are
 	// loaded on demand when the user switches to a thread.
@@ -1274,7 +1301,20 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const usage: Record<string, unknown> = {}
 		for (const [key, value] of Object.entries(thread)) {
 			if (key === 'messages') continue // messages live under their own keys
-			if (key === 'title') continue // ephemeral — computed on read, not persisted
+			if (key === 'title') {
+				// A log thread has no message keys for the metadata-only read to scan, so
+				// its label is persisted with the thread. Derived from the array whenever
+				// it is resident, so editing the first message renames the tab; an
+				// unloaded thread keeps the stored label. Omitted while undefined: a
+				// metadata-only load holds no messages and would otherwise erase it.
+				if (thread.storeFormatVersion === THREAD_STORE_FORMAT_LOG) {
+					const label = this._loadedMessageThreadIds.has(thread.id)
+						? ChatThreadService._titleFromMessages(thread.messages)
+						: value
+					if (label !== undefined) metadata[key] = label
+				}
+				continue
+			}
 			if (ChatThreadService._USAGE_FIELDS.has(key)) {
 				usage[key] = value
 			} else if (key === 'state') {
@@ -1356,11 +1396,17 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	private _storeThread(threadId: string, thread: ThreadType | undefined, updateIndex = false) {
 		if (thread === undefined) {
+			// The format has to be resolved before the pending write is dropped: it is
+			// one of the two places `_isLogThread` can find the thread.
+			const wasLogThread = this._isLogThread(threadId)
 			this._pendingThreadWrites.delete(threadId)
 			this._pendingUsageWrites.delete(threadId)
 			// Remove all storage keys for this thread
 			this._storageService.remove(THREAD_KEY_PREFIX + threadId, StorageScope.APPLICATION)
 			this._storageService.remove(USAGE_KEY_PREFIX + threadId, StorageScope.APPLICATION)
+			// A log thread's messages are one file; the channel deletes it and leaves
+			// the thread's images to the code that owns them.
+			if (wasLogThread) this._logDelete(threadId)
 			// Remove individual message keys (iterate until missing)
 			for (let i = 0; ; i++) {
 				const msgKey = MESSAGE_KEY_PREFIX + threadId + '.' + i
@@ -1419,9 +1465,58 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._flushPendingThreadWrites()
 	}
 
+	// ── The message log (S10b) ──────────────────────────────────────────────
+	//
+	// A thread created by this build keeps its messages in a file, and the channel
+	// above owns the file. Three properties matter at the call sites below:
+	//
+	//   - Operations are sent in program order and the channel runs them one at a time
+	//     per thread, so an append issued after a truncation cannot overtake it.
+	//   - Nothing waits for them. A failed write is logged and the session continues
+	//     with the message in memory, exactly as a failed key write did.
+	//   - There is no debounce here, deliberately. A thread's message writes are a
+	//     handful per turn, and a write sitting in the 500 ms window at close is the
+	//     failure mode the storage layer already has.
+	//
+	// A thread's format is a property of the thread, so every decision below is a
+	// branch on `storeFormatVersion` and a key-backed thread behaves exactly as before.
+
+	private _isLogThread(threadId: string): boolean {
+		// `state.allThreads` is the truth for a thread the UI knows about;
+		// `_pendingThreadWrites` covers the gap between `_storeThread(id, thread)` and
+		// the `_setState` that publishes it, which is where a duplicate or an import
+		// writes its messages.
+		const thread = (this.state.allThreads[threadId] ?? this._pendingThreadWrites.get(threadId)) as ThreadType | undefined
+		return thread?.storeFormatVersion === THREAD_STORE_FORMAT_LOG
+	}
+
+	private _logAppend(threadId: string, records: { i: number, m: ChatMessage }[]): void {
+		void this._threadStore.call('append', { threadId, records } satisfies ThreadStoreAppendParams)
+			.catch(error => console.error('[thread-log] append failed:', error))
+	}
+
+	private _logWriteAll(threadId: string, messages: ChatMessage[]): void {
+		void this._threadStore.call('writeAll', { threadId, messages } satisfies ThreadStoreWriteParams)
+			.catch(error => console.error('[thread-log] rewrite failed:', error))
+	}
+
+	private _logTruncate(threadId: string, boundary: number): void {
+		void this._threadStore.call('truncateFrom', { threadId, boundary } satisfies ThreadStoreTruncateParams)
+			.catch(error => console.error('[thread-log] truncate failed:', error))
+	}
+
+	private _logDelete(threadId: string): void {
+		void this._threadStore.call('deleteThread', { threadId })
+			.catch(error => console.error('[thread-log] delete failed:', error))
+	}
+
 	// Write an individual message key. Called by _addMessageToThread,
 	// _editMessageInThread, etc.
 	private _storeMessageKey(threadId: string, msgIdx: number, message: ChatMessage) {
+		if (this._isLogThread(threadId)) {
+			this._logAppend(threadId, [{ i: msgIdx, m: message }])
+			return
+		}
 		this._pendingMessageKeyWrites.set(threadId + '.' + msgIdx, message)
 		this._scheduleThreadFlush()
 	}
@@ -1438,12 +1533,17 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	// Delete message keys from fromIdx onward (for truncate/rollback).
 	private _deleteMessageKeysFrom(threadId: string, fromIdx: number) {
-		for (let i = fromIdx; ; i++) {
-			const msgKey = MESSAGE_KEY_PREFIX + threadId + '.' + i
-			if (this._storageService.get(msgKey, StorageScope.APPLICATION) === undefined) break
-			this._storageService.remove(msgKey, StorageScope.APPLICATION)
+		if (this._isLogThread(threadId)) {
+			this._logTruncate(threadId, fromIdx)
+		} else {
+			for (let i = fromIdx; ; i++) {
+				const msgKey = MESSAGE_KEY_PREFIX + threadId + '.' + i
+				if (this._storageService.get(msgKey, StorageScope.APPLICATION) === undefined) break
+				this._storageService.remove(msgKey, StorageScope.APPLICATION)
+			}
 		}
-		// Also remove any pending writes for deleted keys
+		// Also remove any pending writes for deleted keys. A log thread has none, but a
+		// thread converted mid-session could still hold keys queued before the switch.
 		for (const k of this._pendingMessageKeyWrites.keys()) {
 			if (k.startsWith(threadId + '.')) {
 				const idx = parseInt(k.slice(threadId.length + 1), 10)
@@ -1455,6 +1555,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// Write all messages for a thread (used after truncation/mutation
 	// where multiple keys change). Deletes stale keys beyond new length.
 	private _storeAllMessageKeys(threadId: string, messages: ChatMessage[]) {
+		if (this._isLogThread(threadId)) {
+			// The in-memory array is the winning state of the log, so one rewrite is
+			// both the truncation and the append. Used by duplicate and import, which
+			// already hold every message.
+			this._logWriteAll(threadId, messages)
+			return
+		}
 		this._deleteMessageKeysFrom(threadId, messages.length)
 		for (let i = 0; i < messages.length; i++) {
 			this._pendingMessageKeyWrites.set(threadId + '.' + i, messages[i])
@@ -1562,15 +1669,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (!loadMessages) {
 			// Metadata-only load — skip message reading and migration.
 			// Messages will be loaded when the thread is opened via _ensureMessagesLoaded.
-			// Read the first few message keys to extract a title for the tab label.
-			let title: string | undefined
-			for (let i = 0; i < 5; i++) {
-				const msgRaw = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
-				if (msgRaw === undefined) continue
-				const msg = JSON.parse(msgRaw, ChatThreadService._storageReviver) as any
-				if (msg.role === 'user' && msg.displayContent) {
-					title = msg.displayContent
-					break
+			// A key-backed thread carries its label on its first message key; a log thread
+			// has none, so the label is read from metadata, where the write path keeps it.
+			let title: string | undefined = metadataParsed.title
+			if (metadataParsed.storeFormatVersion !== THREAD_STORE_FORMAT_LOG) {
+				title = undefined
+				for (let i = 0; i < 5; i++) {
+					const msgRaw = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
+					if (msgRaw === undefined) continue
+					const msg = JSON.parse(msgRaw, ChatThreadService._storageReviver) as any
+					if (msg.role === 'user' && msg.displayContent) {
+						title = msg.displayContent
+						break
+					}
 				}
 			}
 			const thread: ThreadType = { ...metadataParsed, ...usageParsed, messages: [] as ChatMessage[], title } as ThreadType
@@ -1673,11 +1784,34 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	 *  At startup, only metadata is loaded for all threads to avoid
 	 *  deserializing 25k+ messages into renderer memory. This method
 	 *  is called when the user switches to a thread, loading its
-	 *  messages and running any pending migration. */
-	private _ensureMessagesLoaded(threadId: string): void {
+	 *  messages and running any pending migration.
+	 *
+	 *  Asynchronous only for a log thread, whose messages are a file the main process
+	 *  owns. A key-backed thread still resolves synchronously inside the call, so
+	 *  `void _ensureMessagesLoaded(id)` keeps its old meaning at the call sites that
+	 *  cannot wait. */
+	private _ensureMessagesLoaded(threadId: string): Promise<void> {
+		if (this._loadedMessageThreadIds.has(threadId)) return Promise.resolve()
+		const inFlight = this._threadLoads.get(threadId)
+		if (inFlight) return inFlight
+
+		const load = this._loadMessages(threadId)
+		const settled = load.finally(() => {
+			if (this._threadLoads.get(threadId) === settled) this._threadLoads.delete(threadId)
+		})
+		this._threadLoads.set(threadId, settled)
+		return settled
+	}
+
+	private async _loadMessages(threadId: string): Promise<void> {
 		if (this._loadedMessageThreadIds.has(threadId)) return
 		const existing = this.state.allThreads[threadId]
 		if (!existing) return
+
+		if (existing.storeFormatVersion === THREAD_STORE_FORMAT_LOG) {
+			await this._loadLogMessages(threadId, existing)
+			return
+		}
 
 		const fullThread = this._readThread(threadId, true)
 		if (!fullThread) return
@@ -1707,6 +1841,46 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 			this._setState({ allThreads: newThreads })
 		}
+	}
+
+	private async _loadLogMessages(threadId: string, existing: ThreadType): Promise<void> {
+		const read = await this._threadStore.call('readAll', { threadId }) as ThreadStoreReadResult
+		// The thread can be deleted while its file is being read. Publishing it again
+		// here would put a deleted thread back into memory.
+		if (!this.state.allThreads[threadId]) return
+
+		this._loadedMessageThreadIds.add(threadId)
+		if (!read.exists) return
+
+		if (read.gapIndices.length > 0) {
+			// Repacking around the gap is the renumbering the log exists to remove, so
+			// the loss is reported and the rest of the thread opens without it.
+			console.error(`[thread-log] ${threadId}: missing message indices, first ${read.gapIndices[0]}`)
+		}
+
+		const title = ChatThreadService._titleFromMessages(read.messages)
+		const titleChanged = title !== undefined && existing.title !== title
+		if (read.messages.length === 0 && !titleChanged) return
+
+		const updatedThread: ThreadType = {
+			...existing,
+			messages: read.messages,
+			// A log thread's label cannot be derived from message keys on the next
+			// metadata-only read, so it is written with the thread the first time it is
+			// known. Only the fields the read corrected are taken: the persisted copy can
+			// be older than memory while a write is in flight.
+			...(titleChanged ? { title } : {}),
+		}
+		this._setState({ allThreads: { ...this.state.allThreads, [threadId]: updatedThread } })
+		if (titleChanged) this._storeThread(threadId, updatedThread)
+	}
+
+	/** The label a metadata-only read derives from a thread's first few messages. */
+	private static _titleFromMessages(messages: readonly ChatMessage[]): string | undefined {
+		for (const message of messages.slice(0, 5)) {
+			if (message.role === 'user' && message.displayContent) return message.displayContent
+		}
+		return undefined
 	}
 
 	// ── Startup residue sweep (S10c) ────────────────────────────────────────
@@ -1766,6 +1940,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		let reclaimed = false
 		let deferred = false
 		for (const threadId of Object.keys(this.state.allThreads)) {
+			// A log thread has neither message keys to compact nor checkpoint-era gaps;
+			// the residue this pass reclaims belongs to the `void.chatMsg.*` format.
+			if (this._isLogThread(threadId)) continue
 			const outcome = this._sweepThreadResidue(threadId, messageKeysByThread.get(threadId) ?? [], threadsWithCheckpointKeys.has(threadId))
 			if (outcome === 'deferred') deferred = true
 			else if (outcome === 'reclaimed') reclaimed = true
@@ -4177,6 +4354,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 
 	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes, modelSelectionOptionsOverride }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array>, modelSelectionOptionsOverride?: ModelSelectionOptions }) {
+		// The thread is not necessarily the current one (a notification reply arrives
+		// with its own id). A log thread's messages arrive asynchronously, and appending
+		// to one that is not loaded would write index 0 over a conversation that exists.
+		await this._ensureMessagesLoaded(threadId)
+
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
@@ -4813,7 +4995,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	getThreadWithMessages(threadId: string): ThreadType | undefined {
-		this._ensureMessagesLoaded(threadId)
+		// Asynchronous for a log thread. Every caller is looking at the thread that is
+		// already active, and `switchToThread` loads it before it becomes current, so
+		// the returned thread is complete in practice. A thread that is not loaded yet
+		// reads as empty rather than blocking a notification path on file I/O.
+		void this._ensureMessagesLoaded(threadId)
 		return this.state.allThreads[threadId]
 	}
 
@@ -4836,7 +5022,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		return this.getCurrentFocusedMessageIdx() !== undefined
 	}
 
-	switchToThread(threadId: string) {
+	async switchToThread(threadId: string): Promise<void> {
 		// User-initiated switch (tab click, history click, etc). Auto-pins
 		// into the *current workspace's* bucket so the thread surfaces in
 		// THIS workspace's tab strip — and only this one. A foreign thread
@@ -4845,7 +5031,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// is unaffected. Use `_landOnThread` for non-user-initiated
 		// transitions (startup restore, normalize) where the tab strip
 		// should stay exactly as the user left it.
-		this._ensureMessagesLoaded(threadId)
+		const generation = ++this._switchGeneration
+		await this._ensureMessagesLoaded(threadId)
+		// Two tabs clicked in quick succession: a log read resolves in its own time, so
+		// the older switch must not land after the newer one.
+		if (generation !== this._switchGeneration) return
 		const alreadyPinned = this.state.pinnedThreadIds.includes(threadId)
 		if (alreadyPinned) {
 			this._setState({ currentThreadId: threadId })
@@ -4862,9 +5052,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// "every refresh adds a new tab" behavior reported during commit-2
 	// testing. Same lastActive + model-restore side-effects as
 	// `switchToThread` so a reload-landing thread still gets remembered.
-	private _landOnThread(threadId: string): void {
+	private async _landOnThread(threadId: string): Promise<void> {
 		if (!this.state.allThreads[threadId]) return
-		this._ensureMessagesLoaded(threadId)
+		await this._ensureMessagesLoaded(threadId)
+		// Deleted while its messages were being read: do not land on it.
+		if (!this.state.allThreads[threadId]) return
 		this._setState({ currentThreadId: threadId })
 		this._afterCurrentThreadChanged(threadId)
 	}
@@ -5035,7 +5227,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const lastId = this._lastActiveThreadIdByWorkspace[lastActiveKey]
 			if (lastId) {
 				if (this.state.allThreads[lastId] && isPinned(lastId)) {
-					this._landOnThread(lastId)
+					void this._landOnThread(lastId)
 					return
 				}
 				delete this._lastActiveThreadIdByWorkspace[lastActiveKey]
@@ -5048,7 +5240,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			.filter((t): t is NonNullable<typeof t> => !!t)
 			.sort((a, b) => (b.lastModified ?? '').localeCompare(a.lastModified ?? ''))
 		if (pinnedCandidates.length > 0) {
-			this._landOnThread(pinnedCandidates[0].id)
+			void this._landOnThread(pinnedCandidates[0].id)
 			return
 		}
 		// (3) Empty strip in this workspace. Mint a fresh pinned thread —
@@ -5078,7 +5270,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// Idempotent + scoped to unscoped-only, so a properly-tagged empty
 			// thread (whether for this workspace or any other) is left alone.
 			this._claimThreadForCurrentWorkspaceIfUnscoped(threadId)
-			this.switchToThread(threadId)
+			void this.switchToThread(threadId)
 			return
 		}
 		// otherwise, start a new thread, stamped with current workspace
@@ -5130,7 +5322,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// index 0 and stops at the first gap, and reading the thread is what
 			// compacts the gaps a checkpoint-era thread still has. Without this the
 			// keys past the gap are orphaned rather than deleted.
-			this._ensureMessagesLoaded(threadId)
+			//
+			// A log thread is skipped: it has no keys to compact, and its file is
+			// removed whole by the channel.
+			if (!this._isLogThread(threadId)) void this._ensureMessagesLoaded(threadId)
 			this._fileService.del(threadImageDir(this._globalStorageHome(), threadId), { recursive: true })
 				.catch(() => { /* no images, or the directory is already gone */ })
 		}
@@ -5185,7 +5380,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	async duplicateThread(threadId: string): Promise<string | undefined> {
-		this._ensureMessagesLoaded(threadId)
+		await this._ensureMessagesLoaded(threadId)
 		const { allThreads: currentThreads } = this.state
 		const threadToDuplicate = currentThreads[threadId]
 		if (!threadToDuplicate) return undefined
@@ -5239,7 +5434,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// on. Returns the new id so the caller (banner button) can follow up
 	// with UI work if needed.
 	async copyThreadToCurrentWorkspace(threadId: string): Promise<string | undefined> {
-		this._ensureMessagesLoaded(threadId)
+		await this._ensureMessagesLoaded(threadId)
 		const source = this.state.allThreads[threadId]
 		if (!source) return undefined
 		const identity = this._getCurrentWorkspaceIdentity()
@@ -5270,8 +5465,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		await this._copyOwnedImages(threadId, newId, cloned.messages)
 
 		const newThreads = { ...this.state.allThreads, [newId]: cloned }
-		this._storeAllMessageKeys(newId, cloned.messages)
+		// Store the thread before its messages: `_storeAllMessageKeys` decides the store
+		// from the thread, and for an id the state has not published yet the pending
+		// write is the only place it can be found.
 		this._storeThread(newId, cloned, true)
+		this._storeAllMessageKeys(newId, cloned.messages)
 		this._loadedMessageThreadIds.add(newId) // cloned thread already has messages in memory
 		// Drop in-memory telemetry mirrors for the new id (defensive — should
 		// be empty since the id is fresh, but keeps the maps strictly
@@ -5284,7 +5482,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._setState({ allThreads: newThreads })
 		// Use switchToThread so the auto-pin + last-active update flows
 		// through the established channels rather than open-coding them.
-		this.switchToThread(newId)
+		await this.switchToThread(newId)
 		return newId
 	}
 
@@ -5307,7 +5505,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// identity to assign). Caller (banner) shouldn't even offer Move
 		// in those cases, but defensive check for any direct API calls.
 		if (source.workspaceUri === identity.uri) {
-			this.switchToThread(threadId)
+			void this.switchToThread(threadId)
 			return threadId
 		}
 
@@ -5338,7 +5536,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const newThreads = { ...this.state.allThreads, [threadId]: updated }
 		this._storeThread(threadId, updated)
 		this._setState({ allThreads: newThreads })
-		this.switchToThread(threadId)
+		void this.switchToThread(threadId)
 		return threadId
 	}
 

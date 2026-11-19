@@ -64,5 +64,3 @@ export type ThreadStoreTruncateParams = {
 export type ThreadStoreTruncateResult = { records: number }
 
 export type ThreadStoreDeleteParams = { threadId: string }
-
-export type ThreadStoreCopyParams = { fromId: string; toId: string }
