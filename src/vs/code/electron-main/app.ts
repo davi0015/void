@@ -136,6 +136,8 @@ import { MCPChannel } from '../../workbench/contrib/void/electron-main/mcpChanne
 import { FetchUrlChannel } from '../../workbench/contrib/void/electron-main/fetchUrlChannel.js';
 import { EmbeddingChannel } from '../../workbench/contrib/void/electron-main/embeddingChannel.js';
 import { IntegrationChannel } from '../../workbench/contrib/void/electron-main/integrationChannel.js';
+import { ThreadStoreChannel } from '../../workbench/contrib/void/electron-main/threadStoreChannel.js';
+import { THREAD_STORE_CHANNEL_NAME } from '../../workbench/contrib/void/common/threadStoreTypes.js';
 /**
  * The main VS Code application. There will only ever be one instance,
  * even if the user starts many instances (e.g. from the command line).
@@ -1264,6 +1266,12 @@ export class CodeApplication extends Disposable {
 		// Void added this
 		const integrationChannel = new IntegrationChannel();
 		mainProcessElectronServer.registerChannel('void-channel-integration', integrationChannel);
+
+		// Void added this
+		// The channel builds thread paths itself, so it needs the same global storage
+		// home the storage service opens `state.vscdb` in.
+		const threadStoreChannel = new ThreadStoreChannel(accessor.get(IUserDataProfilesMainService).defaultProfile.globalStorageHome);
+		mainProcessElectronServer.registerChannel(THREAD_STORE_CHANNEL_NAME, threadStoreChannel);
 
 		// Void added this
 		const embeddingChannel = new EmbeddingChannel();
