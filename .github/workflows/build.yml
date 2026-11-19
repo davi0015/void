@@ -32,8 +32,9 @@ concurrency:
 jobs:
   build-mac-arm64:
     name: macOS arm64
-    # macos-14 is Apple Silicon — required for a darwin-arm64 build.
-    runs-on: macos-14
+    # macos-15 is Apple Silicon — required for a darwin-arm64 build. macos-14 was
+    # retired on 2026-11-02; a job that asks for it is rejected before its first step.
+    runs-on: macos-15
     timeout-minutes: 120
     # Authenticates api.github.com calls made by postinstall downloaders
     # (@vscode/ripgrep etc.) — anonymous requests from shared runner IPs
