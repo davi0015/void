@@ -46,7 +46,8 @@ The sync model differs from the naive "poll everything" in one important way, di
 - **Channel-level `messages/delta` returns roots only — replies are never included**, not in the initial sync nor incrementally. There is no working `replies/delta` endpoint (400).
 - **But when a reply is posted, the ROOT is re-delivered on the deltaLink** — i.e. the root doubles as a thread-changed signal.
 - So the daemon's loop is: hold one channel deltaLink, poll every ~5s; for each returned root, unknown → new task (bind `conversationKey` = root id), known → fetch `GET /messages/{rootId}/replies` and dispatch replies with `id > last_seen` (per-thread watermark; ids are monotonic). Only threads with actual activity cost a `/replies` call — no N+1 across all threads.
-- **The `/replies` listing returns newest-first** (verified live). Combined with the watermark this makes scan cost proportional to *new replies*, not thread length: walk pages newest→oldest, stop at the first `id <= watermark`. If the watermark is lost, do NOT re-dispatch history — read page 1, set the watermark to its newest id, dispatch nothing.
+- **The `/replies` listing returns newest-first** (verified live). Combined with the watermark this makes scan cost proportional to *new replies*, not thread length: walk pages newest→oldest, stop at the first `id <= watermark`. **First sight of a thread must never use watermark 0** — that replays the thread's whole history as "new" (found in live use: an old thread became active and the agent answered days-old messages). Since ids are globally monotonic across roots and replies, the daemon records a *floor* (highest id at initial sync) and uses it as the watermark for not-yet-watermarked threads; genuinely new replies (id > floor) still dispatch.
+- **Rendered HTML subset (validated live 2026-11-14)**: works — `<b>`, `<i>`, `<s>`, `<u>`, `<h1>`–`<h3>`, `<blockquote>`, `<ul>/<ol>/<li>`, `<table>`, `<hr>`, `<code>` + `&nbsp;` indentation, `<span style="color:…">`; does NOT work — `<details>/<summary>` (stripped server-side: **no expandable content via plain HTML** — expandable requires Adaptive Cards via a "Post card" flow action), `<font color>` (renders black), `<h1>`–`<h3>` on mobile (all render the same size — use `<b style="font-size:…">` instead, explicit inline sizes survive both clients). Still true from earlier validation: `<pre>` breaks, `\n` stripped, leading spaces collapse.
 - Webhook sends: `replyTo` = root id, one-level-deep threading only; 202 with no body means posting failures are only visible in the flow's run history, never to the caller.
 - Author filtering must be null-safe: `from` can be `null`, and `{application: null, user: null}` occurs on system events. Compare `from.user.id` (not displayName) against the configured user.
 - Duplicates: messages posted around deltaLink creation can appear in both the sync and the next incremental call — idempotent dispatch by message id required.
@@ -60,22 +61,31 @@ Defined in `common/integrationTypes.ts`. Two message families:
 ```typescript
 // proxy → void
 export type IntegrationInbound =
-	| { type: 'userMessage'; conversationKey: string; text: string; author: string; threadId?: string }
+	| { type: 'userMessage'; conversationKey: string; text: string; author: string; threadId?: string; permissionMode?: ThreadPermissionMode }
 	| { type: 'approvalResponse'; requestId: string; approved: boolean }
 	| { type: 'interrupt'; conversationKey: string }
 	| { type: 'newThread'; conversationKey: string; workspaceHint?: string }
+	| { type: 'setThreadPermissionMode'; conversationKey: string; threadId: string; permissionMode: ThreadPermissionMode }
+	| { type: 'conversationBound'; conversationKey: string; threadId: string }
 
 // void → proxy — all presentation-safe (see Redaction)
 export type IntegrationOutbound =
 	| { type: 'streamDelta'; conversationKey: string; textSoFar: string }
-	| { type: 'toolStatus'; conversationKey: string; toolName: ToolName; phase: 'running' | 'success' | 'error'; summary: string }
-	| { type: 'approvalRequest'; requestId: string; conversationKey: string; toolName: ToolName; paramsSummary: string }
+	| { type: 'toolStatus'; conversationKey: string; toolName: ToolName; mcpServerName: string | undefined; phase: 'running' | 'success' | 'error'; summary: string }
+	| { type: 'approvalRequest'; requestId: string; conversationKey: string; toolName: ToolName; mcpServerName: string | undefined; paramsSummary: string }
 	| { type: 'final'; conversationKey: string; text: string; usage?: LLMUsage }
 	| { type: 'error'; conversationKey: string; message: string }
 	| { type: 'bound'; conversationKey: string; threadId: string }
+	| { type: 'createConversation'; threadId: string; title?: string }
 ```
 
 `userMessage.threadId` (optional) is the proxy's remembered binding; `bound` is Void's notification whenever a binding is (re)established — together they make the durable `voidThreadIdOfConversationKey` map survive Void restarts: the proxy sends what it remembers, Void adopts it or creates a new thread and tells the proxy which.
+
+`userMessage.permissionMode` lets a proxy with channel-level authorization (e.g. a private Teams channel whose members are trusted for unattended tool use) grant the thread's mode *synchronously before the turn starts* — applying it after dispatch loses to a state race in the turn's snapshot. The same grant is re-applied on `bound` (reactively) and on connect (pre-warm, via `setThreadPermissionMode` carrying the proxy's remembered `threadId`) so it survives app restarts and session-mirror emptiness.
+
+Bindings can also be created from the editor side: the "Mirror Current Chat to an External Chat" command sends `createConversation {threadId}`, the proxy mints an external conversation and confirms with `conversationBound` (inbound) — after which the thread's events flow out and replies route back. Explicit opt-in per thread, not automatic: every editor thread sprouting an external message would be notification spam and would invert the trust model.
+
+**Reaching a specific window / workspace:** one workspace = one port = one proxy connection. The port is derived deterministically by both sides — `base + hash('file://' + workspacePath) % 1000` (int32 rolling hash) — so the proxy needs no discovery: it computes where a window for that workspace *will* listen and dials until one does. Dev builds use base **5757**, released builds **4757** (so the same workspace open in both apps never contends for one port; the proxy's channel config picks the app via `portBase`). Workspace identity matches thread-scoping: single folder → the folder, saved `.code-workspace` → the workspace *file*, untitled multi-root → the first folder. The `hello` handshake authenticates the proxy with a **pairing token** — a per-installation secret (application storage; "Void: Show External Chat Pairing Token" copies it).
 
 - `conversationKey` is an opaque string chosen by the proxy (for the Slack adapter: the `(channel_id, thread_ts)` pair, stable for the lifetime of a Slack thread). Void never parses it.
 - `streamDelta` is throttled to ~1/sec by the proxy before calling `chat.update` (Slack rate limits); Void can emit freely.
