@@ -590,6 +590,12 @@ export interface IChatThreadService {
 	 * loaded, because that is what opening it does.
 	 */
 	getThreadWithMessages(threadId: string): ThreadType | undefined;
+	/**
+	 * Resolves once the thread's messages are in memory. A log thread's messages are read
+	 * from its file, so anything that needs the whole array must wait for this rather than
+	 * call `getThreadWithMessages` and hope the thread was already open.
+	 */
+	ensureMessagesLoaded(threadId: string): Promise<void>;
 	openNewThread(): void;
 	// Creates a new thread in the current workspace WITHOUT switching to it or
 	// pinning it. For programmatic callers (the integration service) that manage
@@ -4998,9 +5004,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// Asynchronous for a log thread. Every caller is looking at the thread that is
 		// already active, and `switchToThread` loads it before it becomes current, so
 		// the returned thread is complete in practice. A thread that is not loaded yet
-		// reads as empty rather than blocking a notification path on file I/O.
+		// reads as empty rather than blocking a notification path on file I/O. Callers
+		// that need the whole array must await `ensureMessagesLoaded` first.
 		void this._ensureMessagesLoaded(threadId)
 		return this.state.allThreads[threadId]
+	}
+
+	ensureMessagesLoaded(threadId: string): Promise<void> {
+		return this._ensureMessagesLoaded(threadId)
 	}
 
 	getCurrentFocusedMessageIdx() {
