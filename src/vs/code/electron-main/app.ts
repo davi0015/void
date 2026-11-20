@@ -138,6 +138,7 @@ import { EmbeddingChannel } from '../../workbench/contrib/void/electron-main/emb
 import { IntegrationChannel } from '../../workbench/contrib/void/electron-main/integrationChannel.js';
 import { ThreadStoreChannel } from '../../workbench/contrib/void/electron-main/threadStoreChannel.js';
 import { THREAD_STORE_CHANNEL_NAME } from '../../workbench/contrib/void/common/threadStoreTypes.js';
+import { ThreadLogMirrorPolicy } from '../../workbench/contrib/void/electron-main/threadLogMigration.js';
 /**
  * The main VS Code application. There will only ever be one instance,
  * even if the user starts many instances (e.g. from the command line).
@@ -1216,7 +1217,7 @@ export class CodeApplication extends Disposable {
 		mainProcessElectronServer.registerChannel('webview', webviewChannel);
 
 		// Storage (main & shared process)
-		const storageChannel = disposables.add((new StorageDatabaseChannel(this.logService, accessor.get(IStorageMainService))));
+		const storageChannel = disposables.add((new StorageDatabaseChannel(this.logService, accessor.get(IStorageMainService), new ThreadLogMirrorPolicy())));
 		mainProcessElectronServer.registerChannel('storage', storageChannel);
 		sharedProcessClient.then(client => client.registerChannel('storage', storageChannel));
 
