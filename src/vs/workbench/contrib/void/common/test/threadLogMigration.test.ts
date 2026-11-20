@@ -137,6 +137,24 @@ suite('ThreadLogMigration', () => {
 		assert.strictEqual(map.get(THREAD_KEY_PREFIX + 'broken'), 'not json', 'the unreadable row is not rewritten')
 	})
 
+	test('a thread whose file cannot be written stays key-backed', async () => {
+		// `void/threads` exists as a file, so every mkdir below it fails — the shape of a
+		// full disk or a blocked directory without needing either.
+		await fs.mkdir(path.join(root, 'void'), { recursive: true })
+		await fs.writeFile(path.join(root, 'void', 'threads'), 'not a directory')
+
+		const map = items()
+		thread(map, 'blocked', { id: 'blocked', messages: [] })
+		message(map, 'blocked', 0, user('a'))
+
+		const result = await convert(map)
+
+		assert.deepStrictEqual(result, { converted: 0, failed: 1, allThreadsAreLogs: false })
+		const metadata = metadataOf(map, 'blocked')
+		assert.strictEqual(metadata.storeFormatVersion, undefined, 'the metadata must not claim a log that was never written')
+		assert.strictEqual(map.get(`${MESSAGE_KEY_PREFIX}blocked.0`), user('a'), 'the message is still readable through its key')
+	})
+
 	test('a second run does nothing', async () => {
 		const map = items()
 		thread(map, 'twice', { id: 'twice', messages: [] })

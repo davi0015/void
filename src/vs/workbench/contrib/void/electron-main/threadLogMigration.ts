@@ -235,7 +235,19 @@ export class ThreadLogMirrorPolicy implements IStorageMirrorPolicy {
 	}
 
 	private async _prepare(storagePath: string, items: Map<string, string>, write: (key: string, value: string) => void): Promise<readonly string[]> {
-		const result = await migrateThreadsToLogs(path.dirname(storagePath), items, write)
+		let result: ThreadLogMigrationResult
+		try {
+			result = await migrateThreadsToLogs(path.dirname(storagePath), items, write)
+		}
+		catch (error) {
+			// Fail open. This runs inside the call that builds the renderer's storage, so an
+			// unexpected throw here would reject `getItems` and take the window down with it.
+			// A complete mirror is slow, not broken.
+			console.error('[thread-log] migration failed; keeping the full mirror:', error)
+			this._hiddenOfStoragePath.set(storagePath, [])
+			return []
+		}
+
 		const hidden = result.allThreadsAreLogs ? [MESSAGE_KEY_PREFIX] : []
 		this._hiddenOfStoragePath.set(storagePath, hidden)
 
