@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import { Disposable, IDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
+import { generateUuid } from '../../../../base/common/uuid.js';
 import { removeAnsiEscapeCodes } from '../../../../base/common/strings.js';
 import { ITerminalCapabilityImplMap, TerminalCapability } from '../../../../platform/terminal/common/capabilities/capabilities.js';
 import { URI } from '../../../../base/common/uri.js';
@@ -631,6 +632,25 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 			userInterruptResolve?.()
 		}
 
+		// A temporary terminal is disposed the instant this call settles, and a
+		// multi-line input is not one command to the shell: every newline becomes
+		// an Enter press, so the shell runs the lines one after another. Settling
+		// on the first `onCommandFinished` therefore closes the pty while the
+		// remaining input is still queued — a slow line (a sleep, a test run) is
+		// killed where it stands, and the lines after it never run at all.
+		// Temporary calls append one more line, `echo <token>`, and settle when
+		// *that* line finishes, which can only happen after every line ahead of it
+		// has. The token is a UUID, so it cannot collide with the model's text, and
+		// its own output is dropped from the result. Persistent terminals are not
+		// disposed and keep the first-completion hand-back.
+		const doneToken = isPersistent ? null : `__void_done_${generateUuid().replace(/-/g, '')}__`
+		const doneCommand = doneToken === null ? null : `echo ${doneToken}`
+		const payload = doneCommand === null ? command : `${command}\n${doneCommand}`
+		/** Drop the echoed marker line from a buffer read; the token never belongs in the result. */
+		const stripDoneTokenLines = (text: string) => doneToken === null
+			? text
+			: text.split('\n').filter(line => !line.includes(doneToken)).join('\n')
+
 		const waitForResult = async () => {
 			try {
 				if (isPersistent) {
@@ -686,13 +706,46 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 				const waitUntilDone = new Promise<void>(resolve => {
 					if (!cmdCap) return
+					// Output is captured per finished command rather than read once
+					// from the buffer at the end: a later command can scroll an
+					// earlier command's output out of the scrollback, and the buffer
+					// read would lose its head.
+					const outputs: string[] = []
+					let lastExitCode: number | undefined
+					let firstFailureExitCode: number | undefined
 					const l = cmdCap.onCommandFinished(cmd => {
 						if (resolveReason?.type === 'done') return // already resolved with structured output
 						if (!commandSent) return // stale command from before we sent ours
-						resolveReason = { type: 'done', exitCode: cmd.exitCode ?? 0 };
-						result = cmd.getOutput() ?? ''
-						l.dispose()
-						resolve()
+						const output = cmd.getOutput() ?? ''
+						if (doneToken === null) {
+							// Persistent terminal: not disposed, so the first completion
+							// is the intended hand-back point.
+							resolveReason = { type: 'done', exitCode: cmd.exitCode ?? 0 };
+							result = output
+							l.dispose()
+							resolve()
+							return
+						}
+						// Finished commands before the marker are the model's own
+						// lines; collect them in order. The marker itself is the
+						// signal that every line ahead of it has finished, and its
+						// output is the token line rather than an answer.
+						if (cmd.command?.includes(doneToken) || output.includes(doneToken)) {
+							// A multi-command input is a batch: any failing line makes the
+							// batch fail, even when a later line succeeds. The last line's
+							// status alone would report success for `cd <missing>` followed
+							// by a command that ran in the wrong directory.
+							resolveReason = { type: 'done', exitCode: firstFailureExitCode ?? lastExitCode ?? 0 };
+							result = outputs.join('')
+							l.dispose()
+							resolve()
+							return
+						}
+						outputs.push(output)
+						if (typeof cmd.exitCode === 'number' && cmd.exitCode !== 0 && firstFailureExitCode === undefined) {
+							firstFailureExitCode = cmd.exitCode
+						}
+						lastExitCode = cmd.exitCode ?? lastExitCode
 					})
 					disposables.push(l)
 				})
@@ -774,7 +827,14 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 				if (sentinel) this._sentinelState(terminal).pendingCommand = command
 				this._writingOfInstanceId.add(terminal.instanceId)
 				try {
-					await terminal.sendText(sentinel?.command ?? command, true)
+					// Two completions can apply, and they are not
+					// interchangeable. The exit-code marker (`sentinel`) only
+					// exists for a single-line command on a shell with no command
+					// detection, and it is the whole payload then: its echo *is*
+					// the completion signal. The done marker (`payload`) is for
+					// command detection, where each line finishes separately and
+					// the marker line can only run after the last one.
+					await terminal.sendText(sentinel?.command ?? payload, true)
 				} finally {
 					this._writingOfInstanceId.delete(terminal.instanceId)
 				}
@@ -866,6 +926,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 				if (!resolveReason) throw new Error('Unexpected internal error: Promise.any should have resolved with a reason.')
 
+				result = stripDoneTokenLines(result)
 				if (!isPersistent) result = `$ ${command}\n${result}`
 				result = removeAnsiEscapeCodes(result)
 				// trim
