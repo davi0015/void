@@ -28,7 +28,7 @@
 import * as path from 'path';
 import { promises as fs } from 'fs';
 
-import { MESSAGE_KEY_PREFIX, THREAD_KEY_PREFIX } from '../common/storageKeys.js';
+import { CHECKPOINT_KEY_PREFIX, MESSAGE_KEY_PREFIX, THREAD_KEY_PREFIX } from '../common/storageKeys.js';
 import { MESSAGE_LOG_FILE_NAME, THREAD_STORE_FORMAT_LOG } from '../common/threadLog.js';
 import { IStorageMirrorPolicy } from '../../../../platform/storage/electron-main/storageIpc.js';
 export type ThreadLogMigrationResult = {
@@ -54,6 +54,7 @@ export async function migrateThreadsToLogs(
 	globalStorageHome: string,
 	items: Map<string, string>,
 	write: (key: string, value: string) => void,
+	remove: (key: string) => void,
 ): Promise<ThreadLogMigrationResult> {
 	const messagesOfThread = collectMessages(items)
 	const threadsRoot = path.join(globalStorageHome, 'void', 'threads')
@@ -77,6 +78,11 @@ export async function migrateThreadsToLogs(
 		try {
 			await convertThread(threadId, metadata, messagesOfThread.get(threadId) ?? [], threadsRoot)
 			write(metadataKey, JSON.stringify(metadata))
+			// The separate checkpoint key range a pre-removal build wrote. The log is now
+			// the record of what those keys repeated.
+			for (const key of items.keys()) {
+				if (key.startsWith(CHECKPOINT_KEY_PREFIX + threadId + '.')) remove(key)
+			}
 			converted++
 		}
 		catch (error) {
@@ -156,8 +162,10 @@ async function convertThread(
 	}
 
 	if (lines.length > 0) {
-		const file = path.join(threadsRoot, threadId, MESSAGE_LOG_FILE_NAME)
-		await fs.mkdir(path.dirname(file), { recursive: true })
+		const threadDir = path.join(threadsRoot, threadId)
+		const file = path.join(threadDir, MESSAGE_LOG_FILE_NAME)
+		await fs.mkdir(threadDir, { recursive: true })
+		await removeAbandonedTemporaries(threadDir)
 		// Temporary and rename, so an interrupted conversion cannot leave a half-written
 		// log that the next launch would then read as short.
 		const temporary = `${file}.${process.pid}.${Date.now()}.tmp`
@@ -169,12 +177,44 @@ async function convertThread(
 			await fs.unlink(temporary).catch(() => undefined)
 			throw error
 		}
+		// Read back and count before claiming the thread is converted. A short log is
+		// indistinguishable from a shorter conversation when it is read, so the one moment
+		// where the mistake can be caught is here, while the keys are still authoritative.
+		const written = await fs.readFile(file, 'utf8')
+		const records = written.length === 0 ? 0 : written.split('\n').length - 1
+		if (records !== lines.length) {
+			throw new Error(`log verification failed for ${threadId}: ${records} records written, ${lines.length} expected`)
+		}
 	}
 
 	// Written last: before this line the thread is still key-backed, so an interrupted
 	// conversion is retried rather than trusted.
 	metadata.storeFormatVersion = THREAD_STORE_FORMAT_LOG
 	if (title !== undefined) metadata.title = title
+
+	// The dead fields the renderer's residue sweep used to strip when it opened a
+	// thread: a Set that serialized as `{}` and was never read, the removed checkpoint
+	// feature's cursor, and live mount wiring that is a Promise and a ref. This pass
+	// already rewrites the row, and a converted thread is never visited by the sweep.
+	delete metadata.filesWithUserChanges
+	delete metadata.checkpoints
+	const state = metadata.state
+	if (state && typeof state === 'object') {
+		delete (state as Record<string, unknown>).currCheckpointIdx
+		delete (state as Record<string, unknown>).mountedInfo
+	}
+}
+
+/** A conversion that was interrupted before its rename leaves a temporary behind. */
+async function removeAbandonedTemporaries(threadDir: string): Promise<void> {
+	let names: string[]
+	try { names = await fs.readdir(threadDir) }
+	catch { return }
+	for (const name of names) {
+		if (name.startsWith(MESSAGE_LOG_FILE_NAME + '.') && name.endsWith('.tmp')) {
+			await fs.unlink(path.join(threadDir, name)).catch(() => undefined)
+		}
+	}
 }
 
 /**
@@ -218,7 +258,7 @@ export class ThreadLogMirrorPolicy implements IStorageMirrorPolicy {
 	private readonly _hiddenOfStoragePath = new Map<string, readonly string[]>()
 	private readonly _preparingOfStoragePath = new Map<string, Promise<readonly string[]>>()
 
-	async prepare(items: Map<string, string>, write: (key: string, value: string) => void, storagePath: string | undefined): Promise<readonly string[]> {
+	async prepare(items: Map<string, string>, write: (key: string, value: string) => void, remove: (key: string) => void, storagePath: string | undefined): Promise<readonly string[]> {
 		if (!storagePath) return []
 		const prepared = this._hiddenOfStoragePath.get(storagePath)
 		if (prepared) return prepared
@@ -228,16 +268,16 @@ export class ThreadLogMirrorPolicy implements IStorageMirrorPolicy {
 		const inFlight = this._preparingOfStoragePath.get(storagePath)
 		if (inFlight) return inFlight
 
-		const run = this._prepare(storagePath, items, write)
+		const run = this._prepare(storagePath, items, write, remove)
 		this._preparingOfStoragePath.set(storagePath, run)
 		try { return await run }
 		finally { this._preparingOfStoragePath.delete(storagePath) }
 	}
 
-	private async _prepare(storagePath: string, items: Map<string, string>, write: (key: string, value: string) => void): Promise<readonly string[]> {
+	private async _prepare(storagePath: string, items: Map<string, string>, write: (key: string, value: string) => void, remove: (key: string) => void): Promise<readonly string[]> {
 		let result: ThreadLogMigrationResult
 		try {
-			result = await migrateThreadsToLogs(path.dirname(storagePath), items, write)
+			result = await migrateThreadsToLogs(path.dirname(storagePath), items, write, remove)
 		}
 		catch (error) {
 			// Fail open. This runs inside the call that builds the renderer's storage, so an

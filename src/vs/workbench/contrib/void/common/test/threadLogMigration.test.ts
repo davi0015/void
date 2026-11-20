@@ -38,7 +38,7 @@ suite('ThreadLogMigration', () => {
 
 	const readLines = async (id: string) => (await fs.readFile(logFile(id), 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line))
 
-	const convert = (map: Map<string, string>) => migrateThreadsToLogs(root, map, (key, value) => map.set(key, value))
+	const convert = (map: Map<string, string>) => migrateThreadsToLogs(root, map, (key, value) => map.set(key, value), key => map.delete(key))
 
 	setup(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'void-thread-migration-')) })
 	teardown(async () => { await fs.rm(root, { recursive: true, force: true }) })
@@ -155,8 +155,41 @@ suite('ThreadLogMigration', () => {
 		assert.strictEqual(map.get(`${MESSAGE_KEY_PREFIX}blocked.0`), user('a'), 'the message is still readable through its key')
 	})
 
-	test('a second run does nothing', async () => {
+	test('dead metadata fields and checkpoint keys go with the conversion', async () => {
 		const map = items()
+		thread(map, 'legacy', {
+			id: 'legacy', createdAt: 'now', messages: [],
+			filesWithUserChanges: {},
+			state: { stagingSelections: [], linksOfMessageIdx: {}, currCheckpointIdx: 3, mountedInfo: { whenMounted: {} } },
+		})
+		message(map, 'legacy', 0, user('a'))
+		map.set('void.chatCheckpoint.legacy.0', JSON.stringify({ role: 'checkpoint' }))
+		map.set('void.chatCheckpoint.legacy.1', JSON.stringify({ role: 'checkpoint' }))
+
+		await convert(map)
+
+		const written = metadataOf(map, 'legacy')
+		assert.strictEqual('filesWithUserChanges' in written, false, 'the Set that serialized as {} is gone')
+		assert.strictEqual('currCheckpointIdx' in written.state, false, 'the removed feature cursor is gone')
+		assert.strictEqual('mountedInfo' in written.state, false, 'live mount wiring is not persisted')
+		assert.strictEqual(map.get('void.chatCheckpoint.legacy.0'), undefined, 'the separate checkpoint key range is gone')
+		assert.strictEqual(map.get('void.chatCheckpoint.legacy.1'), undefined)
+	})
+
+	test('an abandoned temporary file is removed by the next conversion', async () => {
+		const map = items()
+		thread(map, 't-tmp', { id: 't-tmp', messages: [] })
+		message(map, 't-tmp', 0, user('a'))
+		const dir = path.join(root, 'void', 'threads', 't-tmp')
+		await fs.mkdir(dir, { recursive: true })
+		await fs.writeFile(path.join(dir, 'messages.jsonl.999.1.tmp'), 'half a record')
+
+		await convert(map)
+
+		assert.deepStrictEqual(await fs.readdir(dir), ['messages.jsonl'], 'the leftover is not left beside the log')
+	})
+
+	test('a second run does nothing', async () => {		const map = items()
 		thread(map, 'twice', { id: 'twice', messages: [] })
 		message(map, 'twice', 0, user('a'))
 

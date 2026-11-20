@@ -33,9 +33,8 @@ import { joinPath } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
 import { IServerChannel } from '../../../../base/parts/ipc/common/ipc.js';
 
-import { ChatMessage } from '../common/chatThreadServiceTypes.js';
 import { threadStoreDir } from '../common/threadImagePaths.js';
-import { decodeLog, encodeRecord, foldRecords, threadMessageLogFile, truncateFrom } from '../common/threadLog.js';
+import { encodeRecord, decodeLog, threadMessageLogFile, truncateFrom } from '../common/threadLog.js';
 import {
 	ThreadStoreAppendParams, ThreadStoreAppendResult, ThreadStoreDeleteParams,
 	ThreadStoreReadParams, ThreadStoreReadResult, ThreadStoreTruncateParams, ThreadStoreTruncateResult,
@@ -79,23 +78,10 @@ export class ThreadStoreChannel implements IServerChannel {
 	private _readAll({ threadId }: ThreadStoreReadParams): Promise<ThreadStoreReadResult> {
 		return this._perThread(threadId, async () => {
 			const text = await readTextIfPresent(this._logFile(validatedId(threadId)))
-			if (text === undefined) {
-				return {
-					exists: false, messages: [], indices: [], duplicateCount: 0,
-					gapIndices: [], malformedLines: 0, tornTail: false,
-				} satisfies ThreadStoreReadResult
-			}
-			const decoded = decodeLog<ChatMessage>(text)
-			const folded = foldRecords(decoded.records)
-			return {
-				exists: true,
-				messages: folded.messages,
-				indices: folded.indices,
-				duplicateCount: folded.duplicateCount,
-				gapIndices: folded.gapIndices,
-				malformedLines: decoded.malformedLines,
-				tornTail: decoded.tornTail,
-			} satisfies ThreadStoreReadResult
+			// Returned as text, not as messages: a message's URIs only become `URI`
+			// instances where a reviver runs, and that has to be the renderer — IPC strips
+			// the prototype again on the way over.
+			return { exists: text !== undefined, text: text ?? '' } satisfies ThreadStoreReadResult
 		})
 	}
 
@@ -114,7 +100,7 @@ export class ThreadStoreChannel implements IServerChannel {
 			const file = this._logFile(validatedId(threadId))
 			const text = await readTextIfPresent(file)
 			if (text === undefined) return { records: 0 }
-			const kept = truncateFrom(decodeLog<ChatMessage>(text).records, boundary)
+			const kept = truncateFrom(decodeLog<unknown>(text).records, boundary)
 			await this._writeAtomic(file, kept.map(encodeRecord).join(''))
 			return { records: kept.length }
 		})

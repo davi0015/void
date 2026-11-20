@@ -27,7 +27,7 @@ import { reviveIdentifier, IAnyWorkspaceIdentifier } from '../../workspace/commo
  * workbench for the one policy that currently uses it.
  */
 export interface IStorageMirrorPolicy {
-	prepare(items: Map<string, string>, write: (key: string, value: string) => void, storagePath: string | undefined): Promise<readonly string[]>;
+	prepare(items: Map<string, string>, write: (key: string, value: string) => void, remove: (key: string) => void, storagePath: string | undefined): Promise<readonly string[]>;
 }
 
 export class StorageDatabaseChannel extends Disposable implements IServerChannel {
@@ -127,7 +127,7 @@ export class StorageDatabaseChannel extends Disposable implements IServerChannel
 			case 'getItems': {
 				// Void: let a policy prepare the mirror before it is copied to the renderer.
 				const hidden = this.mirrorPolicy
-					? await this.mirrorPolicy.prepare(storage.items, (key, value) => storage.set(key, value), storage.path)
+					? await this.mirrorPolicy.prepare(storage.items, (key, value) => storage.set(key, value), key => storage.delete(key), storage.path)
 					: []
 				const items = Array.from(storage.items.entries())
 				return hidden.length === 0
