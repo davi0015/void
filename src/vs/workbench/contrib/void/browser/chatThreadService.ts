@@ -55,7 +55,7 @@ import { RawMCPToolCall } from '../common/mcpServiceTypes.js';
 import { shouldAutoApprove } from '../common/terminalAutoApprove.js';
 import { IMainProcessService } from '../../../../platform/ipc/common/mainProcessService.js';
 import { IChannel } from '../../../../base/parts/ipc/common/ipc.js';
-import { THREAD_STORE_FORMAT_LOG } from '../common/threadLog.js';
+import { decodeLog, foldRecords, THREAD_STORE_FORMAT_LOG } from '../common/threadLog.js';
 import { THREAD_STORE_CHANNEL_NAME, ThreadStoreAppendParams, ThreadStoreReadResult, ThreadStoreTruncateParams, ThreadStoreWriteParams } from '../common/threadStoreTypes.js';
 
 
@@ -1858,19 +1858,26 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._loadedMessageThreadIds.add(threadId)
 		if (!read.exists) return
 
-		if (read.gapIndices.length > 0) {
+		// Parsed here, with the reviver: a message's URIs are stored as plain JSON and only
+		// become `URI` instances where they are revived. The main process cannot do it —
+		// IPC strips the prototype again on the way over — so the store hands over text.
+		const decoded = decodeLog<ChatMessage>(read.text, ChatThreadService._storageReviver)
+		const folded = foldRecords(decoded.records)
+
+		if (folded.gapIndices.length > 0) {
 			// Repacking around the gap is the renumbering the log exists to remove, so
 			// the loss is reported and the rest of the thread opens without it.
-			console.error(`[thread-log] ${threadId}: missing message indices, first ${read.gapIndices[0]}`)
+			console.error(`[thread-log] ${threadId}: missing message indices, first ${folded.gapIndices[0]}`)
 		}
 
-		const title = ChatThreadService._titleFromMessages(read.messages)
+		const messages = folded.messages
+		const title = ChatThreadService._titleFromMessages(messages)
 		const titleChanged = title !== undefined && existing.title !== title
-		if (read.messages.length === 0 && !titleChanged) return
+		if (messages.length === 0 && !titleChanged) return
 
 		const updatedThread: ThreadType = {
 			...existing,
-			messages: read.messages,
+			messages,
 			// A log thread's label cannot be derived from message keys on the next
 			// metadata-only read, so it is written with the thread the first time it is
 			// known. Only the fields the read corrected are taken: the persisted copy can

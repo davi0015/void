@@ -10,7 +10,7 @@ import * as path from 'path';
 
 import { URI } from '../../../../../base/common/uri.js';
 import { ChatMessage } from '../chatThreadServiceTypes.js';
-import { encodeRecord } from '../threadLog.js';
+import { decodeLog, encodeRecord, foldRecords } from '../threadLog.js';
 import { ThreadStoreChannel } from '../../electron-main/threadStoreChannel.js';
 import { ThreadStoreRecord } from '../threadStoreTypes.js';
 
@@ -48,6 +48,27 @@ suite('ThreadStoreChannel', () => {
 	/** Where the channel puts a thread's log, spelled out so the test does not ask it. */
 	const logFile = (threadId: string) => path.join(root, 'void', 'threads', threadId, 'messages.jsonl')
 
+	/**
+	 * `readAll` hands back the file's text — parsing belongs to whoever has the reviver —
+	 * so the test decodes it the way a reader does.
+	 */
+	async function readAll(threadId: string) {
+		const read = await channel.call({}, 'readAll', { threadId })
+		if (!read.exists) {
+			return {
+				exists: false, messages: [] as ChatMessage[], indices: [] as number[], duplicateCount: 0,
+				gapIndices: [] as number[], malformedLines: 0, tornTail: false,
+			}
+		}
+		const decoded = decodeLog<ChatMessage>(read.text)
+		const folded = foldRecords(decoded.records)
+		return {
+			exists: true, messages: folded.messages, indices: folded.indices,
+			duplicateCount: folded.duplicateCount, gapIndices: folded.gapIndices,
+			malformedLines: decoded.malformedLines, tornTail: decoded.tornTail,
+		}
+	}
+
 	setup(async () => {
 		root = await fs.mkdtemp(path.join(os.tmpdir(), 'void-thread-store-'))
 		channel = new ThreadStoreChannel(URI.file(root))
@@ -61,7 +82,7 @@ suite('ThreadStoreChannel', () => {
 		const appended = await channel.call({}, 'append', { threadId: 't1', records: [rec(0, 'a'), rec(1, 'b')] })
 		assert.deepStrictEqual(appended, { records: 2 })
 
-		const read = await channel.call({}, 'readAll', { threadId: 't1' })
+		const read = await readAll('t1')
 		assert.strictEqual(read.exists, true)
 		assert.deepStrictEqual(texts(read), ['a', 'b'])
 		assert.deepStrictEqual(read.indices, [0, 1])
@@ -72,7 +93,7 @@ suite('ThreadStoreChannel', () => {
 	})
 
 	test('readAll on a thread with no log says so instead of throwing', async () => {
-		const read = await channel.call({}, 'readAll', { threadId: 'never-written' })
+		const read = await readAll('never-written')
 		assert.strictEqual(read.exists, false)
 		assert.deepStrictEqual(read.messages, [])
 	})
@@ -87,7 +108,7 @@ suite('ThreadStoreChannel', () => {
 
 		// Without the repair the new record would be glued onto the fragment, and both
 		// lines would fail to parse.
-		const read = await channel.call({}, 'readAll', { threadId: 'torn' })
+		const read = await readAll('torn')
 		assert.deepStrictEqual(texts(read), ['a', 'b'])
 		assert.strictEqual(read.malformedLines, 0)
 		assert.strictEqual(read.tornTail, false)
@@ -103,7 +124,7 @@ suite('ThreadStoreChannel', () => {
 		const raw = await fs.readFile(file, 'utf8')
 		assert.strictEqual(raw.split('\n').length, 3, 'two terminated records and the empty tail')
 
-		const read = await channel.call({}, 'readAll', { threadId: 'unterminated' })
+		const read = await readAll('unterminated')
 		assert.deepStrictEqual(texts(read), ['a', 'b'])
 	})
 
@@ -114,7 +135,7 @@ suite('ThreadStoreChannel', () => {
 		const truncated = await channel.call({}, 'truncateFrom', { threadId: 'trunc', boundary: 2 })
 		assert.deepStrictEqual(truncated, { records: 2 })
 
-		const read = await channel.call({}, 'readAll', { threadId: 'trunc' })
+		const read = await readAll('trunc')
 		assert.deepStrictEqual(texts(read), ['a', 'b2'], 'b was superseded after c was written')
 	})
 
@@ -123,7 +144,7 @@ suite('ThreadStoreChannel', () => {
 		await fs.mkdir(path.dirname(file), { recursive: true })
 		await fs.writeFile(file, encodeRecord(rec(0, 'a')) + 'not json\n' + encodeRecord(rec(2, 'c')), 'utf8')
 
-		const read = await channel.call({}, 'readAll', { threadId: 'corrupt' })
+		const read = await readAll('corrupt')
 		assert.deepStrictEqual(texts(read), ['a', 'c'])
 		assert.strictEqual(read.malformedLines, 1)
 		assert.deepStrictEqual(read.gapIndices, [1], 'the lost row is visible as a gap')
@@ -148,7 +169,7 @@ suite('ThreadStoreChannel', () => {
 		const second = channel.call({}, 'append', { threadId: 'q', records: [rec(1, 'b')] })
 		await Promise.all([first, second])
 
-		const read = await channel.call({}, 'readAll', { threadId: 'q' })
+		const read = await readAll('q')
 		assert.deepStrictEqual(texts(read), ['a', 'b'])
 		assert.deepStrictEqual(read.indices, [0, 1])
 	})

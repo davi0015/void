@@ -98,12 +98,17 @@ export type DecodedLog<M> = {
  * Parses a whole log file. A malformed line is skipped and counted rather than
  * throwing: a log is user data, and one corrupt line must not cost the thread.
  *
+ * `reviver` is passed to `JSON.parse` and exists because messages carry `URI` values,
+ * which serialize as `$mid` objects: whoever parses has to revive them, and that has to
+ * be the renderer, because crossing IPC strips the prototype again. So the store hands
+ * over text and the reader parses.
+ *
  * `tornTail` distinguishes the one recoverable case — a write interrupted mid-record —
  * from corruption in the middle of the file, which is reported the same way but is not
  * expected. The writer repairs a torn tail by cutting back to the last newline before
  * appending, so a torn tail should only ever be seen on the first read after a crash.
  */
-export function decodeLog<M>(text: string): DecodedLog<M> {
+export function decodeLog<M>(text: string, reviver?: (key: string, value: unknown) => unknown): DecodedLog<M> {
 	const records: LogRecord<M>[] = []
 	let malformedLines = 0
 	let tornTail = false
@@ -118,7 +123,7 @@ export function decodeLog<M>(text: string): DecodedLog<M> {
 	for (let n = 0; n < lineCount; n++) {
 		const line = lines[n]
 		if (line.length === 0) continue
-		const record = parseRecord<M>(line)
+		const record = parseRecord<M>(line, reviver)
 		if (!record) {
 			malformedLines++
 			// Only the last line of a file whose final append did not finish can be
@@ -131,9 +136,9 @@ export function decodeLog<M>(text: string): DecodedLog<M> {
 	return { records, malformedLines, tornTail }
 }
 
-function parseRecord<M>(line: string): LogRecord<M> | undefined {
+function parseRecord<M>(line: string, reviver?: (key: string, value: unknown) => unknown): LogRecord<M> | undefined {
 	let parsed: unknown
-	try { parsed = JSON.parse(line) }
+	try { parsed = JSON.parse(line, reviver) }
 	catch { return undefined }
 	if (!parsed || typeof parsed !== 'object') return undefined
 

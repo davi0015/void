@@ -36,15 +36,13 @@ export type ThreadStoreReadParams = { threadId: string }
 export type ThreadStoreReadResult = {
 	/** False when the thread has no log. A new thread has none until its first append. */
 	exists: boolean
-	messages: ChatMessage[]
-	/** The index of each entry in `messages`. A gap here means the log is corrupt. */
-	indices: number[]
-	/** Records dropped because a later record had the same index. */
-	duplicateCount: number
-	/** Indices missing below the highest one present. Empty for a healthy log. */
-	gapIndices: number[]
-	malformedLines: number
-	tornTail: boolean
+	/**
+	 * The file's text, unparsed. Parsing belongs to the renderer: messages carry URIs,
+	 * which revive to `URI` instances only where they are consumed, and IPC strips the
+	 * prototype on the way back. Decoding the text is `decodeLog` + `foldRecords` in
+	 * `common/threadLog.ts`.
+	 */
+	text: string
 }
 
 export type ThreadStoreWriteParams = {
