@@ -47,15 +47,23 @@ function trace(t, session) {
  * in memory the way an opened thread's messages are.
  */
 async function seedCurrentThread(page, text) {
-	return page.evaluate((message) => {
+	return page.evaluate(async (message) => {
 		const svc = globalThis.__voidChatThreadService
 		const id = svc.state.currentThreadId
 		svc._storeMessageKey(id, 0, { role: 'user', content: message, displayContent: message, selections: null })
-		// _storeMessageKey only queues; the reload below reads storage.
+		// _storeMessageKey only queues; the reload below reads the store.
 		svc._flushPendingThreadWrites()
-		svc._loadedMessageThreadIds.delete(id)
-		svc._ensureMessagesLoaded(id)
-		return { id, messageCount: svc.state.allThreads[id].messages.length }
+		// A thread created by this build appends to its log asynchronously, and the load is
+		// a promise now: wait until the message is really readable, or the guard below fails
+		// on a fixture that never produced a message.
+		let thread = svc.state.allThreads[id]
+		for (let attempt = 0; attempt < 60 && thread.messages.length === 0; attempt++) {
+			await new Promise(resolve => setTimeout(resolve, 50))
+			svc._loadedMessageThreadIds.delete(id)
+			await svc._ensureMessagesLoaded(id)
+			thread = svc.state.allThreads[id]
+		}
+		return { id, messageCount: thread.messages.length }
 	}, text)
 }
 
@@ -85,9 +93,9 @@ async function twoThreads(page) {
 	const a = await seedCurrentThread(page, ALPHA)
 	await page.evaluate(() => globalThis.__voidChatThreadService.openNewThread())
 	const b = await seedCurrentThread(page, BRAVO)
-	const state = await page.evaluate((aId) => {
+	const state = await page.evaluate(async (aId) => {
 		const svc = globalThis.__voidChatThreadService
-		svc.switchToThread(aId)
+		await svc.switchToThread(aId)
 		return { currentThreadId: svc.state.currentThreadId }
 	}, a.id)
 
