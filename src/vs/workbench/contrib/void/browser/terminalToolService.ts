@@ -15,6 +15,7 @@ import { IWorkspaceContextService } from '../../../../platform/workspace/common/
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { ITerminalService, ITerminalInstance, ICreateTerminalOptions } from '../../../../workbench/contrib/terminal/browser/terminal.js';
 import { MAX_TERMINAL_CHARS, MAX_TERMINAL_TIMEOUT_SECONDS } from '../common/prompt/prompts.js';
+import { TerminalCommandOutputTracker } from '../common/terminalOutput.js';
 import { TerminalResolveReason } from '../common/toolsServiceTypes.js';
 import { TERMINAL_AUTO_APPROVE_KEY } from '../common/storageKeys.js';
 import { timeout } from '../../../../base/common/async.js';
@@ -503,6 +504,11 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		const sentinelToken = isPersistent ? null : `__void_done_${generateUuid().replace(/-/g, '')}__`
 		const sentinelCommand = sentinelToken === null ? null : `echo ${sentinelToken}`
 		const payload = sentinelCommand === null ? command : `${command}\n${sentinelCommand}`
+		// The buffer is a display surface: it can open with the prompt and the
+		// echoed command, wraps at the terminal width, and drops its head once the
+		// scrollback is full. The raw pty stream between the shell's C and D
+		// markers is the command's output itself, so temporary calls read that.
+		const outputTracker = isPersistent ? null : new TerminalCommandOutputTracker()
 		/** Drop the echoed sentinel line from a buffer read; the token never belongs in the result. */
 		const stripSentinelLines = (text: string) => sentinelToken === null
 			? text
@@ -528,6 +534,13 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 				const startMarker = terminal.xterm?.raw.registerMarker(0)
 				if (startMarker) disposables.push(startMarker)
 
+				// Feed the tracker from the raw pty stream. The shell integration's
+				// C/D markers arrive as data, so this runs before the first command
+				// can start and does not depend on the buffer being rendered.
+				if (outputTracker) {
+					disposables.push(terminal.onData(chunk => outputTracker.feed(chunk)))
+				}
+
 				// Track whether we've sent our command yet. The listener is attached
 				// before sendText, so any onCommandFinished that fires before we set
 				// this flag is from a previous command and should be ignored.
@@ -548,6 +561,10 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 						if (resolveReason?.type === 'done') return // already resolved with structured output
 						if (!commandSent) return // stale command from before we sent ours
 						const output = cmd.getOutput() ?? ''
+						// The command's bytes between the shell's C and D markers;
+						// null when the shell exposes no integration and the buffer
+						// is the only source.
+						const captured = outputTracker?.take() ?? null
 						if (sentinelToken === null) {
 							// Persistent terminal: not disposed, so the first completion
 							// is the intended hand-back point.
@@ -571,7 +588,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 							resolve()
 							return
 						}
-						outputs.push(output)
+						outputs.push(captured ?? output)
 						if (typeof cmd.exitCode === 'number' && cmd.exitCode !== 0 && firstFailureExitCode === undefined) {
 							firstFailureExitCode = cmd.exitCode
 						}
@@ -597,11 +614,16 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 						// desktop notification, so pull it from the event directly.
 						const launchErrorMessage = typeof exitCodeOrError === 'object' && exitCodeOrError !== null ? exitCodeOrError.message : undefined
 						let output = ''
-						try {
-							const terminalId = isPersistent ? params.persistentTerminalId : params.terminalId
-							output = await this.readTerminalFromLine(terminalId, startMarker?.line ?? 0)
-						} catch {
-							// buffer unavailable
+						const captured = outputTracker?.take() ?? null
+						if (captured !== null) {
+							output = captured
+						} else {
+							try {
+								const terminalId = isPersistent ? params.persistentTerminalId : params.terminalId
+								output = await this.readTerminalFromLine(terminalId, startMarker?.line ?? 0)
+							} catch {
+								// buffer unavailable
+							}
 						}
 						const parts: string[] = []
 						if (launchErrorMessage) parts.push(`Terminal error: ${launchErrorMessage}`)
@@ -688,9 +710,16 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 						}
 					}
 					if (!result) {
-						const terminalId = isPersistent ? params.persistentTerminalId : params.terminalId
-						const fromLine = startMarker?.line ?? 0
-						result = await this.readTerminalFromLine(terminalId, fromLine)
+						// The in-flight command's bytes so far; the buffer read is
+						// the fallback for a shell with no integration.
+						const captured = outputTracker?.take() ?? null
+						if (captured !== null) {
+							result = captured
+						} else {
+							const terminalId = isPersistent ? params.persistentTerminalId : params.terminalId
+							const fromLine = startMarker?.line ?? 0
+							result = await this.readTerminalFromLine(terminalId, fromLine)
+						}
 					}
 				}
 
