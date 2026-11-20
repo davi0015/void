@@ -432,13 +432,17 @@ describe('compaction boundary', () => {
 			})
 
 			trace(t, s)
+			// The send resolves when the run is kicked off, not when its request reaches
+			// the transport, and the load ahead of it is asynchronous now. Wait for the run
+			// before asking what the model was sent.
+			await h.waitForRunEnd(s.page)
 			// Guard: the stored boundary must be the illegal shape.
 			assert.equal(stored.illegalRole, 'tool',
 				`fixture guard: the stored boundary at ${stored.illegal} points at '${stored.illegalRole}', not a tool row`)
 
-			const { request } = lastChatRequest(await h.capturedLLMRequests(s.page))
+			const { request, reason } = lastChatRequest(await h.capturedLLMRequests(s.page))
 			const keptTail = describeKeptTail(request)
-			assert.ok(keptTail.found, 'the captured chat request carries no compacted summary')
+			assert.ok(keptTail.found, `the captured chat request carries no compacted summary (${reason ?? 'captured'})`)
 			assert.ok(keptTail.toolMessages > 0,
 				'fixture guard: the request carries no tool result')
 

@@ -41,7 +41,7 @@ describe('legacy thread storage compatibility', () => {
 
 	test('a thread containing legacy checkpoint records still loads', async (t) => {
 		await h.withScenario('legacy-storage/checkpoint-records', async (s) => {
-			const result = await s.page.evaluate((summary) => {
+			const result = await s.page.evaluate(async (summary) => {
 				const svc = globalThis.__voidChatThreadService
 				const id = svc.state.currentThreadId
 
@@ -49,6 +49,13 @@ describe('legacy thread storage compatibility', () => {
 				// at keys 0,1,2,4,5 (the gap at 3 is from an old delete),
 				// checkpoint records occupying 3 and 6, and a boundary of 7 that
 				// still counts them.
+				// Make this a thread written before the log format, in the only way the read
+				// path distinguishes them: no `storeFormatVersion`, messages in keys. Without
+				// this the fixture writes a log and exercises the new path instead.
+				const asLegacy = { ...svc.state.allThreads[id] }
+				delete asLegacy.storeFormatVersion
+				svc._setState({ allThreads: { ...svc.state.allThreads, [id]: asLegacy } })
+
 				const realAt = [0, 1, 2, 4, 5]
 				for (const i of realAt) {
 					svc._storeMessageKey(id, i, i % 2 === 0
@@ -65,7 +72,7 @@ describe('legacy thread storage compatibility', () => {
 
 				// Force the load path to run as reopening the thread would.
 				svc._loadedMessageThreadIds.delete(id)
-				svc._ensureMessagesLoaded(id)
+				await svc._ensureMessagesLoaded(id)
 
 				const thread = svc.state.allThreads[id]
 				return {

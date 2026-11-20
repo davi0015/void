@@ -135,17 +135,25 @@ async function appPaths(page) {
  * find them.
  */
 async function seedThreadWithImage(page, imagePath, extraSelections = []) {
-	return page.evaluate(({ selection, extra }) => {
+	return page.evaluate(async ({ selection, extra }) => {
 		const svc = globalThis.__voidChatThreadService
 		const id = svc.state.currentThreadId
 		svc._storeMessageKey(id, 0, {
 			role: 'user', content: 'look at this', displayContent: 'look at this', selections: [selection, ...extra],
 		})
-		// _storeMessageKey only queues; the reload below reads storage.
+		// _storeMessageKey only queues; the reload below reads the store.
 		svc._flushPendingThreadWrites()
-		svc._loadedMessageThreadIds.delete(id)
-		svc._ensureMessagesLoaded(id)
-		const loaded = svc.state.allThreads[id]
+		// A thread created by this build keeps its messages in a file, and the append is a
+		// channel call that lands after this tick. The reload is awaited and retried rather
+		// than assumed to be synchronous — the thread would otherwise read back empty and
+		// every assertion below would be about nothing.
+		let loaded = svc.state.allThreads[id]
+		for (let attempt = 0; attempt < 60 && loaded.messages.length === 0; attempt++) {
+			await new Promise(resolve => setTimeout(resolve, 50))
+			svc._loadedMessageThreadIds.delete(id)
+			await svc._ensureMessagesLoaded(id)
+			loaded = svc.state.allThreads[id]
+		}
 		return {
 			threadId: id,
 			messageCount: loaded.messages.length,
@@ -397,14 +405,15 @@ describe('image ownership', () => {
 				{ subject: true },
 			)
 
-			// The copy's own message keys. `_storeThread` persists metadata only, so
-			// an unfixed duplicate reloads with no conversation at all and the images
-			// copied for it are files nothing will ever reference again. Written on
-			// the 500ms coalescing timer, hence the wait above.
+			// The copy's own messages. `_storeThread` persists metadata only, so an
+			// unfixed duplicate reloads with no conversation at all and the images
+			// copied for it are files nothing will ever reference again. They are in the
+			// copy's own log file since this build stores messages per thread.
 			await h.sleep(600)
+			const copyLog = join(s.dirs.userDataDir, 'User', 'globalStorage', 'void', 'threads', copy.threadId, 'messages.jsonl')
 			h.assertPersistence(
-				'the selector-duplicate\'s own message keys',
-				!!s.readKey(`void.chatMsg.${copy.threadId}.0`),
+				'the selector-duplicate\'s own message log',
+				existsSync(copyLog) && readFileSync(copyLog, 'utf8').includes('look at this'),
 				{ subject: true },
 			)
 		})
@@ -518,8 +527,16 @@ describe('image ownership', () => {
 					role: 'user', content: 'remember me', displayContent: 'remember me', selections: null,
 				})
 				svc._flushPendingThreadWrites()
-				svc._loadedMessageThreadIds.delete(id)
-				svc._ensureMessagesLoaded(id)
+				// The append is a channel call that lands after this tick, and the read is a
+				// promise now: wait until the message is really there, or the duplicate is
+				// made from an empty thread and this test would be asserting about nothing.
+				let thread = svc.state.allThreads[id]
+				for (let attempt = 0; attempt < 60 && thread.messages.length === 0; attempt++) {
+					await new Promise(resolve => setTimeout(resolve, 50))
+					svc._loadedMessageThreadIds.delete(id)
+					await svc._ensureMessagesLoaded(id)
+					thread = svc.state.allThreads[id]
+				}
 
 				const before = new Set(Object.keys(svc.state.allThreads))
 				await svc.duplicateThread(id)
@@ -534,9 +551,9 @@ describe('image ownership', () => {
 
 		const second = await h.launchVoid(dirs)
 		try {
-			const loaded = await second.page.evaluate((id) => {
+			const loaded = await second.page.evaluate(async (id) => {
 				const svc = globalThis.__voidChatThreadService
-				svc._ensureMessagesLoaded(id)
+				await svc._ensureMessagesLoaded(id)
 				const thread = svc.state.allThreads[id]
 				return {
 					// Guard: the copy's metadata reached the index, so a missing

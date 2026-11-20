@@ -34,7 +34,7 @@
 
 import { describe, test, before } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import * as h from './harness.mjs'
 
@@ -182,23 +182,27 @@ describe('startup residue sweep', () => {
 			t.diagnostic(`message keys after sweep: [${s.listKeys(`void.chatMsg.${SEEDED_ID}.%`).join(', ')}]`)
 
 			// ── checkpoint residue ──────────────────────────────────────────
+			// The separate key range is removed by the startup conversion, thread by thread.
 			h.assertAbsent('legacy void.chatCheckpoint.* keys',
 				s.listKeys(`void.chatCheckpoint.${SEEDED_ID}.%`).length === 0, { subject: true })
 
-			const msgKeys = s.listKeys(`void.chatMsg.${SEEDED_ID}.%`).sort()
-			h.assertAbsent('checkpoint records left in the message key range',
-				!msgKeys.some(k => (h.readAppKey(dirs, k) ?? '').includes('"role":"checkpoint"')), { subject: true })
+			// The message residue is reclaimed by that conversion now, not by the renderer's
+			// sweep: it writes the thread's log before the mirror is built, dropping the
+			// checkpoint records and closing the gap they sat in. The keys are deliberately
+			// kept, so what is asserted is the log rather than the key range.
+			const logFile = join(dirs.userDataDir, 'User', 'globalStorage', 'void', 'threads', SEEDED_ID, 'messages.jsonl')
+			assert.ok(existsSync(logFile), 'the key-backed thread was not converted at launch')
+			const records = readFileSync(logFile, 'utf8').trimEnd().split('\n').map(line => JSON.parse(line))
 
-			// Compaction is the other half: the records are gone *and* the keys are
-			// contiguous again, so the load path stops tolerating a gap.
-			const expectedKeys = [0, 1, 2, 3, 4].map(i => `void.chatMsg.${SEEDED_ID}.${i}`)
-			h.assertAbsent('a gap in the message key indices',
-				msgKeys.length === expectedKeys.length && expectedKeys.every(k => msgKeys.includes(k)), { subject: true })
+			h.assertAbsent('checkpoint records in the converted log',
+				!records.some(record => record.m.role === 'checkpoint'), { subject: true })
+			h.assertAbsent('a gap in the converted log indices',
+				records.every((record, n) => record.i === n), { subject: true })
 
-			// Control: the real conversation is untouched. A sweep that emptied the
-			// thread would otherwise read as a clean success.
-			h.assertPersistence('the 5 real messages survive',
-				REAL_KEYS.every((_, i) => (h.readAppKey(dirs, `void.chatMsg.${SEEDED_ID}.${i}`) ?? '').includes('"role"')))
+			// Control: the real conversation survived the conversion.
+			assert.equal(records.length, REAL_KEYS.length,
+				`the log holds ${records.length} records, expected ${REAL_KEYS.length}`)
+			assert.equal(records[0].m.displayContent, 'u0', 'the first real message is not first in the log')
 
 			// ── legacy metadata fields ──────────────────────────────────────
 			const meta = h.readThreadMetadata(dirs, SEEDED_ID) ?? ''
