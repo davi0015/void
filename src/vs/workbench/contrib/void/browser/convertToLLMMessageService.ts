@@ -21,6 +21,8 @@ import { IVoidModelService } from '../common/voidModelService.js';
 import { URI } from '../../../../base/common/uri.js';
 import { EndOfLinePreference } from '../../../../editor/common/model.js';
 import { ToolName } from '../common/toolsServiceTypes.js';
+import { ITerminalProfileService } from '../../terminal/common/terminal.js';
+import { timeout } from '../../../../base/common/async.js';
 import { IMCPService } from '../common/mcpService.js';
 import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -950,6 +952,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	constructor(
 		@IModelService private readonly modelService: IModelService,
 		@IWorkspaceContextService private readonly workspaceContextService: IWorkspaceContextService,
+		@ITerminalProfileService private readonly terminalProfileService: ITerminalProfileService,
 		@IEditorService private readonly editorService: IEditorService,
 		@IDirectoryStrService private readonly directoryStrService: IDirectoryStrService,
 		@ITerminalToolService private readonly terminalToolService: ITerminalToolService,
@@ -1314,6 +1317,24 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		return lines.join('\n')
 	}
 
+	/**
+	 * The name of the profile a new terminal would open with, for the prompt.
+	 *
+	 * Profiles are detected asynchronously, and the first message of a window can
+	 * arrive before that finishes — exactly the turn where the model has to choose
+	 * PowerShell vs cmd syntax. So wait for them, capped: this is a label, and a
+	 * slow detection must not delay the user's first message.
+	 */
+	private async _defaultShellName(): Promise<string | undefined> {
+		try {
+			await Promise.race([this.terminalProfileService.profilesReady, timeout(1000)])
+		} catch {
+			// A failed detection leaves the shell unnamed below, which is the
+			// pre-existing behaviour rather than an error worth surfacing.
+		}
+		return this.terminalProfileService.getDefaultProfileName() ?? this.terminalProfileService.availableProfiles[0]?.profileName
+	}
+
 	generateChatVolatileContext: IConvertToLLMMessageService['generateChatVolatileContext'] = async ({ chatMode, includeDirectoryListing = true, prevDirectorySnapshot }) => {
 		const workspaceFolders = this.workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath)
 		const openedURIs = this.modelService.getModels().filter(m => m.isAttachedToEditor()).map(m => m.uri.fsPath) || [];
@@ -1337,7 +1358,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			directorySnapshot = currPaths
 		}
 
-		const volatile = chat_volatileContext({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode, includeDirectoryListing, directoryDiff })
+		const volatile = chat_volatileContext({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode, includeDirectoryListing, directoryDiff, defaultShell: await this._defaultShellName() })
 		return { volatile, directorySnapshot }
 	}
 

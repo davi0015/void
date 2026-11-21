@@ -3675,6 +3675,7 @@ export const SidebarChat = () => {
 		>
 			<VoidInputBox2
 				enableAtToMention
+				chatInput
 				initValue={draftForCurrentThread || null}
 				fixedHeight
 				className={`h-[81px] px-0.5 py-0.5`}
