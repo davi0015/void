@@ -1,72 +1,57 @@
-# Correctness gate for pull requests: dependency install, React bundles,
-# workbench compile, and hygiene on Linux. Catches breakage before merge
-# instead of after. Runs only on PRs (and manually) — never on pushes to
-# main, and it produces no artifacts.
+# Correctness gate for pull requests: dependency install, unit tests, hygiene,
+# and a typecheck on Linux. Runs on PRs, on pushes to main (which is what seeds
+# the cache PRs restore), and manually. It produces no artifacts.
 #
-# Measured on run 35301377142 (575s total), which is what this file is shaped
-# around:
+# Measured on run 44481094052 (428 s), the shape this file started from:
 #
-#   Install dependencies   npm ci                252s   44%
-#   Compile workbench      gulp compile          196s   34%
-#   Typecheck              tsc --noEmit           82s   14%
-#   Install system deps    apt-get                17s
-#   Build React bundles    buildreact             12s
-#   Hygiene                                         0s
+#   Install dependencies   npm ci                198 s   46%
+#   Compile workbench      gulp compile          156 s   36%
+#   Install system deps    apt-get                19 s
+#   Unit tests                                     13 s
+#   Build React bundles                            10 s
+#   Hygiene                                         1 s
 #
-# Four changes follow from those numbers, and each is separable:
+# The `npm ci` was not a missing cache action — there is one — but a scoping
+# mistake: GitHub scopes a cache to the ref that saved it, and a `pull_request`
+# run saves under `refs/pull/<n>/merge`. With no `push` trigger this workflow
+# never ran on `main`, so there was no main-scoped cache for a PR to restore and
+# every PR paid the full install. The `push` trigger below is the fix, and it
+# also gives main the same checks after a merge.
 #
-#   1. The typecheck step is gone. `gulp compile` compiles the same project —
-#      `compileTask('src', 'out', false)` reads `src/tsconfig.json` with
-#      `transpileOnly: false` and `emitError: true` — so it reports the same
-#      diagnostics and fails the step on them. Verified by adding
-#      `export const probe: number = 'string'` under src/ and running the task:
-#      exit 1, "Type 'string' is not assignable to type 'number'". The removed
-#      step could only have been a strict subset: it differed by `--skipLibCheck`,
-#      and `gulp compile` does not skip lib checking and still passes.
+# The compile is split in two, in parallel:
 #
-#   2. node_modules is cached. `npm ci` is the single largest step and almost
-#      none of it is download — setup-node already caches the npm tarballs. It is
-#      extraction of ~2.9 GB across 49 node_modules trees, plus native builds
-#      from source (this is why the apt step exists) and 49 postinstall installs.
-#      Keyed on the lockfile, so a cache hit is the same tree `npm ci` would have
-#      produced.
+#   - `Tests + hygiene` transpiles with SWC (`transpile-client-esbuild`, ~30 s
+#     measured locally; `gulp compile` was 156 s) and runs the node tier. SWC
+#     does not typecheck.
+#   - `Typecheck` runs the project's own `tsc --noEmit --skipLibCheck` (~82 s on
+#     CI). It builds the React bundles first so `./react/out/*` imports resolve,
+#     and compiles the built-in extensions only when the PR touches
+#     `extensions/` — that is a bundling check, not a typecheck, because those
+#     builds are esbuild.
 #
-#   3. The expensive steps are skipped when a PR cannot affect them. Several
-#      recent PRs touched only docs or `test/void/*.mjs` — neither is read by the
-#      compile — and still paid the full ten minutes. The job always runs and
-#      always reports success either way; it is a required check, so skipping it
-#      outright would leave the PR unmergeable rather than fast.
+# Both jobs are independent and both can be required; the wall clock is the
+# slower one. Requiring only `Tests + hygiene` gives the fastest gate and leaves
+# the typecheck visible but advisory.
 #
-#   4. The node tier runs here, gated on the compile. Added after the measurements
-#      above, which are left as they were because they describe the run the rest of
-#      this file was shaped around. It reads `out/`, so a run without a compile
-#      globs zero files and passes green — worse than not running it at all. When
-#      the compile did happen it costs about 50 s, and it is the only place the
-#      POSIX side of a platform-parameterised test is executed: `codespanSearchPattern`
-#      takes `windows` as an argument, so a Linux runner exercises the Windows
-#      branch as well as its own, which is what a Windows-only test run cannot do
-#      in reverse.
+# The job that used to be called `Compile + hygiene (Linux)` is now
+# `Tests + hygiene (Linux)`; the typecheck is its own job. Branch protection
+# names checks, so that rename has to be reflected there once.
 #
-# A cache that is incomplete is a compile that fails for no visible reason. The
-# first version of this file cached six globs that covered `extensions/*` and
-# missed five directories the postinstall also populates — `extensions`,
-# `remote/web`, `test/integration/browser` and, fatally, `.vscode/extensions/*`.
-# Restoring it skipped `npm ci`, so
-# `.vscode/extensions/vscode-selfhost-test-provider` had no `istanbul-to-vscode`
-# or `cockatiel`: two "cannot find module" errors plus three implicit-any errors
-# in the callbacks whose types came from them, and the whole compile aborted
-# after 33s. That list had been checked against itself rather than against
-# `build/npm/dirs.js`, which is the list that matters.
-#
-# Two things prevent a repeat: the glob list below is verified to cover all 49
-# directories in `build/npm/dirs.js`, and the restore is *checked* rather than
-# trusted — a tree missing anything `npm ci` would have created falls back to
-# running it. A forgotten path now costs a slow run instead of a broken one.
+# `node_modules` is checked against `build/npm/dirs.js` rather than trusted: a
+# cache that silently misses a directory produces a compile failure that reads
+# as a source error. The first version of this workflow cached six globs and
+# missed five directories the postinstall populates; restoring it skipped
+# `npm ci` and the compile died on two missing modules plus three implicit-any
+# errors in callbacks whose types came from them. A forgotten path now costs a
+# slow run instead of a broken one.
 
 name: PR check
 
 on:
   pull_request:
+    branches: [main]
+  # Seeds the node_modules cache for PRs and checks main after a merge.
+  push:
     branches: [main]
   workflow_dispatch:
 
@@ -78,12 +63,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check-linux:
-    name: Compile + hygiene (Linux)
+  scope:
+    name: Scope
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+      compile: ${{ steps.scope.outputs.compile }}
+      extensions: ${{ steps.scope.outputs.extensions }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -96,6 +82,7 @@ jobs:
           set -uo pipefail
           run=true
           compile=true
+          extensions=false
           if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
             if git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}" 2>/dev/null; then
               changed="$(git diff --name-only FETCH_HEAD HEAD 2>/dev/null || true)"
@@ -108,6 +95,9 @@ jobs:
                   run=false
                   compile=false
                 else
+                  if printf '%s\n' "${non_docs}" | grep -qE '^extensions/'; then
+                    extensions=true
+                  fi
                   # `test/void/*.mjs` is run by node, never compiled — but it is
                   # linted by hygiene, so the install still happens.
                   non_docs="$(printf '%s\n' "${non_docs}" | grep -vE '^test/void/' || true)"
@@ -118,126 +108,89 @@ jobs:
           fi
           echo "run=${run}" >> "$GITHUB_OUTPUT"
           echo "compile=${compile}" >> "$GITHUB_OUTPUT"
+          echo "extensions=${extensions}" >> "$GITHUB_OUTPUT"
           {
             echo "### PR check scope"
             echo ""
             echo "- install + hygiene: \`${run}\`"
-            echo "- React bundles + workbench compile: \`${compile}\`"
+            echo "- unit tests: \`${compile}\`"
+            echo "- typecheck + built-in extensions: \`${compile}\` (extensions: \`${extensions}\`)"
             if [ "${compile}" = "false" ]; then
               echo ""
-              echo "No file the compile reads changed, so it was skipped. The job still reports success — skipping it outright would leave this required check pending."
+              echo "No file the compile reads changed, so tests and typecheck were skipped. The jobs still report success — skipping them outright would leave required checks pending."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Set up Node
-        if: steps.scope.outputs.run == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: '.nvmrc'
-          cache: 'npm'
+  tests:
+    name: Tests + hygiene (Linux)
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # Covers all 49 directories in `build/npm/dirs.js`. `v2` records the bust
-      # that dropped the first, incomplete entry.
-      - name: Restore node_modules
-        if: steps.scope.outputs.run == 'true'
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            node_modules
-            build/node_modules
-            extensions/node_modules
-            extensions/*/node_modules
-            extensions/*/*/node_modules
-            remote/node_modules
-            remote/web/node_modules
-            test/*/node_modules
-            test/*/*/node_modules
-            .vscode/extensions/*/node_modules
-          # `dirs` is the hash of `build/npm/dirs.js` — the list that decides
-          # which trees exist. Without it the key only moves when the *root*
-          # lockfile does, and adding a directory there (a new built-in
-          # extension with its own lockfile) would hit a cache that predates it.
-          # The check below would then run `npm ci` on every run forever: a hit
-          # never overwrites an entry, and the post step only saves on success.
-          key: node-modules-${{ runner.os }}-${{ runner.arch }}-v2-node${{ hashFiles('.nvmrc') }}-${{ hashFiles('package-lock.json') }}-dirs${{ hashFiles('build/npm/dirs.js') }}
+      - name: Install node modules
+        uses: ./.github/actions/install-modules
 
-      # The tree is checked against `build/npm/dirs.js` — the list the
-      # postinstall itself walks — instead of being trusted, because a cache that
-      # silently misses a directory produces a compile failure that reads as a
-      # source error. A directory declaring no dependencies is skipped: npm does
-      # not create an empty node_modules, and two entries in that list are like
-      # that today.
-      - name: Check the restored node_modules
-        if: steps.scope.outputs.run == 'true'
-        id: modules
-        run: |
-          set -uo pipefail
-          cat > /tmp/check-modules.js <<'JS'
-          const fs = require('fs');
-          const path = require('path');
-          // Absolute: this script lives in /tmp, so a relative require would
-          // resolve against /tmp rather than the checkout.
-          const { dirs } = require(path.join(process.cwd(), 'build', 'npm', 'dirs.js'));
-          const missing = [];
-          for (const dir of dirs) {
-            const modules = dir ? path.join(dir, 'node_modules') : 'node_modules';
-            if (fs.existsSync(modules)) continue;
-            const pkg = dir ? path.join(dir, 'package.json') : 'package.json';
-            let declared = 0;
-            if (fs.existsSync(pkg)) {
-              const parsed = JSON.parse(fs.readFileSync(pkg, 'utf8'));
-              for (const key of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
-                declared += Object.keys(parsed[key] ?? {}).length;
-              }
-            }
-            if (declared > 0) missing.push(modules);
-          }
-          console.log(`checked ${dirs.length} directories`);
-          console.log(`MISSING=${missing.join(' ')}`);
-          JS
-
-          if ! out="$(node /tmp/check-modules.js 2>&1)"; then
-            echo "::warning::Could not verify node_modules — installing to be safe."
-            echo "${out}"
-            echo "install=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "${out}"
-          missing="$(printf '%s\n' "${out}" | sed -n 's/^MISSING=//p')"
-          if [ -n "${missing}" ]; then
-            echo "::warning::Restored node_modules is incomplete, running npm ci. Missing: ${missing}"
-            echo "install=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "install=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # Only a cache miss needs these: the headers are for native modules built
-      # from source during `npm ci`, and a restored tree already has them built.
-      - name: Install system dependencies
-        if: steps.scope.outputs.run == 'true' && steps.modules.outputs.install == 'true'
-        run: sudo apt-get update && sudo apt-get install -y libxkbfile-dev libsecret-1-dev libkrb5-dev pkg-config
-
-      - name: Install dependencies
-        if: steps.scope.outputs.run == 'true' && steps.modules.outputs.install == 'true'
-        run: npm ci
-
+      # Cheap, and it keeps `out/` complete: the workbench imports
+      # `./react/out/*`, which is gitignored. The node tier does not need it
+      # today, but a test that reaches a UI module would fail on a missing
+      # bundle rather than on its own assertion.
       - name: Build React bundles
-        if: steps.scope.outputs.compile == 'true'
+        if: needs.scope.outputs.compile == 'true'
         run: npm run buildreact
 
-      - name: Compile workbench
-        if: steps.scope.outputs.compile == 'true'
-        run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js compile
+      # SWC transpile, not `gulp compile`: the node tier reads `out/`, and the
+      # typecheck is its own job. ~30 s against 156 s.
+      - name: Transpile workbench
+        if: needs.scope.outputs.compile == 'true'
+        run: node ./node_modules/gulp/bin/gulp.js transpile-client-esbuild
 
-      # Gated on the compile for a reason worth stating: `test-node` globs
-      # `out/**/test/**/*.test.js`, so against a runner that never compiled it finds
-      # no files and reports zero tests passing. A required check that goes green
-      # having tested nothing is worse than one that does not run.
+      # Gated on the transpile: `test-node` globs `out/**/test/**/*.test.js`, so
+      # against a runner that never transpiled it finds no files and reports zero
+      # tests passing. A required check that goes green having tested nothing is
+      # worse than one that does not run.
       - name: Unit tests
-        if: steps.scope.outputs.compile == 'true'
+        if: needs.scope.outputs.compile == 'true'
         run: npm run test-node
 
       - name: Hygiene
-        if: steps.scope.outputs.run == 'true'
         run: node build/hygiene.js
+
+  typecheck:
+    name: Typecheck (Linux)
+    needs: scope
+    if: needs.scope.outputs.compile == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install node modules
+        uses: ./.github/actions/install-modules
+
+      # The workbench imports `./react/out/*`, which is gitignored; without the
+      # bundles the imports do not resolve and tsc reports them as errors.
+      - name: Build React bundles
+        run: npm run buildreact
+
+      # Full-project tsc needs more than node's ~4GB default heap.
+      # --skipLibCheck silences pre-existing errors in third-party .d.ts files
+      # (e.g. linkedom); src/ is still fully checked.
+      - name: Typecheck
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: npx tsc -p src/tsconfig.json --noEmit --skipLibCheck
+
+      # Built-in extensions are bundled with esbuild rather than typechecked, so
+      # this is a bundling check. Scoped to PRs that touch them.
+      - name: Compile built-in extensions
+        if: needs.scope.outputs.extensions == 'true'
+        run: node ./node_modules/gulp/bin/gulp.js compile-extensions compile-extension-media

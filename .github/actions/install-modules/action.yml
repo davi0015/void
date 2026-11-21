@@ -1,0 +1,105 @@
+name: Install node modules
+description: >-
+  Restore the cached node_modules tree, verify it against build/npm/dirs.js, and
+  run npm ci only when a directory is missing. Shared by the jobs of the PR check
+  so the cache key and the completeness check exist once.
+
+outputs:
+  install:
+    description: '"true" when npm ci ran'
+    value: ${{ steps.modules.outputs.install }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version-file: '.nvmrc'
+        cache: 'npm'
+
+    # Covers all 49 directories in `build/npm/dirs.js`. `v2` records the bust
+    # that dropped the first, incomplete entry.
+    - name: Restore node_modules
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          node_modules
+          build/node_modules
+          extensions/node_modules
+          extensions/*/node_modules
+          extensions/*/*/node_modules
+          remote/node_modules
+          remote/web/node_modules
+          test/*/node_modules
+          test/*/*/node_modules
+          .vscode/extensions/*/node_modules
+        # `dirs` is the hash of `build/npm/dirs.js` — the list that decides
+        # which trees exist. Without it the key only moves when the *root*
+        # lockfile does, and adding a directory there (a new built-in
+        # extension with its own lockfile) would hit a cache that predates it.
+        # The check below would then run `npm ci` on every run forever: a hit
+        # never overwrites an entry, and the post step only saves on success.
+        key: node-modules-${{ runner.os }}-${{ runner.arch }}-v2-node${{ hashFiles('.nvmrc') }}-${{ hashFiles('package-lock.json') }}-dirs${{ hashFiles('build/npm/dirs.js') }}
+
+    # The tree is checked against `build/npm/dirs.js` — the list the postinstall
+    # itself walks — instead of being trusted, because a cache that silently
+    # misses a directory produces a compile failure that reads as a source error.
+    # A directory declaring no dependencies is skipped: npm does not create an
+    # empty node_modules, and two entries in that list are like that today.
+    - name: Check the restored node_modules
+      id: modules
+      shell: bash
+      run: |
+        set -uo pipefail
+        cat > /tmp/check-modules.js <<'JS'
+        const fs = require('fs');
+        const path = require('path');
+        // Absolute: this script lives in /tmp, so a relative require would
+        // resolve against /tmp rather than the checkout.
+        const { dirs } = require(path.join(process.cwd(), 'build', 'npm', 'dirs.js'));
+        const missing = [];
+        for (const dir of dirs) {
+          const modules = dir ? path.join(dir, 'node_modules') : 'node_modules';
+          if (fs.existsSync(modules)) continue;
+          const pkg = dir ? path.join(dir, 'package.json') : 'package.json';
+          let declared = 0;
+          if (fs.existsSync(pkg)) {
+            const parsed = JSON.parse(fs.readFileSync(pkg, 'utf8'));
+            for (const key of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+              declared += Object.keys(parsed[key] ?? {}).length;
+            }
+          }
+          if (declared > 0) missing.push(modules);
+        }
+        console.log(`checked ${dirs.length} directories`);
+        console.log(`MISSING=${missing.join(' ')}`);
+        JS
+
+        if ! out="$(node /tmp/check-modules.js 2>&1)"; then
+          echo "::warning::Could not verify node_modules — installing to be safe."
+          echo "${out}"
+          echo "install=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "${out}"
+        missing="$(printf '%s\n' "${out}" | sed -n 's/^MISSING=//p')"
+        if [ -n "${missing}" ]; then
+          echo "::warning::Restored node_modules is incomplete, running npm ci. Missing: ${missing}"
+          echo "install=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "install=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Only a cache miss needs these: the headers are for native modules built
+    # from source during `npm ci`, and a restored tree already has them built.
+    - name: Install system dependencies
+      if: steps.modules.outputs.install == 'true' && runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y libxkbfile-dev libsecret-1-dev libkrb5-dev pkg-config
+
+    - name: Install dependencies
+      if: steps.modules.outputs.install == 'true'
+      shell: bash
+      run: npm ci
