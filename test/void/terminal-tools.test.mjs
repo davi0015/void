@@ -280,4 +280,28 @@ describe('terminal tooling', () => {
 			else t.diagnostic('wsl: no WSL profile in this build — the cmd subject still covers completion, but not the POSIX marker')
 		})
 	})
+
+	// A temporary terminal is created before the default profile finishes
+	// resolving, and `shellLaunchConfig.executable` is what decides whether the
+	// command-detection capability is waited for. Reading `undefined` as "this
+	// shell cannot have integration" skipped the wait; the capability attached a
+	// second later with nothing listening, so the command finished, its output sat
+	// on screen, and the call still resolved by the inactivity timeout.
+	test('a temporary command settles on completion, not on the timeout', async (t) => {
+		await h.withScenario('terminal-tools/temporary-settle', async (s) => {
+			const out = await s.page.evaluate(async () => {
+				const tts = globalThis.__voidChatThreadService._terminalToolService
+				const started = Date.now()
+				const { resPromise } = await tts.runCommand('echo temporary-probe', { type: 'temporary', cwd: null, terminalId: 'e2e-temporary-settle', timeoutSeconds: 20 })
+				const res = await resPromise
+				return { ms: Date.now() - started, reason: res.resolveReason, result: String(res.result) }
+			})
+			t.diagnostic(`temporary: ${out.ms}ms reason=${JSON.stringify(out.reason)}`)
+			// Control: the output has to be there either way, so a setup that never
+			// ran the command cannot masquerade as a completion bug.
+			assert.ok(out.result.includes('temporary-probe'), 'the command did not run')
+			assert.equal(out.reason.type, 'done', 'a command that finished must not resolve as a timeout')
+			assert.ok(out.ms < 10_000, `completion took ${out.ms} ms, which is the timeout path`)
+		})
+	})
 })

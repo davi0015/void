@@ -650,11 +650,24 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 
 				// Waiting the full ten seconds for a capability that injection can
-				// never attach is most of what a command in cmd or wsl used to cost.
-				const executable = terminal.shellLaunchConfig?.executable
-				const cmdCap = hasInjectableShellIntegration(executable)
-					? await this._waitForCommandDetectionCapability(terminal)
-					: terminal.capabilities.get(TerminalCapability.CommandDetection)
+				// never attach is most of what a command in cmd or wsl used to cost,
+				// so a shell we can name is not waited on. A shell we cannot name is
+				// a different case: `shellLaunchConfig` is filled from the default
+				// profile, and a fresh window creates the terminal before that
+				// resolves, so the first call after launch sees `executable`
+				// undefined. Reading that as "no integration" skipped the wait, left
+				// `cmdCap` undefined for a terminal whose integration attached a
+				// moment later, and produced neither the structured completion nor a
+				// marker to fall back on — the call then sat until the inactivity
+				// timeout with its output already on screen.
+				let executable = terminal.shellLaunchConfig?.executable
+				let cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection)
+				if (!cmdCap && (hasInjectableShellIntegration(executable) || executable === undefined)) {
+					cmdCap = await this._waitForCommandDetectionCapability(terminal)
+					// The wait is also what lets the profile resolve, so this is the
+					// first point the real shell name can be known.
+					executable = terminal.shellLaunchConfig?.executable
+				}
 				const sentinel = cmdCap ? undefined : withCommandSentinel(command, executable)
 				// if (!cmdCap) throw new Error(`There was an error using the terminal: CommandDetection capability did not mount yet. Please try again in a few seconds or report this to the Void team.`)
 
