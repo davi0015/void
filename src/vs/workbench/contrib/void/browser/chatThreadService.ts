@@ -4413,6 +4413,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			chatMode,
 			includeDirectoryListing: needsFullListing,
 			prevDirectorySnapshot: thread.directorySnapshot,
+			threadId,
 		})
 		if (directorySnapshot) {
 			const updatedThread: ThreadType = { ...thread, directorySnapshot }

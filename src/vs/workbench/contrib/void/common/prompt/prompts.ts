@@ -166,7 +166,7 @@ export const builtinToolNames: BuiltinToolName[] = [
 	'search_pathnames_only', 'search_for_files', 'search_in_file',
 	'go_to_definition', 'go_to_usages', 'read_lint_errors',
 	'create_file_or_folder', 'delete_file_or_folder', 'rename_file_or_folder',
-	'edit_file', 'rewrite_file',
+	'edit_file', 'rewrite_file', 'write_scratch', 'delete_scratch',
 	'run_command', 'run_persistent_command', 'open_persistent_terminal', 'kill_persistent_terminal', 'read_terminal',
 	'fetch_url', 'semantic_search', 'search_history', 'load_skill',
 ]
@@ -241,7 +241,7 @@ export type ChatPromptContext = {
 // should prepend this to the latest user message (Phase B caching layout) rather
 // than embed it in the system message — keeping it out of the system message lets
 // the stable prefix and the full conversation history be prefix-cached across turns.
-export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode: mode, includeDirectoryListing = true, directoryDiff, defaultShell }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'allTerminals' | 'chatMode'> & { includeDirectoryListing?: boolean, directoryDiff?: string | null, defaultShell?: string }) => {
+export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode: mode, includeDirectoryListing = true, directoryDiff, defaultShell, scratchPath }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'allTerminals' | 'chatMode'> & { includeDirectoryListing?: boolean, directoryDiff?: string | null, defaultShell?: string, scratchPath?: string }) => {
 	const terminalBlock = mode === 'agent' && allTerminals.length > 0
 		? allTerminals.map(t => {
 			const cmd = t.lastCommand ? ` — ${t.lastCommand}` : ''
@@ -264,7 +264,7 @@ ${workspaceFolders.join('\n') || 'NO FOLDERS OPEN'}
 ${activeURI}
 
 - Open files:
-${openedURIs.join('\n') || 'NO OPENED FILES'}${defaultShell ? `\n\n- Default shell for new terminals: ${defaultShell}` : ''}${terminalBlock ? `
+${openedURIs.join('\n') || 'NO OPENED FILES'}${defaultShell ? `\n\n- Default shell for new terminals: ${defaultShell}` : ''}${scratchPath ? `\n\n- Scratchpad for this chat: ${scratchPath} (gitignored; \`write_scratch\` writes here, so it never appears as a project change)` : ''}${terminalBlock ? `
 
 - Terminals:
 ${terminalBlock}${terminalNote}` : ''}
@@ -364,6 +364,14 @@ You will be given instructions from the user, and may also receive a list of fil
 		// that appear in tool descriptions AND importantDetails get followed
 		// more reliably than rules that appear in one surface only.
 		details.push(`For file and directory operations, always use the dedicated tool — never shell out via \`run_command\`: use \`read_file\` (not \`cat\`), \`ls_dir\` or \`get_dir_tree\` (not \`ls\` / \`tree\`), \`search_pathnames_only\` (not \`find\`), \`search_in_file\` or \`search_for_files\` (not \`grep\`), and \`edit_file\` or \`rewrite_file\` (not \`sed\` / \`echo >\`). When searching code: use \`go_to_definition\`/\`go_to_usages\` for named symbols, \`search_in_file\`/\`search_for_files\` for exact strings, and \`semantic_search\` for conceptual/intent queries where there's no exact string to match. Pick the right tool upfront — don't cascade through multiple search tools for the same query. \`run_command\` is for things the dedicated tools don't do — installing packages, running tests, git operations, build commands.`)
+
+		// Scratch files are the one kind of file that exists only to answer a
+		// question mid-task. They must not become project changes: a change is
+		// reviewed by the user, and a probe script is not a deliverable. Naming the
+		// tool here as well as in its description is deliberate — tool-choice rules
+		// that appear on one surface get ignored by smaller models (see the comment
+		// above the file-operations rule).
+		details.push(`When you create a file only to check something — a probe script, a throwaway test, generated output — use \`write_scratch\`. Scratch files are gitignored, belong to this chat, and are not project changes, so they never need review. Never write scratch files into the project's folders. Remove ones you no longer need with \`delete_scratch\`.`)
 
 		// A4 — Rebalance over-iteration. Replaces three compounding rules
 		// ("maximal certainty BEFORE" + "OFTEN need to gather context" +

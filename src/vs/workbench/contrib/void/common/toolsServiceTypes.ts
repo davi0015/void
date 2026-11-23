@@ -37,6 +37,11 @@ export const approvalTypeOfBuiltinToolName: Partial<{ [T in BuiltinToolName]?: '
 	'rename_file_or_folder': 'edits',
 	'rewrite_file': 'edits',
 	'edit_file': 'edits',
+	// Scratch writes are file writes, so they sit in the same tier as other
+	// edits. The point of the scratchpad is that the *review* step skips them,
+	// which is a property of the tool, not of approval.
+	'write_scratch': 'edits',
+	'delete_scratch': 'delete',
 	'run_command': 'terminal',
 	'run_persistent_command': 'terminal',
 	'open_persistent_terminal': 'terminal',
@@ -155,6 +160,8 @@ export type BuiltinToolCallParams = {
 	'create_file_or_folder': { uri: URI, isFolder: boolean },
 	'delete_file_or_folder': { uri: URI, isRecursive: boolean, isFolder: boolean },
 	'rename_file_or_folder': { sourceUri: URI, targetUri: URI, overwrite: boolean },
+	'write_scratch': { path: string, content: string },
+	'delete_scratch': { path: string },
 	// ---
 	'run_command': { command: string; cwd: string | null, terminalId: string, timeoutSeconds: number },
 	'open_persistent_terminal': { cwd: string | null },
@@ -190,6 +197,8 @@ export type BuiltinToolResultType = {
 	'create_file_or_folder': {},
 	'delete_file_or_folder': {},
 	'rename_file_or_folder': {},
+	'write_scratch': { fsPath: string, bytes: number },
+	'delete_scratch': { fsPath: string },
 	// ---
 	'run_command': { result: string; resolveReason: TerminalResolveReason; },
 	'run_persistent_command': { result: string; resolveReason: TerminalResolveReason; },
