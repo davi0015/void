@@ -65,13 +65,21 @@ function domHas(page, needle) {
 
 /** Puts one user message on the current thread through the real message store. */
 async function seedCurrentThread(page, text) {
-	return page.evaluate((message) => {
+	return page.evaluate(async (message) => {
 		const svc = globalThis.__voidChatThreadService
 		const id = svc.state.currentThreadId
-		svc._storeMessageKey(id, 0, { role: 'user', content: message, displayContent: message, selections: null })
-		svc._flushPendingThreadWrites()
+		// Since 1.5.0 a thread's messages are a log file the main process owns, and
+		// `_storeMessageKey` appends without touching the in-memory array. The old
+		// helper wrote a key and expected `messages` to be there synchronously; this
+		// awaits the append and reloads, which is what the count below needs.
+		await svc.ensureMessagesLoaded(id)
+		const before = svc.state.allThreads[id].messages.length
+		await svc._threadStore.call('append', {
+			threadId: id,
+			records: [{ i: before, m: { role: 'user', content: message, displayContent: message, selections: null } }],
+		})
 		svc._loadedMessageThreadIds.delete(id)
-		svc._ensureMessagesLoaded(id)
+		await svc.ensureMessagesLoaded(id)
 		return { id, messageCount: svc.state.allThreads[id].messages.length }
 	}, text)
 }
@@ -545,10 +553,12 @@ describe('subagent delegation', () => {
 			// audit without costing the parent any context.
 			assert.ok(await domHas(s.page, CHILD_REPORT), 'the child\'s own conversation did not render')
 
-			// Back to the parent, the way the banner does it.
-			const back = await s.page.evaluate((id) => {
+			// Back to the parent, the way the banner does it. The switch is awaited: since
+			// 1.5.0 it loads the target's messages before it publishes `currentThreadId`,
+			// so reading that immediately after the call still sees the child.
+			const back = await s.page.evaluate(async (id) => {
 				const svc = globalThis.__voidChatThreadService
-				svc.switchToThread(id)
+				await svc.switchToThread(id)
 				return svc.state.currentThreadId
 			}, parent.id)
 			assert.equal(back, parent.id, 'could not return to the parent')
