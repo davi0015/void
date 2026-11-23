@@ -65,15 +65,28 @@ export const sendLLMMessage = async ({
 	let _aborter: (() => void) | null = null
 	let _setAborter = (fn: () => void) => { _aborter = fn }
 	let _didAbort = false
+	// stall watchdog: a dead connection (VPN/network change mid-stream, or the
+	// laptop sleeping) can leave the HTTP stream open with no events and no
+	// error — the turn appears to run forever (UI stuck loading, no final to
+	// remote surfaces). If NO stream activity arrives for this long, fail the
+	// request. Generous on purpose: slow models may think before first token.
+	const LLM_STALL_TIMEOUT_MS = 120_000
+	let _lastStreamActivityAt = Date.now()
+	let _stallWatchdog: ReturnType<typeof setInterval> | undefined
+	const _clearStallWatchdog = () => {
+		if (_stallWatchdog !== undefined) { clearInterval(_stallWatchdog); _stallWatchdog = undefined }
+	}
 
 	const onText: OnText = (params) => {
 		const { fullText } = params
 		if (_didAbort) return
+		_lastStreamActivityAt = Date.now()
 		onText_(params)
 		_fullTextSoFar = fullText
 	}
 
 	const onFinalMessage: OnFinalMessage = (params) => {
+		_clearStallWatchdog()
 		const { fullText, fullReasoning, toolCalls } = params
 		// For FIM, always deliver the result — the autocomplete service
 		// stores it for the next re-query even if the original call was
@@ -90,6 +103,7 @@ export const sendLLMMessage = async ({
 	}
 
 	const onError: OnError = ({ message: errorMessage, fullError }) => {
+		_clearStallWatchdog()
 		if (_didAbort && messagesType !== 'FIMMessage') return
 		console.error('sendLLMMessage onError:', errorMessage)
 
@@ -103,6 +117,7 @@ export const sendLLMMessage = async ({
 
 	// we should NEVER call onAbort internally, only from the outside
 	const onAbort = () => {
+		_clearStallWatchdog()
 		if (messagesType === 'FIMMessage') {
 			// Soft abort for FIM — don't kill the stream. The result may
 			// arrive before the next request completes, so store it for
@@ -117,6 +132,23 @@ export const sendLLMMessage = async ({
 	}
 	abortRef_.current = onAbort
 
+	// timers don't run while the system sleeps, so on wake this check fires
+	// with the full sleep gap in idleMs — exactly the "laptop closed for an
+	// hour" case, reported with the sleep duration rather than a mystery
+	_stallWatchdog = setInterval(() => {
+		if (_didAbort) { _clearStallWatchdog(); return }
+		const idleMs = Date.now() - _lastStreamActivityAt
+		if (idleMs >= LLM_STALL_TIMEOUT_MS) {
+			_clearStallWatchdog()
+			// error first (the onError guard ignores calls after _didAbort)
+			onError({
+				message: `No response from ${displayInfoOfProviderName(providerName).title} for ${Math.round(idleMs / 1000)}s — the connection likely dropped (network/VPN change or system sleep). The request was cancelled; resend when you're back online.`,
+				fullError: null,
+			})
+			_didAbort = true
+			try { _aborter?.() } catch { }
+		}
+	}, 5_000)
 
 	if (messagesType === 'chatMessages')
 		captureLLMEvent(`${loggingName} - Sending Message`, {})
