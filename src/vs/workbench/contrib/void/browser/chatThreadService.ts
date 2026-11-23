@@ -2256,12 +2256,27 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	// this should be the only place this.state = ... appears besides constructor
 	private _setState(state: Partial<ThreadsState>, doNotRefreshMountInfo?: boolean) {
+		const outgoingThreadId = state.currentThreadId !== undefined && state.currentThreadId !== this.state.currentThreadId
+			? this.state.currentThreadId
+			: undefined
+
 		const newState = {
 			...this.state,
 			...state
 		}
 
 		this.state = newState
+
+		// Switching away from a thread is the moment its dropdown value has to be
+		// remembered: `lastUsedModelSelection` was only written on send or on a
+		// dropdown change made *while that thread was current*, so a thread that
+		// never sent a message — or one written before the field existed — had
+		// nothing saved, and returning to it kept whatever model had been picked in
+		// another tab. Done after the state lands so a caller-supplied `allThreads`
+		// snapshot (openNewThread) cannot overwrite the write with its own copy.
+		if (outgoingThreadId !== undefined) {
+			this._rememberModelSelectionForThread(outgoingThreadId)
+		}
 
 		this._onDidChangeCurrentThread.fire()
 
@@ -2562,7 +2577,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// Writes through `_storeThread` to survive reloads. No state change
 	// event here — the dropdown state lives on `IVoidSettingsService`, not on
 	// this service, so there's nothing for chat-UI listeners to re-render.
-	private _setThreadLastUsedModelSelection(threadId: string, modelSelection: ModelSelection | null) {
+	private _setThreadLastUsedModelSelection(threadId: string, modelSelection: ModelSelection | null, opts: { notify?: boolean } = {}) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
 
@@ -2580,7 +2595,24 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const updatedThread = { ...thread, lastUsedModelSelection: modelSelection }
 		const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 		this._storeThread(threadId, updatedThread)
-		this._setState({ allThreads: newThreads })
+		// Quiet writes are the ones made on the way out of a thread: nothing that is
+		// rendered depends on this field, and notifying would fire a second
+		// "current thread changed" for a switch that is already in progress.
+		if (opts.notify === false) this.state = { ...this.state, allThreads: newThreads }
+		else this._setState({ allThreads: newThreads })
+	}
+
+	/**
+	 * Persists whatever the dropdown currently shows onto the thread being left.
+	 * Without this, a thread that never saved a selection of its own has nothing
+	 * for `_afterCurrentThreadChanged` to restore, and keeps the model picked in
+	 * whichever tab was used in between.
+	 */
+	private _rememberModelSelectionForThread(threadId: string | null | undefined): void {
+		if (!threadId || !this.state.allThreads[threadId]) return
+		const current = this._settingsService.state.modelSelectionOfFeature['Chat']
+		if (!current) return
+		this._setThreadLastUsedModelSelection(threadId, current, { notify: false })
 	}
 
 	// Returns true iff `sel` points at a provider+model that still exists in
