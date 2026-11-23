@@ -14,6 +14,7 @@ import { IMetricsService } from './metricsService.js';
 import { isMacintosh } from '../../../../base/common/platform.js';
 import { defaultProviderSettings, getModelCapabilities, ModelOverrides } from './modelCapabilities.js';
 import { VOID_SETTINGS_STORAGE_KEY } from './storageKeys.js';
+import { mergeSettingsWrites } from './storageMerge.js';
 import { defaultSettingsOfProvider, FeatureName, ProviderName, ModelSelectionOfFeature, SettingsOfProvider, SettingName, providerNames, ModelSelection, modelSelectionsEqual, featureNames, VoidStatefulModelInfo, GlobalSettings, GlobalSettingName, defaultGlobalSettings, ModelSelectionOptions, OptionsOfModelSelection, ChatMode, OverridesOfModel, defaultOverridesOfModel, MCPUserStateOfName as MCPUserStateOfName, MCPUserState, BackendId, BackendProtocol, BackendProviderSettings, isBackendId, registerBackendDisplayNames, displayInfoOfProviderName } from './voidSettingsTypes.js';
 
 
@@ -255,6 +256,13 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 
 	state: VoidSettingsState;
 
+	// The state as storage last held it, per this window — the merge base for
+	// `_storeState`, so a write that changed one setting keeps another window's change
+	// to a different one. And the number of writes in flight, which is how an external
+	// reload tells an echo of this window's own write from a real one.
+	private _lastSyncedState: VoidSettingsState | undefined
+	private _writesInFlight = 0
+
 	private readonly _resolver: () => void
 	waitForInitState: Promise<void> // await this if you need a valid state initially
 
@@ -406,6 +414,13 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 	// concurrent write. A failed read keeps current state (never reset
 	// live state on a bad read).
 	private async _reloadExternalState(): Promise<void> {
+		// An echo of a write this window is still making. The main process broadcasts
+		// every storage change back to the window that made it, so adopting here would
+		// read a blob from before that write and undo the setting the user just changed —
+		// which is what made a mode switch revert under the pointer. The write path
+		// merges against storage anyway, so skipping this loses nothing.
+		if (this._writesInFlight > 0) return
+
 		let readS: VoidSettingsState
 		try {
 			readS = await this._readState()
@@ -414,6 +429,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			return
 		}
 		this.state = this._migrateAndValidateState(readS)
+		this._lastSyncedState = this.state
 		this._onDidChangeState.fire()
 	}
 
@@ -447,19 +463,51 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 
 
 	private async _storeState() {
-		const cleanSettings = { ...this.state.settingsOfProvider }
+		const source = this.state
+		const cleanSettings = { ...source.settingsOfProvider }
 		for (const key of Object.keys(cleanSettings)) {
 			if (isBackendId(key as ProviderName)) delete (cleanSettings as any)[key]
 		}
-		const stateToStore = { ...this.state, settingsOfProvider: cleanSettings }
-		const encryptedState = await this._encryptionService.encrypt(JSON.stringify(stateToStore))
-		this._storageService.store(VOID_SETTINGS_STORAGE_KEY, encryptedState, StorageScope.APPLICATION, StorageTarget.USER);
-		// Flush eagerly so other windows (and any imminent reload) see this
-		// write immediately. Renderer storage otherwise sits in a local
-		// cache for up to 60s before reaching the main-process DB — a
-		// reload in that window reads stale data and writes it back over
-		// this update, losing it permanently.
-		await this._storageService.flush()
+		const ours = { ...source, settingsOfProvider: cleanSettings }
+
+		this._writesInFlight++
+		try {
+			// Merge against what storage holds now. The blob carries every setting, so a
+			// write that changed one of them would otherwise revert whatever another
+			// window (or an echo of an earlier write here) changed in the meantime.
+			let toStore: VoidSettingsState = ours
+			try {
+				const persisted = await this._readState()
+				if (this._lastSyncedState) {
+					toStore = mergeSettingsWrites(
+						persisted as unknown as Record<string, unknown>,
+						this._lastSyncedState as unknown as Record<string, unknown>,
+						ours as unknown as Record<string, unknown>,
+					) as unknown as VoidSettingsState
+				}
+			} catch { /* a failed read is not a reason to skip the write */ }
+
+			const encryptedState = await this._encryptionService.encrypt(JSON.stringify(toStore))
+			this._storageService.store(VOID_SETTINGS_STORAGE_KEY, encryptedState, StorageScope.APPLICATION, StorageTarget.USER);
+			// Adopt what was written, including the other window's fields, unless a newer
+			// local change landed while this write was in flight — then merge that in too.
+			this.state = this.state === source
+				? _validatedModelState(toStore)
+				: _validatedModelState(mergeSettingsWrites(
+					toStore as unknown as Record<string, unknown>,
+					ours as unknown as Record<string, unknown>,
+					this.state as unknown as Record<string, unknown>,
+				) as unknown as VoidSettingsState)
+			this._lastSyncedState = this.state
+			// Flush eagerly so other windows (and any imminent reload) see this
+			// write immediately. Renderer storage otherwise sits in a local
+			// cache for up to 60s before reaching the main-process DB — a
+			// reload in that window reads stale data and writes it back over
+			// this update, losing it permanently.
+			await this._storageService.flush()
+		} finally {
+			this._writesInFlight--
+		}
 	}
 
 	setSettingOfProvider: SetSettingOfProviderFn = async (providerName, settingName, newVal) => {
