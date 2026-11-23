@@ -104,18 +104,22 @@ export type IntegrationOutbound =
 	| { type: 'streamDelta'; conversationKey: string; textSoFar: string }
 
 	// One line per tool call, as it transitions phases. `summary` is
-	// redacted, e.g. `readFile src/foo.ts (2,140 chars)`.
-	| { type: 'toolStatus'; conversationKey: string; toolName: ToolName; mcpServerName: string | undefined; phase: 'running' | 'success' | 'error'; summary: string }
+	// redacted, e.g. `readFile src/foo.ts (2,140 chars)`. `title` is the
+	// thread's current title, so posted messages can identify their task
+	// even when read out of context (mobile notifications).
+	| { type: 'toolStatus'; conversationKey: string; toolName: ToolName; mcpServerName: string | undefined; phase: 'running' | 'success' | 'error'; summary: string; title?: string }
 
 	// A tool call needs the user's approval. `paramsSummary` is redacted the
 	// same way as toolStatus summaries. The proxy renders buttons (Slack) or
 	// an approve/reject text prompt (Teams v1) and returns an
 	// approvalResponse with the same requestId. Void applies its own
 	// timeout-to-reject if none arrives.
-	| { type: 'approvalRequest'; requestId: string; conversationKey: string; toolName: ToolName; mcpServerName: string | undefined; paramsSummary: string }
+	| { type: 'approvalRequest'; requestId: string; conversationKey: string; toolName: ToolName; mcpServerName: string | undefined; paramsSummary: string; title?: string }
 
 	// The turn is complete. `text` is the final assistant text (markdown).
-	| { type: 'final'; conversationKey: string; text: string; usage?: LLMUsage }
+	// `title` is the thread's current title — the proxy prefixes it to
+	// posted messages so each identifies its task out of context.
+	| { type: 'final'; conversationKey: string; text: string; usage?: LLMUsage; title?: string }
 
 	// Void (re)bound a conversation to a thread — on thread creation, or on
 	// adopting the proxy's remembered threadId. The proxy persists
@@ -130,7 +134,7 @@ export type IntegrationOutbound =
 	| { type: 'createConversation'; threadId: string; title?: string }
 
 	// The turn failed (LLM error, abort, etc).
-	| { type: 'error'; conversationKey: string; message: string }
+	| { type: 'error'; conversationKey: string; message: string; title?: string }
 
 
 // --- envelope + ack --------------------------------------------------------
