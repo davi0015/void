@@ -5073,10 +5073,20 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// `switchToThread` so a reload-landing thread still gets remembered.
 	private async _landOnThread(threadId: string): Promise<void> {
 		if (!this.state.allThreads[threadId]) return
-		await this._ensureMessagesLoaded(threadId)
-		// Deleted while its messages were being read: do not land on it.
-		if (!this.state.allThreads[threadId]) return
+		// Publish the id before reading the messages. A log thread's messages are a
+		// file in the main process, so this read spans real time — and the sidebar
+		// mounts inside that window. With `currentThreadId` still unset, the first
+		// render calls `getCurrentThread()` on null, which throws; the error boundary
+		// keeps that throw on screen for the rest of the session, so the chat pane is
+		// unusable until the next launch. The message list fills in when the read lands,
+		// which is the one visible cost of landing first.
 		this._setState({ currentThreadId: threadId })
+		await this._ensureMessagesLoaded(threadId)
+		// Deleted while its messages were being read: do not stay landed on it.
+		if (!this.state.allThreads[threadId]) {
+			this._normalizeCurrentThreadInScope()
+			return
+		}
 		this._afterCurrentThreadChanged(threadId)
 	}
 
