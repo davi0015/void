@@ -96,6 +96,27 @@ function lastChatRequest(requestsJson) {
 	return { request: chat[chat.length - 1], reason: null }
 }
 
+/**
+ * The chat request, waited for rather than read once.
+ *
+ * `addUserMessageAndStreamResponse` resolves when the run is kicked off, and
+ * `waitForRunEnd` returns as soon as `isRunning` is false — which it already is before the
+ * send has started. So a single read races the dispatch, and the race looks exactly like a
+ * request with no summary in it. Under the suite's contention this read lost often enough
+ * to fail two different scenarios in two different runs.
+ */
+async function waitForChatRequest(page, { timeoutMs = 20000 } = {}) {
+	const deadline = Date.now() + timeoutMs
+	let last = { request: null, reason: 'nothing captured' }
+	while (Date.now() < deadline) {
+		const attempt = lastChatRequest(await h.capturedLLMRequests(page))
+		if (attempt.request) return attempt
+		last = attempt
+		await h.sleep(200)
+	}
+	return last
+}
+
 describe('compaction boundary', () => {
 
 	test('a boundary never lands inside an assistant message’s tool batch', async (t) => {
@@ -191,7 +212,7 @@ describe('compaction boundary', () => {
 			trace(t, s)
 			assert.equal(outcomeOf(outcome.outcome), 'compacted', `compaction or send did not run: ${outcomeOf(outcome.outcome)}`)
 
-			const { request, reason } = lastChatRequest(await h.capturedLLMRequests(s.page))
+			const { request, reason } = await waitForChatRequest(s.page)
 			assert.ok(request, reason)
 
 			const keptTail = describeKeptTail(request)
@@ -432,13 +453,20 @@ describe('compaction boundary', () => {
 			})
 
 			trace(t, s)
+			// The send resolves when the run is kicked off, not when its request reaches
+			// the transport, and the load ahead of it is asynchronous now. Wait for the run
+			// before asking what the model was sent.
+			await h.waitForRunEnd(s.page)
 			// Guard: the stored boundary must be the illegal shape.
 			assert.equal(stored.illegalRole, 'tool',
 				`fixture guard: the stored boundary at ${stored.illegal} points at '${stored.illegalRole}', not a tool row`)
 
-			const { request } = lastChatRequest(await h.capturedLLMRequests(s.page))
+			const { request, reason } = await waitForChatRequest(s.page)
 			const keptTail = describeKeptTail(request)
-			assert.ok(keptTail.found, 'the captured chat request carries no compacted summary')
+			const captured = JSON.parse(await h.capturedLLMRequests(s.page))
+			t.diagnostic(`captured ${captured.length} request(s): ${JSON.stringify(captured.map(r => ({ name: r?.logging?.loggingName, n: r?.messages?.length, extras: r?.logging?.loggingExtras?.nMessagesSent })))}`)
+			const shape = JSON.stringify((request?.messages ?? []).map(m => `${m.role}:${String(m.content ?? '').slice(0, 30)}`))
+			assert.ok(keptTail.found, `the captured chat request carries no compacted summary (${reason ?? 'captured'}; request: ${shape.slice(0, 900)})`)
 			assert.ok(keptTail.toolMessages > 0,
 				'fixture guard: the request carries no tool result')
 

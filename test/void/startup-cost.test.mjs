@@ -3,30 +3,24 @@
  *  Licensed under the Source Code License, Version 1.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-// What a launch costs in stored conversation volume.
+// What a launch costs in stored conversation volume, after S10b.
 //
-// The renderer's `Storage` mirrors the whole application store at startup —
-// `cache = await database.getItems()`, and `getItems()` passes no filter
-// (`base/parts/storage/common/storage.ts:213`,
-// `platform/storage/common/storageIpc.ts:61`). Thread *metadata* is loaded per
-// thread, but message bodies have already crossed IPC by then, so a launch pays
-// for every message ever stored, whether or not its thread is opened. That is
-// bug 1 in `docs/designs/thread-storage.md`; the design's fix is S10b (message
-// bodies leave the mirrored `void.chatMsg.*` keys for a per-thread log).
+// Before S10b the renderer's `Storage` mirrored the whole application store at startup
+// — `cache = await database.getItems()`, no filter — so a launch paid for every message
+// ever stored, whether or not its thread was opened. Bug 1 in
+// `docs/designs/thread-storage.md`.
 //
-// This scenario measures it rather than restating it:
+// Now message bodies live in `threads/<id>/messages.jsonl`, and the startup pass converts
+// any key-backed thread before the mirror is built. So this file asserts the *inverted*
+// behaviour: after launch, the seeded `void.chatMsg.*` values are NOT resident in the
+// renderer, although their threads exist and were not opened. The keys are still in the
+// database — they are held for a downgrade — which is why the assertion is about the
+// mirror rather than about the rows.
 //
-//  - a control profile with no messages, and a seeded profile with
-//    THREADS x MESSAGES messages of realistic size, each launched RUNS times on
-//    the same profile so later launches are not paying for a cold file cache;
-//  - the mechanism assertion, which is the part that is not a stopwatch: after
-//    launch, seeded message values resolve from the renderer's storage cache,
-//    although no seeded thread was opened.
-//
-// The numbers are the deliverable and are printed as diagnostics. The assertion
-// about the mirror is expected to *fail* once S10b lands — at that point this
-// file should be updated to assert the opposite, and the timings become the
-// acceptance gate.
+// The timings remain the deliverable and are printed as diagnostics: a control profile
+// with no messages and a seeded one, each launched RUNS times. This file cannot assert a
+// duration without becoming a flaky stopwatch; the mechanism is the assertion and the
+// numbers are what a release decision reads.
 //
 //   npm run test-void -- --only=startup-cost
 //   VOID_STARTUP_MEASURE=1 VOID_STARTUP_THREADS=40 VOID_STARTUP_MESSAGES=2500 \
@@ -36,18 +30,14 @@
 // carrying a tool result is that order, and total bytes — not key count — is
 // what crosses IPC.
 //
-// Reference result (this repository, dev build, 2026-11-19, medians of three):
+// Reference result before S10b (this repository, dev build, 2026-11-19, medians of three):
 //
 //   10,000 messages,  39.6 MB   5.8 s control -> 6.3 s load   (+0.4 s, inside noise)
 //  100,000 messages, 395.3 MB   5.9 s control -> 8.7 s load   (+2.9 s, 29 ms/1000)
-//
-// This asserts the *bug*, so it deliberately does not follow VOID_EXPECT: when
-// S10b lands the assertion is expected to fail, and that failure is the signal to
-// invert it and turn the timings into the acceptance gate.
 
 import { describe, test, before } from 'node:test'
 import assert from 'node:assert/strict'
-import { statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import * as h from './harness.mjs'
 
@@ -109,7 +99,7 @@ function sampleMirror(page, { threads, perThread, samplePerThread = 10 }) {
 
 describe('launch cost', () => {
 
-	test('a launch pays for every stored message, opened or not', async (t) => {
+	test('a launch no longer pays for stored messages, opened or not', async (t) => {
 		// ── the fixture shape, taken from a real thread rather than invented ──
 		// `_populateTestThread` fills memory without queueing message keys, so the
 		// template is driven through a real (stubbed) turn: that is what persists
@@ -126,15 +116,21 @@ describe('launch cost', () => {
 		await h.waitForRunEnd(template.scenario.page)
 		await template.scenario.close()
 
-		const messageKeys = template.scenario.listKeys('void.chatMsg.%')
-		assert.ok(messageKeys.length > 0, 'the template turn persisted no message keys, so the shape is unknown')
+		// The message shape now comes from the thread's log: the template turn is a new
+		// thread, and new threads store their messages there from birth.
+		const templateLog = join(templateDirs.userDataDir, 'User', 'globalStorage', 'void', 'threads', ids.threadId, 'messages.jsonl')
+		assert.ok(existsSync(templateLog), 'the template turn persisted no log, so the message shape is unknown')
+		const templateRecords = readFileSync(templateLog, 'utf8').trimEnd().split('\n').map(line => JSON.parse(line))
+		const assistantRecord = templateRecords.find(record => record.m.role === 'assistant')
+		assert.ok(assistantRecord, 'the template log has no assistant message, so the message shape is unknown')
+		assert.equal(template.scenario.listKeys('void.chatMsg.%').length, 0,
+			'a new thread wrote message keys, so it is not using the log')
+
 		const metaRaw = template.scenario.readKey(THREAD_KEY_PREFIX + ids.threadId)
-		const msgRaw = template.scenario.readKey(messageKeys[messageKeys.length - 1])
 		assert.ok(metaRaw, 'the fixture thread did not persist its metadata, so the shape is unknown')
-		assert.ok(msgRaw, 'the fixture thread did not persist a message, so the shape is unknown')
 		const meta = JSON.parse(metaRaw)
-		const message = JSON.parse(msgRaw)
-		t.diagnostic(`fixture: metadata ${metaRaw.length} chars, message ${msgRaw.length} chars, ${messageKeys.length} message key(s)`)
+		const message = assistantRecord.m
+		t.diagnostic(`fixture: metadata ${metaRaw.length} chars, message ${JSON.stringify(message).length} chars, ${templateRecords.length} record(s)`)
 
 		// ── control: same app, a profile with the store but no messages ──────
 		const controlDirs = h.createProfile('startup-cost/control')
@@ -162,6 +158,9 @@ describe('launch cost', () => {
 			threadIds.push(id)
 			const seededMeta = JSON.parse(metaJson)
 			seededMeta.id = id
+			// Seeded as key-backed threads on purpose: the fixture is the conversion, and a
+			// thread that already claims a log would skip the pass this test is measuring.
+			delete seededMeta.storeFormatVersion
 			entries.push([THREAD_KEY_PREFIX + id, JSON.stringify(seededMeta)])
 			for (let i = 0; i < MESSAGES; i++) {
 				entries.push([MESSAGE_KEY_PREFIX + id + '.' + i, JSON.stringify({
@@ -203,14 +202,23 @@ describe('launch cost', () => {
 		assert.equal(last(loadRuns).mirrored.total, THREADS * 10, 'the load profile was sampled for the wrong number of keys')
 		assert.ok(last(loadRuns).mirrored.metadata, 'the seeded thread metadata did not reach the renderer, so the load was not read')
 
-		// The subject, and the mechanism rather than a duration: seeded message
-		// values are resident in the renderer after launch, although no seeded
-		// thread was opened. This is what makes launch cost scale with stored
-		// conversation instead of with thread count.
+		// The subject, and the mechanism rather than a duration: none of the seeded
+		// message values is resident in the renderer after launch. Their threads exist and
+		// were never opened, so before S10b every one of them would have been present.
 		assert.equal(
 			last(loadRuns).mirrored.present,
-			last(loadRuns).mirrored.total,
-			'seeded message values are not resident after launch. If S10b landed, message bodies no longer live in void.chatMsg.* keys — update this assertion and turn the timings above into the acceptance gate',
+			0,
+			'seeded message values are resident after launch, so the bodies are still crossing IPC',
 		)
+
+		// Control: the threads themselves did reach the renderer, so a zero above is not
+		// "the renderer got nothing".
+		assert.ok(last(loadRuns).mirrored.metadata, 'the seeded thread metadata did not reach the renderer')
+
+		// Control: the reason the values are absent is the conversion, not an empty profile.
+		const convertedLog = join(loadDirs.userDataDir, 'User', 'globalStorage', 'void', 'threads', 'seed-0', 'messages.jsonl')
+		assert.ok(existsSync(convertedLog), 'the seeded thread was not converted to a log at launch')
+		assert.ok(readFileSync(convertedLog, 'utf8').trimEnd().split('\n').length >= MESSAGES,
+			'the converted log holds fewer records than were seeded')
 	})
 })

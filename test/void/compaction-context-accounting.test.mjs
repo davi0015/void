@@ -75,9 +75,16 @@ describe('compaction context accounting', () => {
 
 	test('a remapped boundary reaches memory, not just storage', async (t) => {
 		await h.withScenario('compaction-context/remap', async (s) => {
-			const result = await s.page.evaluate((legacySummary) => {
+			const result = await s.page.evaluate(async (legacySummary) => {
 				const svc = globalThis.__voidChatThreadService
 				const id = svc.state.currentThreadId
+
+				// A thread written before the log format: no `storeFormatVersion`, messages in
+				// keys. This is what the read path branches on, so it is the only way to
+				// exercise the legacy load from inside a running session.
+				const asLegacy = { ...svc.state.allThreads[id] }
+				delete asLegacy.storeFormatVersion
+				svc._setState({ allThreads: { ...svc.state.allThreads, [id]: asLegacy } })
 
 				// A legacy thread: real messages 0-5, then two checkpoint records
 				// at 6 and 7, with metadata claiming the boundary sits at 8.
@@ -97,7 +104,7 @@ describe('compaction context accounting', () => {
 
 				// Force the load path to run again, as reopening the thread would.
 				svc._loadedMessageThreadIds.delete(id)
-				svc._ensureMessagesLoaded(id)
+				await svc._ensureMessagesLoaded(id)
 
 				return {
 					id,

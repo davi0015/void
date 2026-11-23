@@ -30,9 +30,13 @@ export const searchHistoryToolCore: ToolDefinitionCore<'search_history'> = {
 		// The thread this call is executing for, not the one on screen. They are
 		// the same thread while a single run is in flight and different the moment
 		// the user reads another thread during one — searching the visible thread
-		// would answer from someone else's conversation. `getThreadWithMessages`
-		// rather than a plain lookup: the visible thread is the only one this
-		// session is guaranteed to have loaded.
+		// would answer from someone else's conversation.
+		//
+		// Waited for, not just fetched: a thread stored as a log file is read from disk
+		// when it is opened, so `getThreadWithMessages` can return a thread whose messages
+		// are still arriving — and searching that would report "no matches" for a message
+		// that exists, which is the worst answer this tool can give.
+		await chatThreadService.ensureMessagesLoaded(threadId)
 		const thread = chatThreadService.getThreadWithMessages(threadId)
 		if (!thread) {
 			return { result: { matches: 'The thread this tool ran for no longer exists.', totalMatches: 0 } }

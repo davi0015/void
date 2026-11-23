@@ -14,6 +14,22 @@ import { IStorageMainService } from './storageMainService.js';
 import { IUserDataProfile } from '../../userDataProfile/common/userDataProfile.js';
 import { reviveIdentifier, IAnyWorkspaceIdentifier } from '../../workspace/common/workspace.js';
 
+/**
+ * Void: a chance to prepare a storage's items before the renderer receives its mirror.
+ *
+ * `prepare` runs once per storage, before the first `getItems` reply is built. It may
+ * update `items` — `write` persists the change through the storage service, so it behaves
+ * like any other write — and returns key prefixes to leave out of the mirror. A prefix is
+ * only omitted from the copy sent to the renderer; the values stay in the database.
+ *
+ * This exists because the mirror is rebuilt from the database on every launch, so data a
+ * launch does not need should not be part of it. See `threadLogMigration.ts` in the Void
+ * workbench for the one policy that currently uses it.
+ */
+export interface IStorageMirrorPolicy {
+	prepare(items: Map<string, string>, write: (key: string, value: string) => void, remove: (key: string) => void, storagePath: string | undefined): Promise<readonly string[]>;
+}
+
 export class StorageDatabaseChannel extends Disposable implements IServerChannel {
 
 	private static readonly STORAGE_CHANGE_DEBOUNCE_TIME = 100;
@@ -24,7 +40,8 @@ export class StorageDatabaseChannel extends Disposable implements IServerChannel
 
 	constructor(
 		private readonly logService: ILogService,
-		private readonly storageMainService: IStorageMainService
+		private readonly storageMainService: IStorageMainService,
+		private readonly mirrorPolicy?: IStorageMirrorPolicy
 	) {
 		super();
 
@@ -108,7 +125,14 @@ export class StorageDatabaseChannel extends Disposable implements IServerChannel
 		// handle call
 		switch (command) {
 			case 'getItems': {
-				return Array.from(storage.items.entries());
+				// Void: let a policy prepare the mirror before it is copied to the renderer.
+				const hidden = this.mirrorPolicy
+					? await this.mirrorPolicy.prepare(storage.items, (key, value) => storage.set(key, value), key => storage.delete(key), storage.path)
+					: []
+				const items = Array.from(storage.items.entries())
+				return hidden.length === 0
+					? items
+					: items.filter(([key]) => !hidden.some(prefix => key.startsWith(prefix)))
 			}
 
 			case 'updateItems': {
