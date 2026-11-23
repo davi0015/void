@@ -405,7 +405,7 @@ class IntegrationService extends Disposable implements IIntegrationService {
 			if (s?.error) {
 				if (this._lastErrorMessageOfThreadId.get(threadId) !== s.error.message) {
 					this._lastErrorMessageOfThreadId.set(threadId, s.error.message)
-					this._postOutbound({ type: 'error', conversationKey, message: s.error.message })
+					this._postOutbound({ type: 'error', conversationKey, message: s.error.message, title: this._threadTitleOf(threadId) })
 				}
 			}
 			else {
@@ -441,6 +441,7 @@ class IntegrationService extends Disposable implements IIntegrationService {
 				mcpServerName: m.mcpServerName,
 				phase,
 				summary: this._summarizeToolMessage(m),
+				title: this._threadTitleOf(threadId),
 			})
 		}
 	}
@@ -470,6 +471,7 @@ class IntegrationService extends Disposable implements IIntegrationService {
 				toolName: m.name,
 				mcpServerName: m.mcpServerName,
 				paramsSummary: this._summarizeToolMessage(m),
+				title: this._threadTitleOf(threadId),
 			})
 		}
 	}
@@ -512,7 +514,23 @@ class IntegrationService extends Disposable implements IIntegrationService {
 			conversationKey,
 			text,
 			usage,
+			title: this._threadTitleOf(threadId),
 		})
+	}
+
+	// The thread's current human-readable label, sent with every posted
+	// outbound message so external surfaces can identify the task out of
+	// context (mobile notifications show reply text without thread
+	// context). Mirrors the anchor-label derivation in mirrorCurrentChat.
+	private _threadTitleOf(threadId: string): string | undefined {
+		const thread = this._chatThreadService.state.allThreads[threadId]
+		const custom = thread?.customTitle?.trim()
+		if (custom) return custom
+		const withMessages = this._chatThreadService.getThreadWithMessages(threadId)
+		const firstUser = withMessages?.messages.find(m => m.role === 'user')
+		if (firstUser && firstUser.role === 'user' && firstUser.displayContent.trim() !== '')
+			return firstUser.displayContent.slice(0, 80)
+		return undefined
 	}
 
 	private _postOutbound(payload: IntegrationOutbound): void {
