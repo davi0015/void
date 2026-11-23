@@ -16,6 +16,8 @@ import { deleteFileOrFolderToolCore } from './deleteFileOrFolder.tool.js'
 import { renameFileOrFolderToolCore } from './renameFileOrFolder.tool.js'
 import { editFileToolCore } from './editFile.tool.js'
 import { rewriteFileToolCore } from './rewriteFile.tool.js'
+import { writeScratchToolCore } from './writeScratch.tool.js'
+import { deleteScratchToolCore } from './deleteScratch.tool.js'
 import { runCommandToolCore } from './runCommand.tool.js'
 import { runPersistentCommandToolCore } from './runPersistentCommand.tool.js'
 import { openPersistentTerminalToolCore } from './openPersistentTerminal.tool.js'
@@ -42,6 +44,8 @@ export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDef
 	rename_file_or_folder: renameFileOrFolderToolCore,
 	edit_file: editFileToolCore,
 	rewrite_file: rewriteFileToolCore,
+	write_scratch: writeScratchToolCore,
+	delete_scratch: deleteScratchToolCore,
 	run_command: runCommandToolCore,
 	run_persistent_command: runPersistentCommandToolCore,
 	open_persistent_terminal: openPersistentTerminalToolCore,

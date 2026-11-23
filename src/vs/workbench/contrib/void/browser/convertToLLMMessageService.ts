@@ -11,6 +11,7 @@ import { ChatMessage, CompactionInfo } from '../common/chatThreadServiceTypes.js
 import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities } from '../common/modelCapabilities.js';
 import { snapToLegalBoundary } from '../common/compactionBoundary.js';
 import { reParsedToolXMLString, chat_systemMessage, chat_volatileContext } from '../common/prompt/prompts.js';
+import { scratchRootUri } from '../common/scratchPad.js';
 import { availableTools } from './tools/toolRegistry.js';
 import { AnthropicLLMChatMessage, AnthropicReasoning, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, OpenAILLMChatMessage, RawToolParamsObj, ResponsesReasoningRef } from '../common/sendLLMMessageTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
@@ -911,7 +912,7 @@ export interface IConvertToLLMMessageService {
 	// Turn 1 includes the full directory listing; subsequent turns include only a
 	// compact diff of added/removed files (compared against prevDirectorySnapshot).
 	// Returns the volatile string and the updated snapshot for the caller to persist.
-	generateChatVolatileContext: (opts: { chatMode: ChatMode, includeDirectoryListing?: boolean, prevDirectorySnapshot?: string[] }) => Promise<{ volatile: string, directorySnapshot: string[] | undefined }>
+	generateChatVolatileContext: (opts: { chatMode: ChatMode, includeDirectoryListing?: boolean, prevDirectorySnapshot?: string[], threadId?: string }) => Promise<{ volatile: string, directorySnapshot: string[] | undefined }>
 
 	// Called by `chatThreadService` after each LLM response resolves with a
 	// reported `inputTokens`. Updates the per-model chars/token ratio via EMA
@@ -1335,7 +1336,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		return this.terminalProfileService.getDefaultProfileName() ?? this.terminalProfileService.availableProfiles[0]?.profileName
 	}
 
-	generateChatVolatileContext: IConvertToLLMMessageService['generateChatVolatileContext'] = async ({ chatMode, includeDirectoryListing = true, prevDirectorySnapshot }) => {
+	generateChatVolatileContext: IConvertToLLMMessageService['generateChatVolatileContext'] = async ({ chatMode, includeDirectoryListing = true, prevDirectorySnapshot, threadId }) => {
 		const workspaceFolders = this.workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath)
 		const openedURIs = this.modelService.getModels().filter(m => m.isAttachedToEditor()).map(m => m.uri.fsPath) || [];
 		const activeURI = this.editorService.activeEditor?.resource?.fsPath;
@@ -1358,7 +1359,13 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			directorySnapshot = currPaths
 		}
 
-		const volatile = chat_volatileContext({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode, includeDirectoryListing, directoryDiff, defaultShell: await this._defaultShellName() })
+		// Grounds the model in the path it should write scratch files to. The
+		// tools compute the same path from the first workspace folder and the
+		// thread, so the prompt cannot drift from where `write_scratch` lands.
+		const firstFolder = this.workspaceContextService.getWorkspace().folders[0]?.uri
+		const scratchPath = threadId && firstFolder ? scratchRootUri(firstFolder, threadId).fsPath : undefined
+
+		const volatile = chat_volatileContext({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode, includeDirectoryListing, directoryDiff, defaultShell: await this._defaultShellName(), scratchPath })
 		return { volatile, directorySnapshot }
 	}
 
