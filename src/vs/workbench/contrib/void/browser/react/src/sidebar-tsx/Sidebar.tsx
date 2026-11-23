@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { useIsDark } from '../util/services.js';
+import { useChatThreadsState, useIsDark } from '../util/services.js';
 // import { SidebarThreadSelector } from './SidebarThreadSelector.js';
 // import { SidebarChat } from './SidebarChat.js';
 
@@ -14,6 +14,9 @@ import ErrorBoundary from './ErrorBoundary.js';
 export const Sidebar = ({ className }: { className: string }) => {
 
 	const isDark = useIsDark()
+	// The boundary watches this: a render that threw while the current thread was
+	// still arriving must be retried when it arrives, not left on screen.
+	const { currentThreadId } = useChatThreadsState()
 	return <div
 		className={`@@void-scope ${isDark ? 'dark' : ''}`}
 		style={{ width: '100%', height: '100%' }}
@@ -28,7 +31,7 @@ export const Sidebar = ({ className }: { className: string }) => {
 		>
 
 			<div className={`w-full h-full`}>
-				<ErrorBoundary>
+				<ErrorBoundary resetKey={currentThreadId}>
 					<SidebarChat />
 				</ErrorBoundary>
 

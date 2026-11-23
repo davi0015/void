@@ -124,6 +124,13 @@ Plain scripts (`test/void/*.mjs`), docs and `.tmp/` are not compiled at all.
   what the branch's `src/` actually holds, or delete the stale files from `out/` before measuring.
 - A full recompile leaves `out/` incomplete for about 75 seconds. `npm run test-void` refuses to run
   with a clear message, which is not a test failure.
+- **`npm run buildreact` alone does not change what the workbench loads.** It writes
+  `src/vs/workbench/contrib/void/browser/react/out/`, but the compiled workbench imports that path as
+  `out/vs/workbench/contrib/void/browser/react/out/`, which exists because a `.ts` file imports the
+  bundle and `allowJs` makes tsc emit a copy during a compile. After a React change, copy the built
+  bundles into `out/` or run a compile before an end-to-end test — otherwise the run exercises the
+  previous bundle, and both the red and the green result are about code you did not touch. Found the
+  expensive way: a boundary fix passed its red phase and failed its green phase for a stale copy.
 - `out/` is gitignored. Build (`npm run compile`) before any end-to-end test.
 
 ## End-to-end harness (`test/void/harness.mjs`)
