@@ -162,6 +162,16 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	private readonly _lastDeltaTextOfConversationKey = new Map<string, string>()
 	private readonly _lastDeltaTimeOfConversationKey = new Map<string, number>()
 	private readonly _lastErrorMessageOfThreadId = new Map<string, string>()
+	// finals held while a conversation is being minted for an unbound
+	// thread (auto-mirror) — flushed on conversationBound
+	private readonly _pendingFinalOfThreadId = new Map<string, { text: string, usage: LLMUsage | undefined }>()
+	// messages-array index captured when a binding was established — tool
+	// and approval scans start there. A thread WITH history (adoption,
+	// auto-mirror, remembered-binding adoption after restart) must not replay
+	// every old tool status as if it just happened: first sight of such a
+	// thread would otherwise flood the external surface with its entire
+	// history of tool errors, and re-flood on every app restart.
+	private readonly _scanStartIdxOfThreadId = new Map<string, number>()
 
 	// per-tool redaction summarizers, built in the constructor where the
 	// relative-uri helper is in scope
@@ -286,12 +296,27 @@ class IntegrationService extends Disposable implements IIntegrationService {
 				return
 			}
 			case 'conversationBound': {
-				// the proxy created a new external conversation for an existing
-				// thread (in response to createConversation) — fill the session
-				// mirror so the thread's events start flowing to it
+				// the proxy created (or re-confirmed) an external conversation for
+				// an existing thread — fill the session mirror, then deliver any
+				// final that was held while the conversation was being minted
 				this._threadIdOfConversationKey.set(p.conversationKey, p.threadId)
 				this._conversationKeyOfThreadId.set(p.threadId, p.conversationKey)
+				// floor the scans at current history — pre-binding tool messages
+				// are history, not news (the pending final below still covers the
+				// turn that triggered the mirroring)
+				this._setScanFloor(p.threadId)
 				console.log(`[integration] mirrored thread ${p.threadId} to conversation ${p.conversationKey}`)
+				const pending = this._pendingFinalOfThreadId.get(p.threadId)
+				if (pending) {
+					this._pendingFinalOfThreadId.delete(p.threadId)
+					this._postOutbound({
+						type: 'final',
+						conversationKey: p.conversationKey,
+						text: pending.text,
+						usage: pending.usage,
+						title: this._threadTitleOf(p.threadId),
+					})
+				}
 				this._notificationService.info('Chat mirrored — replies in the external thread now reach this chat')
 				return
 			}
@@ -346,7 +371,16 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	private _bind(conversationKey: string, threadId: string) {
 		this._threadIdOfConversationKey.set(conversationKey, threadId)
 		this._conversationKeyOfThreadId.set(threadId, conversationKey)
+		// floor the scans at the thread's current history — called BEFORE the
+		// inbound user message that triggered binding is appended, so the
+		// turn it starts is still scanned
+		this._setScanFloor(threadId)
 		this._postOutbound({ type: 'bound', conversationKey, threadId })
+	}
+
+	private _setScanFloor(threadId: string): void {
+		const withMessages = this._chatThreadService.getThreadWithMessages(threadId)
+		this._scanStartIdxOfThreadId.set(threadId, withMessages?.messages.length ?? 0)
 	}
 
 	async mirrorCurrentChat(): Promise<void> {
@@ -380,28 +414,40 @@ class IntegrationService extends Disposable implements IIntegrationService {
 
 	private _onStreamState(threadId: string): void {
 		const conversationKey = this._conversationKeyOfThreadId.get(threadId)
-		if (conversationKey === undefined) return // not a remote conversation
 
 		const s = this._chatThreadService.streamState[threadId]
 		const isRunning = s?.isRunning
 
-		// tool transitions from the thread's messages — skipped mid-stream
-		// ticks already see these, the phase map dedupes
-		this._scanToolMessages(threadId, conversationKey)
+		// mid-turn events only flow for already-bound conversations;
+		// unbound threads are still tracked below so their turn END can
+		// mint a conversation (editor-started threads)
+		if (conversationKey !== undefined) {
+			// tool transitions from the thread's messages — skipped mid-stream
+			// ticks already see these, the phase map dedupes
+			this._scanToolMessages(threadId, conversationKey)
 
-		// assistant text so far — coalesced
-		if (isRunning === 'LLM' && s?.llmInfo)
-			this._maybeStreamDelta(conversationKey, s.llmInfo.displayContentSoFar)
+			// assistant text so far — coalesced
+			if (isRunning === 'LLM' && s?.llmInfo)
+				this._maybeStreamDelta(conversationKey, s.llmInfo.displayContentSoFar)
 
-		// a tool is waiting on the user — surface it as an approvalRequest
-		if (isRunning === 'awaiting_user')
-			this._scanApprovalRequests(threadId, conversationKey)
+			// a tool is waiting on the user — surface it as an approvalRequest
+			if (isRunning === 'awaiting_user')
+				this._scanApprovalRequests(threadId, conversationKey)
+		}
 
 		// turn end: was running, now not — the only transition that fires once
 		// per completed turn ('idle' between agent-loop requests stays truthy)
 		const prev = this._lastRunningPhaseOfThreadId.get(threadId)
 		if (prev !== undefined && isRunning === undefined) {
 			this._lastRunningPhaseOfThreadId.delete(threadId)
+			if (conversationKey === undefined) {
+				// an editor-started thread finished a turn with no external
+				// conversation — mint one now and deliver the final into it
+				// (error/aborted turns don't sprout conversations)
+				if (!s?.error)
+					this._beginAutoMirror(threadId)
+				return
+			}
 			if (s?.error) {
 				if (this._lastErrorMessageOfThreadId.get(threadId) !== s.error.message) {
 					this._lastErrorMessageOfThreadId.set(threadId, s.error.message)
@@ -421,7 +467,9 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		const thread = this._chatThreadService.getThreadWithMessages(threadId)
 		if (!thread) return
 
-		for (const m of thread.messages) {
+		const startIdx = this._scanStartIdxOfThreadId.get(threadId) ?? 0
+		for (let i = startIdx; i < thread.messages.length; i++) {
+			const m = thread.messages[i]
 			if (m.role !== 'tool') continue
 			// 'tool_request' is surfaced by _scanApprovalRequests instead
 			let phase: 'running' | 'success' | 'error' | null = null
@@ -450,7 +498,9 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		const thread = this._chatThreadService.getThreadWithMessages(threadId)
 		if (!thread) return
 
-		for (const m of thread.messages) {
+		const startIdx = this._scanStartIdxOfThreadId.get(threadId) ?? 0
+		for (let i = startIdx; i < thread.messages.length; i++) {
+			const m = thread.messages[i]
 			if (m.role !== 'tool' || m.type !== 'tool_request') continue
 			const key = `${threadId}:${m.id}`
 			if (this._approvalRequestedToolIds.has(key)) continue
@@ -485,9 +535,21 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		this._postOutbound({ type: 'streamDelta', conversationKey, textSoFar })
 	}
 
-	private _postFinal(threadId: string, conversationKey: string): void {
+	// an unbound thread completed a turn — ask the proxy to mint a
+	// conversation for it, and hold the final until conversationBound
+	// brings back the key. The proxy is idempotent on threadId (re-confirms
+	// a remembered binding), so an app restart can't mint a duplicate
+	// conversation — the pending final lands in the existing thread.
+	private _beginAutoMirror(threadId: string): void {
+		const final = this._finalOfThreadId(threadId)
+		if (final === undefined || final.text === '') return // nothing to say — don't mint a thread for it
+		this._pendingFinalOfThreadId.set(threadId, final)
+		this._postOutbound({ type: 'createConversation', threadId, title: this._threadTitleOf(threadId) })
+	}
+
+	private _finalOfThreadId(threadId: string): { text: string, usage: LLMUsage | undefined } | undefined {
 		const thread = this._chatThreadService.getThreadWithMessages(threadId)
-		if (!thread) return
+		if (!thread) return undefined
 
 		// The agent loop creates ONE assistant message per LLM request — so a
 		// multi-step turn has its narration split across several assistant
@@ -509,11 +571,17 @@ class IntegrationService extends Disposable implements IIntegrationService {
 			: ([...messages].reverse().find(m => m.role === 'assistant')?.displayContent ?? '')
 
 		const usage: LLMUsage | undefined = this._chatThreadService.latestUsageOfThreadId[threadId]
+		return { text, usage }
+	}
+
+	private _postFinal(threadId: string, conversationKey: string): void {
+		const final = this._finalOfThreadId(threadId)
+		if (final === undefined) return
 		this._postOutbound({
 			type: 'final',
 			conversationKey,
-			text,
-			usage,
+			text: final.text,
+			usage: final.usage,
 			title: this._threadTitleOf(threadId),
 		})
 	}
