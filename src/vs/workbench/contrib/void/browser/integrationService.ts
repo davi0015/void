@@ -165,6 +165,13 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	// finals held while a conversation is being minted for an unbound
 	// thread (auto-mirror) — flushed on conversationBound
 	private readonly _pendingFinalOfThreadId = new Map<string, { text: string, usage: LLMUsage | undefined }>()
+	// messages-array index captured when a binding was established — tool
+	// and approval scans start there. A thread WITH history (adoption,
+	// auto-mirror, remembered-binding adoption after restart) must not replay
+	// every old tool status as if it just happened: first sight of such a
+	// thread would otherwise flood the external surface with its entire
+	// history of tool errors, and re-flood on every app restart.
+	private readonly _scanStartIdxOfThreadId = new Map<string, number>()
 
 	// per-tool redaction summarizers, built in the constructor where the
 	// relative-uri helper is in scope
@@ -294,6 +301,10 @@ class IntegrationService extends Disposable implements IIntegrationService {
 				// final that was held while the conversation was being minted
 				this._threadIdOfConversationKey.set(p.conversationKey, p.threadId)
 				this._conversationKeyOfThreadId.set(p.threadId, p.conversationKey)
+				// floor the scans at current history — pre-binding tool messages
+				// are history, not news (the pending final below still covers the
+				// turn that triggered the mirroring)
+				this._setScanFloor(p.threadId)
 				console.log(`[integration] mirrored thread ${p.threadId} to conversation ${p.conversationKey}`)
 				const pending = this._pendingFinalOfThreadId.get(p.threadId)
 				if (pending) {
@@ -360,7 +371,16 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	private _bind(conversationKey: string, threadId: string) {
 		this._threadIdOfConversationKey.set(conversationKey, threadId)
 		this._conversationKeyOfThreadId.set(threadId, conversationKey)
+		// floor the scans at the thread's current history — called BEFORE the
+		// inbound user message that triggered binding is appended, so the
+		// turn it starts is still scanned
+		this._setScanFloor(threadId)
 		this._postOutbound({ type: 'bound', conversationKey, threadId })
+	}
+
+	private _setScanFloor(threadId: string): void {
+		const withMessages = this._chatThreadService.getThreadWithMessages(threadId)
+		this._scanStartIdxOfThreadId.set(threadId, withMessages?.messages.length ?? 0)
 	}
 
 	async mirrorCurrentChat(): Promise<void> {
@@ -447,7 +467,9 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		const thread = this._chatThreadService.getThreadWithMessages(threadId)
 		if (!thread) return
 
-		for (const m of thread.messages) {
+		const startIdx = this._scanStartIdxOfThreadId.get(threadId) ?? 0
+		for (let i = startIdx; i < thread.messages.length; i++) {
+			const m = thread.messages[i]
 			if (m.role !== 'tool') continue
 			// 'tool_request' is surfaced by _scanApprovalRequests instead
 			let phase: 'running' | 'success' | 'error' | null = null
@@ -476,7 +498,9 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		const thread = this._chatThreadService.getThreadWithMessages(threadId)
 		if (!thread) return
 
-		for (const m of thread.messages) {
+		const startIdx = this._scanStartIdxOfThreadId.get(threadId) ?? 0
+		for (let i = startIdx; i < thread.messages.length; i++) {
+			const m = thread.messages[i]
 			if (m.role !== 'tool' || m.type !== 'tool_request') continue
 			const key = `${threadId}:${m.id}`
 			if (this._approvalRequestedToolIds.has(key)) continue
