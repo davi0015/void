@@ -21,6 +21,7 @@ import { getShellIntegrationInjection, getWindowsBuildNumber, IShellIntegrationC
 import { WindowsShellHelper } from './windowsShellHelper.js';
 import { IPty, IPtyForkOptions, IWindowsPtyForkOptions, spawn } from 'node-pty';
 import { chunkInput } from '../common/terminalProcess.js';
+import { writeBufferFully } from './writeBuffer.js';
 
 const enum ShutdownConstants {
 	/**
@@ -65,6 +66,8 @@ const enum Constants {
 interface IWriteObject {
 	data: string;
 	isBinary: boolean;
+	/** Bytes not yet accepted by the PTY, when a previous write was partial. */
+	buffer?: Buffer;
 }
 
 const posixShellTypeMap = new Map<string, PosixShellType>([
@@ -541,7 +544,9 @@ export class TerminalProcess extends Disposable implements ITerminalChildProcess
 		// nothing reads, silently, while output keeps flowing. So Windows and Linux
 		// take node-pty's own write path.
 		if (process.platform !== 'darwin') {
-			this._ptyProcess!.write(object.data);
+			// `buffer` is only ever set by the darwin path below (a partial write
+			// being retried), so this is the original string in practice.
+			this._ptyProcess!.write(object.buffer ? object.buffer.toString(object.isBinary ? 'binary' : 'utf8') : object.data);
 			return;
 		}
 
@@ -566,43 +571,67 @@ export class TerminalProcess extends Disposable implements ITerminalChildProcess
 		}
 
 		const fd = (ptyProcess as any).fd;
-		const buffer = object.isBinary
-			? Buffer.from(object.data, 'binary')
-			: Buffer.from(object.data);
-		fs.write(fd, buffer, 0, buffer.length, null, (err) => {
+		const buffer = object.buffer ?? (
+			object.isBinary
+				? Buffer.from(object.data, 'binary')
+				: Buffer.from(object.data)
+		);
+
+		const done = () => {
 			this._isWriting = false;
 
 			// Resume node-pty's read socket after the write completes
 			if (socket && !socket.destroyed) {
 				socket.resume();
 			}
+		};
 
-			if (err) {
-				// EAGAIN means the write would block — re-queue and retry later.
-				// Other errors (EBADF etc.) mean the PTY is gone — drop silently.
-				if (err.code === 'EAGAIN' || err.code === 'EWOULDBLOCK') {
-					this._writeQueue.unshift(object);
-					if (this._writeTimeout === undefined) {
-						this._writeTimeout = setTimeout(() => {
-							this._writeTimeout = undefined;
-							this._startWrite();
-						}, Constants.WriteInterval);
+		// [VOID] A PTY write can be partial. The kernel input queue is small and
+		// fills while the shell is busy with the bytes already delivered, so
+		// fs.write reports a short count rather than an error. Ignoring it drops
+		// the rest of this chunk — which is how a command over about a kilobyte
+		// arrived with one span missing at the queue's limit and everything after
+		// it intact. Keep writing until the buffer is out, and on EAGAIN put only
+		// the unsent bytes back so a retry cannot duplicate the part that made it.
+		writeBufferFully(
+			(full, offset, length, cb) => fs.write(fd, full, offset, length, null, cb),
+			buffer,
+			(err, bytesWritten) => {
+				const unsent = buffer.subarray(bytesWritten);
+				done();
+
+				if (err) {
+					// EAGAIN means the write would block — re-queue the remainder and
+					// retry later. Other errors (EBADF etc.) mean the PTY is gone —
+					// drop silently.
+					if ((err.code === 'EAGAIN' || err.code === 'EWOULDBLOCK') && unsent.length > 0) {
+						this._writeQueue.unshift({
+							data: '',
+							isBinary: object.isBinary,
+							buffer: Buffer.from(unsent),
+						});
+						if (this._writeTimeout === undefined) {
+							this._writeTimeout = setTimeout(() => {
+								this._writeTimeout = undefined;
+								this._startWrite();
+							}, Constants.WriteInterval);
+						}
 					}
+					return;
 				}
-				return;
-			}
-			this._childProcessMonitor?.handleInput();
+				this._childProcessMonitor?.handleInput();
 
-			// [VOID] Start the next queued write now that this one is done.
-			// Without this, writes stall when _writeTimeout was cleared (queue
-			// was empty after _doWrite returned) but more data arrived before
-			// fs.write completed. The _isWriting flag in _startWrite prevents
-			// concurrent fs.write calls on the same fd, which caused N-API
-			// exceptions that broke exit detection and leaked PTY processes.
-			if (!this._store.isDisposed && this._writeQueue.length > 0 && this._writeTimeout === undefined) {
-				this._startWrite();
-			}
-		});
+				// Start the next queued write now that this one is done.
+				// Without this, writes stall when _writeTimeout was cleared (queue
+				// was empty after _doWrite returned) but more data arrived before
+				// fs.write completed. The _isWriting flag in _startWrite prevents
+				// concurrent fs.write calls on the same fd, which caused N-API
+				// exceptions that broke exit detection and leaked PTY processes.
+				if (!this._store.isDisposed && this._writeQueue.length > 0 && this._writeTimeout === undefined) {
+					this._startWrite();
+				}
+			},
+		);
 	}
 
 	resize(cols: number, rows: number): void {
