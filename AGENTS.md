@@ -130,12 +130,14 @@ Plain scripts (`test/void/*.mjs`), docs and `.tmp/` are not compiled at all.
 - A full recompile leaves `out/` incomplete for about 75 seconds. `npm run test-void` refuses to run
   with a clear message, which is not a test failure.
 - **`npm run buildreact` alone does not change what the workbench loads.** It writes
-  `src/vs/workbench/contrib/void/browser/react/out/`, but the compiled workbench imports that path as
-  `out/vs/workbench/contrib/void/browser/react/out/`, which exists because a `.ts` file imports the
-  bundle and `allowJs` makes tsc emit a copy during a compile. After a React change, copy the built
-  bundles into `out/` or run a compile before an end-to-end test — otherwise the run exercises the
-  previous bundle, and both the red and the green result are about code you did not touch. Found the
-  expensive way: a boundary fix passed its red phase and failed its green phase for a stale copy.
+  `src/vs/workbench/contrib/void/browser/react/out/`, but the app imports
+  `./react/out/sidebar-tsx/index.js` relative to the compiled file, so it loads the *copy* tsc emits
+  into `out/vs/workbench/contrib/void/browser/react/out/` — `allowJs` pulls the imported bundle into
+  the program. Rebuild the bundles and the app still runs the previous ones, silently, and the test
+  then asserts on UI that no longer exists. Copy `src/.../react/out/` over `out/.../react/out/` (or
+  recompile) after `buildreact`, and confirm with
+  `grep -c run_subagent out/.../react/out/sidebar-tsx/index.js`. Found the expensive way, twice: a
+  red phase that passed for a stale copy, and two end-to-end runs spent on a missing row.
 - `out/` is gitignored. Build (`npm run compile`) before any end-to-end test.
 
 ## End-to-end harness (`test/void/harness.mjs`)
@@ -199,13 +201,6 @@ Reuse it. Do not rebuild launch plumbing per test.
   check `git status` — if the React change is real, the only tracked file that moves is under
   `react/src/`. A comment-only React edit should leave `out/` byte-identical; that is a cheap way to
   prove the edit was inert.
-- **`npm run buildreact` alone does not put the UI into the running app.** The app imports
-  `./react/out/sidebar-tsx/index.js` relative to the compiled file, so it loads the *copy* under
-  `out/vs/workbench/contrib/void/browser/react/out/`, which `gulp compile` made when it last ran.
-  Rebuild the bundles and the app still runs the previous ones, silently — the test then asserts on UI
-  that no longer exists. Copy `src/.../react/out/` over `out/.../react/out/` (or recompile) after
-  `buildreact`, and confirm with `grep -c run_subagent out/.../react/out/sidebar-tsx/index.js`. This
-  cost two end-to-end runs before it was spotted.
 - **A new tool name needs a UI entry, and nothing will tell you.** `builtinToolNameToComponent` and
   `toolNameToDesc` (`ToolResultComponents.tsx`) are exhaustive over `BuiltinToolName`, but `.tsx` is
   outside `src/tsconfig.json`'s `include`, so neither `gulp compile` nor CI type-checks them.
