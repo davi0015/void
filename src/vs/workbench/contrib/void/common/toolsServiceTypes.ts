@@ -95,6 +95,10 @@ export const levelOfBuiltinToolName: { [T in BuiltinToolName]: ToolLevel } = {
 	// --- 2: writes files or runs commands, so the mode has to be allowed to act ---
 	'create_file_or_folder': 2, 'delete_file_or_folder': 2, 'rename_file_or_folder': 2,
 	'rewrite_file': 2, 'edit_file': 2,
+	// Scratch is a file write too. What the scratchpad skips is review, which is a
+	// property of the tool (it never reaches the edit service), not of approval or of
+	// this rung — so `gather` still cannot write, and that is the point of the rung.
+	'write_scratch': 2, 'delete_scratch': 2,
 	'run_command': 2, 'run_persistent_command': 2, 'open_persistent_terminal': 2, 'kill_persistent_terminal': 2,
 	// --- 3: starts or steers another agent ---
 	'run_subagent': 3, 'send_message': 3, 'list_children': 3,
