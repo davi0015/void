@@ -140,6 +140,15 @@ export type IntegrationOutbound =
 	// The turn failed (LLM error, abort, etc).
 	| { type: 'error'; conversationKey: string; message: string; title?: string }
 
+	// The local user sent this message in the EDITOR on a bound thread.
+	// Proxies mirror it into the conversation as the channel user and mark
+	// it as already-seen so it is never dispatched back — the external
+	// thread then shows both sides of the conversation. Messages that
+	// ORIGINATED from the external surface are never echoed (they are
+	// already there). Fire-and-forget: with no proxy connected the echo
+	// is simply dropped.
+	| { type: 'userMessageEcho'; conversationKey: string; text: string }
+
 
 // --- envelope + ack --------------------------------------------------------
 

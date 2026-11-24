@@ -165,6 +165,14 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	// finals held while a conversation is being minted for an unbound
 	// thread (auto-mirror) — flushed on conversationBound
 	private readonly _pendingFinalOfThreadId = new Map<string, { text: string, usage: LLMUsage | undefined }>()
+	// index of the last user message seen by the echo scan (floored at bind
+	// time) — only user messages appended after this are echoed to the
+	// external conversation, history never is
+	private readonly _lastEchoedUserIdxOfThreadId = new Map<string, number>()
+	// text of the most recent externally-originated user message per thread —
+	// matching messages are skipped by the echo scan (already in the external
+	// thread) and the record is consumed
+	private readonly _inboundUserTextOfThreadId = new Map<string, string>()
 	// messages-array index captured when a binding was established — tool
 	// and approval scans start there. A thread WITH history (adoption,
 	// auto-mirror, remembered-binding adoption after restart) must not replay
@@ -257,6 +265,10 @@ class IntegrationService extends Disposable implements IIntegrationService {
 			case 'userMessage': {
 				const threadId = this._resolveThread(p.conversationKey, p.threadId)
 				if (threadId === undefined) return // createThread failed — nothing more to do
+				// externally-originated: when this text appends as the turn's user
+				// message, the echo scan must skip it (it is already in the
+				// external thread)
+				this._inboundUserTextOfThreadId.set(threadId, p.text)
 				// apply the channel's permission grant BEFORE dispatching — the
 				// turn's own state snapshot happens after this, so the mode is
 				// already in effect when any tool approval gate runs
@@ -381,6 +393,13 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	private _setScanFloor(threadId: string): void {
 		const withMessages = this._chatThreadService.getThreadWithMessages(threadId)
 		this._scanStartIdxOfThreadId.set(threadId, withMessages?.messages.length ?? 0)
+		// echo floor: the index of the last user message at bind — earlier
+		// ones are history and are never echoed
+		const messages = withMessages?.messages ?? []
+		let lastUserIdx = -1
+		for (let i = messages.length - 1; i >= 0; i--)
+			if (messages[i].role === 'user') { lastUserIdx = i; break }
+		this._lastEchoedUserIdxOfThreadId.set(threadId, lastUserIdx)
 	}
 
 	async mirrorCurrentChat(): Promise<void> {
@@ -427,6 +446,9 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		// unbound threads are still tracked below so their turn END can
 		// mint a conversation (editor-started threads)
 		if (conversationKey !== undefined) {
+			// editor-originated user messages echo into the conversation
+			this._scanUserMessages(threadId, conversationKey)
+
 			// tool transitions from the thread's messages — skipped mid-stream
 			// ticks already see these, the phase map dedupes
 			this._scanToolMessages(threadId, conversationKey)
@@ -466,6 +488,31 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		else if (isRunning !== undefined) {
 			this._lastRunningPhaseOfThreadId.set(threadId, isRunning)
 		}
+	}
+
+	// mirror editor-originated user messages into the conversation, so the
+	// external thread shows both sides. Externally-originated messages are
+	// matched by text and skipped; queued follow-ups echo when their own
+	// turn starts (each append is followed by a stream tick)
+	private _scanUserMessages(threadId: string, conversationKey: string): void {
+		const thread = this._chatThreadService.getThreadWithMessages(threadId)
+		if (!thread) return
+		const messages = thread.messages
+		const fromIdx = (this._lastEchoedUserIdxOfThreadId.get(threadId) ?? -1) + 1
+		let lastSeen = fromIdx - 1
+		for (let i = fromIdx; i < messages.length; i++) {
+			const m = messages[i]
+			if (m.role !== 'user') continue
+			lastSeen = i
+			const inboundText = this._inboundUserTextOfThreadId.get(threadId)
+			if (inboundText !== undefined && m.displayContent === inboundText) {
+				this._inboundUserTextOfThreadId.delete(threadId)
+				continue
+			}
+			if (m.displayContent.trim() === '') continue
+			this._postOutbound({ type: 'userMessageEcho', conversationKey, text: m.displayContent.slice(0, 2000) })
+		}
+		this._lastEchoedUserIdxOfThreadId.set(threadId, lastSeen)
 	}
 
 	private _scanToolMessages(threadId: string, conversationKey: string): void {
