@@ -1,4 +1,4 @@
-import { BuiltinToolName, approvalTypeOfBuiltinToolName } from '../../common/toolsServiceTypes.js'
+import { BuiltinToolName, isToolAvailableInChatMode, levelOfChatMode } from '../../common/toolsServiceTypes.js'
 import { InternalToolInfo, builtinToolNames } from '../../common/prompt/prompts.js'
 import { ChatMode } from '../../common/voidSettingsTypes.js'
 import { ToolDefinitionCore } from './toolTypes.js'
@@ -27,6 +27,8 @@ import { fetchUrlToolCore } from './fetchUrl.tool.js'
 import { semanticSearchToolCore } from './semanticSearch.tool.js'
 import { searchHistoryToolCore } from './searchHistory.tool.js'
 import { loadSkillToolCore } from './loadSkill.tool.js'
+import { runSubagentToolCore } from './runSubagent.tool.js'
+import { listChildrenToolCore, sendMessageToolCore } from './childSteering.tool.js'
 
 
 export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDefinitionCore<T> }> = {
@@ -55,6 +57,9 @@ export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDef
 	semantic_search: semanticSearchToolCore,
 	search_history: searchHistoryToolCore,
 	load_skill: loadSkillToolCore,
+	run_subagent: runSubagentToolCore,
+	send_message: sendMessageToolCore,
+	list_children: listChildrenToolCore,
 }
 
 
@@ -65,13 +70,21 @@ export const isConvertedTool = (toolName: BuiltinToolName): boolean => {
 
 // Resolve the effective tool list for a given chat mode. Builtin tool info
 // (name, description, params) is sourced from the per-file registry — no more
-// duplicated descriptions in prompts.ts. MCP tools are only included in agent
-// mode.
+// duplicated descriptions in prompts.ts. MCP tools are included from `agent` up:
+// below it a mode is not allowed to act on the world, and an MCP tool is an
+// arbitrary one.
+//
+// Which names a mode may use is `isToolAvailableInChatMode` (in `common/`, because
+// it is a rule rather than a lookup and the node tier covers it). This function is
+// only the part that needs the registry: turning names into definitions.
 export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined): InternalToolInfo[] | undefined => {
-	const builtinNames: BuiltinToolName[] | undefined = chatMode === 'normal' ? undefined
-		: chatMode === 'gather' ? builtinToolNames.filter(toolName => !(toolName in approvalTypeOfBuiltinToolName))
-			: chatMode === 'agent' ? builtinToolNames
-				: undefined
+	const availableNames = chatMode === null
+		? undefined
+		: builtinToolNames.filter(toolName => isToolAvailableInChatMode(toolName, chatMode))
+	// "This mode has no tools" is `undefined` to the rest of the pipeline, and `normal`
+	// filters down to nothing — so normalise empty to absent rather than handing on an
+	// empty array that reads as a mode with a tool list.
+	const builtinNames: BuiltinToolName[] | undefined = availableNames && availableNames.length > 0 ? availableNames : undefined
 
 	const effectiveBuiltinTools = builtinNames?.map(name => {
 		const def = toolDefinitionOfToolName[name]!
@@ -82,7 +95,7 @@ export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalTool
 		}
 	}) ?? undefined
 
-	const effectiveMCPTools = chatMode === 'agent' ? mcpTools : undefined
+	const effectiveMCPTools = chatMode !== null && levelOfChatMode[chatMode] >= levelOfChatMode['agent'] ? mcpTools : undefined
 
 	const tools: InternalToolInfo[] | undefined = !(builtinNames || mcpTools) ? undefined
 		: [

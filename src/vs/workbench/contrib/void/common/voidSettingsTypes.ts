@@ -469,7 +469,12 @@ export const isFeatureNameDisabled = (featureName: FeatureName, settingsState: V
 
 
 
-export type ChatMode = 'agent' | 'gather' | 'normal'
+// In ladder order, lowest rung first. A mode decides which tools are offered, not
+// what runs unattended — that is `ThreadPermissionMode`, which is per thread.
+// `orchestrator` is the only rung whose tools include delegation, because a rung
+// that can spawn a child is a rung that can spend another agent. The ladder itself
+// (which tool sits where) is `levelOfBuiltinToolName` in toolsServiceTypes.
+export type ChatMode = 'normal' | 'gather' | 'agent' | 'orchestrator'
 
 
 // Notification chime timbres. The names map to players in the sound script

@@ -22,7 +22,7 @@ import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { mergeRecordWrites } from '../common/storageMerge.js';
-import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, effectiveAutoApproveMode, normalizeThreadPermissionMode, ThreadPermissionMode, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
+import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, chatModeOfChildThread, effectiveAutoApproveMode, normalizeThreadPermissionMode, ThreadPermissionMode, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { IToolsService } from './toolsService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
@@ -45,6 +45,8 @@ import { basename as resourceBasename, joinPath } from '../../../../base/common/
 import { IUserDataProfileService } from '../../../services/userDataProfile/common/userDataProfile.js';
 import { isThreadImageUri, threadImageDir, threadImageUri } from '../common/threadImagePaths.js';
 import { deepCloneWithUris } from '../common/deepCloneWithUris.js';
+import { ChildThreadSeed, ChildThreadSummary, childThreadSeedOf, reportedSummaryOf, SubagentOutcome, SubagentStatus, isChildThread, withSubagentPreamble } from '../common/childThreadLinkage.js';
+import { IDelegationService, ContinueSubagentRequest, RunSubagentRequest, StartedSubagent } from '../common/delegationService.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
 import { IHostService } from '../../../services/host/browser/host.js';
@@ -289,6 +291,39 @@ export type ThreadType = {
 	// thread, so the two coexist and the read path is a branch rather than a migration.
 	storeFormatVersion?: number;
 
+	// ===== Delegation (M2) =====
+	// A child thread is an ordinary thread that another thread spawned. These six
+	// fields are its linkage; `common/childThreadLinkage.ts` owns the rules for
+	// computing them and for what the child inherits.
+	//
+	// `parentThreadId` is the *only* classification. There is no `kind` field,
+	// because "is this a child?" is exactly "does this name a parent?" — two
+	// encodings could disagree, and one disagreement is reachable (a child whose
+	// parent was deleted before the cascade). Absent on a top-level thread.
+	parentThreadId?: string;
+
+	// The `run_subagent` call in the parent that spawned this thread, so the
+	// parent's transcript can point at the child it created.
+	parentToolCallId?: string;
+
+	// The parent's name for this child, e.g. "tester". An ergonomic handle for
+	// `send_message` and for the child's card — not an identity; `id` remains the
+	// key. Unique among one parent's children, enforced where they are known.
+	alias?: string;
+
+	// 0 for a top-level thread, `parent.delegationDepth + 1` for a child. Absent on
+	// top-level threads — which is what 0 says — so threads that predate this field
+	// stay byte-identical on disk. Read it through `delegationDepthOf`, which
+	// normalizes absent to 0 and repairs a child that carries no depth.
+	delegationDepth?: number;
+
+	// Written when the child's run settles: the bounded summary the parent received
+	// back, and how the run ended. Absent while the child is running and on a child
+	// that never ran. The child's `messages` never cross back to the parent — that
+	// separation is the point of delegating.
+	resultSummary?: string;
+	resultStatus?: SubagentStatus;
+
 	// Ephemeral (not persisted) — computed during metadata-only reads by
 	// reading the first few message keys. Used by the UI as a label fallback
 	// when messages aren't loaded (lazy loading). Skipped in _splitThreadForStorage.
@@ -511,15 +546,40 @@ export type ThreadStreamState = {
 // Caller (always `chatThreadService`) is responsible for resolving workspace
 // identity from `IWorkspaceContextService` and passing it in. Kept as a free
 // function rather than promoted to a method so the construction shape stays
-// auditable in one place — the only legitimate creators are `openNewThread`
-// (and the Phase-E import flow once it lands). Both `workspaceUri` and
-// `workspaceLabel` are intentionally optional: empty-window / no-folder
-// startup leaves them undefined and the resulting thread becomes "unscoped"
-// (visible in every workspace's list until explicitly Moved). Importantly
-// we do NOT default to a string like "(no workspace)" — undefined is the
-// load-bearing signal that distinguishes "legacy / unscoped" from "tagged".
-const newThreadObject = (workspace?: { uri?: string, label?: string }) => {
+// auditable in one place — the only legitimate creators are `openNewThread`,
+// `run_subagent`'s spawn path, and the Phase-E import flow once it lands. Both
+// `workspaceUri` and `workspaceLabel` are intentionally optional: empty-window /
+// no-folder startup leaves them undefined and the resulting thread becomes
+// "unscoped" (visible in every workspace's list until explicitly Moved).
+// Importantly we do NOT default to a string like "(no workspace)" — undefined is
+// the load-bearing signal that distinguishes "legacy / unscoped" from "tagged".
+//
+// `child` is present only when a delegation is spawning this thread, and it is
+// the seed `childThreadSeedOf` computed — that function has already decided what
+// the child inherits and refused the cases it must not exist in. When it is
+// present, `workspace` is deliberately ignored: a child spawns from a background
+// run, where the ambient workspace is whatever window happens to be in front of
+// the user rather than the workspace the parent is working in.
+const newThreadObject = (workspace?: { uri?: string, label?: string }, child?: ChildThreadSeed) => {
 	const now = new Date().toISOString()
+	// Inherited fields are spread in only for a child, so a top-level thread keeps
+	// exactly the keys it had before delegation existed. `frozenAiInstructions` is
+	// added only when the parent has one: a parent that has never sent a message
+	// has not frozen its instructions yet, and the child freezes its own on its
+	// first send, the same way a new top-level thread does.
+	const linkage: Partial<ThreadType> = child ? {
+		parentThreadId: child.parentThreadId,
+		parentToolCallId: child.parentToolCallId,
+		alias: child.alias,
+		delegationDepth: child.delegationDepth,
+	} : {}
+	// The child's copy of the prompt ends with the subagent framing — who is reading
+	// this — either here, when the parent had already frozen its own, or at freeze time
+	// below when it had not. Either way it is appended exactly once.
+	if (child?.frozenAiInstructions !== undefined) {
+		linkage.frozenAiInstructions = withSubagentPreamble(child.frozenAiInstructions, child.alias)
+	}
+
 	return {
 		id: generateUuid(),
 		createdAt: now,
@@ -529,11 +589,16 @@ const newThreadObject = (workspace?: { uri?: string, label?: string }) => {
 		// `storeFormatVersion` and keep reading their `void.chatMsg.*` keys until the
 		// startup pass converts them.
 		storeFormatVersion: THREAD_STORE_FORMAT_LOG,
-		workspaceUri: workspace?.uri,
-		workspaceLabel: workspace?.label,
+		workspaceUri: child ? child.workspaceUri : workspace?.uri,
+		workspaceLabel: child ? child.workspaceLabel : workspace?.label,
 		// grants nothing on top of global config — out-of-the-box behavior is
-		// identical to threads created before this field existed.
-		permissionMode: 'read_only',
+		// identical to threads created before this field existed. A child copies its
+		// parent's grant verbatim instead, *including* `undefined`: the field
+		// normalizes to 'read_only' on read, so copying undefined copies the parent's
+		// answer exactly, while substituting 'read_only' would narrow the child of a
+		// thread the user had granted more.
+		permissionMode: child ? child.permissionMode : 'read_only',
+		...linkage,
 		state: {
 			stagingSelections: [],
 			focusedMessageIdx: undefined,
@@ -680,6 +745,25 @@ export interface IChatThreadService {
 	// entry pts
 	abortRunning(threadId: string): Promise<void>;
 	dismissStreamError(threadId: string): void;
+
+	/**
+	 * Create a child thread and run it, returning the handle immediately and the
+	 * outcome as a promise. Delegation's implementation lives here rather than in
+	 * the tool because a child is a thread: creating it, giving it its first
+	 * message and driving the loop are this service's work, and only the thin
+	 * `IDelegationService` adapter knows how to forward to it.
+	 */
+	startSubagent(request: RunSubagentRequest): StartedSubagent;
+	/**
+	 * Continue a child that already exists: append the message, run the same loop,
+	 * and resolve with how that turn ended.
+	 */
+	continueSubagent(request: ContinueSubagentRequest): StartedSubagent;
+	/** The children of a thread, read from their stored linkage. */
+	listChildThreads(parentThreadId: string): ChildThreadSummary[];
+
+	/** Stop a child's current turn. Reached from the parent's interrupt cascade. */
+	interruptSubagent(childThreadId: string): void;
 
 	// call to edit a message
 	editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId }: { userMessage: string, messageIdx: number, threadId: string }): Promise<void>;
@@ -3502,7 +3586,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			await timeout(0)
 
 			if (isBuiltInTool) {
-				const { result, interruptTool } = await this._toolsService.callTool[toolName](toolParams as any, threadId)
+				const { result, interruptTool } = await this._toolsService.callTool[toolName](toolParams as any, threadId, toolId)
 				const interruptor = () => { interrupted = true; interruptTool?.() }
 				resolveInterruptor(interruptor)
 
@@ -3564,6 +3648,357 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 
 
+	// ===== Delegation (M2) =====
+	//
+	// A child is an ordinary thread, so none of this is a second execution engine:
+	// it is thread creation, one user message, and the loop the parent already runs.
+	// What is genuinely new is the waiting. `_runChatAgent` resolves when a run
+	// *pauses* as well as when it ends — awaiting approval, or parked on a detached
+	// tool that resumes itself — so the parent cannot read one invocation's return
+	// value as the child's answer. `_awaitThreadSettled` is that distinction.
+	//
+	// The other half is isolation. The parent receives `SubagentOutcome` and nothing
+	// else: no transcript, no tool results, no reasoning. Every field of it is
+	// bounded, and the summary is cut to `SUBAGENT_SUMMARY_MAX_CHARS` rather than
+	// passed through, because an unbounded child result would turn delegation from a
+	// context saving into a context amplifier.
+
+
+	private static readonly _WRITE_TOOL_NAMES = new Set<string>([
+		'edit_file', 'rewrite_file', 'create_file_or_folder', 'delete_file_or_folder', 'rename_file_or_folder',
+	])
+
+	startSubagent(request: RunSubagentRequest): StartedSubagent {
+		// The parent must be loaded: a child copies its workspace, its grant and its
+		// frozen instructions, and a delegation is called from a run, which loads the
+		// thread it belongs to.
+		const parent = this.getThreadWithMessages(request.parentThreadId)
+		if (!parent) throw new Error('Cannot delegate: the thread this tool call belongs to is not loaded.')
+
+		// Refuses depth 2, an empty alias, an over-long alias — see
+		// `childThreadSeedOf`. Thrown, not returned, so it reaches the model as a normal
+		// tool error, which it can correct.
+		const creation = childThreadSeedOf(parent, { toolCallId: request.toolCallId, alias: request.alias })
+		if (!creation.ok) throw new Error(creation.refusal)
+
+		const { seed } = creation
+		const task = request.task.trim()
+		if (!task) throw new Error('task must be the instruction for the child to carry out. The child starts with an empty context, so it receives nothing else.')
+
+		// The parent addresses a child by alias, so two children with one name would be
+		// ambiguous the moment it can talk to them. Checked here rather than in
+		// `childThreadSeedOf`, which sees one thread rather than the set of children.
+		const aliasTaken = Object.values(this.state.allThreads)
+			.some(t => t !== undefined && t.parentThreadId === parent.id && t.alias === seed.alias)
+		if (aliasTaken) {
+			throw new Error(`alias "${seed.alias}" is already used by another child of this thread. Pick a different name.`)
+		}
+
+		const child = newThreadObject(undefined, seed)
+		// Indexed like any other thread. The index is what startup reads, so a child
+		// left out of it would be persisted and unreachable on the next launch, which
+		// is not "inspectable". Not pinned: `pinnedThreadIds` is the tab strip, and a
+		// fan-out must not become a strip of tabs.
+		this._loadedMessageThreadIds.add(child.id)
+		this._storeThread(child.id, child, true)
+		this._setState({ allThreads: { ...this.state.allThreads, [child.id]: child } })
+
+		return { childThreadId: child.id, result: this._runChildThread(child.id, task) }
+	}
+
+	interruptSubagent(childThreadId: string): void {
+		// Fire and forget: the caller is a tool interruptor, which must return at once.
+		// Clearing the child's stream state is what stops its loop, and that is what
+		// resolves the promise the parent's tool call is holding — so the two sides are
+		// already coupled and nothing new is needed here.
+		void this.abortRunning(childThreadId)
+	}
+
+	/**
+	 * Continue a child that already exists.
+	 *
+	 * The run half is identical to a spawn, which is the point: a follow-up is an
+	 * ordinary turn on a conversation that persists, reloads and renders like any
+	 * other. Nothing about the child is re-derived — the workspace, grant and frozen
+	 * instructions it inherited at creation still stand, and re-inheriting them from
+	 * the parent now would quietly move a running child onto a newer prompt.
+	 */
+	continueSubagent(request: ContinueSubagentRequest): StartedSubagent {
+		const parent = this.getThreadWithMessages(request.parentThreadId)
+		if (!parent) throw new Error('Cannot send a message: the thread this tool call belongs to is not loaded.')
+
+		const child = this._childOf(parent.id, request)
+		const message = request.message.trim()
+		if (!message) throw new Error('message must be the instruction for the child; it receives nothing else.')
+
+		return { childThreadId: child.id, result: this._runChildThread(child.id, message) }
+	}
+
+
+	/**
+	 * The children of a thread, derived from stored linkage.
+	 *
+	 * `task` is the child's first user message — the instruction — because a caller
+	 * recovering handles after a compaction needs to recognise *which* child it is
+	 * looking at, and an id is not something a model can recognise.
+	 */
+	listChildThreads(parentThreadId: string): ChildThreadSummary[] {
+		const children = this._childrenOf(parentThreadId)
+		return children.map(child => {
+			const firstUser = child.messages.find(m => m.role === 'user')
+			return {
+				childThreadId: child.id,
+				alias: child.alias ?? null,
+				running: this.streamState[child.id]?.isRunning !== undefined,
+				resultStatus: child.resultStatus,
+				task: firstUser?.role === 'user' ? (firstUser.displayContent ?? firstUser.content ?? '') : '',
+			}
+		})
+	}
+
+	/** Every child of a thread, in the order they were created. */
+	private _childrenOf(parentThreadId: string): ThreadType[] {
+		return Object.values(this.state.allThreads)
+			.filter((t): t is ThreadType => t !== undefined && t.parentThreadId === parentThreadId)
+			.sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+	}
+
+	/**
+	 * Resolve the child a `send_message` is addressed to.
+	 *
+	 * Scoped to this parent's children, which is what makes "you cannot message
+	 * another thread's child" a property of the lookup rather than a check somebody
+	 * has to remember. Resolution is by id or by alias; both failing produces the one
+	 * message the model needs, which names the children it *does* have.
+	 */
+	private _childOf(parentThreadId: string, request: { childThreadId?: string, alias?: string }): ThreadType {
+		const children = this._childrenOf(parentThreadId)
+		const available = children.length === 0
+			? 'This thread has no subagents yet. Use `run_subagent` to start one.'
+			: `Its subagents are: ${children.map(c => c.alias ?? c.id).join(', ')}.`
+
+		if (request.childThreadId) {
+			const byId = children.find(c => c.id === request.childThreadId)
+			if (!byId) throw new Error(`No subagent of this thread has the id ${request.childThreadId}. ${available}`)
+			return byId
+		}
+		if (request.alias) {
+			const byAlias = children.filter(c => c.alias === request.alias)
+			if (byAlias.length === 0) throw new Error(`No subagent of this thread is named "${request.alias}". ${available}`)
+			// Aliases are unique among one parent's children by construction (checked at
+			// spawn), so more than one here means two threads disagree about their parent
+			// rather than an ambiguous name. Refusing beats picking one.
+			if (byAlias.length > 1) throw new Error(`Several subagents are named "${request.alias}", which should not be possible. Address it by childThreadId instead.`)
+			return byAlias[0]
+		}
+		throw new Error(`send_message needs either childThreadId or alias. ${available}`)
+	}
+
+	private async _runChildThread(childThreadId: string, task: string): Promise<SubagentOutcome> {
+		let run: Promise<void> | undefined
+		try {
+			// The same send path a user message takes, so the child gets the directory
+			// listing, a frozen system prompt and usage accounting without a second
+			// implementation of any of it. `onRun` hands the run promise back instead of
+			// letting the send path fire a completion notification for a thread the user
+			// never opened.
+			await this._addUserMessageAndStreamResponse({
+				userMessage: task,
+				threadId: childThreadId,
+				onRun: r => { run = r },
+			})
+		} catch (error) {
+			return this._finishChild(childThreadId, 'error', getErrorMessage(error))
+		}
+		if (!run) return this._finishChild(childThreadId, 'error', 'The child thread could not be started.')
+
+		try {
+			await run
+		} catch (error) {
+			return this._finishChild(childThreadId, 'error', getErrorMessage(error))
+		}
+
+		const settled = await this._awaitThreadSettled(childThreadId)
+		if (settled.status === 'blocked') {
+			const toolName = this._pendingApprovalToolNameOf(childThreadId)
+			const what = toolName ? `\`${toolName}\`` : 'a tool'
+			return this._finishChild(childThreadId, 'blocked', `The child stopped and is waiting for permission to run ${what}. Nothing in this run could answer that, so this call has returned without its result. Open the subagent's transcript from this row and approve it there — the child continues on its own thread, but the outcome will not come back here.`)
+		}
+		if (settled.status === 'error') return this._finishChild(childThreadId, 'error', settled.message)
+		if (settled.status === 'rejected') return this._finishChild(childThreadId, 'rejected', 'The child was stopped before it finished, so it produced no usable report.')
+		return this._finishChild(childThreadId, 'done', this._summaryOfChild(childThreadId))
+	}
+
+	/**
+	 * Wait until a child's run reaches a state the parent can report on.
+	 *
+	 * The first `await run` above is not enough, because `_runChatAgent` returns on
+	 * a *pause* as well as on an end. `awaiting_user` is terminal for this purpose —
+	 * nothing can answer it, so the delegation fails closed instead of hanging.
+	 * `waiting_tools` is not: a detached terminal is still running and the loop
+	 * resumes itself from an event, so the parent keeps waiting. Waiting is
+	 * subscribing to the stream-state event and re-reading, never polling.
+	 */
+	private async _awaitThreadSettled(threadId: string): Promise<{ status: 'done' | 'blocked' | 'rejected' } | { status: 'error', message: string }> {
+		for (;;) {
+			const state = this.streamState[threadId]
+			// No state object at all means the stream was cleared — an abort.
+			if (state === undefined) return { status: 'rejected' }
+			if (state.isRunning === undefined) {
+				// A present object with `isRunning: undefined` is a normal end, or an
+				// error, which the loop leaves on that same object as it clears.
+				return state.error ? { status: 'error', message: state.error.message } : { status: 'done' }
+			}
+			if (state.isRunning === 'awaiting_user') return { status: 'blocked' }
+
+			await new Promise<void>(resolve => {
+				const listener = this._onDidChangeStreamState.event(e => {
+					if (e.threadId !== threadId) return
+					listener.dispose()
+					resolve()
+				})
+			})
+		}
+	}
+
+	/** The last assistant text — the whole of what crosses back from the child. */
+	private _summaryOfChild(threadId: string): string {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return ''
+		// The child's **final message with text**, not literally its last message. A run can
+		// end on a tool-only step — an assistant turn whose text is empty because it only
+		// called a tool — and taking that row would hand the parent a blank report for a
+		// child that had answered a step earlier.
+		for (let i = thread.messages.length - 1; i >= 0; i--) {
+			const msg = thread.messages[i]
+			if (msg?.role !== 'assistant') continue
+			const text = (msg.displayContent ?? '').trim()
+			if (text) return text
+		}
+		return ''
+	}
+
+	/**
+	 * Which of the child's files it actually changed.
+	 *
+	 * Derived from the child's own *completed* write tools, never from intent: a
+	 * `rejected`, `tool_error` or `invalid_params` row changed nothing, and telling
+	 * the parent otherwise would misreport what the delegation did. Paths are
+	 * relative to the child's workspace, which is the parent's, because that is the
+	 * form the parent's own tool calls take.
+	 */
+	private _filesTouchedBy(threadId: string): string[] {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return []
+		const rootPath = thread.workspaceUri ? URI.parse(thread.workspaceUri).path : undefined
+		const seen = new Set<string>()
+		const files: string[] = []
+		for (const m of thread.messages) {
+			if (m.role !== 'tool' || m.type !== 'success') continue
+			if (!ChatThreadService._WRITE_TOOL_NAMES.has(m.name)) continue
+			const uri = (m.params as { uri?: unknown } | undefined)?.uri
+			// Duck-typed rather than `instanceof URI`: messages read back from storage
+			// carry revived uris, and the shape is what matters here.
+			const path = typeof uri === 'object' && uri !== null && typeof (uri as { path?: unknown }).path === 'string'
+				? (uri as { path: string }).path
+				: undefined
+			if (!path) continue
+			const relative = rootPath && path.startsWith(rootPath + '/') ? path.slice(rootPath.length + 1) : path
+			if (seen.has(relative)) continue
+			seen.add(relative)
+			files.push(relative)
+		}
+		return files
+	}
+
+	/**
+	 * Add a child's spend to its parent's figures.
+	 *
+	 * The parent pays for its children — a fan-out that costs four times what the
+	 * thread's own requests did must not read as one thread's worth of tokens — so
+	 * this is what keeps `TokenUsageRing` honest about delegation.
+	 *
+	 * What is added is the child's **this-turn** cumulative, not its lifetime one: a
+	 * child that has been continued several times has already been rolled up for each
+	 * earlier turn, and adding its lifetime total again would count those turns twice.
+	 * Each run on a child is one turn, because the send path resets the turn counter.
+	 *
+	 * Both *baselines* move rather than the visible totals. `_setLatestUsage`
+	 * recomputes each total as baseline + in-flight request on every stream tick, so
+	 * writing a total directly would be erased by the parent's next token.
+	 */
+	private _rollUpChildUsage(parentThreadId: string | undefined, childThreadId: string) {
+		if (!parentThreadId) return
+		const spent = this.cumulativeUsageThisTurnOfThreadId[childThreadId]
+		if (!spent) return
+
+		this._cumulativeThisThreadBaselineOfThreadId[parentThreadId] =
+			this._addUsage(this._cumulativeThisThreadBaselineOfThreadId[parentThreadId], spent)
+		this._cumulativeThisTurnBaselineOfThreadId[parentThreadId] =
+			this._addUsage(this._cumulativeThisTurnBaselineOfThreadId[parentThreadId], spent)
+
+		const inFlight = this.latestUsageOfThreadId[parentThreadId]
+		this.cumulativeUsageThisThreadOfThreadId[parentThreadId] =
+			this._addUsage(this._cumulativeThisThreadBaselineOfThreadId[parentThreadId], inFlight)
+		this.cumulativeUsageThisTurnOfThreadId[parentThreadId] =
+			this._addUsage(this._cumulativeThisTurnBaselineOfThreadId[parentThreadId], inFlight)
+
+		const parent = this.state.allThreads[parentThreadId]
+		if (parent) {
+			parent.cumulativeUsageThisThread = this.cumulativeUsageThisThreadOfThreadId[parentThreadId]
+			this._storeUsage(parentThreadId, parent)
+		}
+		this._onDidChangeStreamState.fire({ threadId: parentThreadId })
+	}
+
+	/** The tool a child is parked on, for the `blocked` message. */
+	private _pendingApprovalToolNameOf(threadId: string): string | undefined {		const thread = this.state.allThreads[threadId]
+		if (!thread) return undefined
+		const pending = findLast(thread.messages, m => m.role === 'tool' && m.type === 'tool_request')
+		return pending?.role === 'tool' && pending.type === 'tool_request' ? pending.name : undefined
+	}
+
+	/**
+	 * Record how the child ended on the child itself, and build what the parent gets.
+	 *
+	 * The write is what makes the outcome durable: after a reload the child thread
+	 * still says how it finished, which is the difference between a transcript and a
+	 * record. The returned outcome is the only channel to the parent.
+	 */
+	private _finishChild(childThreadId: string, status: SubagentStatus, explanation: string): SubagentOutcome {
+		const thread = this.state.allThreads[childThreadId]
+
+		// What the child said it wanted to convey, or its whole final message when it did not
+		// use the format. `reportedSummaryOf` is the contract: a `<report>` block is passed on
+		// verbatim, and a child that ignores the block is heard rather than dropped.
+		const conveyed = status === 'done' ? reportedSummaryOf(this._summaryOfChild(childThreadId)) : ''
+
+		// A run that did not finish leads with why, so a blocked or failed delegation cannot
+		// read as a completed one. The child's own words follow when it produced any.
+		const head = status === 'done' ? '' : explanation.trim()
+		const summary = [head, conveyed].filter(part => part.length > 0).join('\n\n')
+			|| 'The child finished without reporting anything back.'
+
+		if (thread) {
+			const updated: ThreadType = { ...thread, resultStatus: status, resultSummary: summary }
+			this._setState({ allThreads: { ...this.state.allThreads, [childThreadId]: updated } })
+			this._storeThread(childThreadId, updated)
+		}
+
+		const usage = this.cumulativeUsageThisThreadOfThreadId[childThreadId] ?? thread?.cumulativeUsageThisThread ?? undefined
+		// Roll the spend up before reporting it, so the parent's ring includes the child
+		// that just finished rather than the one before it.
+		this._rollUpChildUsage(thread?.parentThreadId, childThreadId)
+		return {
+			status,
+			summary,
+			filesTouched: this._filesTouchedBy(childThreadId),
+			childThreadId,
+			...(usage ? { usage } : {}),
+			...(status === 'error' ? { error: summary } : {}),
+		}
+	}
+
 	private async _runChatAgent({
 		threadId,
 		modelSelection,
@@ -3597,7 +4032,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 
 		// above just defines helpers, below starts the actual function
-		const { chatMode } = this._settingsService.state.globalSettings // should not change as we loop even if user changes it, so it goes here
+		// Read once per run, so a mode change mid-loop cannot switch the tool list under
+		// it. A child runs one rung down — never above its parent, never above `agent` —
+		// because delegation does not inherit (§5 of the multiagent design).
+		const { chatMode: globalChatMode } = this._settingsService.state.globalSettings
+		const chatMode = this.state.allThreads[threadId]?.parentThreadId !== undefined
+			? chatModeOfChildThread(globalChatMode)
+			: globalChatMode
 		const { overridesOfModel } = this._settingsService.state
 
 		let nMessagesSent = 0
@@ -4146,6 +4587,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	private _maybeGenerateThreadTitle(threadId: string, modelSelection: ModelSelection | null, modelSelectionOptions: ModelSelectionOptions | undefined): void {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
+		// A child's name is the alias its parent coined, and a second LLM request to
+		// invent a label for a thread the user did not open is spend with no reader.
+		if (isChildThread(thread)) return
 		if (!modelSelection) return
 		if (thread.customTitle?.trim()) return
 		if (this._titleGenInFlightOfThreadId.has(threadId)) return
@@ -4414,6 +4858,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const clean = (s: string) => truncate(s.replace(/\s+/g, ' ').trim(), 60, '...')
 		const customTitle = thread.customTitle?.trim()
 		if (customTitle) return clean(customTitle)
+		// A child is named by its parent: its first user message is the task, which is a
+		// paragraph, and the notification already carries the first eighty characters of
+		// the *parent's* question on its subtitle line.
+		if (thread.alias) return clean(thread.alias)
 		const firstUser = thread.messages.find(m => m.role === 'user')
 		if (firstUser?.role === 'user' && firstUser.displayContent) return clean(firstUser.displayContent)
 		return thread.title ? clean(thread.title) : 'New Chat'
@@ -4495,7 +4943,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 
-	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes, modelSelectionOptionsOverride }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array>, modelSelectionOptionsOverride?: ModelSelectionOptions }) {
+	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, _pendingImageBytes, modelSelectionOptionsOverride, onRun }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, _pendingImageBytes?: Map<string, Uint8Array>, modelSelectionOptionsOverride?: ModelSelectionOptions, onRun?: (run: Promise<void>) => void }) {
 		// The thread is not necessarily the current one (a notification reply arrives
 		// with its own id). A log thread's messages arrive asynchronously, and appending
 		// to one that is not loaded would write index 0 over a conversation that exists.
@@ -4511,7 +4959,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// the per-workspace filter normally and stops appearing in other
 		// workspaces' lists. No-op when the thread is already tagged (any
 		// workspace) or when the window has no workspace.
-		this._claimThreadForCurrentWorkspaceIfUnscoped(threadId)
+		//
+		// A child is never claimed: its workspace was copied from its parent at
+		// creation and is the parent's for its whole life. Claiming would re-tag a
+		// background child to whatever window happens to be in front, which is the
+		// ambient-scope hazard inheritance exists to avoid.
+		if (!isChildThread(thread)) this._claimThreadForCurrentWorkspaceIfUnscoped(threadId)
 
 		// interrupt existing stream
 		if (this.streamState[threadId]?.isRunning) {
@@ -4570,7 +5023,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// `read_file .voidrules`.
 		if (thread.frozenAiInstructions === undefined) {
 			const combined = await this._convertToLLMMessagesService.getCombinedAIInstructionsAsync()
-			this._setThreadFrozenAiInstructions(threadId, combined)
+			// A child freezes its own first prompt like any thread, plus the framing that
+			// tells it its final message is the whole result. `newThreadObject` appends the
+			// same text when it inherits a frozen parent, so a child is told once, not twice.
+			const instructions = isChildThread(thread)
+				? withSubagentPreamble(combined, thread.alias)
+				: combined
+			this._setThreadFrozenAiInstructions(threadId, instructions)
 		}
 
 		// Add the user message immediately so the chat bubble appears right away.
@@ -4655,10 +5114,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 		this._setThreadLastUsedModelSelection(threadId, modelProps.modelSelection)
 
-		this._wrapRunAgentToNotify(
-			this._runChatAgent({ threadId, ...modelProps, }),
-			threadId,
-		)
+		const run = this._runChatAgent({ threadId, ...modelProps, })
+		// A caller that takes the promise over owns what happens when it settles. That
+		// is how the delegation path awaits a child: it must not fire a "Void finished"
+		// notification for a thread the user never opened, and its own tool result is
+		// the answer the run produces.
+		if (onRun) {
+			onRun(run)
+			return
+		}
+		this._wrapRunAgentToNotify(run, threadId)
 	}
 
 
@@ -5171,6 +5636,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	async switchToThread(threadId: string): Promise<void> {
+		// A child is a preview, not a place: opening one must not add a tab to the strip,
+		// because the strip is the user's own list of threads and a fan-out would fill it
+		// with the agent's conversations. It is reached from the tool row that spawned it
+		// and leaves by the banner's "Back to parent". The workspace's "where I left off"
+		// also stays on the parent, for the same reason.
+		const asChild = this.state.allThreads[threadId]
+		if (isChildThread(asChild)) {
+			await this._landOnThread(threadId, { remember: false })
+			return
+		}
 		// User-initiated switch (tab click, history click, etc). Auto-pins
 		// into the *current workspace's* bucket so the thread surfaces in
 		// THIS workspace's tab strip — and only this one. A foreign thread
@@ -5200,7 +5675,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// "every refresh adds a new tab" behavior reported during commit-2
 	// testing. Same lastActive + model-restore side-effects as
 	// `switchToThread` so a reload-landing thread still gets remembered.
-	private async _landOnThread(threadId: string): Promise<void> {
+	private async _landOnThread(threadId: string, opts?: { remember?: boolean }): Promise<void> {
 		if (!this.state.allThreads[threadId]) return
 		// Publish the id before reading the messages. A log thread's messages are a
 		// file in the main process, so this read spans real time — and the sidebar
@@ -5216,13 +5691,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._normalizeCurrentThreadInScope()
 			return
 		}
-		this._afterCurrentThreadChanged(threadId)
+		this._afterCurrentThreadChanged(threadId, opts)
 	}
 
 	// Shared post-switch side-effects for both the pinning and non-pinning
 	// landing paths above. Updates the per-workspace last-active map and
 	// reapplies the saved per-thread model selection.
-	private _afterCurrentThreadChanged(threadId: string): void {
+	private _afterCurrentThreadChanged(threadId: string, opts?: { remember?: boolean }): void {
 		// Visiting a thread marks it read (clears the green unread dot).
 		this.markThreadRead(threadId)
 		// Phase E — remember "last thread looked at in this workspace" so the
@@ -5232,7 +5707,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// thread viewed in read-only mode shouldn't be remembered as the
 		// landing thread for *its* workspace from this window.
 		const wsUri = this.state.currentWorkspaceUri
-		if (wsUri) {
+		if (wsUri && opts?.remember !== false) {
 			if (this._lastActiveThreadIdByWorkspace[wsUri] !== threadId) {
 				this._lastActiveThreadIdByWorkspace[wsUri] = threadId
 				this._storeLastActiveThreadIdByWorkspace()
@@ -5418,6 +5893,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		for (const threadId in currentThreads) {
 			const t = currentThreads[threadId]
 			if (!t || t.messages.length !== 0) continue
+			// A child is not the user's chat. It is empty only between creation and
+			// the task message landing, but that window is real, and adopting the child
+			// as the new tab would hand the user a thread that reports to a parent.
+			if (isChildThread(t)) continue
 			// Skip threads whose messages haven't been loaded — they might
 			// have messages in storage that just aren't in memory yet.
 			if (!this._loadedMessageThreadIds.has(threadId)) continue
@@ -6534,3 +7013,38 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 }
 
 registerSingleton(IChatThreadService, ChatThreadService, InstantiationType.Eager);
+
+// The single implementation of `IDelegationService`, forwarding straight to the
+// chat service. It lives in this file because forwarding is all it is, and because
+// living anywhere else would mean importing `IChatThreadService` from a module
+// this one imports — `common/delegationService.ts` carries the long version.
+class DelegationService implements IDelegationService {
+
+	readonly _serviceBrand: undefined;
+
+	constructor(
+		@IChatThreadService private readonly _chatThreadService: IChatThreadService,
+	) { }
+
+	startSubagent(request: RunSubagentRequest): StartedSubagent {
+		return this._chatThreadService.startSubagent(request)
+	}
+
+	continueSubagent(request: ContinueSubagentRequest): StartedSubagent {
+		return this._chatThreadService.continueSubagent(request)
+	}
+
+	listChildren(parentThreadId: string): ChildThreadSummary[] {
+		return this._chatThreadService.listChildThreads(parentThreadId)
+	}
+
+
+	interruptSubagent(childThreadId: string): void {
+		this._chatThreadService.interruptSubagent(childThreadId)
+	}
+}
+
+// Delayed, not Eager: this one resolves `IChatThreadService`, and the tools service
+// is built eagerly with the chat service — so constructing it at startup would
+// close a dependency cycle the first delegation does not need.
+registerSingleton(IDelegationService, DelegationService, InstantiationType.Delayed);

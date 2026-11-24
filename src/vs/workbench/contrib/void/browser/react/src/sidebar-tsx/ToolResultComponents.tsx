@@ -15,6 +15,7 @@ import { AlertTriangle, Ban, ChevronRight, CircleEllipsis } from 'lucide-react';
 import { ChatMessage, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, effectiveAutoApproveMode, LintErrorItem, ToolCallParams, ToolName } from '../../../../common/toolsServiceTypes.js';
 import { Edit } from '../../../../common/editCodeServiceTypes.js';
+import type { SubagentOutcome } from '../../../../common/childThreadLinkage.js';
 import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE, DEFAULT_TERMINAL_TIMEOUT_SECONDS, MAX_TERMINAL_TIMEOUT_SECONDS } from '../../../../common/prompt/prompts.js';
 import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
@@ -564,6 +565,28 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 				desc1Info: toolParams.line !== null ? `${filePart}:${toolParams.line}` : filePart,
 			}
 		},
+		'send_message': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['send_message']
+			// Same shape as `run_subagent`: the name the parent coined, with the
+			// instruction as secondary text. A parent that addresses by id has no alias to
+			// show, so fall back to something short enough to read rather than a uuid.
+			const who = toolParams.alias ?? (toolParams.childThreadId ? `${toolParams.childThreadId.slice(0, 8)}…` : '')
+			const message = toolParams.message ?? ''
+			return {
+				desc1: `"${who}"`,
+				desc1Info: message.length > 120 ? `${message.slice(0, 120)}…` : message,
+			}
+		},		'run_subagent': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['run_subagent']
+			// The alias is what the parent called the child, so it is the useful thing on
+			// the row. The task follows as secondary text, cut because it is a paragraph
+			// and this line is not.
+			const task = toolParams.task ?? ''
+			return {
+				desc1: `"${toolParams.alias}"`,
+				desc1Info: task.length > 120 ? `${task.slice(0, 120)}…` : task,
+			}
+		},
 	}
 
 	try {
@@ -839,8 +862,12 @@ const LintErrorChildren = ({ lintErrors }: { lintErrors: LintErrorItem[] }) => {
 	</div>
 }
 
-const BottomChildren = ({ children, title }: { children: React.ReactNode, title: string }) => {
-	const [isOpen, setIsOpen] = useState(false);
+const BottomChildren = ({ children, title, defaultOpen = false }: { children: React.ReactNode, title: string, defaultOpen?: boolean }) => {
+	// Collapsed is the right default for most tools — the body is supplementary detail, and a
+	// file's contents or a command's output would push the conversation off the screen. A
+	// delegation is the exception: its body is the report the user asked for, and the only
+	// route to the child's transcript, so hiding it hides the result.
+	const [isOpen, setIsOpen] = useState(defaultOpen);
 	if (!children) return null;
 	return (
 		<div className="w-full px-2 mt-0.5">
@@ -1028,6 +1055,44 @@ export const MCPToolWrapper = ({ toolMessage }: WrapperProps<string>) => {
 }
 
 export type ResultWrapper<T extends ToolName> = (props: WrapperProps<T>) => React.ReactNode
+
+/**
+ * The body a delegation result renders, shared by `run_subagent` and `send_message`.
+ *
+ * Both report the same contract — a status, a capped summary, the files the child
+ * changed — so splitting them into two renderings would only be a way to let them
+ * drift. A status other than `done` is shown and the header is coloured as an error
+ * by the caller: the tool call succeeded, but "the child stopped to ask for
+ * permission" is not a success to the reader.
+ */
+const SubagentReportChildren = ({ result }: { result: SubagentOutcome }) => {
+	const accessor = useAccessor()
+	const chatThreadsService = accessor.get('IChatThreadService')
+
+	return (
+		<div className='flex flex-col gap-1'>
+			{result.status !== 'done' && (
+				<div className='text-xs text-void-warning'>Stopped: {result.status}</div>
+			)}
+			<SmallProseWrapper>
+				<ChatMarkdownRender string={result.summary} chatMessageLocation={undefined} isApplyEnabled={false} />
+			</SmallProseWrapper>
+			{result.filesTouched.length > 0 && (
+				<div className='text-xs text-void-fg-4'>Changed: {result.filesTouched.join(', ')}</div>
+			)}
+			{/* The child's conversation is a real thread, stored like any other — the row's
+			    value is that a reader can check *why* the child concluded what it did
+			    without that reasoning having to sit in the parent's context. */}
+			<button
+				className='self-start text-xs text-void-fg-4 underline decoration-dotted hover:text-void-fg-1'
+				onClick={() => chatThreadsService.switchToThread(result.childThreadId)}
+				title={"Open the subagent's own conversation. It is a normal thread; your context never saw it."}
+			>
+				Open transcript
+			</button>
+		</div>
+	)
+}
 
 export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: ResultWrapper<T>, } } = {
 	'read_file': {
@@ -1877,6 +1942,104 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 					<SmallProseWrapper>
 						<ChatMarkdownRender string={preview} chatMessageLocation={undefined} isApplyEnabled={false} />
 					</SmallProseWrapper>
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		},
+	},
+	'run_subagent': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const title = getTitle(toolMessage)
+			const icon = null
+
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
+
+			const result = toolMessage.type === 'success' ? toolMessage.result : undefined
+
+			// A delegation whose run completed but whose child did not *finish* — blocked on
+			// approval, errored, stopped — is not a success to the reader, even though the
+			// tool call itself returned a result.
+			const isError = toolMessage.type === 'tool_error' || (result !== undefined && result.status !== 'done')
+			const isRejected = toolMessage.type === 'rejected'
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (result) {
+				// The child's own thread is not linked from here yet: opening a child as a
+				// thread is the rendering step, and a link to a thread the sidebar cannot
+				// show would be a dead end. The report itself is what the row is for.
+				componentParams.bottomChildren = <BottomChildren title='Subagent report' defaultOpen>
+					<SubagentReportChildren result={result} />
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		},
+	},
+	'send_message': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const title = getTitle(toolMessage)
+			const icon = null
+
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
+
+			const result = toolMessage.type === 'success' ? toolMessage.result : undefined
+			const isError = toolMessage.type === 'tool_error' || (result !== undefined && result.status !== 'done')
+			const isRejected = toolMessage.type === 'rejected'
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (result) {
+				componentParams.bottomChildren = <BottomChildren title='Subagent reply' defaultOpen>
+					<SubagentReportChildren result={result} />
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		},
+	},
+	'list_children': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const title = getTitle(toolMessage)
+			const icon = null
+
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
+
+			const isError = toolMessage.type === 'tool_error'
+			const isRejected = toolMessage.type === 'rejected'
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (toolMessage.type === 'success') {
+				const { children } = toolMessage.result
+				componentParams.bottomChildren = <BottomChildren title={`Subagents (${children.length})`} defaultOpen>
+					<div className='flex flex-col gap-0.5 text-xs'>
+						{children.length === 0 && (
+							<div className='text-void-fg-4'>This thread has not started any.</div>
+						)}
+						{children.map(child => (
+							<div key={child.childThreadId} className='flex items-baseline gap-2'>
+								<span className='font-medium'>{child.alias ?? '(unnamed)'}</span>
+								{/* The state a reader cares about is whether it is still working and
+								    how it ended, in that order — not the raw id, which is for
+								    `send_message`. */}
+								<span className='text-void-fg-4'>
+									{child.running ? 'running' : (child.resultStatus ?? 'not run')}
+								</span>
+								<span className='text-void-fg-4 truncate'>{child.task.replace(/\s+/g, ' ').slice(0, 90)}</span>
+							</div>
+						))}
+					</div>
 				</BottomChildren>
 			}
 
