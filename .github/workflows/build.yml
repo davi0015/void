@@ -32,9 +32,13 @@ concurrency:
 jobs:
   build-mac-arm64:
     name: macOS arm64
-    # macos-15 is Apple Silicon — required for a darwin-arm64 build. macos-14 was
-    # retired on 2026-11-02; a job that asks for it is rejected before its first step.
-    runs-on: macos-15
+    # Apple Silicon is required for a darwin-arm64 build. Apple renumbered from 15
+    # straight to 26 (year-based naming), so macos-26 is the next image rather than
+    # eleven releases ahead; it has been GA since 2026-02 and is what `macos-latest`
+    # resolves to. macos-14 was retired on 2026-11-02. The two failure shapes differ:
+    # a retired image is rejected before the first step, while an image that exists
+    # but is short of capacity just queues — which is what v1.6.0 did for 43 minutes.
+    runs-on: macos-26
     timeout-minutes: 120
     # Authenticates api.github.com calls made by postinstall downloaders
     # (@vscode/ripgrep etc.) — anonymous requests from shared runner IPs
@@ -79,6 +83,21 @@ jobs:
       # ../VSCode-darwin-arm64 (sibling of the checkout, per build scripts).
       - name: Package macOS app
         run: node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js vscode-darwin-arm64
+
+      # Building on a newer image can raise the floor of anything compiled at build
+      # time (native modules) even when Electron itself is unchanged, which would
+      # quietly drop users on older macOS. Print the floor instead of assuming it
+      # held: the app's Info.plist and the minos of each bundled .node binary.
+      - name: Report minimum macOS
+        shell: bash
+        run: |
+          set +e
+          echo "image: macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)); $(xcodebuild -version | head -1)"
+          APP=$(ls -d ../VSCode-darwin-arm64/*.app | head -1)
+          echo "app LSMinimumSystemVersion: $(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist" 2>&1)"
+          find "$APP" -name '*.node' | head -20 | while read -r so; do
+            echo "  $(basename "$so"): minos $(otool -l "$so" | awk '/LC_BUILD_VERSION/{seen=1} seen && /minos/{print $2; exit}')"
+          done
 
       - name: Zip app
         run: |
