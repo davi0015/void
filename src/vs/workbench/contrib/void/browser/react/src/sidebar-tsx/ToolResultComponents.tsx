@@ -477,6 +477,24 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 				desc1Info: getRelative(toolParams.uri, accessor),
 			}
 		},
+		// The scratchpad tools take a scratch-relative name rather than a URI, so
+		// the row shows the file name and the folder it lives in. Without an entry
+		// here (and in `builtinToolNameToComponent`) the row renders nothing at all
+		// and the write silently disappears from the transcript.
+		'write_scratch': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['write_scratch']
+			return {
+				desc1: getBasename(toolParams.path),
+				desc1Info: 'scratchpad',
+			}
+		},
+		'delete_scratch': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['delete_scratch']
+			return {
+				desc1: getBasename(toolParams.path),
+				desc1Info: 'scratchpad',
+			}
+		},
 		'run_command': () => {
 			const toolParams = _toolParams as BuiltinToolCallParams['run_command']
 			return {
@@ -1468,6 +1486,58 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 
 	// ---
 
+	'write_scratch': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const isError = false
+			const isRejected = toolMessage.type === 'rejected'
+			const title = getTitle(toolMessage)
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const icon = null
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (toolMessage.type === 'success') {
+				// The absolute path is what makes a scratch write findable: the file is
+				// outside the project, so there is nothing to open from `params`.
+				componentParams.info = toolMessage.result.fsPath
+			}
+			else if (toolMessage.type === 'tool_error') {
+				const { result } = toolMessage
+				componentParams.bottomChildren = <BottomChildren title='Error'>
+					<CodeChildren>
+						{result}
+					</CodeChildren>
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		}
+	},
+	'delete_scratch': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const isError = false
+			const isRejected = toolMessage.type === 'rejected'
+			const title = getTitle(toolMessage)
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const icon = null
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (toolMessage.type === 'success') {
+				componentParams.info = toolMessage.result.fsPath
+			}
+			else if (toolMessage.type === 'tool_error') {
+				const { result } = toolMessage
+				componentParams.bottomChildren = <BottomChildren title='Error'>
+					<CodeChildren>
+						{result}
+					</CodeChildren>
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		}
+	},
 	'create_file_or_folder': {
 		resultWrapper: ({ toolMessage }) => {
 			const accessor = useAccessor()

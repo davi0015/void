@@ -80,6 +80,13 @@ describe('agent scratchpad', () => {
 			h.assertAbsent('a scratch file does not appear among the files awaiting review', !scratch.changedPaths.some(p => p.endsWith('probe.mjs')), { subject: true })
 			assert.ok(scratch.rowContent.includes('.gitignore') || existsSync(join(s.dirs.workspacePath, '.void', '.gitignore')), 'the scratchpad must be kept out of git')
 
+			// The row has to exist in the transcript, not just in state: without an
+			// entry in the React tool maps the write succeeds and renders nothing,
+			// and every state-level assertion still passes.
+			const rendered = await s.page.evaluate(() => document.body.innerText)
+			t.diagnostic(`row rendered in chat: ${rendered.includes('Wrote scratch file')}`)
+			assert.ok(rendered.includes('Wrote scratch file'), 'the scratch write must render a row in the chat')
+
 			// Control: a project write by the same route must show up for review. It
 			// passes in every configuration, so a scratch assertion that stopped
 			// seeing diffs would not pass silently.
