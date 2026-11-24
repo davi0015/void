@@ -9,9 +9,15 @@
 //
 // The trigger is `min(20% of the window, 30k tokens)` of remaining context, computed
 // from the *live* view (summary plus the messages after the boundary). The window comes
-// from `getModelCapabilities`, so the test forces a small one through the model
-// overrides rather than pretending to have a small model — the code path under test is
-// the real one.
+// from `getModelCapabilities`, so the test forces one through the model overrides rather
+// than pretending to have a small model — the code path under test is the real one.
+//
+// The model setup is re-asserted in the same tick as the send, and that is not
+// paranoia: a settings write re-validates the state and replaces a selection that is
+// not in the model options, which on a fresh profile is every selection, since no
+// provider is configured. Mutating the selection and then awaiting anything (a seed, a
+// stub, a reload) is what made this file flaky before; the send itself must be the first
+// thing to read it.
 //
 //   npm run test-void -- --only=auto-compaction
 
@@ -24,18 +30,24 @@ before(() => h.preflight())
 /** A phrase only the summarisation request carries. */
 const COMPACTION_PROMPT = 'Extract and organize the key information'
 
-/** Forces the chat model's context window, which is what the trigger reads. */
-function forceContextWindow(page, tokens) {
-	return page.evaluate((tokens) => {
+/**
+ * Persists the context-window override (through its real setter, so a reload cannot
+ * take it away) and applies the model selection directly, because the setter validates
+ * and would drop a model no configured provider offers.
+ */
+function prepareModel(page, contextWindow) {
+	return page.evaluate(async (tokens) => {
 		const settings = globalThis.__voidChatThreadService._settingsService
 		const selection = settings.state.modelSelectionOfFeature['Chat']
-		const { providerName, modelName } = selection
-		settings.state.overridesOfModel[providerName] ??= {}
-		settings.state.overridesOfModel[providerName][modelName] = {
-			...settings.state.overridesOfModel[providerName][modelName],
-			contextWindow: tokens,
+			?? { providerName: 'ollama', modelName: 'qwen2.5-coder:7b' }
+		const existing = settings.state.overridesOfModel[selection.providerName]?.[selection.modelName] ?? {}
+		await settings.setOverridesOfModel(selection.providerName, selection.modelName, { ...existing, contextWindow: tokens })
+		settings.state.modelSelectionOfFeature['Chat'] = selection
+		return {
+			selection: settings.state.modelSelectionOfFeature['Chat'],
+			contextWindow: settings.state.overridesOfModel[selection.providerName]?.[selection.modelName]?.contextWindow,
 		}
-	}, tokens)
+	}, contextWindow)
 }
 
 /** Appends a long alternating conversation to the current thread's log. */
@@ -62,6 +74,24 @@ function seedLongThread(page, { messages = 40, chars = 2_000 } = {}) {
 	}, { messages, chars })
 }
 
+/**
+ * Re-asserts the model selection and the context window and sends the message, all in
+ * one call so nothing awaits between the setup and the request that reads it.
+ */
+function sendWithModel(page, { threadId, contextWindow }) {
+	return page.evaluate(async ({ threadId, contextWindow }) => {
+		const svc = globalThis.__voidChatThreadService
+		const settings = svc._settingsService
+		const selection = settings.state.modelSelectionOfFeature['Chat']
+			?? { providerName: 'ollama', modelName: 'qwen2.5-coder:7b' }
+		const existing = settings.state.overridesOfModel[selection.providerName]?.[selection.modelName] ?? {}
+		settings.state.overridesOfModel[selection.providerName] ??= {}
+		settings.state.overridesOfModel[selection.providerName][selection.modelName] = { ...existing, contextWindow }
+		settings.state.modelSelectionOfFeature['Chat'] = selection
+		await svc.addUserMessageAndStreamResponse({ userMessage: 'carry on', threadId })
+	}, { threadId, contextWindow })
+}
+
 /** The thread's compaction fields, read after the run. */
 function compactionState(page, threadId) {
 	return page.evaluate((id) => {
@@ -71,7 +101,7 @@ function compactionState(page, threadId) {
 }
 
 /** Which captured requests carry the summarisation prompt. */
-async function requestKinds(page, threadId) {
+async function requestKinds(page) {
 	const raw = JSON.parse(await h.capturedLLMRequests(page))
 	return raw.map((req, idx) => ({
 		idx,
@@ -83,23 +113,23 @@ describe('auto compaction', () => {
 
 	test('a request that would leave too little context is compacted first', async () => {
 		await h.withScenario('auto-compaction/triggered', async (s) => {
-			await h.ensureModelSelection(s.page)
-			await forceContextWindow(s.page, 8_000) // threshold = min(1,600, 30,000) = 1,600
-			await h.stubLLM(s.page, 'ok')
-
 			const seeded = await seedLongThread(s.page)
 			assert.ok(seeded.count >= 40, `fixture: the long thread was not seeded (${seeded.count} messages)`)
 
-			await s.page.evaluate(async (id) => {
-				await globalThis.__voidChatThreadService.addUserMessageAndStreamResponse({ userMessage: 'carry on', threadId: id })
-			}, seeded.id)
+			// 8k window: threshold = min(1,600, 30,000) = 1,600 tokens left.
+			const model = await prepareModel(s.page, 8_000)
+			assert.ok(model.selection, 'fixture: no chat model is selected')
+			assert.equal(model.contextWindow, 8_000, 'fixture: the context-window override did not stick')
+			await h.stubLLM(s.page, 'ok')
+
+			await sendWithModel(s.page, { threadId: seeded.id, contextWindow: 8_000 })
 			await h.waitForRunEnd(s.page)
 
 			const state = await compactionState(s.page, seeded.id)
 			h.assertPersistence('the thread was summarised before sending', typeof state.summary === 'string' && state.summary.length > 0, { subject: true })
 			h.assertPersistence('a boundary was written', state.boundaryIdx !== null, { subject: true })
 
-			const kinds = await requestKinds(s.page, seeded.id)
+			const kinds = await requestKinds(s.page)
 			const compactionIndex = kinds.findIndex(k => k.isCompaction)
 			// Control: the summarisation request exists at all, and the chat request is
 			// after it. Without this the subject assertions could pass on a thread that
@@ -111,20 +141,21 @@ describe('auto compaction', () => {
 
 	test('a conversation with room to spare is not compacted (control)', async () => {
 		await h.withScenario('auto-compaction/quiet', async (s) => {
-			await h.ensureModelSelection(s.page)
-			// Default window for a recognized model is >= 32k, so the same seed that
-			// triggers above stays far from the line.
+			const seeded = await seedLongThread(s.page)
+
+			// A large window, forced the same way, so the control goes down the same
+			// setup path and only the window differs.
+			const model = await prepareModel(s.page, 200_000)
+			assert.ok(model.selection, 'fixture: no chat model is selected')
+			assert.equal(model.contextWindow, 200_000, 'fixture: the control did not get its window')
 			await h.stubLLM(s.page, 'ok')
 
-			const seeded = await seedLongThread(s.page)
-			await s.page.evaluate(async (id) => {
-				await globalThis.__voidChatThreadService.addUserMessageAndStreamResponse({ userMessage: 'carry on', threadId: id })
-			}, seeded.id)
+			await sendWithModel(s.page, { threadId: seeded.id, contextWindow: 200_000 })
 			await h.waitForRunEnd(s.page)
 
 			const state = await compactionState(s.page, seeded.id)
 			h.assertAbsent('no summary was written', state.summary === null, {})
-			const kinds = await requestKinds(s.page, seeded.id)
+			const kinds = await requestKinds(s.page)
 			h.assertAbsent('no summarisation request was sent', !kinds.some(k => k.isCompaction), {})
 		})
 	})
