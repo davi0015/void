@@ -4535,7 +4535,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// The run ended (done or error) while the user was looking elsewhere —
 		// mark unread so the tab shows the green "completed" dot until visited.
-		if (isRunningWhenEnd === undefined && threadId !== this.state.currentThreadId
+		// A child never gets the unread dot: it has no tab to wear one, and its finish is
+		// read from the delegation row. Marking it unread would add an entry nothing can
+		// clear, since the only way in is a thread the user did not open.
+		if (isRunningWhenEnd === undefined && !isChildThread(this.state.allThreads[threadId])
+			&& threadId !== this.state.currentThreadId
 			&& !this._unreadThreadIds.has(threadId)) {
 			this._unreadThreadIds.add(threadId)
 			this._onDidChangeUnreadThreads.fire()
@@ -4879,7 +4883,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	private _wrapRunAgentToNotify(p: Promise<void>, threadId: string) {
 
-		const shouldNotify = () => threadId !== this.state.currentThreadId || !this._hostService.hasFocus
+		// A child thread is not a conversation the user opened, so it has nothing to
+		// announce: its parent is still working, and the row that spawned it is where the
+		// child is read. Checked here rather than at the call site because four paths reach
+		// this wrapper — send, approval, rejection, concurrent drain — and only the send
+		// path suppresses a child (through `onRun`). A child that paused for approval and
+		// then resumed used to announce "Void finished" for a thread with no tab.
+		const shouldNotify = () =>
+			!isChildThread(this.state.allThreads[threadId])
+			&& (threadId !== this.state.currentThreadId || !this._hostService.hasFocus)
 		// Don't fire "chat ready" when the agent paused for approval —
 		// the approval notification is already shown — nor while parked on
 		// background tools (nothing finished yet). The agent hasn't actually
