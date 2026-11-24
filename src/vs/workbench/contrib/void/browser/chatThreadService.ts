@@ -15,6 +15,7 @@ import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { builtinToolNames, chat_userMessageContent, isABuiltinToolName, visionHelper_systemMessage, visionHelper_userMessage } from '../common/prompt/prompts.js';
 import { getModelCapabilities } from '../common/modelCapabilities.js';
 import { CompactionPlan, planCompaction, RETENTION_MIN_CHARS, RETENTION_RATIO } from '../common/compactionBoundary.js';
+import { AUTO_COMPACT_PERCENT, AUTO_COMPACT_PROTECT_TURNS, liveViewChars, shouldCompactProactively } from '../common/compactionTrigger.js';
 import { isContextOverflowError } from '../common/contextOverflow.js';
 import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, RawToolParamsObj, ResponsesReasoningRef } from '../common/sendLLMMessageTypes.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -3606,6 +3607,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		let overflowRelieved = false
 		let shouldSendAnotherMessage = true
 		let isRunningWhenEnd: IsRunningType = undefined
+		// The proactive compaction runs at most once per run. After it, the thread's live
+		// view is the summary plus its tail while `priorContentTokens` still describes the
+		// prompt it replaced — re-deciding from that would summarise again on the next
+		// tool iteration, and again on the one after that.
+		let autoCompactionAttempted = false
 
 		// before enter loop, call tool
 		if (callThisToolFirst) {
@@ -3684,8 +3690,53 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// Undefined on the first request of a thread (no prior usage) — the
 			// chars/ratio estimate handles that case alone.
 			const lastUsage = this.latestUsageOfThreadId[threadId]
-			const priorContentTokens = lastUsage ? (lastUsage.inputTokens ?? 0) + (lastUsage.outputTokens ?? 0) : undefined
+			let priorContentTokens = lastUsage ? (lastUsage.inputTokens ?? 0) + (lastUsage.outputTokens ?? 0) : undefined
 			const pendingImageBytes = this._pendingImageBytesByThread.get(threadId)
+
+			// Proactive compaction: before this request is built, if the conversation has
+			// less than the trigger's worth of context left, summarise the oldest span
+			// first — the manual button's operation, with the manual button's settings,
+			// run inline in this turn so the request that follows is built from the
+			// compacted view. Placed here rather than before the loop so it covers a tool
+			// iteration as well as the turn's first request.
+			if (!autoCompactionAttempted && modelSelection) {
+				const { contextWindow } = getModelCapabilities(modelSelection.providerName, modelSelection.modelName, overridesOfModel)
+				const charsPerToken = this._convertToLLMMessagesService.getCharsPerToken(modelSelection.providerName, modelSelection.modelName)
+				const threadNow = this.state.allThreads[threadId]
+				if (threadNow) {
+					// The live view, not the message array: after a compaction the array still
+					// holds everything the summary replaced, so counting it would say the
+					// thread is full the moment after it was compacted.
+					const liveChars = liveViewChars({
+						messages: threadNow.messages,
+						summary: threadNow.compactionSummary,
+						boundaryIdx: threadNow.compactionBoundaryIdx,
+					})
+					const usedTokens = Math.max(priorContentTokens ?? 0, Math.round(liveChars / charsPerToken))
+					const plan = this._planCompaction(threadNow.messages, AUTO_COMPACT_PROTECT_TURNS, modelSelection, charsPerToken)
+					// Nothing to summarise (too few turns) is not a failure to report on every
+					// iteration; the provider's overflow path still covers a request that does
+					// not fit for another reason.
+					if (plan.boundaryIdx > 0 && shouldCompactProactively({ usedTokens, contextWindowTokens: contextWindow })) {
+						autoCompactionAttempted = true
+						const outcome = await this._compactThread(
+							threadId,
+							{ compactPercent: AUTO_COMPACT_PERCENT, protectTurns: AUTO_COMPACT_PROTECT_TURNS },
+							{ handOffQueuedMessage: false, loggingName: 'Auto Compaction' },
+						)
+						// Stop means stop: the user's interrupt cancelled the summarisation, so
+						// the turn ends here rather than sending the request it was making room for.
+						if (outcome.status === 'cancelled') return
+						if (outcome.status === 'failed') console.warn('[Compaction] proactive pass failed:', outcome.message)
+						if (outcome.status === 'compacted') {
+							// The prompt is now the summary plus the kept tail; the last usage
+							// predates it, so let the builder estimate from chars instead.
+							priorContentTokens = undefined
+						}
+					}
+				}
+			}
+
 			const currentThread = this.state.allThreads[threadId]
 			const frozenAiInstructions = currentThread?.frozenAiInstructions
 			// `!== undefined`, not truthiness: a boundary of 0 is legitimate (it
@@ -6079,8 +6130,24 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		})
 	}
 
-	async compactCurrentThread({ compactPercent, protectTurns = 3 }: { compactPercent: number, protectTurns?: number }): Promise<CompactionOutcome> {
-		const threadId = this.state.currentThreadId
+	async compactCurrentThread(opts: { compactPercent: number, protectTurns?: number }): Promise<CompactionOutcome> {
+		return this._compactThread(this.state.currentThreadId, opts, { handOffQueuedMessage: true, loggingName: 'Manual Compaction' })
+	}
+
+	/**
+	 * The one compaction implementation, shared by the manual button and the agent loop's
+	 * proactive pass.
+	 *
+	 * `handOffQueuedMessage` is what tells the two callers apart. A user-initiated
+	 * compaction is a turn of its own, so a message typed while it ran goes out when it
+	 * finishes. The proactive pass runs *inside* a turn that is about to send: handing a
+	 * queued message to a new run there would start a second run inside the first.
+	 */
+	private async _compactThread(
+		threadId: string,
+		{ compactPercent, protectTurns = 3 }: { compactPercent: number, protectTurns?: number },
+		{ handOffQueuedMessage, loggingName }: { handOffQueuedMessage: boolean, loggingName: string },
+	): Promise<CompactionOutcome> {
 		const thread = this.state.allThreads[threadId]
 		if (!thread || thread.messages.length < 10) return { status: 'failed', message: 'Not enough messages to compact.' }
 
@@ -6243,7 +6310,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const preCompactionLatestUsage = thread.latestUsage ? { ...thread.latestUsage } : undefined
 
 		try {
-			const summary = await sendCompactionFromChatMessages(compactionMessages, 'Manual Compaction')
+			const summary = await sendCompactionFromChatMessages(compactionMessages, loggingName)
 
 			if (!summary || summary.trim().length === 0) {
 				return { status: 'failed', message: 'The model returned an empty summary.' }
@@ -6336,7 +6403,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// A message typed while compaction ran waits in the queue, exactly as
 			// it does during a run: send the head now that the thread is idle.
 			// Fire-and-forget, so the caller's completion isn't held back by it.
-			const head = this._queuedMessagesOfThreadId.get(threadId)?.[0]
+			// Skipped by the proactive pass, which is mid-turn and about to send.
+			const head = handOffQueuedMessage ? this._queuedMessagesOfThreadId.get(threadId)?.[0] : undefined
 			if (head) {
 				this.removeQueuedMessage(threadId, head.id)
 				this.addUserMessageAndStreamResponse({
