@@ -165,6 +165,14 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	// finals held while a conversation is being minted for an unbound
 	// thread (auto-mirror) — flushed on conversationBound
 	private readonly _pendingFinalOfThreadId = new Map<string, { text: string, usage: LLMUsage | undefined }>()
+	// index of the last user message seen by the echo scan (floored at bind
+	// time) — only user messages appended after this are echoed to the
+	// external conversation, history never is
+	private readonly _lastEchoedUserIdxOfThreadId = new Map<string, number>()
+	// text of the most recent externally-originated user message per thread —
+	// matching messages are skipped by the echo scan (already in the external
+	// thread) and the record is consumed
+	private readonly _inboundUserTextOfThreadId = new Map<string, string>()
 	// messages-array index captured when a binding was established — tool
 	// and approval scans start there. A thread WITH history (adoption,
 	// auto-mirror, remembered-binding adoption after restart) must not replay
@@ -257,6 +265,10 @@ class IntegrationService extends Disposable implements IIntegrationService {
 			case 'userMessage': {
 				const threadId = this._resolveThread(p.conversationKey, p.threadId)
 				if (threadId === undefined) return // createThread failed — nothing more to do
+				// externally-originated: when this text appends as the turn's user
+				// message, the echo scan must skip it (it is already in the
+				// external thread)
+				this._inboundUserTextOfThreadId.set(threadId, p.text)
 				// apply the channel's permission grant BEFORE dispatching — the
 				// turn's own state snapshot happens after this, so the mode is
 				// already in effect when any tool approval gate runs
@@ -381,6 +393,13 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	private _setScanFloor(threadId: string): void {
 		const withMessages = this._chatThreadService.getThreadWithMessages(threadId)
 		this._scanStartIdxOfThreadId.set(threadId, withMessages?.messages.length ?? 0)
+		// echo floor: the index of the last user message at bind — earlier
+		// ones are history and are never echoed
+		const messages = withMessages?.messages ?? []
+		let lastUserIdx = -1
+		for (let i = messages.length - 1; i >= 0; i--)
+			if (messages[i].role === 'user') { lastUserIdx = i; break }
+		this._lastEchoedUserIdxOfThreadId.set(threadId, lastUserIdx)
 	}
 
 	async mirrorCurrentChat(): Promise<void> {
@@ -403,7 +422,12 @@ class IntegrationService extends Disposable implements IIntegrationService {
 				title = firstUser.displayContent.slice(0, 80)
 		}
 
-		this._postOutbound({ type: 'createConversation', threadId: thread.id, title })
+		this._postOutbound({
+			type: 'createConversation',
+			threadId: thread.id,
+			title,
+			text: this._openingMessageOf(thread.id),
+		})
 		// conversationBound (from the proxy) completes the mirroring; events
 		// for this thread are dropped until it arrives — mirroring effectively
 		// starts with the next turn
@@ -422,6 +446,9 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		// unbound threads are still tracked below so their turn END can
 		// mint a conversation (editor-started threads)
 		if (conversationKey !== undefined) {
+			// editor-originated user messages echo into the conversation
+			this._scanUserMessages(threadId, conversationKey)
+
 			// tool transitions from the thread's messages — skipped mid-stream
 			// ticks already see these, the phase map dedupes
 			this._scanToolMessages(threadId, conversationKey)
@@ -461,6 +488,31 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		else if (isRunning !== undefined) {
 			this._lastRunningPhaseOfThreadId.set(threadId, isRunning)
 		}
+	}
+
+	// mirror editor-originated user messages into the conversation, so the
+	// external thread shows both sides. Externally-originated messages are
+	// matched by text and skipped; queued follow-ups echo when their own
+	// turn starts (each append is followed by a stream tick)
+	private _scanUserMessages(threadId: string, conversationKey: string): void {
+		const thread = this._chatThreadService.getThreadWithMessages(threadId)
+		if (!thread) return
+		const messages = thread.messages
+		const fromIdx = (this._lastEchoedUserIdxOfThreadId.get(threadId) ?? -1) + 1
+		let lastSeen = fromIdx - 1
+		for (let i = fromIdx; i < messages.length; i++) {
+			const m = messages[i]
+			if (m.role !== 'user') continue
+			lastSeen = i
+			const inboundText = this._inboundUserTextOfThreadId.get(threadId)
+			if (inboundText !== undefined && m.displayContent === inboundText) {
+				this._inboundUserTextOfThreadId.delete(threadId)
+				continue
+			}
+			if (m.displayContent.trim() === '') continue
+			this._postOutbound({ type: 'userMessageEcho', conversationKey, text: m.displayContent.slice(0, 2000) })
+		}
+		this._lastEchoedUserIdxOfThreadId.set(threadId, lastSeen)
 	}
 
 	private _scanToolMessages(threadId: string, conversationKey: string): void {
@@ -544,7 +596,12 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		const final = this._finalOfThreadId(threadId)
 		if (final === undefined || final.text === '') return // nothing to say — don't mint a thread for it
 		this._pendingFinalOfThreadId.set(threadId, final)
-		this._postOutbound({ type: 'createConversation', threadId, title: this._threadTitleOf(threadId) })
+		this._postOutbound({
+			type: 'createConversation',
+			threadId,
+			title: this._threadTitleOf(threadId),
+			text: this._openingMessageOf(threadId),
+		})
 	}
 
 	private _finalOfThreadId(threadId: string): { text: string, usage: LLMUsage | undefined } | undefined {
@@ -584,6 +641,20 @@ class IntegrationService extends Disposable implements IIntegrationService {
 			usage: final.usage,
 			title: this._threadTitleOf(threadId),
 		})
+	}
+
+	// The user message that opens a mirrored conversation: the LAST user
+	// message in the thread — for auto-mirror that is the turn that just
+	// completed, for the manual command it is the message the user is
+	// looking at. Posted by the proxy as the conversation's root so the
+	// external thread begins with real content instead of a synthetic
+	// anchor. Capped to keep protocol frames small; the thread itself has
+	// the full text.
+	private _openingMessageOf(threadId: string): string | undefined {
+		const withMessages = this._chatThreadService.getThreadWithMessages(threadId)
+		const lastUser = withMessages ? [...withMessages.messages].reverse().find(m => m.role === 'user') : undefined
+		if (!lastUser || lastUser.role !== 'user' || lastUser.displayContent.trim() === '') return undefined
+		return lastUser.displayContent.slice(0, 2000)
 	}
 
 	// The thread's current human-readable label, sent with every posted
