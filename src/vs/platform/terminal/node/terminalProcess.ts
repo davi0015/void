@@ -21,7 +21,6 @@ import { getShellIntegrationInjection, getWindowsBuildNumber, IShellIntegrationC
 import { WindowsShellHelper } from './windowsShellHelper.js';
 import { IPty, IPtyForkOptions, IWindowsPtyForkOptions, spawn } from 'node-pty';
 import { chunkInput } from '../common/terminalProcess.js';
-import { writeBufferFully } from './writeBuffer.js';
 
 const enum ShutdownConstants {
 	/**
@@ -66,8 +65,6 @@ const enum Constants {
 interface IWriteObject {
 	data: string;
 	isBinary: boolean;
-	/** Bytes not yet accepted by the PTY, when a previous write was partial. */
-	buffer?: Buffer;
 }
 
 const posixShellTypeMap = new Map<string, PosixShellType>([
@@ -116,7 +113,6 @@ export class TerminalProcess extends Disposable implements ITerminalChildProcess
 	private _titleInterval: NodeJS.Timeout | null = null;
 	private _writeQueue: IWriteObject[] = [];
 	private _writeTimeout: NodeJS.Timeout | undefined;
-	private _isWriting: boolean = false;
 	private _delayedResizer: DelayedResizer | undefined;
 	private readonly _initialCwd: string;
 	private readonly _ptyOptions: IPtyForkOptions | IWindowsPtyForkOptions;
@@ -509,8 +505,8 @@ export class TerminalProcess extends Disposable implements ITerminalChildProcess
 	}
 
 	private _startWrite(): void {
-		// Don't write if it's already queued, if there is nothing to write, or if a write is in flight
-		if (this._writeTimeout !== undefined || this._writeQueue.length === 0 || this._isWriting) {
+		// Don't write if it's already queued or if there is nothing to write
+		if (this._writeTimeout !== undefined || this._writeQueue.length === 0) {
 			return;
 		}
 
@@ -532,106 +528,12 @@ export class TerminalProcess extends Disposable implements ITerminalChildProcess
 	private _doWrite(): void {
 		const object = this._writeQueue.shift()!;
 		this._logService.trace('node-pty.IPty#write', object.data);
-
-		// [VOID] The fd workaround below is macOS-only. It exists because
-		// net.Socket.write() can block the event loop when the kernel PTY input
-		// buffer is full, which hangs the pty host there; fs.write() runs on the
-		// libuv thread pool instead.
-		//
-		// On Windows the input channel is node-pty's socket over the console input
-		// pipe, and `WindowsTerminal.fd` is a console handle rather than a file
-		// descriptor fs.write() can address: every keystroke is written to a handle
-		// nothing reads, silently, while output keeps flowing. So Windows and Linux
-		// take node-pty's own write path.
-		if (process.platform !== 'darwin') {
-			// `buffer` is only ever set by the darwin path below (a partial write
-			// being retried), so this is the original string in practice.
-			this._ptyProcess!.write(object.buffer ? object.buffer.toString(object.isBinary ? 'binary' : 'utf8') : object.data);
-			return;
-		}
-
-		this._isWriting = true;
-
-		// [VOID] On macOS, node-pty's net.Socket.write() can block the
-		// event loop when the kernel PTY input buffer is full (e.g. shell
-		// is busy writing output and not reading stdin). This permanently
-		// hangs the PTY host, killing all terminals.
-		//
-		// To prevent this, we bypass node-pty's socket and write directly
-		// to the PTY fd using fs.write() with a callback. This runs in the
-		// libuv thread pool, so even if the kernel write blocks, the event
-		// loop stays responsive.
-		//
-		// We must pause node-pty's internal read socket before writing to
-		// avoid N-API callback exceptions from concurrent fd access.
-		const ptyProcess = this._ptyProcess!;
-		const socket = (ptyProcess as any)._socket as (NodeJS.ReadWriteStream & { pause(): void; resume(): void; destroyed: boolean }) | undefined;
-		if (socket) {
-			socket.pause();
-		}
-
-		const fd = (ptyProcess as any).fd;
-		const buffer = object.buffer ?? (
-			object.isBinary
-				? Buffer.from(object.data, 'binary')
-				: Buffer.from(object.data)
-		);
-
-		const done = () => {
-			this._isWriting = false;
-
-			// Resume node-pty's read socket after the write completes
-			if (socket && !socket.destroyed) {
-				socket.resume();
-			}
-		};
-
-		// [VOID] A PTY write can be partial. The kernel input queue is small and
-		// fills while the shell is busy with the bytes already delivered, so
-		// fs.write reports a short count rather than an error. Ignoring it drops
-		// the rest of this chunk — which is how a command over about a kilobyte
-		// arrived with one span missing at the queue's limit and everything after
-		// it intact. Keep writing until the buffer is out, and on EAGAIN put only
-		// the unsent bytes back so a retry cannot duplicate the part that made it.
-		writeBufferFully(
-			(full, offset, length, cb) => fs.write(fd, full, offset, length, null, cb),
-			buffer,
-			(err, bytesWritten) => {
-				const unsent = buffer.subarray(bytesWritten);
-				done();
-
-				if (err) {
-					// EAGAIN means the write would block — re-queue the remainder and
-					// retry later. Other errors (EBADF etc.) mean the PTY is gone —
-					// drop silently.
-					if ((err.code === 'EAGAIN' || err.code === 'EWOULDBLOCK') && unsent.length > 0) {
-						this._writeQueue.unshift({
-							data: '',
-							isBinary: object.isBinary,
-							buffer: Buffer.from(unsent),
-						});
-						if (this._writeTimeout === undefined) {
-							this._writeTimeout = setTimeout(() => {
-								this._writeTimeout = undefined;
-								this._startWrite();
-							}, Constants.WriteInterval);
-						}
-					}
-					return;
-				}
-				this._childProcessMonitor?.handleInput();
-
-				// Start the next queued write now that this one is done.
-				// Without this, writes stall when _writeTimeout was cleared (queue
-				// was empty after _doWrite returned) but more data arrived before
-				// fs.write completed. The _isWriting flag in _startWrite prevents
-				// concurrent fs.write calls on the same fd, which caused N-API
-				// exceptions that broke exit detection and leaked PTY processes.
-				if (!this._store.isDisposed && this._writeQueue.length > 0 && this._writeTimeout === undefined) {
-					this._startWrite();
-				}
-			},
-		);
+		// [VOID] Writes go through node-pty's own write path. Since node-pty 1.2.0
+		// that path is a direct fs.write()-based stream on the libuv thread pool
+		// with proper EAGAIN and partial-write handling (node-pty#833), so the
+		// macOS socket workaround and the partial-write retry built on top of it
+		// are no longer needed on any platform — see fix/node-pty-fd-leak and #174.
+		this._ptyProcess!.write(object.data);
 	}
 
 	resize(cols: number, rows: number): void {
