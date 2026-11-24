@@ -707,7 +707,16 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 				// C/D markers arrive as data, so this runs before the first command
 				// can start and does not depend on the buffer being rendered.
 				if (outputTracker) {
-					disposables.push(terminal.onData(chunk => outputTracker.feed(chunk)))
+					// `onWillData` fires *before* xterm parses a chunk; `onData` fires
+					// in the write callback, after. Command detection runs during that
+					// parse, so a tracker fed from `onData` has not yet seen the chunk
+					// carrying the output and the `D` marker when `onCommandFinished`
+					// fires for it: the window it hands back is the empty, still
+					// collecting one, and an empty window is indistinguishable from a
+					// command that printed nothing. A process with startup cost (node)
+					// makes that the normal case, which is why its output disappeared
+					// while `echo` usually survived.
+					disposables.push(terminal.onWillData(chunk => outputTracker.feed(chunk)))
 				}
 
 				// Track whether we've sent our command yet. The listener is attached
