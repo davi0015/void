@@ -20,6 +20,7 @@ import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, Raw
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
+import { mergeRecordWrites } from '../common/storageMerge.js';
 import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, effectiveAutoApproveMode, normalizeThreadPermissionMode, ThreadPermissionMode, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { IToolsService } from './toolsService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
@@ -862,6 +863,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// Phase E — hydrate per-workspace pin map. Reader handles v1→v2
 		// migration, ghost-id filtering, and empty-bucket pruning.
 		Object.assign(this._pinnedThreadIdsByWorkspace, this._readPinnedThreadIdsByWorkspace(allThreads))
+		this._pinsSynced = { ...this._pinnedThreadIdsByWorkspace }
 		const currentPins = this._pinnedThreadIdsByWorkspace[currentWorkspace.uri ?? ''] ?? []
 
 		this.state = {
@@ -890,6 +892,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// restore where the user left off in *this* workspace, even when other
 		// workspaces' threads were touched more recently.
 		Object.assign(this._lastActiveThreadIdByWorkspace, this._readLastActiveThreadIdByWorkspace())
+		this._lastActiveSynced = { ...this._lastActiveThreadIdByWorkspace }
 
 		// Migration: re-tag threads that used the old volatile
 		// `void-untitled-workspace://<workspace.id>` URI to the current
@@ -962,6 +965,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const fresh = this._readPinnedThreadIdsByWorkspace(this.state.allThreads)
 			for (const k of Object.keys(this._pinnedThreadIdsByWorkspace)) delete this._pinnedThreadIdsByWorkspace[k]
 			Object.assign(this._pinnedThreadIdsByWorkspace, fresh)
+			this._pinsSynced = { ...fresh }
 			const newPins = this._pinnedThreadIdsByWorkspace[this._currentPinKey()] ?? []
 			const oldPins = this.state.pinnedThreadIds
 			const samePins = newPins.length === oldPins.length && newPins.every((id, i) => id === oldPins[i])
@@ -972,6 +976,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const fresh = this._readLastActiveThreadIdByWorkspace()
 			for (const k of Object.keys(this._lastActiveThreadIdByWorkspace)) delete this._lastActiveThreadIdByWorkspace[k]
 			Object.assign(this._lastActiveThreadIdByWorkspace, fresh)
+			this._lastActiveSynced = { ...fresh }
 			// Intentionally not auto-switching the current thread when this
 			// changes externally. That would yank the user's focus to a
 			// different thread because another window happened to switch —
@@ -2133,6 +2138,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// re-derived on every mutation (see `_setPinsForCurrentWorkspace`).
 	private readonly _pinnedThreadIdsByWorkspace: Record<string, string[]> = {}
 
+	// The stored maps as this window last read or wrote them, used as the merge base
+	// for the write path in `_storePinnedThreadIdsByWorkspace`. Without a base there is
+	// no way to tell a bucket this window changed from one it never touched, and the
+	// difference decides whether a write keeps or discards another window's change.
+	private _pinsSynced: Record<string, string[]> = {}
+	private _lastActiveSynced: Record<string, string> = {}
+
 	// Storage shape v1: `string[]` (single global pin list).
 	// Storage shape v2: `Record<workspaceUri, string[]>` (per-workspace).
 	// Reads tolerate both shapes; v1 is migrated by distributing each pinned
@@ -2178,12 +2190,43 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	private _storePinnedThreadIdsByWorkspace() {
+		// Merged against what storage holds now, not written over it. Each window keeps
+		// its own buckets, so a write from one that merely rearranged *its* tab strip
+		// must not revert a pin another window added to a different workspace — which is
+		// what serialising this whole map did.
+		const persisted = this._readPinnedMapFromStorage()
+		const merged = mergeRecordWrites(persisted, this._pinsSynced, this._pinnedThreadIdsByWorkspace) as Record<string, string[]>
 		this._storageService.store(
 			PINNED_THREADS_STORAGE_KEY,
-			JSON.stringify(this._pinnedThreadIdsByWorkspace),
+			JSON.stringify(merged),
 			StorageScope.APPLICATION,
 			StorageTarget.USER
 		);
+		this._pinsSynced = merged
+	}
+
+	// The stored map, unread, as this window's merge base sees it. Deliberately not
+	// `_readPinnedThreadIdsByWorkspace`: that applies the ghost-id and v1-migration
+	// filters, and a filtered view would make filtered-out ids look like local
+	// deletions and remove them from other windows' buckets.
+	private _readPinnedMapFromStorage(): Record<string, unknown> {
+		const raw = this._storageService.get(PINNED_THREADS_STORAGE_KEY, StorageScope.APPLICATION)
+		if (!raw) return {}
+		try {
+			const parsed: unknown = JSON.parse(raw)
+			if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+		} catch { /* fall through to empty */ }
+		return {}
+	}
+
+	private _readLastActiveMapFromStorage(): Record<string, unknown> {
+		const raw = this._storageService.get(LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, StorageScope.APPLICATION)
+		if (!raw) return {}
+		try {
+			const parsed: unknown = JSON.parse(raw)
+			if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+		} catch { /* fall through to empty */ }
+		return {}
 	}
 
 	// The sentinel key under which empty-window pins live. Empty string keeps
@@ -2227,12 +2270,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	private _storeLastActiveThreadIdByWorkspace() {
+		const persisted = this._readLastActiveMapFromStorage()
+		const merged = mergeRecordWrites(persisted, this._lastActiveSynced, this._lastActiveThreadIdByWorkspace) as Record<string, string>
 		this._storageService.store(
 			LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY,
-			JSON.stringify(this._lastActiveThreadIdByWorkspace),
+			JSON.stringify(merged),
 			StorageScope.APPLICATION,
 			StorageTarget.USER
 		)
+		this._lastActiveSynced = merged
 	}
 
 	// Phase E — drop every `lastActive[ws]` entry that currently points at
