@@ -403,7 +403,12 @@ class IntegrationService extends Disposable implements IIntegrationService {
 				title = firstUser.displayContent.slice(0, 80)
 		}
 
-		this._postOutbound({ type: 'createConversation', threadId: thread.id, title })
+		this._postOutbound({
+			type: 'createConversation',
+			threadId: thread.id,
+			title,
+			text: this._openingMessageOf(thread.id),
+		})
 		// conversationBound (from the proxy) completes the mirroring; events
 		// for this thread are dropped until it arrives — mirroring effectively
 		// starts with the next turn
@@ -544,7 +549,12 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		const final = this._finalOfThreadId(threadId)
 		if (final === undefined || final.text === '') return // nothing to say — don't mint a thread for it
 		this._pendingFinalOfThreadId.set(threadId, final)
-		this._postOutbound({ type: 'createConversation', threadId, title: this._threadTitleOf(threadId) })
+		this._postOutbound({
+			type: 'createConversation',
+			threadId,
+			title: this._threadTitleOf(threadId),
+			text: this._openingMessageOf(threadId),
+		})
 	}
 
 	private _finalOfThreadId(threadId: string): { text: string, usage: LLMUsage | undefined } | undefined {
@@ -584,6 +594,20 @@ class IntegrationService extends Disposable implements IIntegrationService {
 			usage: final.usage,
 			title: this._threadTitleOf(threadId),
 		})
+	}
+
+	// The user message that opens a mirrored conversation: the LAST user
+	// message in the thread — for auto-mirror that is the turn that just
+	// completed, for the manual command it is the message the user is
+	// looking at. Posted by the proxy as the conversation's root so the
+	// external thread begins with real content instead of a synthetic
+	// anchor. Capped to keep protocol frames small; the thread itself has
+	// the full text.
+	private _openingMessageOf(threadId: string): string | undefined {
+		const withMessages = this._chatThreadService.getThreadWithMessages(threadId)
+		const lastUser = withMessages ? [...withMessages.messages].reverse().find(m => m.role === 'user') : undefined
+		if (!lastUser || lastUser.role !== 'user' || lastUser.displayContent.trim() === '') return undefined
+		return lastUser.displayContent.slice(0, 2000)
 	}
 
 	// The thread's current human-readable label, sent with every posted

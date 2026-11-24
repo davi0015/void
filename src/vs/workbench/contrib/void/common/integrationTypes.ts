@@ -129,9 +129,13 @@ export type IntegrationOutbound =
 
 	// Ask the proxy to create a NEW external conversation (e.g. a Teams
 	// thread) mirroring an EXISTING Void thread — the editor-initiated
-	// direction of the binding. `title` is a human-readable label for the
-	// anchor message (thread title / first-message excerpt).
-	| { type: 'createConversation'; threadId: string; title?: string }
+	// direction of the binding. `title` is a human-readable label (thread
+	// title / first-message excerpt). `text` is the user message that opens
+	// the mirrored conversation — proxies that support it post this as the
+	// conversation's root (authored by the channel user, never dispatched
+	// back to Void) instead of a synthetic anchor, so the external thread
+	// starts with real content.
+	| { type: 'createConversation'; threadId: string; title?: string; text?: string }
 
 	// The turn failed (LLM error, abort, etc).
 	| { type: 'error'; conversationKey: string; message: string; title?: string }
