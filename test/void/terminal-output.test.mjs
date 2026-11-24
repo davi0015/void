@@ -82,4 +82,23 @@ describe('terminal output capture', () => {
 			t.diagnostic(`first body line: ${JSON.stringify((short.model.split('\n')[1] ?? '').trim())}`)
 		})
 	})
+
+	test('output that arrives after the start marker still reaches the model', async (t) => {
+		await h.withScenario('terminal-output/late', async (s) => {
+			// The shell integration parses a chunk and fires `onCommandFinished`
+			// during that parse; `onData` for the same chunk fires afterwards. If the
+			// tracker is fed from `onData`, a command whose output lands in the same
+			// chunk as its `D` marker is still "collecting" when the finish handler
+			// runs, so the window it hands back is empty and the output is lost. A
+			// process that takes a moment to start (node) makes that the normal case.
+			const token = 'LATE-' + Math.random().toString(36).slice(2)
+			const command = isWindows
+				? `Start-Sleep -Milliseconds 300; Write-Output "${token}"`
+				: `sleep 0.3; echo ${token}`
+			const late = await runCommand(s.page, command)
+			t.diagnostic(`late output (${late.elapsedMs} ms): ${JSON.stringify(late.model)}`)
+			assert.equal(late.resolveReason.type, 'done', 'control: the command settled on the done marker')
+			assertSubject('output produced after the start marker reaches the model', late.model.includes(token), t)
+		})
+	})
 })

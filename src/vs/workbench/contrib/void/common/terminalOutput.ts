@@ -19,6 +19,13 @@
 // stream and hands each command's output back in completion order.
 //
 // It is dependency-free so the parsing runs under `npm run test-node`.
+//
+// The feed comes from `onWillData`, before xterm parses the chunk, because
+// command detection reports `D` *during* that parse. Feeding from `onData`
+// would leave the tracker one chunk behind at the moment `onCommandFinished`
+// runs, so a command whose output and marker arrive together would hand back
+// an empty window. `take()` still accepts a partially collected window: that
+// is what a timeout needs.
 
 const MARKER = '\x1b]633;'
 const BEL = '\x07'
