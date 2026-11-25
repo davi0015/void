@@ -45,4 +45,49 @@ describe('settings writes', () => {
 			h.assertPersistence('the mode is still set a second later', later === 'gather', { subject: true })
 		})
 	})
+
+	test('a reload whose read spans a write does not undo it', async (t) => {
+		// The same defect as the scenario above, made deterministic. `_reloadExternalState`
+		// reads the blob, and if a write completes while that read is in flight the read can
+		// return the *previous* blob — which the reload then adopts, undoing a write that has
+		// already been persisted. Under load the read is slow enough to overlap a write about
+		// once per suite run; here the read is held open so it always does.
+		await h.withScenario('settings-write/reload-race', async (s) => {
+			await h.ensureModelSelection(s.page)
+
+			const out = await s.page.evaluate(async () => {
+				const settings = globalThis.__voidChatThreadService._settingsService
+				const originalRead = settings._readState.bind(settings)
+				let releaseRead = () => { }
+				let held = false
+				// Read the blob *now* (the state before the write), then hold the result: the
+				// reload is between its read and its adoption while the write runs. Only the
+				// first read is held — the write's own merge read must not wait for us.
+				settings._readState = async () => {
+					const value = await originalRead()
+					if (!held) {
+						held = true
+						await new Promise(resolve => { releaseRead = resolve })
+					}
+					return value
+				}
+				const reload = settings._reloadExternalState()
+				await new Promise(r => setTimeout(r, 100)) // let the reload reach the held read
+				const before = settings.state.globalSettings.chatMode
+				await settings.setGlobalSetting('chatMode', 'gather')
+				const afterWrite = settings.state.globalSettings.chatMode
+				releaseRead()
+				await reload
+				settings._readState = originalRead
+				return { before, afterWrite, afterReload: settings.state.globalSettings.chatMode }
+			})
+			t.diagnostic(`reload race: ${JSON.stringify(out)}`)
+			h.assertPersistence('the write applied', out.afterWrite === 'gather', {})
+			h.assertPersistence(
+				'the write survives a reload that read before it and adopted after it',
+				out.afterReload === 'gather',
+				{ subject: true },
+			)
+		})
+	})
 })

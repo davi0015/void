@@ -262,6 +262,9 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 	// reload tells an echo of this window's own write from a real one.
 	private _lastSyncedState: VoidSettingsState | undefined
 	private _writesInFlight = 0
+	// Bumped when a write starts. A reload captures it before its read and checks it after,
+	// so a read that straddles a write can be told from one that does not.
+	private _writeGeneration = 0
 
 	private readonly _resolver: () => void
 	waitForInitState: Promise<void> // await this if you need a valid state initially
@@ -421,6 +424,13 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 		// merges against storage anyway, so skipping this loses nothing.
 		if (this._writesInFlight > 0) return
 
+		// A write that begins while this read is in flight is newer than anything the read can
+		// return: the read may have taken the blob from before that write, and adopting it
+		// would undo a setting that is already persisted — after which the next write persists
+		// the reverted value, which is how a mode switch flips back under the pointer. The
+		// write path merges against storage and adopts its own result, so dropping this read
+		// loses nothing: another window's change was in that same merge read.
+		const generation = this._writeGeneration
 		let readS: VoidSettingsState
 		try {
 			readS = await this._readState()
@@ -428,6 +438,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 		catch (e) {
 			return
 		}
+		if (this._writesInFlight > 0 || this._writeGeneration !== generation) return
 		this.state = this._migrateAndValidateState(readS)
 		this._lastSyncedState = this.state
 		this._onDidChangeState.fire()
@@ -463,6 +474,9 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 
 
 	private async _storeState() {
+		// Bumped before the first await: any echo-driven read that starts from here on is
+		// reading a blob this write is about to replace.
+		this._writeGeneration++
 		const source = this.state
 		const cleanSettings = { ...source.settingsOfProvider }
 		for (const key of Object.keys(cleanSettings)) {
