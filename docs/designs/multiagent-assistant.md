@@ -215,12 +215,15 @@ There is no `agent_name`, because there is no catalogue (§1). The `task` is the
 
 **There is no `wait` parameter.** An earlier revision specified
 `wait: boolean` — `true` blocks, `false` returns a handle — and background
-delegation is not what shipped. In this build the call always waits, because a
-child cannot be running while the parent is: tool calls run one at a time, and
-nothing resumes a parent that parked on a child. Shipping the flag with a `false`
-branch that did nothing would be a lie told to the model, so `wait` arrives with
-the parallelism it needs (M3), where the parent parks in `waiting_tools` and is
-resumed.
+delegation is not what shipped in M2. In that build the call always waited,
+because a child cannot be running while the parent is: tool calls run one at a
+time, and nothing resumes a parent that parked on a child. Shipping the flag with
+a `false` branch that did nothing would have been a lie told to the model.
+
+**Superseded by M3** ([see below](#m3-asynchronous-children)): the call now
+returns a handle unconditionally, and `collect_subagent` is the join. The flag is
+still absent on purpose — waiting is a property of the collect, not of the spawn,
+so there is no `false` branch to get wrong.
 
 **Hand over by file, not by paste.** A child starts empty, so the parent has to give it
 whatever it needs. When the artefact already exists — a design document, a failing test, a
@@ -260,10 +263,11 @@ and its mistakes would anchor the retry. That second half is the part that is ea
 lose: for a review, carrying three prior reviews *is* consistency; for a second opinion it
 is contamination, and the same sentence would produce both.
 
-**It cannot steer a child that is running**, because in this build a child is never
-running while the parent is: `run_subagent` waits, and tool calls run one at a time. So
-`send_message` is "start a turn on an idle child" and nothing else; the steering half of
-§7 arrives with parallelism, and a queue that never has anything in it would be a lie.
+**It cannot steer a child that is running** — true in M2, where a child was never
+running while the parent was, and still true in M3, where a child can be: the
+queue exists, but nothing reads it at a step boundary yet, so `send_message`
+refuses a running child rather than silently appending to a turn that has already
+started. Steering is M4; the refusal is the interim answer (§7).
 
 **`list_children`** — derived from `parentThreadId`. It exists because the handles have to
 survive the parent's own compaction: once a long conversation is summarised, the ids it
@@ -373,7 +377,13 @@ Caps get revisited with M3, where concurrency is first-class and there is someth
 
 The hazard that does need saying, because it is not about cost: **concurrent children can write to the same file.** §5 carries it, the tool description carries it, and the fix — partitioning, worktrees — is M5. Until then the model partitions by choosing disjoint work, which is exactly the judgement a delegating agent is being asked to exercise.
 
-A declarative **batch** call — "run these N tasks, join, return all results" — remains the M3 form, because models are unreliable at orchestrating fan-out turn by turn: they lose track of children, serialize them, or re-delegate redundantly. It is a convenience over the same machinery, not a second one.
+A declarative **batch** call — "run these N tasks, join, return all results" — is not
+what M3 shipped. The substrate it predicted is what shipped instead: `run_subagent`
+returns a handle, several in one turn run concurrently, and `collect_subagent` takes a
+list and joins them — so the batch is a convenience a model can already express, rather
+than a second way to say the same thing. It stays on the table for the case §6 was
+written about — models that lose track of children turn by turn — and M3 makes it
+measurable whether they do.
 
 ### 7. Steering and lifecycle
 
@@ -385,12 +395,16 @@ Exposed to the parent as:
   child"**. Steering a running child at its next step boundary is the half that needs
   parallelism: in this build a child is never running while the parent is, so there is
   nothing to steer.
-- `interrupt_child(child_thread_id)` — **shipped as an internal cascade, not a tool.** The
-  parent's abort already aborts the child's run through the tool's `interruptTool`, which
-  is the property that mattered (a cancelled run cannot leave an orphan burning tokens);
-  a model-facing verb for it waits for M3, where a child can outlive the call that started it.
+- `interrupt_child(child_thread_id)` — **shipped as an internal cascade in M2, and as a
+  tool in M3**. M2's cascade existed so a cancelled run could not orphan a child burning
+  tokens; M3 removes it, because a child is now supposed to outlive the turn that started
+  it, and adds `cancel_subagent` as the deliberate act (§M3). A cancelled child reports
+  `cancelled`, which is distinguishable from `rejected` on purpose.
 - `list_children()` — live status snapshot. Not a polling mechanism: the parent is notified
-  when a child settles, consistent with how the rest of Void's concurrent tools resolve.
+  when a child settles, consistent with how the rest of Void's concurrent tools resolve. In
+  M3 nothing *wakes* the parent — the next turn's volatile context carries the child
+  statuses, and a parent that wants to wait calls `collect_subagent` at the point it needs
+  the reports.
 
 `_interruptConcurrentTools` (`:2601`) extends to cascade into children on parent abort, so
 cancelling the parent does not leave orphaned children burning tokens. **Implemented**, via
@@ -512,6 +526,14 @@ result is the answer and the child is a thread the user never opened. A child th
 for approval still surfaces through the existing approval notification, because something
 does need the user.
 
+**M3 moves where the report lives.** The spawn row keeps its name, its `View` control and
+the child's current step while it runs, and loses its body: the reports render on the
+`collect_subagent` row, which is the row that carries them now. That is also where the
+"still running" count sits, so a fan-out is legible from the transcript without a separate
+tree — which is one of the three parts above that M3 was expected to need, and it turned
+out the row plus the collect already says it. What M3 does *not* add is the nested live
+card, and the tree stays in M3.5 with the rest of the surface work.
+
 ## Design decisions
 
 - **A child is a `ThreadType`, not a new execution engine.** Reusing `_runChatAgent` means approvals, cancellation, compaction, telemetry, and persistence are inherited rather than reimplemented. A second loop would drift from the first within two releases. Cost: `_runChatAgent` must be parameterized — it currently reads `chatMode` and `overridesOfModel` from global settings at `chatThreadService.ts:3079` — which is a contained refactor.
@@ -577,7 +599,8 @@ Bug numbers are canonical across both documents — see [`thread-storage.md` §1
 | **S10** | Message store, migration, and bounded residency — message bodies leave the mirrored database; memory scales with active threads; load cost scales with thread size; per-thread lazy migration with a read fallback; **the image migration S5 defers** — the flat `voidImages/` directory attributed to its threads and reclaimed (bugs 1, 2, 3, 10, and the legacy half of 6, 7, 8) | Renderer memory no longer scales with total message count; a 5,000-message thread opens within budget; threads created before the change still open; after a pass over a profile holding flat images, `voidImages/` holds none and every image still renders |
 | **M1** | **Folded into M2.** Was agent definitions and attenuation; both are dropped (§1, §5), and what remained had no consumer before a child exists. Budgets were deferred out of S8 and are now deprioritised entirely (§8) | — |
 | **M2** | Delegation — child threads with parent linkage, `alias` and full inheritance of the parent's context; `run_subagent`; `send_message` and `list_children`, so delegation is iterative and recoverable; depth-1 in `validateParams`; bounded result contract; cost rollup; child rendering with a transcript link. **No roles, no attenuated permissions, and nothing prunes a child** — a child's capability is its parent's and its data is as durable as a user thread's (§1, §2). **Shipped** — see the note below for the five deviations | Design, develop, test and review a feature through children, and the parent's peak context stays below what doing the same work inline needs |
-| **M3** | Parallelism and control — batched fan-out in one call; `interrupt_child`; parent→child tree UI; interrupt cascade; approval routing for non-visible children; failure isolation; aggregate status; **the shared residency budget, eviction priority and cascade** ([`thread-storage.md`](./thread-storage.md) §2.2). Caps and the residency budget are measured here rather than pre-built (§6) | A fan-out of a dozen children creates, runs, seals and prunes without unbounded renderer growth; one child failing leaves siblings and the parent usable |
+| **M3** | **Asynchronous children** — a spawn that returns a handle instead of a report, `collect_subagent` as the join, `cancel_subagent` as the escape, and the interrupt cascade removed so stopping a turn stops the *wait* rather than the child. `cancelled` and `interrupted` join the result contract; the volatile context lists children by status. See [M3](#m3-asynchronous-children) for the contract and the tests. **Split:** the tree UI, aggregate status, approval routing for non-visible children and failure isolation move to M3.5, and the shared residency budget stays with [`thread-storage.md`](./thread-storage.md) §2.2. Caps are still measured, not pre-built (§6); M3 is what makes the IPC burst measurable | Two children spawned in one turn start within seconds of each other; `collect` with a 0 s timeout returns `running`; a cancelled child's files survive; a user message during a child's run is answered without losing the report; stopping a turn leaves the child running |
+| **M3.5** | The orchestration surface — parent→child tree, aggregate status per fan-out, approval routing for children the user cannot see, and the failure-isolation affordances that make one bad child obvious without reading each report | A fan-out of a dozen children is legible from the parent row alone; a child needing approval is reachable in one click |
 | **M4** | Context inheritance and routing — `fork_subagent`; an optional model argument on the spawn call, so a parent can route a child to a cheaper model; declarative pipeline and parallel stages | A fork inherits the parent's compaction state consistently, not raw pre-boundary messages |
 | **M5** | Scoped implementation — writer children with explicit file partitioning; worktree-per-child isolation; optional JS orchestration sandbox | Deleting a parent removes children and their images; parallel writers do not lose updates |
 
@@ -619,6 +642,160 @@ branch boundary is about delivery, not construction.
 **A pre-S8 fix ships on its own branch.** The manual compaction boundary was capped at ten messages and cut by position, so it could slice an assistant message's tool batch in half: part of the batch was summarised together with the assistant's own text and reasoning, and the surviving results reached the next request attached to the projection's synthetic acknowledgement rather than to the assistant that made the calls. It is **not** an S8 deliverable — no budgets, no `blocked`, and it is not the automatic trigger §8.1 later added — and it is not covered by S8's gate. It rode on `fix/compaction-turns-not-messages` (#138) because the summarisation rung §8.2 still owes is built on the same primitive: a boundary that is a legal cut, planned by `planCompaction`. A reader wondering why a compaction fix appears in the multiagent sequence should find this paragraph rather than infer it from §8. See [`thread-storage.md`](./thread-storage.md) §1.6 for the log-growth defect found alongside it.
 
 **An independent defect shipped on S5's branch.** Bug 18 — the selector's Duplicate persisted no message keys, so its copies came back empty after a restart — is **not** part of image ownership and is not covered by S5's gate. It rides on S5 only because S5 hands that method the copy-on-duplicate treatment and copies image bytes for it, and bytes written for a conversation that will not survive a restart are only leaked. It is recorded as its own ledger row in [`thread-storage.md`](./thread-storage.md) §1.6, with its own acceptance scenario, and should be read and reviewed as a separate change: it alters what Duplicate persists, which no image path depends on. A reader looking for why S5's branch touches `duplicateThread` should find this paragraph rather than infer it from the row above.
+
+## M3: asynchronous children
+
+M2 built the shape it could build: a spawn that waits. Everything a manager needs from
+delegation beyond "one child, then read its report" is blocked on that one decision, and
+the evaluation of the shipped build names the consequences in order:
+
+1. **Children serialize.** A turn with three `run_subagent` calls runs them one after
+   another, because each holds the tool call. The loop already dispatches parallel tool
+   calls concurrently — `run_command` in the same batch proves it — so the serialization
+   is the tool's, not the loop's.
+2. **Nothing can be cancelled.** A child that turned out to be unnecessary keeps burning
+   tokens until it finishes, because the parent is inside its call and the only thing that
+   can stop a child is stopping the parent.
+3. **A user message waits.** The message queues behind the parent's run, and the parent's
+   run is behind the child. Answering the user costs the child's remaining runtime.
+4. **A child cannot be looked at while it works.** There is no status beyond alive/done,
+   so a manager cannot redirect a child that is searching the wrong tree.
+
+The fix is one decision — *a spawn returns a handle instead of a report* — and a great deal
+follows from it, so this section is the contract, the loop changes, and the lifecycle.
+
+### 1. The tools
+
+```ts
+'run_subagent': { alias: string, task: string }
+  -> { childThreadId, alias, status: 'running' }              // returns immediately
+
+'collect_subagent': { children?: string[], timeout_seconds?: number }
+  -> { results: [{ childThreadId, alias, status, summary?, filesTouched? }] }
+
+'cancel_subagent': { child_thread_id?: string, alias?: string }
+  -> { childThreadId, status: 'cancelled' }
+```
+
+**`run_subagent` returns the handle and nothing else.** The child is created, its thread
+stored, and its run started before the call returns — so the id is real and the work is
+underway. What it no longer returns is the report.
+
+**`collect_subagent` is the join.** It takes one or more handles (ids or aliases, resolved
+against the delegating thread's own children like `send_message`), waits up to
+`timeout_seconds` for them to settle, and returns each child's status with the report for
+the settled ones. Default timeout 60 s, maximum 300, and `0` returns the current status
+without blocking — which is the primitive a manager uses to peek at a fan-out rather than
+sit on it. Omitting `children` is not allowed: "everything uncollected" needs a delivered
+flag to be well defined, and a hidden flag is a way for a report to be read twice or lost.
+
+**`cancel_subagent` is the escape.** It stops a running child through `abortRunning`, the
+same primitive the interrupt cascade uses, and the files it already wrote stay on disk.
+The result is a distinct `cancelled` status rather than reusing `rejected`: `rejected` means
+"a stop we did not ask for" and is worth reading; `cancelled` means "the manager decided".
+
+**`send_message` is unchanged**, and gains one guard: a running child is refused with
+"It is still running; collect it or cancel it first." Steering a child *between* its tool
+calls is a different feature — it needs the queue to be visible to the child's loop at a
+step boundary, and it is not worth half-building here (M4).
+
+### 2. The loop
+
+Almost nothing changes, and that is the point of `interruptTool`.
+
+- `run_subagent`'s `callTool` returns a resolved result, so the loop continues in the same
+  turn. Parallel calls in one batch now spawn in parallel, which is what §6 predicted.
+- `collect_subagent`'s `callTool` awaits its join and returns `interruptTool: () => {}` for
+  the wait only. **Stopping the parent's turn stops the wait, never the children** — the
+  requirement that "user interrupts preempt the conversation, not the children", expressed
+  as the absence of a cascade.
+- The old cascade is removed: `run_subagent` no longer returns
+  `interruptTool: () => interruptSubagent(childThreadId)`. A cancelled parent turn leaves
+  its children running, which is the whole point, and `cancel_subagent` is the deliberate
+  act that stops them.
+
+### 3. Who wakes the parent
+
+Nothing does. A child that settles while the parent is idle does not start a turn — that
+would spend the user's tokens on work nobody asked for at that moment, and it is how a
+fan-out turns into a conversation with itself.
+
+Instead the *next* turn knows. The volatile context gains one line per child of the current
+thread: alias, status, and — for a settled one — whether its report has been collected
+since. That is what makes `list_children` unnecessary for the common case, and it is cheap:
+a handful of short lines, only on orchestrator threads.
+
+`collect_subagent` with a long timeout is the way to wait for work inside a turn. A parent
+that wants to wait for a fan-out calls collect once, at the point it needs the reports, and
+that is a normal blocking tool call — the loop already supports those.
+
+### 4. Lifecycle and the window
+
+A child's *thread* is durable (§2). A child's *run* is not: it lives in the renderer, and
+closing the window ends every in-flight child, exactly as it ends any other run.
+
+That leaves one state the design must name rather than discover: a child marked `running`
+in its stored linkage whose process is gone. On load, any child of the loading thread that
+is not actually running is read as **`interrupted`** — a status meaning "started, never
+reported, the window closed". `collect_subagent` returns it like any other terminal status,
+with the summary it managed to store before the run ended, so a manager can decide whether
+to re-run the task or take what is there. Nothing is deleted; nothing is retried
+automatically.
+
+### 5. Result contract
+
+`SubagentStatus` gains `cancelled` and `interrupted`:
+
+| status | meaning | manager's move |
+|---|---|---|
+| `done` | finished, reported | read the report; verify it |
+| `blocked` | stopped on an approval nothing could answer | narrow the task, or approve in its transcript |
+| `error` | the run failed | read the error; re-run narrower |
+| `cancelled` | the manager stopped it | none — its files are on disk |
+| `interrupted` | the window closed mid-run | re-run, or take the partial summary |
+| `rejected` | stopped by something other than an explicit cancel | read the summary |
+
+### 6. What M3 does not include
+
+The delivery table's M3 row was written before M2 shipped and lists more than the
+concurrency substrate. This section is the substrate; the rest keeps its place:
+
+- **Steering a running child** (a queued message the child's loop reads at a step
+  boundary) — M4, with `send_message`'s guard as the interim answer.
+- **The tree UI, aggregate status, approval routing for non-visible children, failure
+  isolation** — the row now labelled M3.5, one surface over a substrate that already works.
+  Failure isolation is partly true already: one child failing returns `error` for that
+  child, and its siblings are untouched.
+- **Caps.** §6 says measure before building one. The measurement M3 makes possible is the
+  500 ms write-coalescing window under a fan-out: N children flushing at once is an IPC
+  burst, observable in the e2e harness with a counter, not predictable from the source.
+- **The shared residency budget and eviction cascade** ([`thread-storage.md`](./thread-storage.md)
+  §2.2) — unchanged, unstarted, and belonging to the storage sequence rather than to
+  delegation.
+
+### 7. Acceptance tests
+
+The first two are the ones the evaluation asked for, in its words:
+
+1. Two children spawned in one turn start within seconds of each other, not one full
+   runtime apart — verbatim timestamps from each child.
+2. `collect_subagent(timeout_seconds: 0)` on a running child returns `running` without
+   blocking.
+3. Cancel a child mid-`sleep`; `list_children` shows `cancelled` within seconds, and the
+   files it wrote before cancellation still exist.
+4. While a child sleeps, a user message becomes the parent's next turn with the child's
+   status in its context, and the child's report still arrives at a later collect.
+5. Stop during a `collect_subagent` wait: the turn ends, the child keeps running, and a
+   later collect returns its report.
+6. A child that finished before a restart is collectable after it, from its stored report.
+
+### 8. Why this is one branch and several commits
+
+`run_subagent` returning a handle breaks every caller that expects a report, so the tool
+contract, the loop's interrupt handling, `collect`, `cancel`, the volatile-context line and
+the statuses cannot land independently and be useful. The commits separate as: contract
+change, collect, cancel and interrupts, lifecycle (load-time `interrupted`), context line.
+Reviewing them in that order is reviewing one decision and its consequences.
 
 ## Non-goals
 

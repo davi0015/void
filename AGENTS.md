@@ -207,6 +207,14 @@ Reuse it. Do not rebuild launch plumbing per test.
   `SidebarChat.tsx` reads the map with `?.`, so a missing entry renders **nothing** rather than
   failing: the tool call vanishes from the transcript and every test still passes. Add the entry, and
   assert the row renders.
+- **So does a changed result shape, and that one fails loudly in the wrong place.** When
+  `run_subagent` started returning a handle instead of a report, its row kept reading
+  `result.status !== 'done'` and rendering `result.summary`; the component threw, the error
+  boundary caught it, and the transcript showed "Render error" where the row should have been.
+  Every state assertion around it passed, and the only clue the e2e run gave was a missing
+  title — the page's short `<span>` texts, dumped from the failure message, showed
+  `Tool: run_subagent` next to `Render error`. Changing what a tool returns means re-reading
+  its row, not just its `stringOfResult`.
 - **Preparatory work has a test.** A change qualifies only if a user hits the problem today with a
   single agent *and* it removes a multiagent blocker. `AgentDefinition` is the instructive case: the
   type and the loop parameterization are safe, the file format is deferred.
