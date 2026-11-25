@@ -3802,6 +3802,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const message = request.message.trim()
 		if (!message) throw new Error('message must be the instruction for the child; it receives nothing else.')
 
+		// A running child cannot be steered yet: the message would either queue behind the
+		// current turn or start a second run on the same thread, and neither is what
+		// "continue this child" means. Refusing says so; steering between its tool calls is
+		// M4, and a queue nothing reads would be worse than the refusal.
+		if (this.streamState[child.id]?.isRunning !== undefined) {
+			throw new Error(`"${child.alias ?? child.id}" is still running, so there is no idle turn to continue. Collect it with collect_subagent, or cancel_subagent first if the work is no longer wanted.`)
+		}
+
 		return { childThreadId: child.id, result: this._runChildThread(child.id, message) }
 	}
 
