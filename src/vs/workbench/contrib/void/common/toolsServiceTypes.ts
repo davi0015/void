@@ -247,10 +247,10 @@ export type BuiltinToolCallParams = {
 	// ---
 	'run_command': { command: string; cwd: string | null, terminalId: string, timeoutSeconds: number },
 	'open_persistent_terminal': { cwd: string | null },
-	'run_persistent_command': { command: string; persistentTerminalId: string, timeoutSeconds: number },
+	'run_persistent_command': { command: string; persistentTerminalId: string, timeoutSeconds: number, interruptFirst?: boolean },
 	'kill_persistent_terminal': { persistentTerminalId: string },
 	// --- terminal read ---
-	'read_terminal': { terminalName: string, lastNCommands: number | null },
+	'read_terminal': { terminalId?: string, terminalName?: string, lastNCommands: number | null },
 	// --- web ---
 	'fetch_url': { url: string },
 	// --- semantic search ---

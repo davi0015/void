@@ -21,6 +21,7 @@ export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_co
 		command: { description: 'The terminal command to run.' },
 		persistent_terminal_id: { description: 'The ID of the terminal created using open_persistent_terminal.' },
 		timeout_seconds: { description: timeoutHelper },
+		interrupt_first: { description: 'Optional. Send Ctrl-C to the terminal before running this command. Use it when the terminal looks stuck rather than busy: a pager or REPL holding the prompt, or a line left open at a continuation prompt (a > or quote> prompt) after a bad paste. The command then runs on a fresh prompt.' },
 	},
 	approvalType: 'terminal',
 
@@ -29,11 +30,13 @@ export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_co
 		const command = validateStr('command', commandUnknown)
 		const persistentTerminalId = validateProposedTerminalId(persistentTerminalIdUnknown)
 		const timeoutSeconds = validateTimeoutSeconds(timeoutSecondsUnknown, MAX_TERMINAL_TIMEOUT_SECONDS)
-		return { command, persistentTerminalId, timeoutSeconds }
+		// Raw params are the model's text, so every flag arrives as a string.
+		const interruptFirst = String(raw.interrupt_first ?? '').toLowerCase() === 'true'
+		return { command, persistentTerminalId, timeoutSeconds, interruptFirst }
 	},
 
-	callTool: async ({ command, persistentTerminalId, timeoutSeconds }, ctx) => {
-		const { resPromise, interrupt } = await ctx.terminalToolService.runCommand(command, { type: 'persistent', persistentTerminalId, timeoutSeconds })
+	callTool: async ({ command, persistentTerminalId, timeoutSeconds, interruptFirst }, ctx) => {
+		const { resPromise, interrupt } = await ctx.terminalToolService.runCommand(command, { type: 'persistent', persistentTerminalId, timeoutSeconds, interruptFirst })
 		return { result: resPromise, interruptTool: interrupt }
 	},
 
@@ -47,11 +50,11 @@ export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_co
 		// bg command
 		if (resolveReason.type === 'timeout') {
 			if (resolveReason.reason === 'inactivity') {
-				return `${result_}\nCommand timed out after ${timeoutSeconds}s of no output. It may be waiting for input (e.g. a pager, y/n prompt). The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal. Do NOT run sleep or any wait command to wait for it.`
+				return `${result_}\nCommand timed out after ${timeoutSeconds}s of no output. It may be waiting for input (e.g. a pager, y/n prompt). The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal(terminal_id="${persistentTerminalId}"). Do NOT run sleep or any wait command to wait for it.`
 			}
 			// The backstop is a fixed total-wait cap (see terminalToolService),
 			// independent of the silence window.
-			return `${result_}\nCommand is still running after the maximum wait (${MAX_TERMINAL_TIMEOUT_SECONDS}s). The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal. Do NOT run sleep or any wait command to wait for it.`
+			return `${result_}\nCommand is still running after the maximum wait (${MAX_TERMINAL_TIMEOUT_SECONDS}s). The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal(terminal_id="${persistentTerminalId}"). Do NOT run sleep or any wait command to wait for it.`
 		}
 		throw new Error(`Unexpected internal error: Terminal command did not resolve with a valid reason.`)
 	},
