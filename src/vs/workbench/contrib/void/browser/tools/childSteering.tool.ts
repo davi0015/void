@@ -18,10 +18,11 @@ import { ToolDefinitionCore, ToolCtx } from './toolTypes.js'
 // has lost the ids it read from earlier tool results, and deriving the list from
 // stored linkage is the only thing that still answers after that.
 //
-// Neither blocks on a *running* child, because in this build a child cannot be
-// running while the parent is: `run_subagent` waits, and the tools run one at a
-// time. Steering a child mid-run is the parallelism step, where the parent parks
-// and is resumed; a queue that never has anything in it would be a lie.
+// A child can now be running while the parent is (M3), so `send_message` guards
+// against it rather than assuming it away: a follow-up on a running child is
+// refused with "collect it or cancel it first". Steering *between* the child's tool
+// calls — a queued message its loop reads at a step boundary — is M4; a queue that
+// is silently dropped would be worse than the refusal.
 
 /** Shared by both tools: the delegation service, resolved past the DI cycle. */
 const delegationServiceOf = (ctx: ToolCtx) =>
@@ -39,7 +40,7 @@ This is the same child, not a new one: it still has its own history, its own rep
 
 Address the child by \`alias\` (the name you gave it) or by \`child_thread_id\` (what \`list_children\` returns). If you have forgotten which children exist — a long conversation may have been summarised since you spawned them — call \`list_children\` first rather than guessing.
 
-The message is the child's next instruction, and its whole input for this turn: it does not see this conversation, so refer to files by path rather than to "the change we discussed". The reply is bounded the same way \`run_subagent\`'s is: a status, a summary and the files the child changed, never its transcript.`,
+The message is the child's next instruction, and its whole input for this turn: it does not see this conversation, so refer to files by path rather than to "the change we discussed". The reply is bounded the way a collected report is: a status, a summary and the files the child changed, never its transcript.`,
 	params: {
 		alias: { description: 'The name you gave the child when you spawned it, e.g. "tester". Use this or child_thread_id, not both.' },
 		child_thread_id: { description: 'The child\'s thread id, from `list_children` or a previous result. Use this when the alias is unknown or the conversation has been summarised.' },

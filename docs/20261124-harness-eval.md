@@ -11,9 +11,10 @@ restated.
 note: `read_terminal` takes the `terminal_id` that `open_persistent_terminal` returns
 and refuses an ambiguous name, and `run_persistent_command` takes `interrupt_first` to
 send Ctrl-C before a command. Finding 3 is still open (its exit-status shape was never
-reproduced), finding 4 does not reproduce here, finding 5 changes with the asynchronous
-work, and finding 6 is still unmeasured. The rows below record the evaluation as it
-stood on 2026-11-24.
+reproduced), finding 4 does not reproduce here, finding 5 is being changed by M3 (the
+spawn returns a handle, so children run beside the parent and the serialization this
+note records as "by design" is going away), and finding 6 is still unmeasured. The rows
+below record the evaluation as it stood on 2026-11-24.
 
 ## Findings, and their status here
 

@@ -3,7 +3,7 @@ import { RawMCPToolCall } from './mcpServiceTypes.js';
 import { Edit } from './editCodeServiceTypes.js';
 import { SnakeCaseKeys } from './prompt/prompts.js';
 import { RawToolParamsObj } from './sendLLMMessageTypes.js';
-import type { ChildThreadSummary, SubagentOutcome } from './childThreadLinkage.js';
+import type { ChildThreadSummary, SubagentOutcome, SubagentStatus } from './childThreadLinkage.js';
 // Type-only: `voidSettingsTypes` imports the approval types from here, so a value
 // import would close a runtime cycle. Erased at compile time, and `ChatMode` is a
 // string union, so nothing about this file is worse for it.
@@ -66,7 +66,7 @@ export const toolApprovalTypes = new Set<ToolApprovalType>([
 // not a consequence of the approval table above: delegation needs no approval, so
 // graded by approval alone it would land with the read-only tools and let a `gather`
 // investigation spawn a child that can write. What separates them is what they *do*.
-export const delegationToolNames = new Set<BuiltinToolName>(['run_subagent', 'send_message', 'list_children'])
+export const delegationToolNames = new Set<BuiltinToolName>(['run_subagent', 'send_message', 'list_children', 'collect_subagent', 'cancel_subagent'])
 
 
 // ===== Rungs: which tools a mode is offered =====
@@ -101,7 +101,7 @@ export const levelOfBuiltinToolName: { [T in BuiltinToolName]: ToolLevel } = {
 	'write_scratch': 2, 'delete_scratch': 2,
 	'run_command': 2, 'run_persistent_command': 2, 'open_persistent_terminal': 2, 'kill_persistent_terminal': 2,
 	// --- 3: starts or steers another agent ---
-	'run_subagent': 3, 'send_message': 3, 'list_children': 3,
+	'run_subagent': 3, 'send_message': 3, 'list_children': 3, 'collect_subagent': 3, 'cancel_subagent': 3,
 }
 
 // Same scale for modes. `normal` is below every tool on purpose: it has none. Total
@@ -269,6 +269,23 @@ export type BuiltinToolCallParams = {
 	// returns after a compaction has eaten the alias. Exactly one is required.
 	'send_message': { childThreadId: string | null, alias: string | null, message: string },
 	'list_children': {},
+	// The join. Handles are ids or aliases; the timeout bounds the wait and 0 reads the
+	// current status without waiting. Omitted handles are refused rather than defaulted
+	// to everything uncollected, which needs a delivered flag to be well defined.
+	'collect_subagent': { children: string[], timeoutSeconds: number },
+	// The escape. Same addressing as send_message, scoped to the caller's own children.
+	'cancel_subagent': { childThreadId: string | null, alias: string | null },
+}
+
+// One child as collect_subagent reports it. 'status' widens SubagentStatus with
+// 'running', which is deliberately not part of the child's own contract: a run is
+// either still going or it ended one way.
+export type CollectedSubagent = {
+	childThreadId: string
+	alias: string
+	status: SubagentStatus | 'running'
+	summary: string
+	filesTouched: string[]
 }
 
 // RESULT OF TOOL CALL
@@ -309,11 +326,15 @@ export type BuiltinToolResultType = {
 	// --- delegation ---
 	// The bounded result the parent receives. Not the child's transcript — see
 	// `SubagentOutcome`.
-	'run_subagent': SubagentOutcome,
+	'run_subagent': { childThreadId: string, alias: string, status: 'running' },
 	// Same contract: continuing a child reports how *that* turn ended, not a
 	// different shape the parent would have to learn.
 	'send_message': SubagentOutcome,
 	'list_children': { children: ChildThreadSummary[] },
+	// One entry per handle asked for, in the same order. 'running' is not a terminal
+	// status: it means the timeout expired, or 0 was asked for.
+	'collect_subagent': { results: CollectedSubagent[] },
+	'cancel_subagent': { childThreadId: string, status: SubagentStatus },
 }
 
 

@@ -2,6 +2,8 @@ import { BuiltinToolName, isToolAvailableInChatMode, levelOfChatMode } from '../
 import { InternalToolInfo, builtinToolNames } from '../../common/prompt/prompts.js'
 import { ChatMode } from '../../common/voidSettingsTypes.js'
 import { ToolDefinitionCore } from './toolTypes.js'
+import { collectSubagentToolCore } from './collectSubagent.tool.js'
+import { cancelSubagentToolCore } from './cancelSubagent.tool.js'
 import { readFileToolCore } from './readFile.tool.js'
 import { lsDirToolCore } from './lsDir.tool.js'
 import { getDirTreeToolCore } from './getDirTree.tool.js'
@@ -58,6 +60,8 @@ export const toolDefinitionOfToolName: Partial<{ [T in BuiltinToolName]: ToolDef
 	search_history: searchHistoryToolCore,
 	load_skill: loadSkillToolCore,
 	run_subagent: runSubagentToolCore,
+	collect_subagent: collectSubagentToolCore,
+	cancel_subagent: cancelSubagentToolCore,
 	send_message: sendMessageToolCore,
 	list_children: listChildrenToolCore,
 }
