@@ -363,4 +363,54 @@ describe('terminal tooling', () => {
 			})
 		})
 	})
+
+	test('interrupt_first sends Ctrl-C so a command runs on a fresh prompt', async (t) => {
+		await h.withScenario('terminal-tools/interrupt-first', async (s) => {
+			const page = s.page
+			await h.ensureModelSelection(page)
+			await h.stubLLM(page, 'ok')
+
+			const opened = await callTool(page, {
+				name: 'open_persistent_terminal',
+				params: { cwd: null },
+				validated: { cwd: null },
+				toolId: 'call-open',
+			})
+			assert.equal(opened.rowType, 'success', `the terminal did not open: ${opened.rowContent.slice(0, 300)}`)
+			const terminalId = opened.rowResult?.persistentTerminalId
+			assert.ok(terminalId, 'the tool returned no terminal id')
+
+			// Something long and silent is running: the call times out and the terminal is still
+			// busy with it. That is the state the escape exists for — a stuck foreground process,
+			// a pager, a REPL, or a line left open at a continuation prompt.
+			const busyCommand = 'node -e "setTimeout(()=>{},30000)"'
+			const busy = await callTool(page, {
+				name: 'run_persistent_command',
+				params: { persistent_terminal_id: terminalId, command: busyCommand, timeout_seconds: 3 },
+				validated: { persistentTerminalId: terminalId, command: busyCommand, timeoutSeconds: 3 },
+				toolId: 'call-busy',
+			})
+			const busyReason = busy.rowResult?.resolveReason?.type
+			t.diagnostic(`busy: ${busy.rowType} reason=${busyReason}`)
+			assert.equal(busyReason, 'timeout', `the fixture did not leave the terminal busy (${busyReason})`)
+
+			// The escape: Ctrl-C first, then the command, all in one call.
+			const recovered = await callTool(page, {
+				name: 'run_persistent_command',
+				params: { persistent_terminal_id: terminalId, command: 'echo interrupt-recovered', timeout_seconds: 15, interrupt_first: true },
+				validated: { persistentTerminalId: terminalId, command: 'echo interrupt-recovered', timeoutSeconds: 15, interruptFirst: true },
+				toolId: 'call-recovered',
+			})
+			t.diagnostic(`recovered: ${recovered.rowType} ${String(recovered.rowResult?.result ?? '').slice(-160)}`)
+			assert.equal(recovered.rowType, 'success', `the command after Ctrl-C did not run: ${recovered.rowContent.slice(0, 300)}`)
+			assert.ok(String(recovered.rowResult?.result ?? '').includes('interrupt-recovered'), 'the command after Ctrl-C produced no output')
+
+			await callTool(page, {
+				name: 'kill_persistent_terminal',
+				params: { persistent_terminal_id: terminalId },
+				validated: { persistentTerminalId: terminalId },
+				toolId: 'call-kill',
+			})
+		})
+	})
 })

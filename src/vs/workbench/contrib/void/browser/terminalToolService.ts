@@ -102,7 +102,7 @@ export interface ITerminalToolService {
 
 	listAllTerminals(): { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[];
 	runCommand(command: string, opts:
-		| { type: 'persistent', persistentTerminalId: string, timeoutSeconds: number }
+		| { type: 'persistent', persistentTerminalId: string, timeoutSeconds: number, interruptFirst?: boolean }
 		| { type: 'temporary', cwd: string | null, terminalId: string, timeoutSeconds: number }
 		// | { type: 'apply', terminalId: string }
 	): Promise<{ interrupt: () => void; resPromise: Promise<{ result: string, resolveReason: TerminalResolveReason }> }>;
@@ -872,6 +872,25 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 					disposables.push(l)
 				})
 
+
+				// A wedged terminal first: a pager or REPL holding the prompt, or a line left
+				// open at a continuation prompt (`>` / `quote>`) by a paste that wrapped. Without
+				// this the command is typed *into* whatever is waiting, which is how a bad paste
+				// turns into a terminal that answers nothing until it is killed. The sentinel
+				// state is cleared by the input listener, which is correct here: anything we were
+				// waiting on has just been interrupted.
+				if (params.type === 'persistent' && params.interruptFirst) {
+					await terminal.sendText('\u0003', false)
+					// Wait for the interrupted command to actually die before typing: text sent
+					// while the shell is still tearing the last process down is swallowed, and the
+					// call then reports success with the prompt redraw as its output.
+					const capsAfterInterrupt = terminal.capabilities.get(TerminalCapability.CommandDetection)
+					for (let i = 0; i < 20; i++) {
+						if (!capsAfterInterrupt?.executingCommand) break
+						await timeout(50)
+					}
+					await timeout(100)
+				}
 
 				// send the command now that listeners are attached
 				if (sentinel) this._sentinelState(terminal).pendingCommand = command

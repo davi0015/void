@@ -21,6 +21,7 @@ export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_co
 		command: { description: 'The terminal command to run.' },
 		persistent_terminal_id: { description: 'The ID of the terminal created using open_persistent_terminal.' },
 		timeout_seconds: { description: timeoutHelper },
+		interrupt_first: { description: 'Optional. Send Ctrl-C to the terminal before running this command. Use it when the terminal looks stuck rather than busy: a pager or REPL holding the prompt, or a line left open at a continuation prompt (a > or quote> prompt) after a bad paste. The command then runs on a fresh prompt.' },
 	},
 	approvalType: 'terminal',
 
@@ -29,11 +30,13 @@ export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_co
 		const command = validateStr('command', commandUnknown)
 		const persistentTerminalId = validateProposedTerminalId(persistentTerminalIdUnknown)
 		const timeoutSeconds = validateTimeoutSeconds(timeoutSecondsUnknown, MAX_TERMINAL_TIMEOUT_SECONDS)
-		return { command, persistentTerminalId, timeoutSeconds }
+		// Raw params are the model's text, so every flag arrives as a string.
+		const interruptFirst = String(raw.interrupt_first ?? '').toLowerCase() === 'true'
+		return { command, persistentTerminalId, timeoutSeconds, interruptFirst }
 	},
 
-	callTool: async ({ command, persistentTerminalId, timeoutSeconds }, ctx) => {
-		const { resPromise, interrupt } = await ctx.terminalToolService.runCommand(command, { type: 'persistent', persistentTerminalId, timeoutSeconds })
+	callTool: async ({ command, persistentTerminalId, timeoutSeconds, interruptFirst }, ctx) => {
+		const { resPromise, interrupt } = await ctx.terminalToolService.runCommand(command, { type: 'persistent', persistentTerminalId, timeoutSeconds, interruptFirst })
 		return { result: resPromise, interruptTool: interrupt }
 	},
 
