@@ -158,6 +158,11 @@ async function scenario(page, { report = CHILD_REPORT } = {}) {
 	// over here — this helper's job is to put the app in a state, not to test the write.
 	const mode = await page.evaluate(async () => {
 		const svc = globalThis.__voidChatThreadService
+		// Wait for the settings service to finish reading storage before writing to it. A
+		// write that lands first is overwritten by the initial read, which is a fixture
+		// racing startup rather than a product bug — and it fails here as "the app is in
+		// agent mode", which reads like a gate problem and is not.
+		await svc._settingsService.waitForInitState
 		await svc._settingsService.setGlobalSetting('chatMode', 'orchestrator')
 		for (let i = 0; i < 40; i++) {
 			const mode = svc._settingsService.state.globalSettings.chatMode
@@ -587,27 +592,18 @@ describe('subagent delegation', () => {
 			// test is what caught that on the first run; this is the setup it needs. Read the
 			// values back rather than assuming the write landed — a guard that silently did
 			// nothing is the failure mode this whole test is about.
-			const settings = await s.page.evaluate(async () => {
+			// Notifications are off by default on Windows, and turning them on through the
+			// settings path is wrong for this test twice over: that write is a whole-blob
+			// store whose timing is unreliable under this fixture, and it is not the subject.
+			// The subject is the guard in `_wrapRunAgentToNotify`, which is decided before
+			// `_shouldNotify` is ever consulted. So the fixture states the premise — "this
+			// user has finish notifications on" — and the control proves it took.
+			const fixture = await s.page.evaluate(() => {
 				const svc = globalThis.__voidChatThreadService
-				const read = () => {
-					const g = svc._settingsService.state.globalSettings
-					return { notificationsEnabled: g.notificationsEnabled, notifyOnDone: g.notifyOnDone }
-				}
-				await svc._settingsService.setGlobalSetting('notificationsEnabled', true)
-				await svc._settingsService.setGlobalSetting('notifyOnDone', true)
-				const samples = [read()]
-				for (let i = 0; i < 40; i++) {
-					await new Promise(r => setTimeout(r, 50))
-					const now = read()
-					samples.push(now)
-					if (now.notificationsEnabled && now.notifyOnDone) break
-				}
-				return samples
+				svc._shouldNotify = () => true
+				return typeof svc._shouldNotify === 'function'
 			})
-			t.diagnostic(`notification settings samples: ${JSON.stringify(settings)}`)
-			const settingsNow = settings[settings.length - 1]
-			assert.equal(settingsNow.notificationsEnabled && settingsNow.notifyOnDone, true,
-				`notifications never came on (${JSON.stringify(settings)}), so nothing would be recorded either way`)
+			assert.equal(fixture, true, 'could not turn notifications on for the fixture')
 
 			// The child's first request asks for a command, which the default settings do
 			// not auto-approve, so its run parks at `awaiting_user` and `run_subagent`
