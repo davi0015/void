@@ -59,6 +59,31 @@ export function shouldCompactProactively({ usedTokens, contextWindowTokens }: {
 }
 
 /**
+ * How big the request about to be sent is.
+ *
+ * The provider told us the previous request's size in its usage: `input` plus `output`,
+ * both of which are resent verbatim, so that sum is exact for everything except what has
+ * been appended since — a tool result, a new user message — and the overflow path covers
+ * the remainder if one of those is large. It is used **instead of** any estimate, not as
+ * one candidate in a `max`.
+ *
+ * The character estimate is the fallback for the two moments when there is no count: the
+ * thread's first request, and the request right after a compaction, whose previous usage
+ * describes the pre-compaction prompt. It is a count of the live view — the summary plus
+ * the messages after the boundary — and it excludes the system prompt and the tool
+ * schemas, so it is a lower bound, in the direction that compacts later rather than
+ * sooner.
+ */
+export function usedTokensForTrigger({ priorContentTokens, liveChars, charsPerToken }: {
+	priorContentTokens: number | undefined
+	liveChars: number
+	charsPerToken: number
+}): number {
+	if (priorContentTokens !== undefined) return priorContentTokens
+	return Math.round(liveChars / charsPerToken)
+}
+
+/**
  * Characters of the live view: the summary that replaced the compacted span, plus every
  * message after the boundary. Before any compaction this is the whole array. A boundary
  * past the end of the array counts the summary alone, which is what a truncated thread

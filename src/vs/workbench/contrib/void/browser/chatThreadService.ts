@@ -15,7 +15,7 @@ import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { builtinToolNames, chat_userMessageContent, isABuiltinToolName, visionHelper_systemMessage, visionHelper_userMessage } from '../common/prompt/prompts.js';
 import { getModelCapabilities } from '../common/modelCapabilities.js';
 import { CompactionPlan, planCompaction, RETENTION_MIN_CHARS, RETENTION_RATIO } from '../common/compactionBoundary.js';
-import { AUTO_COMPACT_PERCENT, AUTO_COMPACT_PROTECT_TURNS, liveViewChars, shouldCompactProactively } from '../common/compactionTrigger.js';
+import { AUTO_COMPACT_PERCENT, AUTO_COMPACT_PROTECT_TURNS, liveViewChars, shouldCompactProactively, usedTokensForTrigger } from '../common/compactionTrigger.js';
 import { isContextOverflowError } from '../common/contextOverflow.js';
 import { AnthropicReasoning, getErrorMessage, type LLMUsage, RawToolCallObj, RawToolParamsObj, ResponsesReasoningRef } from '../common/sendLLMMessageTypes.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -4153,7 +4153,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						summary: threadNow.compactionSummary,
 						boundaryIdx: threadNow.compactionBoundaryIdx,
 					})
-					const usedTokens = Math.max(priorContentTokens ?? 0, Math.round(liveChars / charsPerToken))
+					// The provider's count for the previous request is the size of everything
+					// about to be resent; the char count of the live view is only for the two
+					// moments there is no count to use (see `usedTokensForTrigger`).
+					const usedTokens = usedTokensForTrigger({ priorContentTokens, liveChars, charsPerToken })
 					const plan = this._planCompaction(threadNow.messages, AUTO_COMPACT_PROTECT_TURNS, modelSelection, charsPerToken)
 					// Nothing to summarise (too few turns) is not a failure to report on every
 					// iteration; the provider's overflow path still covers a request that does

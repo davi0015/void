@@ -10,15 +10,17 @@ import {
 	AUTO_COMPACT_PROTECT_TURNS,
 	liveViewChars,
 	shouldCompactProactively,
+	usedTokensForTrigger,
 } from '../compactionTrigger.js';
 
 // The arithmetic of "compact before sending": a fraction of the window with an absolute
 // ceiling, and a size estimate that counts the live view rather than the message array.
 //
 // The cases worth pinning are the two ends of the ceiling (a small model is governed by
-// the fraction, a large one by 30k) and the post-compaction estimate, which must not
-// report the replaced messages — otherwise a compacted thread looks full forever and
-// compacts on every iteration.
+// the fraction, a large one by 30k), the post-compaction estimate, which must not report
+// the replaced messages — otherwise a compacted thread looks full forever and compacts on
+// every iteration — and the used size, which is the provider's count whenever there is
+// one, because a character estimate can say a 450k request is 620k.
 
 const user = (text: string) => ({ role: 'user', content: text });
 
@@ -51,6 +53,31 @@ suite('CompactionTrigger', () => {
 	test('the settings are the manual dialog\'s maximum retention', () => {
 		assert.strictEqual(AUTO_COMPACT_PERCENT, 70, 'a summary targeting ~30% of the compacted span');
 		assert.strictEqual(AUTO_COMPACT_PROTECT_TURNS, 10, 'the last ten turns stay verbatim');
+	});
+
+	test('the used size is the provider\'s count whenever there is one', () => {
+		// A 650k window with 460k reported: 190k left, so nothing to do. The character
+		// estimate below disagrees (4M chars at 2.5 is 1.6M tokens) and must be ignored —
+		// that disagreement is what made a thread at 450k compact.
+		assert.strictEqual(
+			usedTokensForTrigger({ priorContentTokens: 460_000, liveChars: 4_000_000, charsPerToken: 2.5 }),
+			460_000,
+			'a reported count is exact; an estimate does not compete with it',
+		);
+		assert.strictEqual(shouldCompactProactively({ usedTokens: 460_000, contextWindowTokens: 650_000 }), false,
+			'190k of headroom is not "about to overflow"');
+		assert.strictEqual(shouldCompactProactively({ usedTokens: 625_000, contextWindowTokens: 650_000 }), true,
+			'25k of headroom is');
+	});
+
+	test('without a count, the live view is the fallback', () => {
+		assert.strictEqual(
+			usedTokensForTrigger({ priorContentTokens: undefined, liveChars: 12_000, charsPerToken: 4 }),
+			3_000,
+			'the first request of a thread, and the request right after a compaction, have no prior usage',
+		);
+		assert.strictEqual(usedTokensForTrigger({ priorContentTokens: 0, liveChars: 12_000, charsPerToken: 4 }), 0,
+			'a reported zero is a count, and is used as one');
 	});
 
 	test('the live view is the whole array before any compaction', () => {
