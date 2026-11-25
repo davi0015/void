@@ -12,7 +12,7 @@ import { URI } from '../../../../base/common/uri.js';
 import { VSBuffer } from '../../../../base/common/buffer.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
-import { builtinToolNames, chat_userMessageContent, isABuiltinToolName, visionHelper_systemMessage, visionHelper_userMessage } from '../common/prompt/prompts.js';
+import { builtinToolNames, chat_userMessageContent, isABuiltinToolName, visionHelper_systemMessage, visionHelper_userMessage, type VolatileSubagent } from '../common/prompt/prompts.js';
 import { getModelCapabilities } from '../common/modelCapabilities.js';
 import { CompactionPlan, planCompaction, RETENTION_MIN_CHARS, RETENTION_RATIO } from '../common/compactionBoundary.js';
 import { AUTO_COMPACT_PERCENT, AUTO_COMPACT_PROTECT_TURNS, liveViewChars, shouldCompactProactively } from '../common/compactionTrigger.js';
@@ -3715,6 +3715,27 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	/** Children the manager cancelled explicitly, so the rejected path can say `cancelled`. */
 	private readonly _cancelledChildIds = new Set<string>()
 
+	/**
+	 * Children whose run is in flight in this renderer.
+	 *
+	 * In memory on purpose: it is the one fact that separates "a run is happening now"
+	 * from "stored as running, and the window that ran it is gone". The first is
+	 * `running`; the second is `interrupted` (design §4). A reload starts with this
+	 * empty, which is exactly right — the runs it does not know about did not outlive
+	 * their window. It also beats a stale `resultStatus`: a continued child still
+	 * carries the previous turn's outcome until this run records its own.
+	 */
+	private readonly _runningChildIds = new Set<string>()
+
+	/**
+	 * Children whose settled report a collect has already returned.
+	 *
+	 * Only feeds the volatile line (`(report collected)`), so a manager that has read a
+	 * report is not told to read it again. Cleared when a new run starts, because that
+	 * run has produced nothing yet.
+	 */
+	private readonly _collectedChildIds = new Set<string>()
+
 	collectSubagents(request: CollectSubagentsRequest): { promise: Promise<CollectedSubagent[]>, interrupt: () => void } {
 		// Resolution is synchronous and throws, so a bad handle is an ordinary tool error
 		// rather than a status the model has to interpret.
@@ -3731,16 +3752,27 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const deadline = Date.now() + Math.max(0, request.timeoutSeconds) * 1000
 			for (;;) {
 				const collected = children.map(child => this._collectedOf(child.id))
-				// Settled, out of time, or the wait was interrupted - every one of those is an
+				// The wait was stopped: the results are discarded by the tool layer, so nothing
+				// has been handed over and nothing may be marked collected.
+				if (interrupted) return collected
+				// Settled, out of time, or zero budget - every one of those is an
 				// answer, and `running` in the result says which happened.
-				if (interrupted || collected.every(c => c.status !== 'running') || request.timeoutSeconds <= 0 || Date.now() >= deadline) {
-					return collected
+				if (collected.every(c => c.status !== 'running') || request.timeoutSeconds <= 0 || Date.now() >= deadline) {
+					return this._markCollected(collected)
 				}
 				await new Promise(resolve => setTimeout(resolve, 100))
 			}
 		})()
 
 		return { promise, interrupt }
+	}
+
+	/** Records that these reports reached the caller, which is all the volatile line needs. */
+	private _markCollected(results: CollectedSubagent[]): CollectedSubagent[] {
+		for (const r of results) {
+			if (r.status !== 'running') this._collectedChildIds.add(r.childThreadId)
+		}
+		return results
 	}
 
 	cancelSubagent(request: CancelSubagentRequest): { childThreadId: string, status: SubagentStatus } {
@@ -3757,18 +3789,35 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		return { childThreadId: child.id, status: 'cancelled' }
 	}
 
-	/** One child as a collect reports it: live status while running, stored status after. */
+	/**
+	 * How one child stands, as a reader sees it.
+	 *
+	 * A live run wins over the stored record; a settled child reports what it stored;
+	 * and a child this renderer never started has no run left to wait on — its window
+	 * closed mid-run — so it reads `interrupted` (design §4). Nothing is written: the
+	 * stored record keeps whatever it had, and a second read gives the same answer.
+	 */
+	private _statusOfChild(thread: ThreadType): SubagentStatus | 'running' {
+		// A run in flight is the current answer, even when the thread still carries the
+		// previous turn's outcome — a continued child does until this run ends.
+		if (this._runningChildIds.has(thread.id)) return 'running'
+		if (thread.resultStatus !== undefined) return thread.resultStatus
+		const stream = this.streamState[thread.id]
+		// Resumed from its own transcript by an approval, so a run exists with no recorded
+		// outcome yet. `awaiting_user` is not that: it is a pause, and `blocked` above
+		// already says so.
+		if (stream?.isRunning !== undefined && stream.isRunning !== 'awaiting_user') return 'running'
+		// An error the loop has surfaced but not yet recorded as an outcome.
+		if (stream?.error) return 'error'
+		// No run in flight and no outcome: the window that ran it is gone. Nothing is
+		// retried and nothing is written; the reader decides.
+		return 'interrupted'
+	}
+
+	/** One child as a collect reports it. */
 	private _collectedOf(childThreadId: string): CollectedSubagent {
 		const thread = this.state.allThreads[childThreadId]
-		const stream = this.streamState[childThreadId]
-		// A child that has not reported yet is running, even before its loop reaches its
-		// first await: streamState is only populated once it does, and reading that absence
-		// as "settled" made collect answer done with an empty report the instant it was
-		// called after a spawn.
-		const settled = thread?.resultStatus !== undefined
-		const status: CollectedSubagent['status'] = settled
-			? (thread!.resultStatus as CollectedSubagent['status'])
-			: (stream?.error ? 'error' : 'running')
+		const status: CollectedSubagent['status'] = thread ? this._statusOfChild(thread) : 'interrupted'
 		return {
 			childThreadId,
 			alias: thread?.alias ?? '',
@@ -3825,11 +3874,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const children = this._childrenOf(parentThreadId)
 		return children.map(child => {
 			const firstUser = child.messages.find(m => m.role === 'user')
+			// Reported the way collect reports it, so the two tools cannot disagree about a
+			// child whose window closed: `running: false` with no status reads as "still
+			// working" and sends a manager back to collect for something that will never
+			// arrive.
+			const status = this._statusOfChild(child)
 			return {
 				childThreadId: child.id,
 				alias: child.alias ?? null,
-				running: this.streamState[child.id]?.isRunning !== undefined,
-				resultStatus: child.resultStatus,
+				running: status === 'running',
+				resultStatus: status === 'running' ? undefined : status,
 				task: firstUser?.role === 'user' ? (firstUser.displayContent ?? firstUser.content ?? '') : '',
 			}
 		})
@@ -3840,6 +3894,22 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		return Object.values(this.state.allThreads)
 			.filter((t): t is ThreadType => t !== undefined && t.parentThreadId === parentThreadId)
 			.sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+	}
+
+	/**
+	 * The children as the volatile block reports them, or undefined when there are none.
+	 *
+	 * This is the whole of "who wakes the parent": nothing does. The next turn simply
+	 * carries the state of the work it left running (design §3).
+	 */
+	private _childrenForVolatile(threadId: string): VolatileSubagent[] | undefined {
+		const children = this._childrenOf(threadId)
+		if (children.length === 0) return undefined
+		return children.map(child => ({
+			alias: child.alias ?? child.id,
+			status: this._statusOfChild(child),
+			collected: this._collectedChildIds.has(child.id),
+		}))
 	}
 
 	/**
@@ -3873,7 +3943,25 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		throw new Error(`send_message needs either childThreadId or alias. ${available}`)
 	}
 
+	/**
+	 * A run is in flight for the whole of one turn, from before its loop reaches its
+	 * first await until its outcome is recorded. Bookkeeping here rather than in the
+	 * turn so `_statusOfChild` can answer "is this child working right now" without
+	 * guessing from a stream state that a paused child also has.
+	 */
 	private async _runChildThread(childThreadId: string, task: string): Promise<SubagentOutcome> {
+		// Recorded before the first await, so a collect dispatched in the same tick as the
+		// spawn sees `running` rather than a child with no run at all.
+		this._runningChildIds.add(childThreadId)
+		this._collectedChildIds.delete(childThreadId)
+		try {
+			return await this._runChildTurn(childThreadId, task)
+		} finally {
+			this._runningChildIds.delete(childThreadId)
+		}
+	}
+
+	private async _runChildTurn(childThreadId: string, task: string): Promise<SubagentOutcome> {
 		let run: Promise<void> | undefined
 		try {
 			// The same send path a user message takes, so the child gets the directory
@@ -5092,6 +5180,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			includeDirectoryListing: needsFullListing,
 			prevDirectorySnapshot: thread.directorySnapshot,
 			threadId,
+			children: this._childrenForVolatile(threadId),
 		})
 		if (directorySnapshot) {
 			const updatedThread: ThreadType = { ...thread, directorySnapshot }

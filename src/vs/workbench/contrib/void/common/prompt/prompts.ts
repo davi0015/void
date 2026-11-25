@@ -11,6 +11,7 @@ import { os } from '../helpers/systemInfo.js';
 import { RawToolParamsObj } from '../sendLLMMessageTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolName, levelOfChatMode, ToolName } from '../toolsServiceTypes.js';
 import { ChatMode } from '../voidSettingsTypes.js';
+import type { SubagentStatus } from '../childThreadLinkage.js';
 
 // Triple backtick wrapper used throughout the prompts for code blocks
 export const tripleTick = ['```', '```']
@@ -237,12 +238,17 @@ export type ChatPromptContext = {
 	tools: InternalToolInfo[] | undefined
 }
 
+// One child of the conversation, as the volatile block reports it. `collected`
+// is what keeps a settled child from looking like work still to do: the report
+// has already crossed back, and re-collecting it buys nothing.
+export type VolatileSubagent = { alias: string, status: SubagentStatus | 'running', collected: boolean }
+
 
 // Returns the volatile runtime-grounding block as a standalone string. Callers
 // should prepend this to the latest user message (Phase B caching layout) rather
 // than embed it in the system message — keeping it out of the system message lets
 // the stable prefix and the full conversation history be prefix-cached across turns.
-export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode: mode, includeDirectoryListing = true, directoryDiff, defaultShell, scratchPath }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'allTerminals' | 'chatMode'> & { includeDirectoryListing?: boolean, directoryDiff?: string | null, defaultShell?: string, scratchPath?: string }) => {
+export const chat_volatileContext = ({ workspaceFolders, openedURIs, activeURI, allTerminals, directoryStr, chatMode: mode, includeDirectoryListing = true, directoryDiff, defaultShell, scratchPath, children }: Pick<ChatPromptContext, 'workspaceFolders' | 'directoryStr' | 'openedURIs' | 'activeURI' | 'allTerminals' | 'chatMode'> & { includeDirectoryListing?: boolean, directoryDiff?: string | null, defaultShell?: string, scratchPath?: string, children?: VolatileSubagent[] }) => {
 	const terminalBlock = modeCanAct(mode) && allTerminals.length > 0
 		? allTerminals.map(t => {
 			const cmd = t.lastCommand ? ` — ${t.lastCommand}` : ''
@@ -272,6 +278,20 @@ ${terminalBlock}${terminalNote}` : ''}
 </system_info>`)
 
 
+	// One line per child, and only on a thread that has any, so every other
+	// conversation pays nothing for it. This is what makes a settled child
+	// visible on the parent's next turn without waking the parent: nothing
+	// starts a run, the turn simply knows (design §3).
+	const subagentBlock = children && children.length > 0
+		? `Your subagents, and where each one stands:
+<subagents>
+${children.map(c => {
+			const report = c.status === 'running' ? '' : (c.collected ? ' (report collected)' : ' (report not collected)')
+			return `- ${c.alias}: ${c.status}${report}`
+		}).join('\n')}
+</subagents>`
+		: null
+
 	const fsInfo = includeDirectoryListing ? (`Here is an overview of the user's file system:
 <files_overview>
 ${directoryStr}
@@ -285,7 +305,7 @@ ${directoryDiff}
 	return (`<volatile_context>
 Today's date is ${new Date().toDateString()}.
 
-${sysInfo}${fsInfo ? `\n\n${fsInfo}` : ''}${diffInfo ? `\n\n${diffInfo}` : ''}
+${sysInfo}${subagentBlock ? `\n\n${subagentBlock}` : ''}${fsInfo ? `\n\n${fsInfo}` : ''}${diffInfo ? `\n\n${diffInfo}` : ''}
 </volatile_context>`)
 }
 
