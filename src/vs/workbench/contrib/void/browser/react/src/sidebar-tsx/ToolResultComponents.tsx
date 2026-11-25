@@ -2145,25 +2145,15 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 				/>
 			}
 
-			const result = toolMessage.type === 'success' ? toolMessage.result : undefined
-
-			// A delegation whose run completed but whose child did not *finish* — blocked on
-			// approval, errored, stopped — is not a success to the reader, even though the
-			// tool call itself returned a result.
-			const isError = toolMessage.type === 'tool_error' || (result !== undefined && result.status !== 'done')
+			// Since M3 the spawn's result is a handle, not a report, so this row has no body:
+			// the reports render on `collect_subagent`. Treating `status: 'running'` as an
+			// unfinished delegation — which is what this row did while the result was an
+			// outcome — rendered a report body from a result with no summary and threw.
+			const isError = toolMessage.type === 'tool_error'
 			const isRejected = toolMessage.type === 'rejected'
 			const componentParams: ToolHeaderParams = {
 				title, desc1, desc1Info, isError, icon, isRejected,
 				desc2: openChild ? 'View' : undefined, desc2OnClick: openChild,
-			}
-
-			if (result) {
-				// Closed by default: the row is the summary and the report is what you open
-				// when you want it. A delegation that did not finish is the exception — that
-				// body is a decision (approve, narrow the task, re-run), so it arrives open.
-				componentParams.bottomChildren = <BottomChildren title='Subagent report' defaultOpen={result.status !== 'done'}>
-					<SubagentReportChildren result={result} />
-				</BottomChildren>
 			}
 
 			return <ToolHeaderWrapper {...componentParams} />

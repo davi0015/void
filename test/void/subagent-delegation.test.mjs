@@ -283,15 +283,22 @@ describe('subagent delegation', () => {
 			// presence, not appearance: the harness has no opinion on how it looks.
 			const dom = await s.page.evaluate((alias) => {
 				const text = document.body.textContent ?? ''
+				// Titles are spans; `body.textContent` also carries the workbench's stylesheet,
+				// which is why the short-span list is the useful diagnostic here rather than a
+				// tail of the page text.
+				const spans = [...document.querySelectorAll('span')]
+					.map(el => (el.textContent ?? '').trim())
+					.filter(t => t.length > 0 && t.length < 48)
 				return {
 					hasParentMarker: text.includes('PARENT-MARKER'),
-					hasDelegated: text.includes('Delegated'),
-			tail: text.slice(-500),
+					hasDelegated: spans.includes('Delegated'),
+					hasCollected: spans.includes('Collected subagents'),
 					hasAlias: text.includes(alias),
-					tail: text.slice(-900).replace(/\s+/g, ' '),
+					spans: spans.slice(0, 24),
 				}
 			}, ALIAS)
-			t.diagnostic(`DOM: parentMarker=${dom.hasParentMarker} delegated=${dom.hasDelegated} alias=${dom.hasAlias}; tail: ${dom.tail}`)
+			t.diagnostic(`DOM: parentMarker=${dom.hasParentMarker} delegated=${dom.hasDelegated} collected=${dom.hasCollected} alias=${dom.hasAlias}`)
+			t.diagnostic(`short spans: ${JSON.stringify(dom.spans)}`)
 
 			// Guard: the transcript is rendered at all, so a missing row is about the row and
 			// not about the chat never having painted.
@@ -559,17 +566,21 @@ describe('subagent delegation', () => {
 			// The report arrives closed. The row is the summary — a status, the name, the way
 			// in — and the report is what a reader opens when they want it. Measured as height
 			// rather than as text: the body is a collapsible that renders its children and hides
-			// them with `max-h-0`, so presence alone would pass for a body on screen.
-			const bodyHeight = await s.page.evaluate(() => {
-				const button = [...document.querySelectorAll('button')]
+			// them with `max-h-0`, so presence alone would pass for a body on screen. Since M3
+			// the reports render on the collect row, not on the spawn row.
+			const measured = await s.page.evaluate(() => {
+				const title = [...document.querySelectorAll('span')]
 					.find(el => (el.textContent ?? '').trim() === 'Subagent reports')
-				if (!button) return -1
-				let el = button.parentElement
-				while (el && !(el.className ?? '').includes('transition-all')) el = el.parentElement
-				return el ? Math.round(el.getBoundingClientRect().height) : -1
+				if (!title) return { found: false, height: -1 }
+				// The body is the header row's next sibling; querying by class would depend on
+				// the scoped Tailwind names this build emits.
+				const header = title.closest('div')
+				const body = header?.nextElementSibling ?? null
+				return { found: true, hasBody: !!body, height: body ? Math.round(body.getBoundingClientRect().height) : -1 }
 			})
-			t.diagnostic(`delegation body height: ${bodyHeight}px`)
-			assert.equal(bodyHeight, 0, `the report arrived expanded (${bodyHeight}px)`)
+			t.diagnostic(`reports body: ${JSON.stringify(measured)}`)
+			assert.equal(measured.found, true, 'the collect row has no reports section')
+			assert.equal(measured.height, 0, `the report arrived expanded (${measured.height}px)`)
 
 			// The way in is on the row itself, so closing the body does not close the door.
 			assert.ok(await domHas(s.page, 'View'), 'the delegation row has no way into the child')
@@ -747,6 +758,106 @@ describe('subagent delegation', () => {
 			t.diagnostic(`control: ${JSON.stringify(control)}`)
 			assert.equal(control.ids.includes('probe-direct'), true, 'the notification recorder never took, so no claim about the child can be made')
 			assert.equal(control.found, true, `the parent did not announce (${JSON.stringify(control)}), so the recorder proves nothing about the child`)
+		})
+	})
+
+	test('a collect with no timeout budget reports running instead of waiting', async (t) => {
+		await h.withScenario('subagent/collect-zero', async (s) => {
+			const parent = await scenario(s.page)
+			// The child's first request is held open, so it is genuinely still running.
+			await h.stubLLM(s.page, CHILD_REPORT, { usage: STUB_USAGE, hang: true })
+
+			const spawned = await s.page.evaluate(async ({ threadId, alias, task }) => {
+				const svc = globalThis.__voidChatThreadService
+				await svc._runToolCall(threadId, 'run_subagent', 'call-zero-spawn', undefined, {
+					preapproved: false,
+					unvalidatedToolParams: { alias, task },
+				})
+				const row = svc.state.allThreads[threadId].messages.find(m => m.role === 'tool' && m.id === 'call-zero-spawn')
+				return row?.result ?? null
+			}, { threadId: parent.id, alias: ALIAS, task: CHILD_MARKER })
+			assert.ok(spawned?.childThreadId, 'the spawn returned no handle')
+			t.diagnostic(`handle: ${JSON.stringify(spawned)}`)
+
+			// The spawn is asynchronous, so the child may not have reached its first await yet.
+			// Poll until it is running, or the scenario would prove nothing.
+			let running = false
+			for (let i = 0; i < 100; i++) {
+				running = await s.page.evaluate((id) => globalThis.__voidChatThreadService.streamState[id]?.isRunning !== undefined, spawned.childThreadId)
+				if (running) break
+				await sleep(100)
+			}
+			assert.ok(running, 'the child never started, so a 0 s collect would prove nothing')
+
+			const out = await s.page.evaluate(async ({ threadId, id }) => {
+				const svc = globalThis.__voidChatThreadService
+				const started = Date.now()
+				await svc._runToolCall(threadId, 'collect_subagent', 'call-zero-collect', undefined, {
+					preapproved: false,
+					unvalidatedToolParams: { children: [id], timeout_seconds: 0 },
+				})
+				const row = svc.state.allThreads[threadId].messages.find(m => m.role === 'tool' && m.id === 'call-zero-collect')
+				return { ms: Date.now() - started, results: row?.result?.results ?? null }
+			}, { threadId: parent.id, id: spawned.childThreadId })
+
+			t.diagnostic(`collect(0): ${out.ms}ms ${JSON.stringify(out.results)}`)
+			assert.ok(out.ms < 3000, `a 0 s collect blocked for ${out.ms} ms`)
+			assert.equal(out.results?.[0]?.status, 'running', 'a running child was not reported as running')
+
+			// Clean up: stop the child so the scenario ends on a settled run.
+			await s.page.evaluate(async ({ threadId, id }) => {
+				const svc = globalThis.__voidChatThreadService
+				await svc._runToolCall(threadId, 'cancel_subagent', 'call-zero-cancel', undefined, {
+					preapproved: false,
+					unvalidatedToolParams: { child_thread_id: id },
+				})
+			}, { threadId: parent.id, id: spawned.childThreadId })
+		})
+	})
+
+	test('cancelling a child stops it and reports cancelled, not rejected', async (t) => {
+		await h.withScenario('subagent/cancel', async (s) => {
+			const parent = await scenario(s.page)
+			await h.stubLLM(s.page, CHILD_REPORT, { usage: STUB_USAGE, hang: true })
+
+			const spawned = await s.page.evaluate(async ({ threadId, alias, task }) => {
+				const svc = globalThis.__voidChatThreadService
+				await svc._runToolCall(threadId, 'run_subagent', 'call-cancel-spawn', undefined, {
+					preapproved: false,
+					unvalidatedToolParams: { alias, task },
+				})
+				const row = svc.state.allThreads[threadId].messages.find(m => m.role === 'tool' && m.id === 'call-cancel-spawn')
+				return row?.result ?? null
+			}, { threadId: parent.id, alias: ALIAS, task: CHILD_MARKER })
+			assert.ok(spawned?.childThreadId, 'the spawn returned no handle')
+
+			let running = false
+			for (let i = 0; i < 100; i++) {
+				running = await s.page.evaluate((id) => globalThis.__voidChatThreadService.streamState[id]?.isRunning !== undefined, spawned.childThreadId)
+				if (running) break
+				await sleep(100)
+			}
+			assert.ok(running, 'the child never started, so cancelling it would prove nothing')
+
+			const cancelled = await s.page.evaluate(async ({ threadId, id }) => {
+				const svc = globalThis.__voidChatThreadService
+				await svc._runToolCall(threadId, 'cancel_subagent', 'call-cancel', undefined, {
+					preapproved: false,
+					unvalidatedToolParams: { child_thread_id: id },
+				})
+				const row = svc.state.allThreads[threadId].messages.find(m => m.role === 'tool' && m.id === 'call-cancel')
+				// The run writes its own terminal status asynchronously; wait for it so the
+				// assertion is about the settled record rather than about the abort call.
+				for (let i = 0; i < 100; i++) {
+					if (svc.state.allThreads[id]?.resultStatus !== undefined) break
+					await new Promise(r => setTimeout(r, 50))
+				}
+				return { rowResult: row?.result ?? null, status: svc.state.allThreads[id]?.resultStatus ?? null }
+			}, { threadId: parent.id, id: spawned.childThreadId })
+
+			t.diagnostic(`cancel: ${JSON.stringify(cancelled)}`)
+			assert.equal(cancelled.rowResult?.status, 'cancelled', 'the cancel tool did not report a cancellation')
+			assert.equal(cancelled.status, 'cancelled', `the child settled as "${cancelled.status}" instead of cancelled`)
 		})
 	})
 
