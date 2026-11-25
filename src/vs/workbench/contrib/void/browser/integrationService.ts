@@ -171,20 +171,21 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	// finals held while a conversation is being minted for an unbound
 	// thread (auto-mirror) — flushed on conversationBound
 	private readonly _pendingFinalOfThreadId = new Map<string, { text: string, usage: LLMUsage | undefined, heldAt: number }>()
-	// index of the last user message seen by the echo scan (floored at bind
-	// time) — only user messages appended after this are echoed to the
-	// external conversation, history never is
+	// index of the last user message seen by the echo scan (floored lazily on
+	// the thread's first running tick) — only user messages above it are
+	// echoed to the external conversation, history never is
 	private readonly _lastEchoedUserIdxOfThreadId = new Map<string, number>()
 	// text of the most recent externally-originated user message per thread —
 	// matching messages are skipped by the echo scan (already in the external
 	// thread) and the record is consumed
 	private readonly _inboundUserTextOfThreadId = new Map<string, string>()
-	// messages-array index captured when a binding was established — tool
-	// and approval scans start there. A thread WITH history (adoption,
-	// auto-mirror, remembered-binding adoption after restart) must not replay
-	// every old tool status as if it just happened: first sight of such a
-	// thread would otherwise flood the external surface with its entire
-	// history of tool errors, and re-flood on every app restart.
+	// messages-array index captured on the thread's first running tick after a
+	// binding — tool and approval scans start at the turn's trigger message.
+	// A thread WITH history (adoption, auto-mirror, remembered-binding adoption
+	// after restart) must not replay every old tool status as if it just
+	// happened: first sight of such a thread would otherwise flood the external
+	// surface with its entire history of tool errors, and re-flood on every app
+	// restart.
 	private readonly _scanStartIdxOfThreadId = new Map<string, number>()
 
 	// per-tool redaction summarizers, built in the constructor where the
@@ -319,10 +320,10 @@ class IntegrationService extends Disposable implements IIntegrationService {
 				// final that was held while the conversation was being minted
 				this._threadIdOfConversationKey.set(p.conversationKey, p.threadId)
 				this._conversationKeyOfThreadId.set(p.threadId, p.conversationKey)
-				// floor the scans at current history — pre-binding tool messages
-				// are history, not news (the pending final below still covers the
-				// turn that triggered the mirroring)
-				this._setScanFloor(p.threadId)
+				// the scan floor is set lazily on the thread's next stream
+				// tick — see _ensureScanFloor. Reading the messages here would
+				// kick off a full load of a possibly-huge thread for every
+				// binding on every proxy reconnect
 				console.log(`[integration] mirrored thread ${p.threadId} to conversation ${p.conversationKey}`)
 				const pending = this._pendingFinalOfThreadId.get(p.threadId)
 				if (pending) {
@@ -393,23 +394,43 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	private _bind(conversationKey: string, threadId: string) {
 		this._threadIdOfConversationKey.set(conversationKey, threadId)
 		this._conversationKeyOfThreadId.set(threadId, conversationKey)
-		// floor the scans at the thread's current history — called BEFORE the
-		// inbound user message that triggered binding is appended, so the
-		// turn it starts is still scanned
-		this._setScanFloor(threadId)
 		this._postOutbound({ type: 'bound', conversationKey, threadId })
 	}
 
-	private _setScanFloor(threadId: string): void {
-		const withMessages = this._chatThreadService.getThreadWithMessages(threadId)
-		this._scanStartIdxOfThreadId.set(threadId, withMessages?.messages.length ?? 0)
-		// echo floor: the index of the last user message at bind — earlier
-		// ones are history and are never echoed
-		const messages = withMessages?.messages ?? []
-		let lastUserIdx = -1
+	// Floor the scans at the thread's pre-turn history, lazily: a running
+	// turn means the messages are loaded, so the first stream tick of a
+	// binding is the earliest safe moment to read them. Doing this at bind
+	// time instead would load the full history of every bound thread on
+	// every proxy reconnect (getThreadWithMessages kicks off the load) —
+	// with multi-megabyte threads that alone froze the window for seconds,
+	// and an unloaded thread reads as empty, so the floor landed at 0 and a
+	// later turn would replay the whole history as "new".
+	//
+	// Returns whether a floor is known: callers must not scan until it is.
+	// An idle tick on a restored thread is deliberately not enough — it
+	// would floor at the last historical turn, which the next turn would
+	// then replay.
+	private _ensureScanFloor(threadId: string): boolean {
+		if (this._scanStartIdxOfThreadId.has(threadId)) return true
+		const messages = this._chatThreadService.getThreadWithMessages(threadId)?.messages ?? []
+
+		// the turn's trigger is the last user message; tool scans start at
+		// it so the turn's own tools are seen, everything below is history
+		let triggerUserIdx = -1
 		for (let i = messages.length - 1; i >= 0; i--)
-			if (messages[i].role === 'user') { lastUserIdx = i; break }
-		this._lastEchoedUserIdxOfThreadId.set(threadId, lastUserIdx)
+			if (messages[i].role === 'user') { triggerUserIdx = i; break }
+		if (triggerUserIdx === -1) return false
+
+		// echo floor is the user message *before* the trigger, so the trigger
+		// itself is still echoed when it originated in the editor (external
+		// ones are matched and skipped by the scan)
+		let prevUserIdx = -1
+		for (let i = triggerUserIdx - 1; i >= 0; i--)
+			if (messages[i].role === 'user') { prevUserIdx = i; break }
+
+		this._scanStartIdxOfThreadId.set(threadId, triggerUserIdx)
+		this._lastEchoedUserIdxOfThreadId.set(threadId, prevUserIdx)
+		return true
 	}
 
 	async mirrorCurrentChat(): Promise<void> {
@@ -456,19 +477,27 @@ class IntegrationService extends Disposable implements IIntegrationService {
 		// unbound threads are still tracked below so their turn END can
 		// mint a conversation (editor-started threads)
 		if (conversationKey !== undefined) {
-			// editor-originated user messages echo into the conversation
-			this._scanUserMessages(threadId, conversationKey)
+			// Establish the floor only while a turn is running: the messages are
+			// loaded then, and it is the first safe moment to read them without
+			// loading a whole history at bind time. Until it exists the scans are
+			// skipped — an idle tick on a restored thread would floor at its last
+			// historical turn, and the next turn would replay it.
+			const floored = isRunning !== undefined && this._ensureScanFloor(threadId)
+			if (floored) {
+				// editor-originated user messages echo into the conversation
+				this._scanUserMessages(threadId, conversationKey)
 
-			// tool transitions from the thread's messages — skipped mid-stream
-			// ticks already see these, the phase map dedupes
-			this._scanToolMessages(threadId, conversationKey)
+				// tool transitions from the thread's messages — skipped mid-stream
+				// ticks already see these, the phase map dedupes
+				this._scanToolMessages(threadId, conversationKey)
+			}
 
 			// assistant text so far — coalesced
 			if (isRunning === 'LLM' && s?.llmInfo)
 				this._maybeStreamDelta(conversationKey, s.llmInfo.displayContentSoFar)
 
 			// a tool is waiting on the user — surface it as an approvalRequest
-			if (isRunning === 'awaiting_user')
+			if (isRunning === 'awaiting_user' && floored)
 				this._scanApprovalRequests(threadId, conversationKey)
 		}
 
