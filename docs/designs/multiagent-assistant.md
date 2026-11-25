@@ -215,12 +215,15 @@ There is no `agent_name`, because there is no catalogue (§1). The `task` is the
 
 **There is no `wait` parameter.** An earlier revision specified
 `wait: boolean` — `true` blocks, `false` returns a handle — and background
-delegation is not what shipped. In this build the call always waits, because a
-child cannot be running while the parent is: tool calls run one at a time, and
-nothing resumes a parent that parked on a child. Shipping the flag with a `false`
-branch that did nothing would be a lie told to the model, so `wait` arrives with
-the parallelism it needs (M3), where the parent parks in `waiting_tools` and is
-resumed.
+delegation is not what shipped in M2. In that build the call always waited,
+because a child cannot be running while the parent is: tool calls run one at a
+time, and nothing resumes a parent that parked on a child. Shipping the flag with
+a `false` branch that did nothing would have been a lie told to the model.
+
+**Superseded by M3** ([see below](#m3-asynchronous-children)): the call now
+returns a handle unconditionally, and `collect_subagent` is the join. The flag is
+still absent on purpose — waiting is a property of the collect, not of the spawn,
+so there is no `false` branch to get wrong.
 
 **Hand over by file, not by paste.** A child starts empty, so the parent has to give it
 whatever it needs. When the artefact already exists — a design document, a failing test, a
@@ -260,10 +263,11 @@ and its mistakes would anchor the retry. That second half is the part that is ea
 lose: for a review, carrying three prior reviews *is* consistency; for a second opinion it
 is contamination, and the same sentence would produce both.
 
-**It cannot steer a child that is running**, because in this build a child is never
-running while the parent is: `run_subagent` waits, and tool calls run one at a time. So
-`send_message` is "start a turn on an idle child" and nothing else; the steering half of
-§7 arrives with parallelism, and a queue that never has anything in it would be a lie.
+**It cannot steer a child that is running** — true in M2, where a child was never
+running while the parent was, and still true in M3, where a child can be: the
+queue exists, but nothing reads it at a step boundary yet, so `send_message`
+refuses a running child rather than silently appending to a turn that has already
+started. Steering is M4; the refusal is the interim answer (§7).
 
 **`list_children`** — derived from `parentThreadId`. It exists because the handles have to
 survive the parent's own compaction: once a long conversation is summarised, the ids it
@@ -373,7 +377,13 @@ Caps get revisited with M3, where concurrency is first-class and there is someth
 
 The hazard that does need saying, because it is not about cost: **concurrent children can write to the same file.** §5 carries it, the tool description carries it, and the fix — partitioning, worktrees — is M5. Until then the model partitions by choosing disjoint work, which is exactly the judgement a delegating agent is being asked to exercise.
 
-A declarative **batch** call — "run these N tasks, join, return all results" — remains the M3 form, because models are unreliable at orchestrating fan-out turn by turn: they lose track of children, serialize them, or re-delegate redundantly. It is a convenience over the same machinery, not a second one.
+A declarative **batch** call — "run these N tasks, join, return all results" — is not
+what M3 shipped. The substrate it predicted is what shipped instead: `run_subagent`
+returns a handle, several in one turn run concurrently, and `collect_subagent` takes a
+list and joins them — so the batch is a convenience a model can already express, rather
+than a second way to say the same thing. It stays on the table for the case §6 was
+written about — models that lose track of children turn by turn — and M3 makes it
+measurable whether they do.
 
 ### 7. Steering and lifecycle
 
@@ -385,12 +395,16 @@ Exposed to the parent as:
   child"**. Steering a running child at its next step boundary is the half that needs
   parallelism: in this build a child is never running while the parent is, so there is
   nothing to steer.
-- `interrupt_child(child_thread_id)` — **shipped as an internal cascade, not a tool.** The
-  parent's abort already aborts the child's run through the tool's `interruptTool`, which
-  is the property that mattered (a cancelled run cannot leave an orphan burning tokens);
-  a model-facing verb for it waits for M3, where a child can outlive the call that started it.
+- `interrupt_child(child_thread_id)` — **shipped as an internal cascade in M2, and as a
+  tool in M3**. M2's cascade existed so a cancelled run could not orphan a child burning
+  tokens; M3 removes it, because a child is now supposed to outlive the turn that started
+  it, and adds `cancel_subagent` as the deliberate act (§M3). A cancelled child reports
+  `cancelled`, which is distinguishable from `rejected` on purpose.
 - `list_children()` — live status snapshot. Not a polling mechanism: the parent is notified
-  when a child settles, consistent with how the rest of Void's concurrent tools resolve.
+  when a child settles, consistent with how the rest of Void's concurrent tools resolve. In
+  M3 nothing *wakes* the parent — the next turn's volatile context carries the child
+  statuses, and a parent that wants to wait calls `collect_subagent` at the point it needs
+  the reports.
 
 `_interruptConcurrentTools` (`:2601`) extends to cascade into children on parent abort, so
 cancelling the parent does not leave orphaned children burning tokens. **Implemented**, via
@@ -511,6 +525,14 @@ child's completion does not fire the "Void finished" notification, since the par
 result is the answer and the child is a thread the user never opened. A child that parks
 for approval still surfaces through the existing approval notification, because something
 does need the user.
+
+**M3 moves where the report lives.** The spawn row keeps its name, its `View` control and
+the child's current step while it runs, and loses its body: the reports render on the
+`collect_subagent` row, which is the row that carries them now. That is also where the
+"still running" count sits, so a fan-out is legible from the transcript without a separate
+tree — which is one of the three parts above that M3 was expected to need, and it turned
+out the row plus the collect already says it. What M3 does *not* add is the nested live
+card, and the tree stays in M3.5 with the rest of the surface work.
 
 ## Design decisions
 
