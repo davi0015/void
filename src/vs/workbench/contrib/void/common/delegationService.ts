@@ -4,7 +4,8 @@
  *--------------------------------------------------------------------------------------*/
 
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js'
-import type { ChildThreadSummary, SubagentOutcome } from './childThreadLinkage.js'
+import type { ChildThreadSummary, SubagentOutcome, SubagentStatus } from './childThreadLinkage.js'
+import type { CollectedSubagent } from './toolsServiceTypes.js'
 
 // The seam between the delegation *tool* and the chat loop that runs a child.
 //
@@ -45,6 +46,26 @@ export type ContinueSubagentRequest = {
 	childThreadId?: string
 	alias?: string
 	message: string
+}
+
+/**
+ * Join children that are already running.
+ *
+ * `children` are ids or aliases, resolved against the delegating thread's own children
+ * exactly like `send_message`. The wait is bounded by `timeoutSeconds`; `0` reports the
+ * current status without waiting. Resolution errors are the caller's to fix, so they
+ * throw rather than becoming a status.
+ */
+export type CollectSubagentsRequest = {
+	parentThreadId: string
+	children: string[]
+	timeoutSeconds: number
+}
+
+export type CancelSubagentRequest = {
+	parentThreadId: string
+	childThreadId?: string
+	alias?: string
 }
 
 export type StartedSubagent = {
@@ -97,11 +118,26 @@ export interface IDelegationService {
 
 
 	/**
-	 * Stop a child's current turn. This is the interrupt cascade: aborting the
-	 * parent calls it, so a delegation cannot keep spending tokens after the run
-	 * that asked for it has been cancelled.
+	 * Stop a child's current turn without losing what it wrote.
+	 *
+	 * This is no longer a cascade from the parent's abort: stopping a turn stops the
+	 * *wait* a `collect_subagent` is holding, never the child. Cancellation is this,
+	 * called deliberately, and the child's status becomes `cancelled` rather than
+	 * `rejected` so the manager can tell its own decision from someone else's.
 	 */
 	interruptSubagent(childThreadId: string): void
+
+	/**
+	 * Wait for children to settle and report them.
+	 *
+	 * The returned `interrupt` stops the wait, not the children — the tool loop's
+	 * interrupt is wired to it, which is what makes "a user interrupt preempts the
+	 * conversation, not the work" true by construction.
+	 */
+	collectSubagents(request: CollectSubagentsRequest): { promise: Promise<CollectedSubagent[]>, interrupt: () => void }
+
+	/** Stop one child, keeping its files. Throws when it is not running. */
+	cancelSubagent(request: CancelSubagentRequest): { childThreadId: string, status: SubagentStatus }
 }
 
 export const IDelegationService = createDecorator<IDelegationService>('voidDelegationService')

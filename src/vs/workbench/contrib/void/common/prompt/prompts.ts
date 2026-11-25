@@ -169,7 +169,7 @@ export const builtinToolNames: BuiltinToolName[] = [
 	'edit_file', 'rewrite_file', 'write_scratch', 'delete_scratch',
 	'run_command', 'run_persistent_command', 'open_persistent_terminal', 'kill_persistent_terminal', 'read_terminal',
 	'fetch_url', 'semantic_search', 'search_history', 'load_skill',
-	'run_subagent', 'send_message', 'list_children',
+	'run_subagent', 'send_message', 'list_children', 'collect_subagent', 'cancel_subagent',
 ]
 const toolNamesSet = new Set<string>(builtinToolNames)
 export const isABuiltinToolName = (toolName: string): toolName is BuiltinToolName => {
@@ -417,6 +417,9 @@ You will be given instructions from the user, and may also receive a list of fil
 	}
 
 	if (mode === 'orchestrator') {
+		// M3: delegation is asynchronous, so the posture is "spawn, keep working, collect".
+		// One line says it, because the shape of a fan-out is the part a model gets wrong.
+		details.push(`Delegating does not wait: \`run_subagent\` returns a handle and the child keeps working while you do. Start every child a partition needs in the same turn so they run at the same time, then \`collect_subagent\` at the point you actually need their reports - not immediately after spawning, or you have paid for parallelism and not used it.`)
 		// The mode exists to make fan-out a posture rather than a per-turn decision, so
 		// these rules are about *dividing* the work — which no tool description can say,
 		// because a description explains one call and this explains the shape of many.

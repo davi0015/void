@@ -41,7 +41,7 @@ import type { LLMUsage } from './sendLLMMessageTypes.js'
  * are not produced by M2 — nothing bounds a run yet — but they are part of the
  * contract the parent reads, and a status added later would be a contract change.
  */
-export type SubagentStatus = 'done' | 'blocked' | 'budget_exceeded' | 'error' | 'rejected'
+export type SubagentStatus = 'done' | 'blocked' | 'budget_exceeded' | 'error' | 'rejected' | 'cancelled' | 'interrupted'
 
 /**
  * What the parent receives back from a delegation. This is where isolation is

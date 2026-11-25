@@ -13,6 +13,7 @@ import { VoidDiffEditor } from '../util/inputs.js';
 import { extractSearchReplaceBlocks } from '../../../../common/helpers/extractCodeFromResult.js';
 import { AlertTriangle, Ban, ChevronRight, CircleEllipsis } from 'lucide-react';
 import { ChatMessage, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
+import type { CollectedSubagent } from '../../../../common/toolsServiceTypes.js'
 import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, effectiveAutoApproveMode, LintErrorItem, ToolCallParams, ToolName } from '../../../../common/toolsServiceTypes.js';
 import { Edit } from '../../../../common/editCodeServiceTypes.js';
 import type { SubagentOutcome } from '../../../../common/childThreadLinkage.js';
@@ -594,7 +595,21 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 				desc1: `"${who}"`,
 				desc1Info: message.length > 120 ? `${message.slice(0, 120)}…` : message,
 			}
-		},		'run_subagent': () => {
+		},
+		'collect_subagent': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['collect_subagent']
+			const children = (toolParams.children ?? []) as string[]
+			return {
+				desc1: children.join(', '),
+				desc1Info: `wait up to ${toolParams.timeoutSeconds}s`,
+			}
+		},
+		'cancel_subagent': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['cancel_subagent']
+			const who = toolParams.alias ? `"${toolParams.alias}"` : (toolParams.childThreadId ?? '')
+			return { desc1: who }
+		},
+		'run_subagent': () => {
 			const toolParams = _toolParams as BuiltinToolCallParams['run_subagent']
 			// The alias is what the parent called the child, so it is the useful thing on
 			// the row. The task follows as secondary text, cut because it is a paragraph
@@ -2043,6 +2058,60 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			}
 
 			return <ToolHeaderWrapper {...componentParams} />
+		},
+	},
+	'collect_subagent': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const title = getTitle(toolMessage)
+			const icon = null
+
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
+
+			const isError = toolMessage.type === 'tool_error'
+			const isRejected = toolMessage.type === 'rejected'
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (toolMessage.type === 'success') {
+				const results = (toolMessage.result?.results ?? []) as CollectedSubagent[]
+				const running = results.filter(r => r.status === 'running').length
+				componentParams.desc2 = running > 0 ? `${running} still running` : `${results.length} settled`
+				// The reports live here now: a spawn returns a handle, so this row is the only
+				// place the parent's transcript carries what the children said. Closed like every
+				// other body; the count above says whether opening it is worth the scroll.
+				componentParams.bottomChildren = <BottomChildren title='Subagent reports'>
+					{results.map(r => (
+						<div key={r.childThreadId} className='flex flex-col gap-1 mb-2'>
+							<div className='text-xs text-void-fg-4'>{`${r.alias || r.childThreadId}: ${r.status}`}</div>
+							{r.summary && <SmallProseWrapper>
+								<ChatMarkdownRender string={r.summary} chatMessageLocation={undefined} isApplyEnabled={false} />
+							</SmallProseWrapper>}
+							{r.filesTouched.length > 0 && (
+								<div className='text-xs text-void-fg-4'>Changed: {r.filesTouched.join(', ')}</div>
+							)}
+						</div>
+					))}
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		},
+	},
+	'cancel_subagent': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const title = getTitle(toolMessage)
+			const icon = null
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
+			const isError = toolMessage.type === 'tool_error'
+			const isRejected = toolMessage.type === 'rejected'
+			return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} isError={isError} icon={icon} isRejected={isRejected} />
 		},
 	},
 	'run_subagent': {

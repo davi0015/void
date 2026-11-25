@@ -22,7 +22,7 @@ import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { mergeRecordWrites } from '../common/storageMerge.js';
-import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, chatModeOfChildThread, effectiveAutoApproveMode, normalizeThreadPermissionMode, ThreadPermissionMode, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
+import { approvalIsWorkspaceScoped, approvalTypeOfBuiltinToolName, BuiltinToolCallParams, chatModeOfChildThread, CollectedSubagent, effectiveAutoApproveMode, normalizeThreadPermissionMode, ThreadPermissionMode, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { IToolsService } from './toolsService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
@@ -46,7 +46,7 @@ import { IUserDataProfileService } from '../../../services/userDataProfile/commo
 import { isThreadImageUri, threadImageDir, threadImageUri } from '../common/threadImagePaths.js';
 import { deepCloneWithUris } from '../common/deepCloneWithUris.js';
 import { ChildThreadSeed, ChildThreadSummary, childThreadSeedOf, reportedSummaryOf, SubagentOutcome, SubagentStatus, isChildThread, withSubagentPreamble } from '../common/childThreadLinkage.js';
-import { IDelegationService, ContinueSubagentRequest, RunSubagentRequest, StartedSubagent } from '../common/delegationService.js';
+import { IDelegationService, CancelSubagentRequest, CollectSubagentsRequest, ContinueSubagentRequest, RunSubagentRequest, StartedSubagent } from '../common/delegationService.js';
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { ILifecycleService } from '../../../services/lifecycle/common/lifecycle.js';
 import { IHostService } from '../../../services/host/browser/host.js';
@@ -764,6 +764,12 @@ export interface IChatThreadService {
 
 	/** Stop a child's current turn. Reached from the parent's interrupt cascade. */
 	interruptSubagent(childThreadId: string): void;
+
+	/** Wait for children to settle; the returned interrupt stops the wait, not them. */
+	collectSubagents(request: CollectSubagentsRequest): { promise: Promise<CollectedSubagent[]>, interrupt: () => void }
+
+	/** Stop one child, keeping its files. Throws when it is not running. */
+	cancelSubagent(request: CancelSubagentRequest): { childThreadId: string, status: SubagentStatus }
 
 	// call to edit a message
 	editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId }: { userMessage: string, messageIdx: number, threadId: string }): Promise<void>;
@@ -3706,6 +3712,71 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		return { childThreadId: child.id, result: this._runChildThread(child.id, task) }
 	}
 
+	/** Children the manager cancelled explicitly, so the rejected path can say `cancelled`. */
+	private readonly _cancelledChildIds = new Set<string>()
+
+	collectSubagents(request: CollectSubagentsRequest): { promise: Promise<CollectedSubagent[]>, interrupt: () => void } {
+		// Resolution is synchronous and throws, so a bad handle is an ordinary tool error
+		// rather than a status the model has to interpret.
+		// A handle may be an id or an alias, and _childOf prefers the id when given both -
+		// so it is asked twice rather than passed both at once.
+		const children = request.children.map(handle => {
+			const byId = this._childrenOf(request.parentThreadId).find(c => c.id === handle)
+			return byId ?? this._childOf(request.parentThreadId, { alias: handle })
+		})
+		let interrupted = false
+		const interrupt = () => { interrupted = true }
+
+		const promise = (async () => {
+			const deadline = Date.now() + Math.max(0, request.timeoutSeconds) * 1000
+			for (;;) {
+				const collected = children.map(child => this._collectedOf(child.id))
+				// Settled, out of time, or the wait was interrupted - every one of those is an
+				// answer, and `running` in the result says which happened.
+				if (interrupted || collected.every(c => c.status !== 'running') || request.timeoutSeconds <= 0 || Date.now() >= deadline) {
+					return collected
+				}
+				await new Promise(resolve => setTimeout(resolve, 100))
+			}
+		})()
+
+		return { promise, interrupt }
+	}
+
+	cancelSubagent(request: CancelSubagentRequest): { childThreadId: string, status: SubagentStatus } {
+		const child = this._childOf(request.parentThreadId, request)
+		const running = this.streamState[child.id]?.isRunning !== undefined
+		if (!running) {
+			throw new Error(`"${child.alias ?? child.id}" is not running, so there is nothing to cancel. Its last run ended as ${child.resultStatus ?? 'unknown'}; collect it to read the report.`)
+		}
+		// Recorded before the abort so the run's own rejection path can report `cancelled`
+		// rather than `rejected`: one is the manager's decision, the other is a stop nobody
+		// asked for and is worth reading.
+		this._cancelledChildIds.add(child.id)
+		this.interruptSubagent(child.id)
+		return { childThreadId: child.id, status: 'cancelled' }
+	}
+
+	/** One child as a collect reports it: live status while running, stored status after. */
+	private _collectedOf(childThreadId: string): CollectedSubagent {
+		const thread = this.state.allThreads[childThreadId]
+		const stream = this.streamState[childThreadId]
+		// A child that has not reported yet is running, even before its loop reaches its
+		// first await: streamState is only populated once it does, and reading that absence
+		// as "settled" made collect answer done with an empty report the instant it was
+		// called after a spawn.
+		const settled = thread?.resultStatus !== undefined
+		const status: CollectedSubagent['status'] = settled
+			? (thread!.resultStatus as CollectedSubagent['status'])
+			: (stream?.error ? 'error' : 'running')
+		return {
+			childThreadId,
+			alias: thread?.alias ?? '',
+			status,
+			summary: status === 'running' ? '' : (thread?.resultSummary ?? ''),
+			filesTouched: status === 'running' ? [] : this._filesTouchedBy(childThreadId),
+		}
+	}
 	interruptSubagent(childThreadId: string): void {
 		// Fire and forget: the caller is a tool interruptor, which must return at once.
 		// Clearing the child's stream state is what stops its loop, and that is what
@@ -3825,7 +3896,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			return this._finishChild(childThreadId, 'blocked', `The child stopped and is waiting for permission to run ${what}. Nothing in this run could answer that, so this call has returned without its result. Open the subagent's transcript from this row and approve it there — the child continues on its own thread, but the outcome will not come back here.`)
 		}
 		if (settled.status === 'error') return this._finishChild(childThreadId, 'error', settled.message)
-		if (settled.status === 'rejected') return this._finishChild(childThreadId, 'rejected', 'The child was stopped before it finished, so it produced no usable report.')
+		if (settled.status === 'rejected') {
+			const cancelled = this._cancelledChildIds.delete(childThreadId)
+			return cancelled
+				? this._finishChild(childThreadId, 'cancelled', 'The manager cancelled this child. Anything it wrote before stopping is on disk.')
+				: this._finishChild(childThreadId, 'rejected', 'The child was stopped before it finished, so it produced no usable report.')
+		}
 		return this._finishChild(childThreadId, 'done', this._summaryOfChild(childThreadId))
 	}
 
@@ -7050,6 +7126,14 @@ class DelegationService implements IDelegationService {
 		return this._chatThreadService.listChildThreads(parentThreadId)
 	}
 
+
+	collectSubagents(request: CollectSubagentsRequest): { promise: Promise<CollectedSubagent[]>, interrupt: () => void } {
+		return this._chatThreadService.collectSubagents(request)
+	}
+
+	cancelSubagent(request: CancelSubagentRequest): { childThreadId: string, status: SubagentStatus } {
+		return this._chatThreadService.cancelSubagent(request)
+	}
 
 	interruptSubagent(childThreadId: string): void {
 		this._chatThreadService.interruptSubagent(childThreadId)

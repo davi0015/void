@@ -114,14 +114,29 @@ async function delegateFrom(page, { threadId, name = 'run_subagent', rawParams, 
 		const svc = globalThis.__voidChatThreadService
 		const delegatingThreadId = threadIdArg ?? svc.state.currentThreadId
 
-		const res = await svc._runToolCall(delegatingThreadId, toolName, id, undefined, {
+		// Since M3 a spawn returns a handle, so the fixture spawns and then collects: the
+		// report still reaches the parent, just through the join rather than the call.
+		const spawn = await svc._runToolCall(delegatingThreadId, toolName, id, undefined, {
 			preapproved: false,
 			unvalidatedToolParams: params,
 		})
+		let res = spawn
+		if (toolName === 'run_subagent') {
+			const handle = svc.state.allThreads[delegatingThreadId].messages.find(m => m.role === 'tool' && m.id === id)?.result
+			if (handle?.childThreadId) {
+				res = await svc._runToolCall(delegatingThreadId, 'collect_subagent', id + '-collect', undefined, {
+					preapproved: false,
+					unvalidatedToolParams: { children: [handle.childThreadId], timeout_seconds: 60 },
+				})
+			}
+		}
 
 		const textOf = (m) => m.displayContent ?? m.content ?? ''
 		const delegating = svc.state.allThreads[delegatingThreadId]
 		const row = delegating.messages.find(m => m.role === 'tool' && m.id === id)
+		// What the parent actually learns: the collected child, not the spawn handle.
+		const collectRow = delegating.messages.find(m => m.role === 'tool' && m.id === id + '-collect')
+		const collected = collectRow?.type === 'success' ? collectRow.result?.results?.[0] : undefined
 		const children = Object.values(svc.state.allThreads).filter(x => x !== undefined && x.parentThreadId === delegatingThreadId)
 
 		return {
@@ -129,7 +144,7 @@ async function delegateFrom(page, { threadId, name = 'run_subagent', rawParams, 
 			interrupted: res.interrupted === true,
 			toolRowType: row?.type,
 			toolRowContent: row?.content ?? '',
-			toolRowResult: row?.type === 'success' ? row.result : undefined,
+			toolRowResult: collected ?? (row?.type === 'success' ? row.result : undefined),
 			delegatingWorkspaceUri: delegating.workspaceUri,
 			delegatingPermissionMode: delegating.permissionMode,
 			delegatingMessages: delegating.messages.map(textOf).join('\n'),
@@ -249,10 +264,13 @@ describe('subagent delegation', () => {
 				!out.delegatingMessages.includes('CHILD-MARKER'),
 				'the child\'s task text reached the parent thread — delegation is not isolated',
 			)
+			// Since M3 the spawn's row is a handle and the report renders on the collect row.
+			// Both halves are asserted: the handle names the child, the join carries the words.
 			assert.ok(
-				out.toolRowContent.includes('CHILD-REPORT'),
-				`the rendered tool result did not carry the report: ${out.toolRowContent.slice(0, 300)}`,
+				out.toolRowContent.includes(child.id),
+				`the spawn row is not a handle naming the child: ${out.toolRowContent.slice(0, 300)}`,
 			)
+			assert.equal(result.summary, CHILD_REPORT, 'the collected report was not what the child wrote')
 
 			// The child records how it ended, which is what makes its thread a record
 			// rather than a transcript the parent happens to have dropped.
@@ -268,6 +286,7 @@ describe('subagent delegation', () => {
 				return {
 					hasParentMarker: text.includes('PARENT-MARKER'),
 					hasDelegated: text.includes('Delegated'),
+			tail: text.slice(-500),
 					hasAlias: text.includes(alias),
 					tail: text.slice(-900).replace(/\s+/g, ' '),
 				}
@@ -277,7 +296,7 @@ describe('subagent delegation', () => {
 			// Guard: the transcript is rendered at all, so a missing row is about the row and
 			// not about the chat never having painted.
 			assert.ok(dom.hasParentMarker, 'the transcript itself is not in the DOM — the fixture never painted')
-			assert.ok(dom.hasDelegated, 'the delegation row did not render in the chat')
+			assert.ok(dom.hasDelegated, 'the delegation row did not render in the chat: ' + dom.tail)
 			assert.ok(dom.hasAlias, 'the delegation row did not show the child\'s alias')
 		})
 	})
@@ -543,7 +562,7 @@ describe('subagent delegation', () => {
 			// them with `max-h-0`, so presence alone would pass for a body on screen.
 			const bodyHeight = await s.page.evaluate(() => {
 				const button = [...document.querySelectorAll('button')]
-					.find(b => (b.textContent ?? '').includes('Open transcript'))
+					.find(el => (el.textContent ?? '').trim() === 'Subagent reports')
 				if (!button) return -1
 				let el = button.parentElement
 				while (el && !(el.className ?? '').includes('transition-all')) el = el.parentElement
