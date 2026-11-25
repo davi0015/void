@@ -87,6 +87,12 @@ const STREAM_DELTA_MIN_INTERVAL_MS = 1000
 // forever would pin the thread.
 const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
 
+// a held (auto-mirror) final older than this is dropped when the
+// conversation finally binds instead of delivered — a turn that finished
+// long ago answers a question the user has already moved past, and
+// delivering it on reconnect reads as a duplicate message
+const PENDING_FINAL_MAX_AGE_MS = 10 * 60 * 1000
+
 // Commands longer than this are cut for display in summaries.
 const SUMMARY_MAX_COMMAND_LEN = 80
 
@@ -164,7 +170,7 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	private readonly _lastErrorMessageOfThreadId = new Map<string, string>()
 	// finals held while a conversation is being minted for an unbound
 	// thread (auto-mirror) — flushed on conversationBound
-	private readonly _pendingFinalOfThreadId = new Map<string, { text: string, usage: LLMUsage | undefined }>()
+	private readonly _pendingFinalOfThreadId = new Map<string, { text: string, usage: LLMUsage | undefined, heldAt: number }>()
 	// index of the last user message seen by the echo scan (floored at bind
 	// time) — only user messages appended after this are echoed to the
 	// external conversation, history never is
@@ -321,13 +327,17 @@ class IntegrationService extends Disposable implements IIntegrationService {
 				const pending = this._pendingFinalOfThreadId.get(p.threadId)
 				if (pending) {
 					this._pendingFinalOfThreadId.delete(p.threadId)
-					this._postOutbound({
-						type: 'final',
-						conversationKey: p.conversationKey,
-						text: pending.text,
-						usage: pending.usage,
-						title: this._threadTitleOf(p.threadId),
-					})
+					if (Date.now() - pending.heldAt <= PENDING_FINAL_MAX_AGE_MS) {
+						this._postOutbound({
+							type: 'final',
+							conversationKey: p.conversationKey,
+							text: pending.text,
+							usage: pending.usage,
+							title: this._threadTitleOf(p.threadId),
+						})
+					}
+					else
+						console.log(`[integration] dropped stale held final for thread ${p.threadId} (held ${Math.round((Date.now() - pending.heldAt) / 60000)} min ago)`)
 				}
 				this._notificationService.info('Chat mirrored — replies in the external thread now reach this chat')
 				return
@@ -595,7 +605,7 @@ class IntegrationService extends Disposable implements IIntegrationService {
 	private _beginAutoMirror(threadId: string): void {
 		const final = this._finalOfThreadId(threadId)
 		if (final === undefined || final.text === '') return // nothing to say — don't mint a thread for it
-		this._pendingFinalOfThreadId.set(threadId, final)
+		this._pendingFinalOfThreadId.set(threadId, { ...final, heldAt: Date.now() })
 		this._postOutbound({
 			type: 'createConversation',
 			threadId,
