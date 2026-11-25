@@ -112,7 +112,14 @@ export interface ITerminalToolService {
 
 	readTerminal(terminalId: string): Promise<string>
 
-	readTerminalByName(terminalName: string, lastNCommands?: number | null): Promise<{ output: string, status: string, commands: { command: string, exitCode: number | null, duration: number }[] }>
+	/**
+	 * Read a terminal's scrollback by the handle the caller actually has.
+	 *
+	 * An id comes from `open_persistent_terminal` and cannot be ambiguous. A name is
+	 * whatever a terminal is displaying, and two terminals can display the same one — so a
+	 * name that matches more than once is refused rather than resolved to the first match.
+	 */
+	readTerminalByHandle(handle: { terminalId?: string, terminalName?: string }, lastNCommands?: number | null): Promise<{ output: string, status: string, commands: { command: string, exitCode: number | null, duration: number }[] }>
 
 	createPersistentTerminal(opts: { cwd: string | null }): Promise<string>
 	killPersistentTerminal(terminalId: string): Promise<void>
@@ -487,11 +494,23 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		return result
 	};
 
-	readTerminalByName: ITerminalToolService['readTerminalByName'] = async (terminalName, lastNCommands?) => {
-		// Find terminal by name across all instances (Void + user-created)
-		const terminal = [...this.terminalService.instances].find(t => t.title === terminalName)
+	readTerminalByHandle: ITerminalToolService['readTerminalByHandle'] = async ({ terminalId, terminalName }, lastNCommands?) => {
+		// Resolved by id when there is one: `open_persistent_terminal` returns that id, and a
+		// name — whatever the terminal happens to display — is shared the moment a user opens
+		// one with the same title. Resolving a shared name to its first match read a
+		// *different* terminal's scrollback and said nothing, so ambiguity is refused now.
+		const matches = terminalId !== undefined
+			? (() => { const t = this.persistentTerminalInstanceOfId[terminalId]; return t ? [t] : [] })()
+			: [...this.terminalService.instances].filter(t => t.title === terminalName)
+		if (matches.length > 1) {
+			throw new Error(`Read Terminal: ${matches.length} terminals are named "${terminalName}", so reading one of them by name would be a guess. Pass terminal_id instead — it is returned by open_persistent_terminal and cannot be ambiguous.`)
+		}
+		const terminal = matches[0]
 		if (!terminal) {
-			throw new Error(`Read Terminal: No terminal found with name "${terminalName}". The terminal may have been closed.`)
+			const openIds = Object.keys(this.persistentTerminalInstanceOfId)
+			throw new Error(terminalId !== undefined
+				? `Read Terminal: no persistent terminal with id "${terminalId}". ${openIds.length ? `Open persistent terminals: ${openIds.join(', ')}.` : 'No persistent terminals are open.'}`
+				: `Read Terminal: No terminal found with name "${terminalName}". The terminal may have been closed.` + (openIds.length ? ` Persistent terminals are addressable by id: ${openIds.join(', ')}.` : ''))
 		}
 		if (!terminal.xterm) {
 			throw new Error('Read Terminal: The requested terminal has not yet been rendered and therefore has no scrollback buffer available.')

@@ -304,4 +304,63 @@ describe('terminal tooling', () => {
 			assert.ok(out.ms < 10_000, `completion took ${out.ms} ms, which is the timeout path`)
 		})
 	})
+
+	test('read_terminal takes the id open_persistent_terminal returned', async (t) => {
+		await h.withScenario('terminal-tools/read-by-id', async (s) => {
+			const page = s.page
+			await h.ensureModelSelection(page)
+			await h.stubLLM(page, 'ok')
+
+			const opened = await callTool(page, {
+				name: 'open_persistent_terminal',
+				params: { cwd: null },
+				validated: { cwd: null },
+				toolId: 'call-open',
+			})
+			assert.equal(opened.rowType, 'success', `the terminal did not open: ${opened.rowContent.slice(0, 300)}`)
+			const terminalId = opened.rowResult?.persistentTerminalId
+			assert.ok(terminalId, 'the tool returned no terminal id')
+
+			const ran = await callTool(page, {
+				name: 'run_persistent_command',
+				params: { persistent_terminal_id: terminalId, command: 'echo read-by-id-marker', timeout_seconds: 20 },
+				validated: { persistentTerminalId: terminalId, command: 'echo read-by-id-marker', timeoutSeconds: 20 },
+				toolId: 'call-run',
+			})
+			t.diagnostic(`run: ${ran.rowType} ${ran.rowContent.slice(0, 120)}`)
+
+			// The id the tool itself returned, which the previous signature could not use: it
+			// resolved by display title only, and the title of this terminal is "Void Agent (n)"
+			// — so the documented follow-up ("check it later with read_terminal") always failed.
+			const byId = await callTool(page, {
+				name: 'read_terminal',
+				params: { terminal_id: terminalId },
+				validated: { terminalId, terminalName: undefined, lastNCommands: null },
+				toolId: 'call-read-id',
+			})
+			t.diagnostic(`read by id: ${byId.rowType} ${byId.rowContent.slice(0, 160)}`)
+			assert.equal(byId.rowType, 'success', `reading by the id the tool returned failed: ${byId.rowContent.slice(0, 300)}`)
+			assert.ok(byId.rowContent.includes('read-by-id-marker'), 'the scrollback read by id did not contain the command output')
+
+			// A wrong id must fail with the ids that would work, or the model has nothing to
+			// correct itself with.
+			const bogus = await callTool(page, {
+				name: 'read_terminal',
+				params: { terminal_id: '9999' },
+				validated: { terminalId: '9999', terminalName: undefined, lastNCommands: null },
+				toolId: 'call-read-bogus',
+			})
+			assert.equal(bogus.rowType, 'tool_error', 'a terminal id that does not exist was accepted')
+			assert.ok(bogus.rowContent.includes(String(terminalId)), `the error does not list the open ids: ${bogus.rowContent.slice(0, 200)}`)
+
+			// Close what the scenario opened: a live terminal keeps its profile directory busy
+			// for a moment after the window closes, and the teardown then fails on the rm.
+			await callTool(page, {
+				name: 'kill_persistent_terminal',
+				params: { persistent_terminal_id: terminalId },
+				validated: { persistentTerminalId: terminalId },
+				toolId: 'call-kill',
+			})
+		})
+	})
 })

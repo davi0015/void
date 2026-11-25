@@ -47,11 +47,11 @@ export const runPersistentCommandToolCore: ToolDefinitionCore<'run_persistent_co
 		// bg command
 		if (resolveReason.type === 'timeout') {
 			if (resolveReason.reason === 'inactivity') {
-				return `${result_}\nCommand timed out after ${timeoutSeconds}s of no output. It may be waiting for input (e.g. a pager, y/n prompt). The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal. Do NOT run sleep or any wait command to wait for it.`
+				return `${result_}\nCommand timed out after ${timeoutSeconds}s of no output. It may be waiting for input (e.g. a pager, y/n prompt). The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal(terminal_id="${persistentTerminalId}"). Do NOT run sleep or any wait command to wait for it.`
 			}
 			// The backstop is a fixed total-wait cap (see terminalToolService),
 			// independent of the silence window.
-			return `${result_}\nCommand is still running after the maximum wait (${MAX_TERMINAL_TIMEOUT_SECONDS}s). The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal. Do NOT run sleep or any wait command to wait for it.`
+			return `${result_}\nCommand is still running after the maximum wait (${MAX_TERMINAL_TIMEOUT_SECONDS}s). The command keeps running in terminal ${persistentTerminalId} — check it later with read_terminal(terminal_id="${persistentTerminalId}"). Do NOT run sleep or any wait command to wait for it.`
 		}
 		throw new Error(`Unexpected internal error: Terminal command did not resolve with a valid reason.`)
 	},
