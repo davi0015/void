@@ -636,13 +636,33 @@ export function seedTestThread(page, turns = 15, toolCallsPerTurn = 0, opts) {
 	)
 }
 
-/** Ensures a model selection exists so features gated on one are reachable. */
+/**
+ * Ensures a model selection exists so features gated on one are reachable.
+ *
+ * A poke is not durable, so this waits, pokes and verifies rather than setting it once.
+ * The app writes settings of its own during startup, and that write's echo replaces the
+ * state the poke was made on: measured, a selection set right after `waitForInitState`
+ * was still there at +200 ms and gone by +400 ms. When it goes, `prepareLLMChatMessages`
+ * sends **no messages at all** — a stubbed transport answers anyway, so the only symptom
+ * is a test that reads the request and finds it empty, several seconds later.
+ *
+ * Returns false if the selection could not be made to stick, so a caller that cares can
+ * say so instead of asserting on an empty request.
+ */
 export function ensureModelSelection(page) {
-	return page.evaluate(() => {
+	return page.evaluate(async () => {
 		const settings = globalThis.__voidChatThreadService._settingsService
-		if (!settings.state.modelSelectionOfFeature['Chat']) {
-			settings.state.modelSelectionOfFeature['Chat'] = { providerName: 'ollama', modelName: 'qwen2.5-coder:7b' }
+		await settings.waitForInitState
+		const selection = { providerName: 'ollama', modelName: 'qwen2.5-coder:7b' }
+		for (let attempt = 0; attempt < 4; attempt++) {
+			// Let the startup write and its echo pass before poking, then hold the poke long
+			// enough that a poke that survives the wait is not undone a moment later.
+			await new Promise(r => setTimeout(r, 500))
+			settings.state.modelSelectionOfFeature['Chat'] = selection
+			await new Promise(r => setTimeout(r, 250))
+			if (settings.state.modelSelectionOfFeature['Chat']) return true
 		}
+		return !!settings.state.modelSelectionOfFeature['Chat']
 	})
 }
 
