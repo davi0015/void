@@ -52,6 +52,22 @@ before(() => h.preflight())
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 
 /**
+ * Answers the stub's next held request, waiting until there is one.
+ *
+ * `completeStubbedLLM` returns false when nothing is held, and a held request only exists
+ * once the loop has reached it — which is a render or a tool run later than the call site
+ * that wants to answer it. Firing once and ignoring the answer hangs the child until the
+ * scenario's page is torn down.
+ */
+async function answerNextRequest(page) {
+	for (let i = 0; i < 120; i++) {
+		if (await h.completeStubbedLLM(page)) return true
+		await sleep(100)
+	}
+	return false
+}
+
+/**
  * True when the rendered chat contains `needle`.
  *
  * This asserts the row *exists*, not that it looks right: a builtin tool with no
@@ -150,9 +166,25 @@ async function delegateFrom(page, { threadId, name = 'run_subagent', rawParams, 
  */
 async function scenario(page, { report = CHILD_REPORT } = {}) {
 	await h.ensureModelSelection(page)
+	// The setting is read back in a bounded loop rather than once: a write can be
+	// visible, reverted by a storage echo, and re-applied inside the first ~50 ms
+	// (measured: `{false}` at 0 ms, `{true}` at 50 ms, twice on this machine). Reading it
+	// once makes this fixture flake about once per suite run, on a scenario unrelated to
+	// the write. The transient itself is a separate question and is not being papered
+	// over here — this helper's job is to put the app in a state, not to test the write.
 	const mode = await page.evaluate(async () => {
 		const svc = globalThis.__voidChatThreadService
+		// Wait for the settings service to finish reading storage before writing to it. A
+		// write that lands first is overwritten by the initial read, which is a fixture
+		// racing startup rather than a product bug — and it fails here as "the app is in
+		// agent mode", which reads like a gate problem and is not.
+		await svc._settingsService.waitForInitState
 		await svc._settingsService.setGlobalSetting('chatMode', 'orchestrator')
+		for (let i = 0; i < 40; i++) {
+			const mode = svc._settingsService.state.globalSettings.chatMode
+			if (mode === 'orchestrator') return mode
+			await new Promise(r => setTimeout(r, 50))
+		}
 		return svc._settingsService.state.globalSettings.chatMode
 	})
 	assert.equal(mode, 'orchestrator', `the app is in "${mode}" mode, so delegation would not be offered to a user`)
@@ -505,14 +537,10 @@ describe('subagent delegation', () => {
 			assert.equal(out.children.length, 1, 'the fixture did not create a child')
 			const childId = out.children[0].id
 
-			// The way in exists. Asserted on the DOM because a missing UI entry renders
-			// nothing at all, and every state assertion above would still pass.
-			assert.ok(await domHas(s.page, 'Open transcript'), 'the delegation row has no transcript link')
-
-			// And the report is *showing*, not merely in the DOM: every tool body is a
-			// collapsible that renders its children and hides them with `max-h-0`, so text
-			// presence alone would pass for a body the reader has to expand to find — including
-			// the transcript link, which lives inside it.
+			// The report arrives closed. The row is the summary — a status, the name, the way
+			// in — and the report is what a reader opens when they want it. Measured as height
+			// rather than as text: the body is a collapsible that renders its children and hides
+			// them with `max-h-0`, so presence alone would pass for a body on screen.
 			const bodyHeight = await s.page.evaluate(() => {
 				const button = [...document.querySelectorAll('button')]
 					.find(b => (b.textContent ?? '').includes('Open transcript'))
@@ -522,21 +550,29 @@ describe('subagent delegation', () => {
 				return el ? Math.round(el.getBoundingClientRect().height) : -1
 			})
 			t.diagnostic(`delegation body height: ${bodyHeight}px`)
-			assert.ok(bodyHeight > 0, `the delegation body is collapsed (${bodyHeight}px) — the report and its link are hidden`)
+			assert.equal(bodyHeight, 0, `the report arrived expanded (${bodyHeight}px)`)
+
+			// The way in is on the row itself, so closing the body does not close the door.
+			assert.ok(await domHas(s.page, 'View'), 'the delegation row has no way into the child')
 
 			// Guard: spawning is the agent's act, so a child must not arrive as a tab. A
 			// fan-out that pinned every child is the "strip of tabs" collapse.
 			const before = await s.page.evaluate(() => [...globalThis.__voidChatThreadService.state.pinnedThreadIds])
 			assert.equal(before.includes(childId), false, 'the child was pinned at spawn')
 
-			// Exactly what the row's link does. It must *not* pin: the strip is the user's own
-			// list of threads, and a preview of the agent's delegate does not belong in it —
-			// that is the supervision collapse, one tab per child.
-			const opened = await s.page.evaluate((id) => {
+			// The row's own control, clicked the way a user clicks it. It must *not* pin: the
+			// strip is the user's own list of threads, and a preview of the agent's delegate does
+			// not belong in it — that is the supervision collapse, one tab per child.
+			assert.ok(await domHas(s.page, 'View'), 'the delegation row has no View control')
+			const opened = await s.page.evaluate(async () => {
 				const svc = globalThis.__voidChatThreadService
-				svc.switchToThread(id)
-				return { currentThreadId: svc.state.currentThreadId, pinned: [...svc.state.pinnedThreadIds] }
-			}, childId)
+				const control = [...document.querySelectorAll('span')].find(el => (el.textContent ?? '').trim() === 'View')
+				if (!control) return { clicked: false, currentThreadId: svc.state.currentThreadId, pinned: [...svc.state.pinnedThreadIds] }
+				control.click()
+				await new Promise(r => setTimeout(r, 300))
+				return { clicked: true, currentThreadId: svc.state.currentThreadId, pinned: [...svc.state.pinnedThreadIds] }
+			})
+			assert.equal(opened.clicked, true, 'the View control could not be found to click')
 
 			assert.equal(opened.currentThreadId, childId, 'the link did not switch to the child')
 			assert.equal(opened.pinned.includes(childId), false, 'opening a child pinned it — it would sit in the tab strip for good')
@@ -563,6 +599,135 @@ describe('subagent delegation', () => {
 			}, parent.id)
 			assert.equal(back, parent.id, 'could not return to the parent')
 			assert.equal(await domHas(s.page, 'Back to parent'), false, 'the child banner still renders on the parent thread')
+		})
+	})
+
+	test('a child that pauses and resumes announces nothing, while the parent still announces', async (t) => {
+		await h.withScenario('subagent/no-notify', async (s) => {
+			const parent = await scenario(s.page)
+
+			// Notifications default to off on Windows (`notificationsEnabled: isMacintosh`),
+			// so a scenario that never turns them on records nothing and its "the child said
+			// nothing" assertion holds for the wrong reason. The control at the end of this
+			// test is what caught that on the first run; this is the setup it needs. Read the
+			// values back rather than assuming the write landed — a guard that silently did
+			// nothing is the failure mode this whole test is about.
+			// Notifications are off by default on Windows, and turning them on through the
+			// settings path is wrong for this test twice over: that write is a whole-blob
+			// store whose timing is unreliable under this fixture, and it is not the subject.
+			// The subject is the guard in `_wrapRunAgentToNotify`, which is decided before
+			// `_shouldNotify` is ever consulted. So the fixture states the premise — "this
+			// user has finish notifications on" — and the control proves it took.
+			const fixture = await s.page.evaluate(() => {
+				const svc = globalThis.__voidChatThreadService
+				svc._shouldNotify = () => true
+				return typeof svc._shouldNotify === 'function'
+			})
+			assert.equal(fixture, true, 'could not turn notifications on for the fixture')
+
+			// The child's first request asks for a command, which the default settings do
+			// not auto-approve, so its run parks at `awaiting_user` and `run_subagent`
+			// returns 'blocked'. Approving it afterwards resumes the child through the
+			// approval entry rather than the send entry a spawn uses — and that second
+			// entry used to announce the child as though it were a chat the user opened.
+			await h.stubLLM(s.page, CHILD_REPORT, {
+				usage: STUB_USAGE,
+				toolCalls: [{ name: 'run_command', rawParams: { command: 'echo subagent-approval' } }],
+			})
+
+			// Record every notification the workbench would show, from here on. The native
+			// host service is a `ProxyChannel` proxy — its methods are get traps, so assigning
+			// over `showNotification` silently does nothing. The field on the chat service is
+			// a plain property, so the whole service is replaced instead, and the recorder
+			// proves itself before the scenario depends on it.
+			const recorder = await s.page.evaluate(() => {
+				const svc = globalThis.__voidChatThreadService
+				globalThis.__voidNotifications = []
+				const real = svc._nativeHostService
+				const fake = {
+					windowId: real?.windowId,
+					showNotification: (n) => { globalThis.__voidNotifications.push(n) },
+					dismissNotification: () => { },
+					onNotificationAction: () => ({ dispose() { } }),
+				}
+				svc._nativeHostService = fake
+				fake.showNotification({ id: 'probe-setup' })
+				return {
+					proved: (globalThis.__voidNotifications ?? []).some(n => n.id === 'probe-setup'),
+					replaced: svc._nativeHostService === fake,
+					realType: real?.constructor?.name ?? null,
+				}
+			})
+			t.diagnostic(`notification recorder: ${JSON.stringify(recorder)}`)
+			assert.equal(recorder.proved, true, `could not instrument notifications: ${JSON.stringify(recorder)}`)
+
+			const out = await delegateFrom(s.page, { threadId: parent.id, alias: ALIAS, task: CHILD_MARKER, toolId: 'call-blocked' })
+			assert.equal(out.children.length, 1, 'the fixture did not create a child')
+			const childId = out.children[0].id
+
+			// Guard: the child really parked. Without this the scenario asserts against the
+			// ordinary path, which was already suppressed, and would pass for the wrong reason.
+			const parked = await s.page.evaluate((id) => globalThis.__voidChatThreadService.streamState[id]?.isRunning, childId)
+			t.diagnostic(`child stream state after the blocked spawn: ${parked}`)
+			assert.equal(out.toolRowResult?.status, 'blocked', `run_subagent returned "${out.toolRowResult?.status}" instead of blocking`)
+			assert.equal(parked, 'awaiting_user', `the child did not park for approval (${parked}), so the resume path is untested`)
+
+			// Approve on the child's own thread, the way its transcript button does, and wait
+			// for the resumed run to settle — the notification fires when it does.
+			const approved = await s.page.evaluate(async (id) => {
+				const svc = globalThis.__voidChatThreadService
+				const pending = svc.state.allThreads[id].messages.filter(m => m.role === 'tool' && m.type === 'tool_request')
+				if (pending.length === 0) return { ok: false, reason: 'the child has no pending tool to approve' }
+				svc.approveToolRequest(id, pending[pending.length - 1].id)
+				for (let i = 0; i < 240; i++) {
+					await new Promise(r => setTimeout(r, 50))
+					if (svc.streamState[id]?.isRunning === undefined) return { ok: true }
+				}
+				return { ok: false, reason: `the resumed child never settled (${svc.streamState[id]?.isRunning})` }
+			}, childId)
+			t.diagnostic(`resume: ${JSON.stringify(approved)}`)
+			assert.equal(approved.ok, true, `the child did not finish after approval: ${approved.reason}`)
+
+			// The assertion. A child has no tab to raise and no chat waiting behind it, so it
+			// must not announce *its own finish*. Approval notices are a different question —
+			// a child parked at `awaiting_user` is one the user may have to go and unblock —
+			// so they are reported but not asserted on here.
+			const allNotes = await s.page.evaluate(() => (globalThis.__voidNotifications ?? []).map(n => String(n.id)))
+			t.diagnostic(`notifications so far: ${JSON.stringify(allNotes)}`)
+			const childNotes = allNotes.filter(n => n === `done:${childId}` || n === `error:${childId}`)
+			assert.deepEqual(childNotes, [], `the child announced itself: ${childNotes.join(', ')}`)
+
+			// Control: the same recorder sees a top-level thread announce. Without it the
+			// assertion above could pass because nothing was recorded at all. The current
+			// thread is moved to the child first, so the parent is unambiguously a thread the
+			// user is not looking at — that is the condition the notification exists for, and
+			// leaving it to window focus would make the control depend on the harness.
+			const control = await s.page.evaluate(async ({ parentId, childId }) => {
+				const svc = globalThis.__voidChatThreadService
+				await svc.switchToThread(childId)
+				await svc.addUserMessageAndStreamResponse({ userMessage: 'control turn', threadId: parentId })
+				const ids = () => (globalThis.__voidNotifications ?? []).map(n => String(n.id))
+				let found = false
+				for (let i = 0; i < 160; i++) {
+					await new Promise(r => setTimeout(r, 50))
+					if (ids().some(x => x.startsWith('done:' + parentId))) { found = true; break }
+				}
+				// Whether or not the parent announced, prove the recorder itself works: a
+				// patch that never took would also produce an empty list, and that would be
+				// indistinguishable from a suppressed child.
+				svc._nativeHostService.showNotification({ id: 'probe-direct' })
+				const g = svc._settingsService.state.globalSettings
+				return {
+					found,
+					ids: ids(),
+					settings: { notificationsEnabled: g.notificationsEnabled, notifyOnDone: g.notifyOnDone },
+					streamState: svc.streamState[parentId]?.isRunning ?? null,
+					error: svc.streamState[parentId]?.error?.message ?? null,
+				}
+			}, { parentId: parent.id, childId })
+			t.diagnostic(`control: ${JSON.stringify(control)}`)
+			assert.equal(control.ids.includes('probe-direct'), true, 'the notification recorder never took, so no claim about the child can be made')
+			assert.equal(control.found, true, `the parent did not announce (${JSON.stringify(control)}), so the recorder proves nothing about the child`)
 		})
 	})
 

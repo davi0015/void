@@ -5,7 +5,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { useAccessor, useChatThread, useChatThreadsStreamState, useSettingsState } from '../util/services.js';
+import { useAccessor, useChatThread, useChildThreadByAlias, useChatThreadsStreamState, useSettingsState } from '../util/services.js';
 
 import { ChatMarkdownRender, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
 import { URI } from '../../../../../../../base/common/uri.js';
@@ -1112,6 +1112,33 @@ const SubagentReportChildren = ({ result }: { result: SubagentOutcome }) => {
 	)
 }
 
+/**
+ * What the child is doing right now, in the words the transcript already uses for a tool
+ * row: its last tool message, cut like every other description on a row.
+ *
+ * Deliberately not the child's text. A child's prose is its report, and previewing it on
+ * the parent's row would spend the parent's context on the transcript delegation exists
+ * to keep out of it. One line, then a click.
+ */
+const childActivityOf = (child: { messages?: readonly any[] } | undefined, accessor: any): string | undefined => {
+	const lastTool = child?.messages?.slice().reverse().find((m: any) => m?.role === 'tool')
+	if (!lastTool) return undefined
+	// A tool name with no entry would call `undefined(...)` and take the renderer down with
+	// it — the map is exhaustive over `BuiltinToolName` in the type system, but this runs on
+	// whatever is in the thread, and `.tsx` is not type-checked by the build.
+	const describe = (toolNameToDesc as Record<string, unknown>)[String(lastTool.name)]
+	if (typeof describe !== 'function') return undefined
+	try {
+		const { desc1, desc1Info } = (describe as any)(lastTool.params, accessor) as { desc1?: string, desc1Info?: string }
+		const text = [desc1, desc1Info].filter(Boolean).join(' ')
+		if (!text) return undefined
+		return text.length > 120 ? `${text.slice(0, 120)}…` : text
+	} catch {
+		// A description helper that cannot read these params is not a reason to drop the row.
+		return undefined
+	}
+}
+
 export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: ResultWrapper<T>, } } = {
 	'read_file': {
 		resultWrapper: ({ toolMessage }) => {
@@ -2019,14 +2046,34 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 		},
 	},
 	'run_subagent': {
-		resultWrapper: ({ toolMessage }) => {
+		resultWrapper: ({ toolMessage, threadId }) => {
 			const accessor = useAccessor()
+			const chatThreadService = accessor.get('IChatThreadService')
 			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
 			const title = getTitle(toolMessage)
 			const icon = null
 
+			// Resolved on every render, including while the call is still running: the child's
+			// id only arrives in the result, so the row finds it the way `send_message` does —
+			// the name the parent coined, under the parent thread. Both are stored fields, so
+			// the row still finds its child after a reload.
+			const alias = (toolMessage.params as { alias?: string } | undefined)?.alias
+			const child = useChildThreadByAlias(threadId, alias)
+			const openChild = child ? () => { void chatThreadService.switchToThread(child.id) } : undefined
+
 			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
-				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+				// While it runs, the row answers "is it alive, and on what". The task text is
+				// already above it in the transcript, so it moves to the tooltip and the line
+				// carries the child's current step instead of repeating what was asked.
+				return <ToolHeaderWrapper
+					title={title}
+					desc1={desc1}
+					desc1Info={childActivityOf(child, accessor) ?? desc1Info}
+					info={(toolMessage.params as { task?: string } | undefined)?.task}
+					desc2={openChild ? 'View' : undefined}
+					desc2OnClick={openChild}
+					icon={icon}
+				/>
 			}
 
 			const result = toolMessage.type === 'success' ? toolMessage.result : undefined
@@ -2036,13 +2083,16 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			// tool call itself returned a result.
 			const isError = toolMessage.type === 'tool_error' || (result !== undefined && result.status !== 'done')
 			const isRejected = toolMessage.type === 'rejected'
-			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+			const componentParams: ToolHeaderParams = {
+				title, desc1, desc1Info, isError, icon, isRejected,
+				desc2: openChild ? 'View' : undefined, desc2OnClick: openChild,
+			}
 
 			if (result) {
-				// The child's own thread is not linked from here yet: opening a child as a
-				// thread is the rendering step, and a link to a thread the sidebar cannot
-				// show would be a dead end. The report itself is what the row is for.
-				componentParams.bottomChildren = <BottomChildren title='Subagent report' defaultOpen>
+				// Closed by default: the row is the summary and the report is what you open
+				// when you want it. A delegation that did not finish is the exception — that
+				// body is a decision (approve, narrow the task, re-run), so it arrives open.
+				componentParams.bottomChildren = <BottomChildren title='Subagent report' defaultOpen={result.status !== 'done'}>
 					<SubagentReportChildren result={result} />
 				</BottomChildren>
 			}
@@ -2051,23 +2101,42 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 		},
 	},
 	'send_message': {
-		resultWrapper: ({ toolMessage }) => {
+		resultWrapper: ({ toolMessage, threadId }) => {
 			const accessor = useAccessor()
+			const chatThreadService = accessor.get('IChatThreadService')
 			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
 			const title = getTitle(toolMessage)
 			const icon = null
 
+			// A follow-up can address the child by id instead of by name, so the row resolves
+			// both ways and takes whichever exists.
+			const params = toolMessage.params as { alias?: string, childThreadId?: string } | undefined
+			const byAlias = useChildThreadByAlias(threadId, params?.alias)
+			const byId = useChatThread(params?.childThreadId ?? '')
+			const child = byAlias ?? byId
+			const openChild = child ? () => { void chatThreadService.switchToThread(child.id) } : undefined
+
 			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
-				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+				return <ToolHeaderWrapper
+					title={title}
+					desc1={desc1}
+					desc1Info={childActivityOf(child, accessor) ?? desc1Info}
+					desc2={openChild ? 'View' : undefined}
+					desc2OnClick={openChild}
+					icon={icon}
+				/>
 			}
 
 			const result = toolMessage.type === 'success' ? toolMessage.result : undefined
 			const isError = toolMessage.type === 'tool_error' || (result !== undefined && result.status !== 'done')
 			const isRejected = toolMessage.type === 'rejected'
-			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+			const componentParams: ToolHeaderParams = {
+				title, desc1, desc1Info, isError, icon, isRejected,
+				desc2: openChild ? 'View' : undefined, desc2OnClick: openChild,
+			}
 
 			if (result) {
-				componentParams.bottomChildren = <BottomChildren title='Subagent reply' defaultOpen>
+				componentParams.bottomChildren = <BottomChildren title='Subagent reply' defaultOpen={result.status !== 'done'}>
 					<SubagentReportChildren result={result} />
 				</BottomChildren>
 			}

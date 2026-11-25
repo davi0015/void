@@ -369,6 +369,38 @@ export const useChatThread = (threadId: string) => {
 	return thread
 }
 
+/**
+ * The child one delegation row spawned, found by the name its parent coined.
+ *
+ * The row carries `alias`, not an id — the id only comes back in the result, long after
+ * the row has to say something useful. Scanning for `(parentThreadId, alias)` is the same
+ * addressing `send_message` uses, and it also works on a thread reloaded from storage,
+ * where the running row and the child are separate objects again.
+ *
+ * Identity-stable like `useChatThread`: the listener only updates when *this child*
+ * changes, so a token from another thread does not re-render the row.
+ */
+export const useChildThreadByAlias = (parentThreadId: string | undefined, alias: string | undefined) => {
+	const find = (state: ThreadsState): ThreadType | undefined =>
+		!parentThreadId || !alias
+			? undefined
+			: Object.values(state.allThreads).find(t => t !== undefined && t.parentThreadId === parentThreadId && t.alias === alias)
+	const [thread, setThread] = useState<ThreadType | undefined>(() => find(chatThreadsState))
+	useEffect(() => {
+		setThread(find(chatThreadsState))
+		const listener = (newState: ThreadsState) => {
+			setThread(prev => {
+				const next = find(newState)
+				if (prev === next) return prev
+				return next
+			})
+		}
+		chatThreadsStateListeners.add(listener)
+		return () => { chatThreadsStateListeners.delete(listener) }
+	}, [parentThreadId, alias])
+	return thread
+}
+
 export const useCurrentWorkspaceUri = () => {
 	const [uri, setUri] = useState(chatThreadsState.currentWorkspaceUri)
 	useEffect(() => {
