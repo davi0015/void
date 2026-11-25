@@ -52,6 +52,22 @@ before(() => h.preflight())
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 
 /**
+ * Answers the stub's next held request, waiting until there is one.
+ *
+ * `completeStubbedLLM` returns false when nothing is held, and a held request only exists
+ * once the loop has reached it — which is a render or a tool run later than the call site
+ * that wants to answer it. Firing once and ignoring the answer hangs the child until the
+ * scenario's page is torn down.
+ */
+async function answerNextRequest(page) {
+	for (let i = 0; i < 120; i++) {
+		if (await h.completeStubbedLLM(page)) return true
+		await sleep(100)
+	}
+	return false
+}
+
+/**
  * True when the rendered chat contains `needle`.
  *
  * This asserts the row *exists*, not that it looks right: a builtin tool with no
@@ -521,14 +537,10 @@ describe('subagent delegation', () => {
 			assert.equal(out.children.length, 1, 'the fixture did not create a child')
 			const childId = out.children[0].id
 
-			// The way in exists. Asserted on the DOM because a missing UI entry renders
-			// nothing at all, and every state assertion above would still pass.
-			assert.ok(await domHas(s.page, 'Open transcript'), 'the delegation row has no transcript link')
-
-			// And the report is *showing*, not merely in the DOM: every tool body is a
-			// collapsible that renders its children and hides them with `max-h-0`, so text
-			// presence alone would pass for a body the reader has to expand to find — including
-			// the transcript link, which lives inside it.
+			// The report arrives closed. The row is the summary — a status, the name, the way
+			// in — and the report is what a reader opens when they want it. Measured as height
+			// rather than as text: the body is a collapsible that renders its children and hides
+			// them with `max-h-0`, so presence alone would pass for a body on screen.
 			const bodyHeight = await s.page.evaluate(() => {
 				const button = [...document.querySelectorAll('button')]
 					.find(b => (b.textContent ?? '').includes('Open transcript'))
@@ -538,21 +550,29 @@ describe('subagent delegation', () => {
 				return el ? Math.round(el.getBoundingClientRect().height) : -1
 			})
 			t.diagnostic(`delegation body height: ${bodyHeight}px`)
-			assert.ok(bodyHeight > 0, `the delegation body is collapsed (${bodyHeight}px) — the report and its link are hidden`)
+			assert.equal(bodyHeight, 0, `the report arrived expanded (${bodyHeight}px)`)
+
+			// The way in is on the row itself, so closing the body does not close the door.
+			assert.ok(await domHas(s.page, 'View'), 'the delegation row has no way into the child')
 
 			// Guard: spawning is the agent's act, so a child must not arrive as a tab. A
 			// fan-out that pinned every child is the "strip of tabs" collapse.
 			const before = await s.page.evaluate(() => [...globalThis.__voidChatThreadService.state.pinnedThreadIds])
 			assert.equal(before.includes(childId), false, 'the child was pinned at spawn')
 
-			// Exactly what the row's link does. It must *not* pin: the strip is the user's own
-			// list of threads, and a preview of the agent's delegate does not belong in it —
-			// that is the supervision collapse, one tab per child.
-			const opened = await s.page.evaluate((id) => {
+			// The row's own control, clicked the way a user clicks it. It must *not* pin: the
+			// strip is the user's own list of threads, and a preview of the agent's delegate does
+			// not belong in it — that is the supervision collapse, one tab per child.
+			assert.ok(await domHas(s.page, 'View'), 'the delegation row has no View control')
+			const opened = await s.page.evaluate(async () => {
 				const svc = globalThis.__voidChatThreadService
-				svc.switchToThread(id)
-				return { currentThreadId: svc.state.currentThreadId, pinned: [...svc.state.pinnedThreadIds] }
-			}, childId)
+				const control = [...document.querySelectorAll('span')].find(el => (el.textContent ?? '').trim() === 'View')
+				if (!control) return { clicked: false, currentThreadId: svc.state.currentThreadId, pinned: [...svc.state.pinnedThreadIds] }
+				control.click()
+				await new Promise(r => setTimeout(r, 300))
+				return { clicked: true, currentThreadId: svc.state.currentThreadId, pinned: [...svc.state.pinnedThreadIds] }
+			})
+			assert.equal(opened.clicked, true, 'the View control could not be found to click')
 
 			assert.equal(opened.currentThreadId, childId, 'the link did not switch to the child')
 			assert.equal(opened.pinned.includes(childId), false, 'opening a child pinned it — it would sit in the tab strip for good')
