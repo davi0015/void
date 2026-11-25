@@ -2549,6 +2549,10 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	const contentRef = useRef<HTMLDivElement | null>(null)
 	const spacerHeightRef = useRef(0)
 	const lastScrollTopRef = useRef(0)
+	// Last scrollTop the scroll handler itself saw. Separate from
+	// `lastScrollTopRef`, which the rAF uses for expand/trim direction and which
+	// the layout effect also writes.
+	const lastObservedScrollTopRef = useRef(0)
 	const isAtBottomRef = useRef(true)
 
 	const getContentHeight = useCallback(() => {
@@ -2615,14 +2619,16 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				const delta = contentH - prevContentH
 				scrollEl.scrollTop += delta
 			}
-			lastScrollTopRef.current = scrollEl.scrollTop
 		} else {
 			// New message appended at the end — stay at bottom if we were there
 			if (isAtBottomRef.current) {
 				scrollToBottom(scrollContainerRef)
 			}
-			lastScrollTopRef.current = scrollEl.scrollTop
 		}
+		// Both refs track the position this effect just produced, so the next
+		// scroll event compares against it rather than a pre-compensation value.
+		lastScrollTopRef.current = scrollEl.scrollTop
+		lastObservedScrollTopRef.current = scrollEl.scrollTop
 	}, [mountStart, totalCount, isActive, scrollContainerRef, getContentHeight])
 
 	// Fill check: runs AFTER paint as a useEffect so its setMountStart
@@ -2853,14 +2859,43 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		if (!el) return
 		let rafId = 0
 		lastScrollTopRef.current = el.scrollTop
+		lastObservedScrollTopRef.current = el.scrollTop
+
+		// A wheel up is the earliest evidence of intent to leave the bottom: it
+		// arrives before the browser moves scrollTop and before a stream tick's
+		// effect can run. Without it, a token arriving in the same frame as the
+		// first pixel of an upward scroll could still call scrollToBottom.
+		const isInsideInnerScroller = (target: EventTarget | null) => {
+			let node = target instanceof Element ? target : null
+			while (node && node !== el) {
+				const style = getComputedStyle(node)
+				if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight + 1) return true
+				node = node.parentElement
+			}
+			return false
+		}
+		const onWheel = (e: WheelEvent) => {
+			if (e.deltaY < 0 && el.scrollTop > 0 && !isInsideInnerScroller(e.target)) isAtBottomRef.current = false
+		}
+		el.addEventListener('wheel', onWheel, { passive: true })
 
 		const onScroll = () => {
 			const currScrollTopSync = el.scrollTop
 			const prevScrollTopSync = lastScrollTopRef.current
-			// Update isAtBottomRef synchronously — before the rAF — so
-			// that StreamingBubble's useLayoutEffect (which fires on every
-			// stream tick with no deps array) sees the correct value.
-			isAtBottomRef.current = el.scrollHeight - el.clientHeight - currScrollTopSync < 100
+			const prevObservedSync = lastObservedScrollTopRef.current
+			lastObservedScrollTopRef.current = currScrollTopSync
+
+			// Follow the bottom only while the reader is at it, and release the
+			// moment they move up. This used to be `distance < 100`, which made the
+			// first 100 px of an upward scroll a dead zone: a stream tick, a content
+			// resize, or a message mount then called scrollToBottom and yanked the
+			// reader back to the last message. The slack existed to absorb content
+			// growing while pinned, but growth shows up as a larger distance, not as
+			// a different position, so the pin does not need any.
+			const distance = el.scrollHeight - el.clientHeight - currScrollTopSync
+			if (distance < 4) isAtBottomRef.current = true
+			else if (currScrollTopSync < prevObservedSync) isAtBottomRef.current = false
+
 			cancelAnimationFrame(rafId)
 			rafId = requestAnimationFrame(() => {
 				const currScrollTop = el.scrollTop
@@ -2890,6 +2925,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		return () => {
 			cancelAnimationFrame(rafId)
 			el.removeEventListener('scroll', onScroll)
+			el.removeEventListener('wheel', onWheel)
 		}
 	}, [scrollContainerRef, expandUp, updateStickyQuestion, trimFromTop])
 
@@ -3099,10 +3135,11 @@ const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOn
 	const chatThreadsService = accessor.get('IChatThreadService')
 	const commandService = accessor.get('ICommandService')
 
-	// Auto-scroll to bottom on every stream tick if the user is at the
-	// bottom. isAtBottomRef is updated synchronously in onScroll (before
-	// rAF), so stream ticks always see the correct value — the user can
-	// escape by scrolling >100px from the bottom without needing hysteresis.
+	// Auto-scroll to bottom on every stream tick while the reader is pinned to
+	// the bottom. The pin is released by the first upward movement (see
+	// onScroll), not by a distance threshold, so one wheel notch is enough to
+	// stop following — before this, the first 100 px of an upward scroll was
+	// reclaimed by the next token.
 	// useEffect (not useLayoutEffect) so the browser can paint new content before
 	// we force a layout reflow via scrollTop. The 1-frame delay is imperceptible at
 	// ~10Hz streaming and avoids blocking the main thread on every token.
@@ -3525,6 +3562,12 @@ export const SidebarChat = () => {
 		} finally {
 			isSubmittingRef.current = false
 		}
+
+		// Sending is a request to see the new message: follow the bottom even if the
+		// reader had scrolled up (the pin is otherwise only re-established by
+		// scrolling back down). The scroll event sets the pin; the message list's
+		// layout effect follows once the new row renders.
+		scrollToBottom(scrollContainerRef)
 
 		textAreaRef.current?.focus() // focus input after submit
 
