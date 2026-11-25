@@ -189,12 +189,22 @@ export type ThreadType = {
 	latestCompaction?: CompactionInfo;
 	cumulativeCompactionThisThread?: CompactionInfo;
 
-	// Model used to send the most recent user message on this thread. Captured
-	// on send, restored on `switchToThread` (writes to settings' `Chat` model
-	// selection). `null` means "no message was sent on this thread yet"; if the
-	// provider/model no longer exists or is hidden, the restore is skipped and
-	// the user keeps whatever model is currently globally selected.
+	// Model used to send the most recent user message on this thread — the run
+	// record, and the first thing `switchToThread` restores from. Captured on
+	// send and written by nothing else: a dropdown change is a pick for a
+	// message that has not been sent yet, so it goes to `draftModelSelection`
+	// instead. `null` means "no message was sent on this thread yet". If the
+	// provider/model no longer exists or is hidden, the restore falls back to
+	// the draft and then to the current global selection.
 	lastUsedModelSelection?: ModelSelection | null;
+
+	// What this chat was showing for a message that has not been sent: a pick
+	// made while the chat was current, or whatever it showed when the user left
+	// it. Restored only when there is no run record to restore (a new chat, or
+	// one written before `lastUsedModelSelection` existed) — a chat that has run
+	// keeps showing the model its last message ran with, whatever was picked or
+	// visited in between. Cleared on send, where the run record takes over.
+	draftModelSelection?: ModelSelection | null;
 
 	// Snapshot of `.voidrules` content as it was at the most recent user message
 	// send on this thread. Compared against the current on-disk content at send
@@ -1071,16 +1081,17 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// without disrupting the in-progress session.
 		}))
 
-		// Capture live dropdown changes onto whichever thread is currently in
-		// focus, so switching tabs round-trips the chosen model even when no
-		// message was sent. Without this listener, the field is only written
-		// at send time (see `_addUserMessageAndStreamResponse`) and an "unsent"
-		// dropdown change would be lost on tab switch.
+		// Capture live dropdown changes as the chat's *draft*, so switching tabs
+		// round-trips a model picked for a message that has not been sent yet — and
+		// so a pick can never rewrite the run record (see the field comments on
+		// `ThreadType`). Without this listener an unsent change would be lost on tab
+		// switch, which is what #172 fixed; writing it into `lastUsedModelSelection`
+		// is what made a chat that *had* run show the pick instead of its run model.
 		//
 		// Races are benign: `switchToThread` itself calls
 		// `setModelSelectionOfFeature` which will fire this listener back, but
 		// by the time it fires `currentThreadId` is already the new thread and
-		// the equality check in `_setThreadLastUsedModelSelection` skips the
+		// the equality check in `_setThreadModelSelectionField` skips the
 		// redundant write.
 		let lastSeenChatModel = this._settingsService.state.modelSelectionOfFeature['Chat']
 		this._register(this._settingsService.onDidChangeState(() => {
@@ -1095,7 +1106,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			lastSeenChatModel = current
 			const threadId = this.state.currentThreadId
 			if (threadId && this.state.allThreads[threadId]) {
-				this._setThreadLastUsedModelSelection(threadId, current)
+				this._setThreadDraftModelSelection(threadId, current)
 			}
 		}))
 
@@ -2398,15 +2409,15 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		this.state = newState
 
-		// Switching away from a thread is the moment its dropdown value has to be
-		// remembered: `lastUsedModelSelection` was only written on send or on a
-		// dropdown change made *while that thread was current*, so a thread that
-		// never sent a message — or one written before the field existed — had
-		// nothing saved, and returning to it kept whatever model had been picked in
-		// another tab. Done after the state lands so a caller-supplied `allThreads`
-		// snapshot (openNewThread) cannot overwrite the write with its own copy.
+		// Switching away from a thread is the moment its *draft* has to be captured:
+		// a chat that has never run (or one from before the run record existed) must
+		// not keep whatever model was picked in another tab. `lastUsedModelSelection`
+		// is deliberately left alone — it names what the thread ran with, and a switch
+		// is not evidence of a message having run. Done after the state lands so a
+		// caller-supplied `allThreads` snapshot (openNewThread) cannot overwrite the
+		// write with its own copy.
 		if (outgoingThreadId !== undefined) {
-			this._rememberModelSelectionForThread(outgoingThreadId)
+			this._rememberDraftModelSelectionForThread(outgoingThreadId)
 		}
 
 		this._onDidChangeCurrentThread.fire()
@@ -2683,7 +2694,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (!thread) return
 
 		// Skip the (persistent) write if unchanged. Same rationale as
-		// `_setThreadLastUsedModelSelection`: avoids rewriting the full threads
+		// `_setThreadModelSelectionField`: avoids rewriting the full threads
 		// blob every turn when rules haven't moved.
 		if (thread.lastAppliedRules === rules) return
 
@@ -2703,19 +2714,28 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._setState({ allThreads: newThreads })
 	}
 
-	// Persists the given model selection on the thread so that a later
-	// `switchToThread` can restore the dropdown to whatever the user sent with.
-	// Writes through `_storeThread` to survive reloads. No state change
-	// event here — the dropdown state lives on `IVoidSettingsService`, not on
-	// this service, so there's nothing for chat-UI listeners to re-render.
-	private _setThreadLastUsedModelSelection(threadId: string, modelSelection: ModelSelection | null, opts: { notify?: boolean } = {}) {
+	// Persists a model-selection field on the thread. Two fields carry model
+	// memory; only their writers differ:
+	//   - `lastUsedModelSelection` is the run record, written by the send path;
+	//   - `draftModelSelection` is what the chat showed for an unsent message,
+	//     written when the dropdown changes and when the user leaves the chat.
+	// Writes through `_storeThread` to survive reloads. No state change event by
+	// default past `_setState` — the dropdown state lives on
+	// `IVoidSettingsService`, not on this service, so chat-UI listeners have
+	// nothing to re-render on a write here.
+	private _setThreadModelSelectionField(
+		threadId: string,
+		field: 'lastUsedModelSelection' | 'draftModelSelection',
+		modelSelection: ModelSelection | null | undefined,
+		opts: { notify?: boolean } = {}
+	) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
 
 		// Skip the (persistent) write if the stored value is already identical.
 		// Without this, every user message would rewrite the whole threads blob
 		// to storage for no reason.
-		const prev = thread.lastUsedModelSelection
+		const prev = thread[field]
 		if (
 			prev && modelSelection &&
 			prev.providerName === modelSelection.providerName &&
@@ -2723,27 +2743,42 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		) return
 		if (!prev && !modelSelection) return
 
-		const updatedThread = { ...thread, lastUsedModelSelection: modelSelection }
+		const updatedThread = field === 'lastUsedModelSelection'
+			? { ...thread, lastUsedModelSelection: modelSelection }
+			: { ...thread, draftModelSelection: modelSelection }
 		const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 		this._storeThread(threadId, updatedThread)
 		// Quiet writes are the ones made on the way out of a thread: nothing that is
-		// rendered depends on this field, and notifying would fire a second
+		// rendered depends on these fields, and notifying would fire a second
 		// "current thread changed" for a switch that is already in progress.
 		if (opts.notify === false) this.state = { ...this.state, allThreads: newThreads }
 		else this._setState({ allThreads: newThreads })
 	}
 
+	// The run record, and only the send path writes it.
+	private _setThreadLastUsedModelSelection(threadId: string, modelSelection: ModelSelection | null) {
+		this._setThreadModelSelectionField(threadId, 'lastUsedModelSelection', modelSelection)
+	}
+
+	// A pick that has not been sent (or the model a run-less chat was showing).
+	private _setThreadDraftModelSelection(threadId: string, modelSelection: ModelSelection | null | undefined, opts: { notify?: boolean } = {}) {
+		this._setThreadModelSelectionField(threadId, 'draftModelSelection', modelSelection, opts)
+	}
+
 	/**
-	 * Persists whatever the dropdown currently shows onto the thread being left.
-	 * Without this, a thread that never saved a selection of its own has nothing
-	 * for `_afterCurrentThreadChanged` to restore, and keeps the model picked in
-	 * whichever tab was used in between.
+	 * Persists whatever the dropdown currently shows as the outgoing thread's
+	 * draft. Without this, a chat that has never run (or one from before the run
+	 * record existed) has nothing for `_afterCurrentThreadChanged` to restore, and
+	 * keeps the model picked in whichever tab was used in between. The run record
+	 * is deliberately not written here — a switch is not evidence of a message
+	 * having run, and #172 wrote this draft into `lastUsedModelSelection`, which
+	 * made tabs show a model their last message never used.
 	 */
-	private _rememberModelSelectionForThread(threadId: string | null | undefined): void {
+	private _rememberDraftModelSelectionForThread(threadId: string | null | undefined): void {
 		if (!threadId || !this.state.allThreads[threadId]) return
 		const current = this._settingsService.state.modelSelectionOfFeature['Chat']
 		if (!current) return
-		this._setThreadLastUsedModelSelection(threadId, current, { notify: false })
+		this._setThreadDraftModelSelection(threadId, current, { notify: false })
 	}
 
 	// Returns true iff `sel` points at a provider+model that still exists in
@@ -5125,6 +5160,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			modelProps.modelSelectionOptions = { ...modelProps.modelSelectionOptions, ...modelSelectionOptionsOverride }
 		}
 		this._setThreadLastUsedModelSelection(threadId, modelProps.modelSelection)
+		// The run now defines this chat's model: a pick that was waiting for a send
+		// is superseded, not kept as a fallback. Quiet — nothing renders the draft.
+		this._setThreadDraftModelSelection(threadId, undefined, { notify: false })
 
 		const run = this._runChatAgent({ threadId, ...modelProps, })
 		// A caller that takes the promise over owns what happens when it settles. That
@@ -5726,16 +5764,24 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			}
 		}
 
-		// Restore the dropdown to the model that was last used to send a
-		// message on this thread. Fire-and-forget: the switch already took
-		// effect visually; `setModelSelectionOfFeature` just updates settings
-		// state which the model-selector component listens to separately.
-		// Skip when the thread has no saved selection (fresh thread, or
-		// pre-feature thread) or when the saved model has since been deleted
-		// or hidden — in both cases we intentionally leave the current global
-		// selection alone so the user isn't surprised by a blank dropdown.
-		const saved = this.state.allThreads[threadId]?.lastUsedModelSelection
-		if (saved && this._isModelSelectionCurrentlyValid(saved)) {
+		// Restore the dropdown to the run record: the model this thread's last
+		// message was actually sent with. Only a thread that has never run (or one
+		// written before the record existed) falls back to its draft, so a pick made
+		// on the chat — or a model visited in another tab — cannot displace what the
+		// chat ran with. Fire-and-forget: the switch already took effect visually;
+		// `setModelSelectionOfFeature` just updates settings state which the
+		// model-selector component listens to separately.
+		//
+		// Skip when there is nothing valid to restore — fresh thread, pre-feature
+		// thread, or a provider/model deleted or hidden since — leaving the current
+		// global selection alone so the user isn't surprised by a blank dropdown.
+		const thread = this.state.allThreads[threadId]
+		const run = thread?.lastUsedModelSelection
+		const draft = thread?.draftModelSelection
+		const saved = run && this._isModelSelectionCurrentlyValid(run) ? run
+			: draft && this._isModelSelectionCurrentlyValid(draft) ? draft
+				: undefined
+		if (saved) {
 			const current = this._settingsService.state.modelSelectionOfFeature['Chat']
 			const alreadyMatches = current
 				&& current.providerName === saved.providerName
