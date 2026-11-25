@@ -171,6 +171,69 @@ async function delegateFrom(page, { threadId, name = 'run_subagent', rawParams, 
 }
 
 /**
+ * Dispatches one `run_subagent` and returns the handle it recorded.
+ *
+ * The tool row is read back rather than the call's return value, because the row is
+ * what the transcript and the replayed conversation show; a handle that exists only
+ * in the call's return would be invisible to both.
+ */
+async function spawnChild(page, { threadId, alias, task, toolId }) {
+	return page.evaluate(async ({ threadIdArg, aliasArg, taskArg, id }) => {
+		const svc = globalThis.__voidChatThreadService
+		await svc._runToolCall(threadIdArg, 'run_subagent', id, undefined, {
+			preapproved: false,
+			unvalidatedToolParams: { alias: aliasArg, task: taskArg },
+		})
+		const row = svc.state.allThreads[threadIdArg].messages.find(m => m.role === 'tool' && m.id === id)
+		return { rowType: row?.type, handle: row?.result ?? null }
+	}, { threadIdArg: threadId, aliasArg: alias, taskArg: task, id: toolId })
+}
+
+/** The children of a thread, with the live state a parent could act on. */
+const childrenState = (page, parentId) => page.evaluate((pid) => {
+	const svc = globalThis.__voidChatThreadService
+	return Object.values(svc.state.allThreads)
+		.filter(t => t !== undefined && t.parentThreadId === pid)
+		.map(t => ({
+			id: t.id,
+			alias: t.alias ?? null,
+			createdAt: t.createdAt,
+			resultStatus: t.resultStatus ?? null,
+			running: svc.streamState[t.id]?.isRunning !== undefined,
+		}))
+}, parentId)
+
+/** Polls until `fn` returns something truthy; returns the last value either way. */
+async function waitFor(fn, { tries = 100, ms = 100 } = {}) {
+	let value
+	for (let i = 0; i < tries; i++) {
+		value = await fn()
+		if (value) return value
+		await sleep(ms)
+	}
+	return value
+}
+
+/**
+ * Answers the held request whose body mentions `needle`.
+ *
+ * Answering by index is wrong once a parent turn, a child turn and a title
+ * generation can all be in flight: the request that matters is identified by what it
+ * was asked, not by when it arrived. The whole request is searched rather than the
+ * last message's `content`, because that content is a string *or* an array of parts
+ * depending on the provider shape the translator produced. False when none is held.
+ */
+async function answerRequestFor(page, needle) {
+	return page.evaluate((n) => {
+		const pending = globalThis.__voidPendingLLMRequests ?? []
+		const idx = pending.findIndex(opts => JSON.stringify(opts ?? {}).includes(n))
+		if (idx < 0) return false
+		return globalThis.__voidCompleteLLMRequest(idx)
+	}, needle)
+}
+
+
+/**
  * A launched app with a model selected and a stubbed transport, plus one parent message.
  *
  * The parent is put in `orchestrator` mode first: that is the only mode whose tool list
@@ -181,29 +244,44 @@ async function delegateFrom(page, { threadId, name = 'run_subagent', rawParams, 
  * app's state match the feature under test.
  */
 async function scenario(page, { report = CHILD_REPORT } = {}) {
-	await h.ensureModelSelection(page)
-	// The setting is read back in a bounded loop rather than once: a write can be
-	// visible, reverted by a storage echo, and re-applied inside the first ~50 ms
-	// (measured: `{false}` at 0 ms, `{true}` at 50 ms, twice on this machine). Reading it
-	// once makes this fixture flake about once per suite run, on a scenario unrelated to
-	// the write. The transient itself is a separate question and is not being papered
-	// over here — this helper's job is to put the app in a state, not to test the write.
-	const mode = await page.evaluate(async () => {
-		const svc = globalThis.__voidChatThreadService
-		// Wait for the settings service to finish reading storage before writing to it. A
-		// write that lands first is overwritten by the initial read, which is a fixture
-		// racing startup rather than a product bug — and it fails here as "the app is in
-		// agent mode", which reads like a gate problem and is not.
-		await svc._settingsService.waitForInitState
-		await svc._settingsService.setGlobalSetting('chatMode', 'orchestrator')
-		for (let i = 0; i < 40; i++) {
-			const mode = svc._settingsService.state.globalSettings.chatMode
-			if (mode === 'orchestrator') return mode
-			await new Promise(r => setTimeout(r, 50))
+	const state = await page.evaluate(async () => {
+		const settings = globalThis.__voidChatThreadService._settingsService
+		await settings.waitForInitState
+		// Waited for, then verified — and poked rather than written, both for a reason.
+		//
+		// Poked: `_validatedModelState` runs on every settings *write* and nulls a selection
+		// whose model is not in a provider that has its keys filled in, and this profile has
+		// none. Ollama needs only the endpoint it already defaults to, so a write with its
+		// model list seeded would validate — but the write's storage echo reverts the state,
+		// which is the separate defect `fix/whole-blob-writes` did not finish.
+		//
+		// Waited for: the app writes settings of its own during startup, and a poke made
+		// while one of those is in flight is replaced when its echo lands (measured: a poke
+		// still correct at +250 ms had reverted to the defaults by +300 ms).
+		//
+		// Why it matters at all: with no Chat model, `prepareLLMChatMessages` sends **no
+		// messages at all**. A stubbed transport answers anyway, so nothing noticed — but a
+		// test that reads the request has nothing to read.
+		const poke = () => {
+			settings.state.globalSettings.chatMode = 'orchestrator'
+			settings.state.modelSelectionOfFeature['Chat'] = { providerName: 'ollama', modelName: 'qwen2.5-coder:7b' }
 		}
-		return svc._settingsService.state.globalSettings.chatMode
+		const readBack = () => {
+			const model = settings.state.modelSelectionOfFeature['Chat']
+			return { mode: settings.state.globalSettings.chatMode, model: model ? `${model.providerName}/${model.modelName}` : null }
+		}
+		for (let attempt = 0; attempt < 3; attempt++) {
+			await new Promise(r => setTimeout(r, 1200))
+			poke()
+			await new Promise(r => setTimeout(r, 300))
+			const now = readBack()
+			if (now.mode === 'orchestrator' && now.model) return now
+		}
+		return readBack()
 	})
-	assert.equal(mode, 'orchestrator', `the app is in "${mode}" mode, so delegation would not be offered to a user`)
+	assert.equal(state.mode, 'orchestrator', `the app is in "${state.mode}" mode, so delegation would not be offered to a user`)
+	assert.ok(state.model, 'fixture: no Chat model is selected, so every request would be sent with no messages')
+
 	await h.stubLLM(page, report, { usage: STUB_USAGE })
 	const parent = await seedCurrentThread(page, PARENT_MARKER)
 	assert.equal(parent.messageCount, 1, `the parent thread did not take its message (${parent.messageCount})`)
@@ -860,6 +938,251 @@ describe('subagent delegation', () => {
 			assert.equal(cancelled.rowResult?.status, 'cancelled', 'the cancel tool did not report a cancellation')
 			assert.equal(cancelled.status, 'cancelled', `the child settled as "${cancelled.status}" instead of cancelled`)
 		})
+	})
+
+	test('two spawns in one turn start children that run together', async (t) => {
+		await h.withScenario('subagent/parallel', async (s) => {
+			const parent = await scenario(s.page)
+			await h.stubLLM(s.page, CHILD_REPORT, { usage: STUB_USAGE, hang: true })
+
+			// The loop runs one tool call at a time, so this is its shape: each spawn returns
+			// a handle before the next call starts. Under M2 the first call held the loop until
+			// its child finished, so the second child could not exist while the first worked.
+			const alpha = await spawnChild(s.page, { threadId: parent.id, alias: 'alpha', task: 'TASK-ALPHA: count the tool names.', toolId: 'call-par-alpha' })
+			const beta = await spawnChild(s.page, { threadId: parent.id, alias: 'beta', task: 'TASK-BETA: count the tool names.', toolId: 'call-par-beta' })
+			assert.equal(alpha.rowType, 'success', `the first spawn failed: ${JSON.stringify(alpha)}`)
+			assert.equal(beta.rowType, 'success', `the second spawn failed: ${JSON.stringify(beta)}`)
+
+			const together = await waitFor(async () => {
+				const state = await childrenState(s.page, parent.id)
+				return state.length === 2 && state.every(c => c.running) ? state : null
+			})
+			assert.ok(together, `the two children never ran at the same time (${JSON.stringify(await childrenState(s.page, parent.id))})`)
+
+			const [first, second] = [...together].sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+			const gapMs = Date.parse(second.createdAt) - Date.parse(first.createdAt)
+			t.diagnostic(`children created ${gapMs} ms apart: ${JSON.stringify(together)}`)
+			assert.ok(gapMs >= 0 && gapMs < 3000, `the second child was created ${gapMs} ms after the first, so it waited for the first's run`)
+			assert.deepEqual([first.alias, second.alias], ['alpha', 'beta'], 'the children are not the two that were spawned')
+
+			// Both finish, and one collect joins them: the fan-out the design describes.
+			for (const marker of ['TASK-ALPHA', 'TASK-BETA']) {
+				assert.ok(await waitFor(() => answerRequestFor(s.page, marker)), `the request for ${marker} was never held`)
+			}
+			const settled = await waitFor(async () => {
+				const state = await childrenState(s.page, parent.id)
+				return state.length === 2 && state.every(c => c.resultStatus === 'done') ? state : null
+			})
+			assert.ok(settled, `the children did not both settle: ${JSON.stringify(await childrenState(s.page, parent.id))}`)
+
+			const joined = await s.page.evaluate(async ({ threadId, handles }) => {
+				const svc = globalThis.__voidChatThreadService
+				await svc._runToolCall(threadId, 'collect_subagent', 'call-par-collect', undefined, {
+					preapproved: false,
+					unvalidatedToolParams: { children: handles, timeout_seconds: 30 },
+				})
+				const row = svc.state.allThreads[threadId].messages.find(m => m.role === 'tool' && m.id === 'call-par-collect')
+				return row?.result?.results ?? null
+			}, { threadId: parent.id, handles: ['alpha', 'beta'] })
+
+			assert.equal(joined?.length, 2, `one collect did not join both children: ${JSON.stringify(joined)}`)
+			assert.deepEqual(joined.map(r => r.status), ['done', 'done'], `a joined child did not report done: ${JSON.stringify(joined)}`)
+			assert.ok(joined.every(r => r.summary.includes('CHILD-REPORT')), `a report did not cross back: ${JSON.stringify(joined)}`)
+		})
+	})
+
+	test('a user message while a child runs carries that child in its context', async (t) => {
+		await h.withScenario('subagent/context-line', async (s) => {
+			const parent = await scenario(s.page)
+			await h.stubLLM(s.page, CHILD_REPORT, { usage: STUB_USAGE, hang: true })
+
+			const spawned = await spawnChild(s.page, { threadId: parent.id, alias: ALIAS, task: CHILD_MARKER, toolId: 'call-ctx-spawn' })
+			assert.ok(spawned.handle?.childThreadId, `the spawn returned no handle: ${JSON.stringify(spawned)}`)
+			const childId = spawned.handle.childThreadId
+			assert.ok(await waitFor(() => s.page.evaluate((id) => globalThis.__voidChatThreadService.streamState[id]?.isRunning !== undefined, childId)), 'the child never started, so its status could not be in the parent\'s context')
+
+			// Nothing wakes the parent when a child settles. The next turn simply knows
+			// (design §3) — so the child has to be visible in what the model is sent.
+			await s.page.evaluate(async ({ threadId, message }) => {
+				const svc = globalThis.__voidChatThreadService
+				await svc.addUserMessageAndStreamResponse({ userMessage: message, threadId })
+			}, { threadId: parent.id, message: 'STATUS-MARKER: what are my subagents doing?' })
+
+			const firstTurn = await waitFor(async () => {
+				const captured = JSON.parse(await h.capturedLLMRequests(s.page))
+				const request = captured.find(o => JSON.stringify(o ?? {}).includes('STATUS-MARKER'))
+				return request ? JSON.stringify(request) : null
+			})
+			assert.ok(firstTurn, 'the parent never reached the model, so its context was never built')
+			assert.ok(firstTurn.includes('<subagents>'), `the parent's context carries no subagent block: ${firstTurn.slice(0, 600)}`)
+			assert.ok(firstTurn.includes(`${ALIAS}: running`), `the running child is missing from the parent's context: ${firstTurn.slice(0, 600)}`)
+
+			// Let the parent's turn finish and the child's run end, then collect the report.
+			assert.ok(await waitFor(() => answerRequestFor(s.page, 'STATUS-MARKER')), 'the parent\'s held request could not be answered')
+			assert.ok(await waitFor(() => answerRequestFor(s.page, CHILD_MARKER)), 'the child\'s held request could not be answered')
+			const settled = await waitFor(async () => {
+				const state = await childrenState(s.page, parent.id)
+				return state[0]?.resultStatus === 'done' ? state[0] : null
+			})
+			assert.ok(settled, `the child did not settle: ${JSON.stringify(await childrenState(s.page, parent.id))}`)
+
+			const collected = await s.page.evaluate(async ({ threadId, id }) => {
+				const svc = globalThis.__voidChatThreadService
+				await svc._runToolCall(threadId, 'collect_subagent', 'call-ctx-collect', undefined, {
+					preapproved: false,
+					unvalidatedToolParams: { children: [id], timeout_seconds: 30 },
+				})
+				const row = svc.state.allThreads[threadId].messages.find(m => m.role === 'tool' && m.id === 'call-ctx-collect')
+				return row?.result?.results?.[0] ?? null
+			}, { threadId: parent.id, id: childId })
+			assert.equal(collected?.status, 'done', `the report did not arrive at a later collect: ${JSON.stringify(collected)}`)
+			assert.ok(collected.summary.includes('CHILD-REPORT'), 'the collected report is not the child\'s')
+
+			// A settled, collected child must not read like work still to do.
+			await s.page.evaluate(async ({ threadId, message }) => {
+				const svc = globalThis.__voidChatThreadService
+				await svc.addUserMessageAndStreamResponse({ userMessage: message, threadId })
+			}, { threadId: parent.id, message: 'REPORT-MARKER: anything left?' })
+			const secondTurn = await waitFor(async () => {
+				const captured = JSON.parse(await h.capturedLLMRequests(s.page))
+				const request = captured.find(o => JSON.stringify(o ?? {}).includes('REPORT-MARKER'))
+				return request ? JSON.stringify(request) : null
+			})
+			assert.ok(secondTurn, 'the second parent turn never reached the model')
+			assert.ok(secondTurn.includes(`${ALIAS}: done (report collected)`), `a collected child does not read as collected: ${secondTurn.slice(0, 600)}`)
+			await answerRequestFor(s.page, 'REPORT-MARKER')
+		})
+	})
+
+	test('stopping a collect ends the wait, not the child', async (t) => {
+		await h.withScenario('subagent/collect-stop', async (s) => {
+			const parent = await scenario(s.page)
+			await h.stubLLM(s.page, CHILD_REPORT, { usage: STUB_USAGE, hang: true })
+
+			const spawned = await spawnChild(s.page, { threadId: parent.id, alias: ALIAS, task: CHILD_MARKER, toolId: 'call-stop-spawn' })
+			assert.ok(spawned.handle?.childThreadId, `the spawn returned no handle: ${JSON.stringify(spawned)}`)
+			const childId = spawned.handle.childThreadId
+			assert.ok(await waitFor(() => s.page.evaluate((id) => globalThis.__voidChatThreadService.streamState[id]?.isRunning !== undefined, childId)), 'the child never started')
+
+			const out = await s.page.evaluate(async ({ threadId, id }) => {
+				const svc = globalThis.__voidChatThreadService
+				const collect = svc._runToolCall(threadId, 'collect_subagent', 'call-stop-collect', undefined, {
+					preapproved: false,
+					unvalidatedToolParams: { children: [id], timeout_seconds: 60 },
+				})
+				// Park the join in the tool, then stop the turn the way the Stop button does.
+				let parked = false
+				for (let i = 0; i < 100; i++) {
+					if (svc.streamState[threadId]?.isRunning === 'tool') { parked = true; break }
+					await new Promise(r => setTimeout(r, 20))
+				}
+				await svc.abortRunning(threadId)
+				const res = await collect
+				const row = svc.state.allThreads[threadId].messages.find(m => m.role === 'tool' && m.id === 'call-stop-collect')
+				return {
+					parked,
+					interrupted: res.interrupted === true,
+					childRunning: svc.streamState[id]?.isRunning !== undefined,
+					childStatus: svc.state.allThreads[id]?.resultStatus ?? null,
+				}
+			}, { threadId: parent.id, id: childId })
+
+			t.diagnostic(`stop during collect: ${JSON.stringify(out)}`)
+			assert.ok(out.parked, 'the collect never parked in the tool, so stopping it would prove nothing')
+			assert.equal(out.interrupted, true, 'stopping the parent\'s turn did not end the collect wait')
+			assert.equal(out.childRunning, true, 'stopping the wait also stopped the child')
+			assert.equal(out.childStatus, null, 'the child recorded an outcome even though its run never ended')
+
+			// The work continued, so its report is still there for a later collect.
+			assert.ok(await waitFor(() => answerRequestFor(s.page, CHILD_MARKER)), 'the child\'s request was never held')
+			assert.ok(await waitFor(async () => (await childrenState(s.page, parent.id))[0]?.resultStatus === 'done'), 'the child did not settle after the wait ended')
+			const later = await s.page.evaluate(async ({ threadId, id }) => {
+				const svc = globalThis.__voidChatThreadService
+				await svc._runToolCall(threadId, 'collect_subagent', 'call-stop-later', undefined, {
+					preapproved: false,
+					unvalidatedToolParams: { children: [id], timeout_seconds: 30 },
+				})
+				const row = svc.state.allThreads[threadId].messages.find(m => m.role === 'tool' && m.id === 'call-stop-later')
+				return row?.result?.results?.[0] ?? null
+			}, { threadId: parent.id, id: childId })
+			assert.equal(later?.status, 'done', `the report was lost with the wait: ${JSON.stringify(later)}`)
+			assert.ok(later.summary.includes('CHILD-REPORT'), 'the later collect returned the wrong report')
+		})
+	})
+
+	test('send_message refuses a child that is still running', async (t) => {
+		await h.withScenario('subagent/running-refusal', async (s) => {
+			const parent = await scenario(s.page)
+			await h.stubLLM(s.page, CHILD_REPORT, { usage: STUB_USAGE, hang: true })
+
+			const spawned = await spawnChild(s.page, { threadId: parent.id, alias: ALIAS, task: CHILD_MARKER, toolId: 'call-refuse-spawn' })
+			assert.ok(spawned.handle?.childThreadId, `the spawn returned no handle: ${JSON.stringify(spawned)}`)
+			const childId = spawned.handle.childThreadId
+			assert.ok(await waitFor(() => s.page.evaluate((id) => globalThis.__voidChatThreadService.streamState[id]?.isRunning !== undefined, childId)), 'the child never started')
+
+			const refused = await s.page.evaluate(async ({ threadId, id, message }) => {
+				const svc = globalThis.__voidChatThreadService
+				const before = svc.state.allThreads[id].messages.length
+				await svc._runToolCall(threadId, 'send_message', 'call-refuse', undefined, {
+					preapproved: false,
+					unvalidatedToolParams: { child_thread_id: id, message },
+				})
+				const row = svc.state.allThreads[threadId].messages.find(m => m.role === 'tool' && m.id === 'call-refuse')
+				return { type: row?.type, content: row?.content ?? '', before, after: svc.state.allThreads[id].messages.length }
+			}, { threadId: parent.id, id: childId, message: SECOND_TASK })
+
+			t.diagnostic(`refusal: ${JSON.stringify(refused)}`)
+			assert.equal(refused.type, 'tool_error', `the refusal was not reported as a tool error: ${JSON.stringify(refused)}`)
+			assert.match(refused.content, /still running/, `the refusal does not say why: ${refused.content}`)
+			assert.equal(refused.after, refused.before, 'the refused message was appended to the child anyway')
+		})
+	})
+
+	test('a child whose window closed mid-run reads interrupted after a restart', async (t) => {
+		// The one state the lifecycle has to name rather than discover: stored as
+		// running, and the process that ran it is gone. Nothing is retried, and the
+		// stored record is not rewritten — the read is the whole feature.
+		const dirs = h.createProfile('subagent/interrupted')
+		const first = await h.launchVoid(dirs)
+		let parentId, childId
+		try {
+			const parent = await scenario(first.page)
+			parentId = parent.id
+			await h.stubLLM(first.page, CHILD_REPORT, { usage: STUB_USAGE, hang: true })
+			const spawned = await spawnChild(first.page, { threadId: parent.id, alias: ALIAS, task: CHILD_MARKER, toolId: 'call-int-spawn' })
+			childId = spawned.handle?.childThreadId
+			assert.ok(childId, 'the fixture did not create a child')
+			assert.ok(await waitFor(() => first.page.evaluate((id) => globalThis.__voidChatThreadService.streamState[id]?.isRunning !== undefined, childId)), 'the child never started, so there is no mid-run state to lose')
+			// The linkage must be on disk before the window dies; the outcome is the part
+			// that does not get written. Closing the window is the case the design names —
+			// a hard kill is the same fact with less to go wrong on the way out.
+			await first.page.evaluate(() => globalThis.__voidChatThreadService._flushPendingThreadWrites())
+			await sleep(300)
+		} finally {
+			await first.close()
+		}
+
+		const raw = first.readThread(childId)
+		assert.ok(raw, 'the child thread has no storage key — nothing was persisted to be interrupted')
+		assert.equal(JSON.parse(raw).resultStatus, undefined, 'the dead session recorded an outcome, so there would be nothing to read as interrupted')
+
+		const second = await h.launchVoid(dirs)
+		try {
+			const out = await second.page.evaluate(async ({ pid, alias, id }) => {
+				const svc = globalThis.__voidChatThreadService
+				const collected = await svc.collectSubagents({ parentThreadId: pid, children: [alias], timeoutSeconds: 0 }).promise
+				const listed = svc.listChildThreads(pid)
+				return { collected, listed, storedStatus: svc.state.allThreads[id]?.resultStatus ?? null }
+			}, { pid: parentId, alias: ALIAS, id: childId })
+			t.diagnostic(`after restart: ${JSON.stringify(out)}`)
+			assert.equal(out.collected?.[0]?.status, 'interrupted', `a child whose window closed reads "${out.collected?.[0]?.status}" instead of interrupted`)
+			assert.equal(out.listed?.[0]?.resultStatus, 'interrupted', 'list_children disagrees with collect about the same child')
+			assert.equal(out.listed?.[0]?.running, false, 'a child with no run left is reported as running')
+			assert.equal(out.storedStatus, null, 'the read wrote an outcome into the stored thread')
+		} finally {
+			await second.close()
+		}
+		assert.equal(JSON.parse(second.readThread(childId)).resultStatus, undefined, 'reading the status persisted it')
 	})
 
 	test('a child thread and its linkage survive a restart', async (t) => {
