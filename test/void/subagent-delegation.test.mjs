@@ -3,9 +3,10 @@
  *  Licensed under the Source Code License, Version 1.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-// Delegation (M2b).
+// Delegation (M2b, asynchronous since M3).
 //
-// `run_subagent` hands a task to a child agent and returns a bounded report. The
+// `run_subagent` hands a task to a child agent and returns a handle;
+// `collect_subagent` is the join that reads the bounded report. The
 // child is not a new kind of object: it is a `ThreadType` naming the thread that
 // spawned it, run through the same `_runChatAgent` the parent uses. What is new is
 // the two-sided guarantee this file exists to pin:
