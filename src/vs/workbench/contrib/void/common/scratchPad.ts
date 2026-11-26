@@ -63,3 +63,17 @@ export const normalizeScratchPath = (raw: unknown): string => {
 /** The absolute URI of one scratch file inside a thread's scratchpad. */
 export const scratchEntryUri = (rootUri: URI, normalizedPath: string): URI =>
 	URI.joinPath(rootUri, ...normalizedPath.split('/'))
+
+/**
+ * Whether a URI is inside a scratchpad: anywhere under `.void/tmp`, for any thread.
+ *
+ * The edit service asks this so an ordinary `edit_file` or `rewrite_file` on a scratch
+ * path cannot become a reviewable change. The scratchpad exists so that agent writes
+ * there are *not* project changes, and a diff the user must accept would make them
+ * project changes in every way except the commit.
+ */
+export const isScratchUri = (uri: URI): boolean => {
+	const segments = uri.path.toLowerCase().split('/')
+	const root = segments.indexOf(SCRATCH_ROOT_SEGMENTS[0].toLowerCase())
+	return root >= 0 && segments[root + 1] === SCRATCH_ROOT_SEGMENTS[1]
+}
