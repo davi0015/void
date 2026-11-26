@@ -2549,10 +2549,59 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	const contentRef = useRef<HTMLDivElement | null>(null)
 	const spacerHeightRef = useRef(0)
 	const lastScrollTopRef = useRef(0)
+	// Last scrollTop the scroll handler itself saw. Separate from
+	// `lastScrollTopRef`, which the rAF uses for expand/trim direction and which
+	// the layout effect also writes.
+	const lastObservedScrollTopRef = useRef(0)
 	const isAtBottomRef = useRef(true)
 
 	const getContentHeight = useCallback(() => {
 		return contentRef.current?.offsetHeight ?? 0
+	}, [])
+
+	// The element under the reading position (a quarter into the viewport, clear
+	// of the sticky-header overlay) and where it sat on the last scroll, for
+	// scroll anchoring. The scroller sets `overflow-anchor: none`, so the browser
+	// will not correct layout changes — and the content observer used to skip
+	// compensation when not at the bottom because a total-height delta cannot say
+	// whether content grew above or below. The anchor can: growth above the
+	// reading position moves it, growth below leaves it still.
+	const anchorRef = useRef<{ el: Element, top: number, scrollTop: number } | null>(null)
+	const captureAnchor = useCallback((scrollEl: HTMLElement) => {
+		const contentEl = contentRef.current
+		if (!contentEl || scrollEl.clientHeight === 0 || !contentEl.isConnected) {
+			anchorRef.current = null
+			return
+		}
+		// An element inside a nested scroller (a code block, the reasoning box) can
+		// move without the transcript's layout changing at all — its own content
+		// scrolled. Anchor the scroller itself instead: its place in the transcript
+		// flow is stable, and it does move when content above it grows.
+		const innerScrollerOf = (node: Element | null): Element | null => {
+			let n = node
+			while (n && n !== contentEl) {
+				if (n instanceof HTMLElement) {
+					const style = getComputedStyle(n)
+					if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && n.scrollHeight > n.clientHeight + 1) return n
+				}
+				n = n.parentElement
+			}
+			return null
+		}
+		const rect = scrollEl.getBoundingClientRect()
+		const x = rect.left + Math.min(rect.width / 2, 120)
+		const y = Math.min(Math.max(rect.top + scrollEl.clientHeight * 0.25, rect.top + 96), rect.bottom - 10)
+		let el: Element | null = document.elementFromPoint(x, y)
+		if (!el || el === contentEl || !contentEl.contains(el)) el = null
+		else el = innerScrollerOf(el) ?? el
+		if (!el) {
+			// The probe point fell in the gap between messages (the container
+			// itself): anchor the first message instead.
+			for (const child of Array.from(contentEl.children)) {
+				if (child.getBoundingClientRect().bottom > y) { el = child; break }
+			}
+		}
+		anchorRef.current = el ? { el, top: el.getBoundingClientRect().top, scrollTop: scrollEl.scrollTop } : null
 	}, [])
 
 	const getAvgHeight = useCallback(() => {
@@ -2615,15 +2664,18 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				const delta = contentH - prevContentH
 				scrollEl.scrollTop += delta
 			}
-			lastScrollTopRef.current = scrollEl.scrollTop
 		} else {
 			// New message appended at the end — stay at bottom if we were there
 			if (isAtBottomRef.current) {
 				scrollToBottom(scrollContainerRef)
 			}
-			lastScrollTopRef.current = scrollEl.scrollTop
 		}
-	}, [mountStart, totalCount, isActive, scrollContainerRef, getContentHeight])
+		// Both refs track the position this effect just produced, so the next
+		// scroll event compares against it rather than a pre-compensation value.
+		lastScrollTopRef.current = scrollEl.scrollTop
+		lastObservedScrollTopRef.current = scrollEl.scrollTop
+		captureAnchor(scrollEl)
+	}, [mountStart, totalCount, isActive, scrollContainerRef, getContentHeight, captureAnchor])
 
 	// Fill check: runs AFTER paint as a useEffect so its setMountStart
 	// doesn't force a synchronous re-render. If content is too short,
@@ -2685,17 +2737,30 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				if (isAtBottomRef.current) {
 					scrollToBottom(scrollContainerRef)
 					lastScrollTopRef.current = scrollEl.scrollTop
+					lastObservedScrollTopRef.current = scrollEl.scrollTop
+				} else {
+					// Anchor the reading position instead of the content height. The
+					// layout effect above already compensates trim/expand (it runs
+					// before this observer, so delta is ~0 for those); what reaches
+					// here is content growing on its own — a LazyBlockCode placeholder
+					// swapping to Monaco, an image loading, a tool row finalizing.
+					// A total-height delta cannot say whether that growth was above or
+					// below the viewport, which is why this branch used to do nothing
+					// (and why compensating by delta pushed the viewport). The anchor
+					// answers it: growth above moves it, growth below does not.
+					const anchor = anchorRef.current
+					if (anchor && anchor.el.isConnected && contentEl.contains(anchor.el)
+						&& Math.abs(anchor.scrollTop - scrollEl.scrollTop) < 1) {
+						const shift = anchor.el.getBoundingClientRect().top - anchor.top
+						if (Math.abs(shift) >= 1) {
+							scrollEl.scrollTop += shift
+							lastScrollTopRef.current = scrollEl.scrollTop
+							lastObservedScrollTopRef.current = scrollEl.scrollTop
+						}
+					}
 				}
-				// When not at bottom, do NOT compensate scrollTop. The
-				// useLayoutEffect already handles virtualization (trim/expand)
-				// compensation — it runs before the RO in the React commit
-				// phase, so by the time the RO fires, spacerHeightRef is
-				// already updated and delta ≈ 0. The only time the RO sees
-				// a non-zero delta is for content changes the layout effect
-				// doesn't handle (tool result expansion, tokenization) —
-				// and compensating those pushes the viewport, causing the
-				// expansion header to jump out of view.
 			}
+			captureAnchor(scrollEl)
 		})
 		contentRo.observe(contentEl)
 
@@ -2714,12 +2779,15 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			// If was at bottom, snap back to bottom
 			if (isAtBottomRef.current) {
 				scrollToBottom(scrollContainerRef)
+				lastScrollTopRef.current = scrollEl.scrollTop
+				lastObservedScrollTopRef.current = scrollEl.scrollTop
 			}
+			captureAnchor(scrollEl)
 		})
 		scrollRo.observe(scrollEl)
 
 		return () => { contentRo.disconnect(); scrollRo.disconnect() }
-	}, [scrollContainerRef])
+	}, [scrollContainerRef, captureAnchor])
 
 	const expandUp = useCallback(() => {
 		const scrollEl = scrollContainerRef.current
@@ -2853,14 +2921,44 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		if (!el) return
 		let rafId = 0
 		lastScrollTopRef.current = el.scrollTop
+		lastObservedScrollTopRef.current = el.scrollTop
+
+		// A wheel up is the earliest evidence of intent to leave the bottom: it
+		// arrives before the browser moves scrollTop and before a stream tick's
+		// effect can run. Without it, a token arriving in the same frame as the
+		// first pixel of an upward scroll could still call scrollToBottom.
+		const isInsideInnerScroller = (target: EventTarget | null) => {
+			let node = target instanceof Element ? target : null
+			while (node && node !== el) {
+				const style = getComputedStyle(node)
+				if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight + 1) return true
+				node = node.parentElement
+			}
+			return false
+		}
+		const onWheel = (e: WheelEvent) => {
+			if (e.deltaY < 0 && el.scrollTop > 0 && !isInsideInnerScroller(e.target)) isAtBottomRef.current = false
+		}
+		el.addEventListener('wheel', onWheel, { passive: true })
 
 		const onScroll = () => {
 			const currScrollTopSync = el.scrollTop
 			const prevScrollTopSync = lastScrollTopRef.current
-			// Update isAtBottomRef synchronously — before the rAF — so
-			// that StreamingBubble's useLayoutEffect (which fires on every
-			// stream tick with no deps array) sees the correct value.
-			isAtBottomRef.current = el.scrollHeight - el.clientHeight - currScrollTopSync < 100
+			const prevObservedSync = lastObservedScrollTopRef.current
+			lastObservedScrollTopRef.current = currScrollTopSync
+
+			// Follow the bottom only while the reader is at it, and release the
+			// moment they move up. This used to be `distance < 100`, which made the
+			// first 100 px of an upward scroll a dead zone: a stream tick, a content
+			// resize, or a message mount then called scrollToBottom and yanked the
+			// reader back to the last message. The slack existed to absorb content
+			// growing while pinned, but growth shows up as a larger distance, not as
+			// a different position, so the pin does not need any.
+			const distance = el.scrollHeight - el.clientHeight - currScrollTopSync
+			if (distance < 4) isAtBottomRef.current = true
+			else if (currScrollTopSync < prevObservedSync) isAtBottomRef.current = false
+			captureAnchor(el)
+
 			cancelAnimationFrame(rafId)
 			rafId = requestAnimationFrame(() => {
 				const currScrollTop = el.scrollTop
@@ -2890,8 +2988,9 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		return () => {
 			cancelAnimationFrame(rafId)
 			el.removeEventListener('scroll', onScroll)
+			el.removeEventListener('wheel', onWheel)
 		}
-	}, [scrollContainerRef, expandUp, updateStickyQuestion, trimFromTop])
+	}, [scrollContainerRef, expandUp, updateStickyQuestion, trimFromTop, captureAnchor])
 
 	// Trim old messages from the top when streaming completes. The scroll
 	// handler skips trim when at the bottom (to avoid desyncing auto-scroll
@@ -3099,10 +3198,11 @@ const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOn
 	const chatThreadsService = accessor.get('IChatThreadService')
 	const commandService = accessor.get('ICommandService')
 
-	// Auto-scroll to bottom on every stream tick if the user is at the
-	// bottom. isAtBottomRef is updated synchronously in onScroll (before
-	// rAF), so stream ticks always see the correct value — the user can
-	// escape by scrolling >100px from the bottom without needing hysteresis.
+	// Auto-scroll to bottom on every stream tick while the reader is pinned to
+	// the bottom. The pin is released by the first upward movement (see
+	// onScroll), not by a distance threshold, so one wheel notch is enough to
+	// stop following — before this, the first 100 px of an upward scroll was
+	// reclaimed by the next token.
 	// useEffect (not useLayoutEffect) so the browser can paint new content before
 	// we force a layout reflow via scrollTop. The 1-frame delay is imperceptible at
 	// ~10Hz streaming and avoids blocking the main thread on every token.
@@ -3541,6 +3641,12 @@ export const SidebarChat = () => {
 		} finally {
 			isSubmittingRef.current = false
 		}
+
+		// Sending is a request to see the new message: follow the bottom even if the
+		// reader had scrolled up (the pin is otherwise only re-established by
+		// scrolling back down). The scroll event sets the pin; the message list's
+		// layout effect follows once the new row renders.
+		scrollToBottom(scrollContainerRef)
 
 		textAreaRef.current?.focus() // focus input after submit
 
