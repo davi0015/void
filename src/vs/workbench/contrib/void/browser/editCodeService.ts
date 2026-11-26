@@ -28,6 +28,7 @@ import { voidPrefixAndSuffix, ctrlKStream_userMessage, ctrlKStream_systemMessage
 import { IVoidCommandBarService } from './voidCommandBarService.js';
 import { IKeybindingService } from '../../../../platform/keybinding/common/keybinding.js';
 import { VOID_ACCEPT_DIFF_ACTION_ID, VOID_REJECT_DIFF_ACTION_ID } from './actionIDs.js';
+import { isScratchUri } from '../common/scratchPad.js';
 
 import { mountCtrlK } from './react/out/quick-edit-tsx/index.js'
 import { QuickEditPropsType } from './quickEditActions.js';
@@ -1356,7 +1357,12 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			onFinishEdit()
 
 			// auto accept
-			if (this._settingsService.state.globalSettings.autoAcceptLLMChanges) {
+			// Auto accept. A scratch file is accepted here whatever the setting says: the
+			// scratchpad exists so its writes are not project changes, and a diff waiting
+			// for the user would make them project changes in every way except the commit.
+			// Keeping it in every apply path is what stops an ordinary edit on a
+			// `.void/tmp` path from appearing for review.
+			if (this._settingsService.state.globalSettings.autoAcceptLLMChanges || isScratchUri(uri)) {
 				this.acceptOrRejectAllDiffAreas({ uri, removeCtrlKs: false, behavior: 'accept' })
 			}
 		}
@@ -1412,7 +1418,12 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			onFinishEdit()
 
 			// auto accept
-			if (this._settingsService.state.globalSettings.autoAcceptLLMChanges) {
+			// Auto accept. A scratch file is accepted here whatever the setting says: the
+			// scratchpad exists so its writes are not project changes, and a diff waiting
+			// for the user would make them project changes in every way except the commit.
+			// Keeping it in every apply path is what stops an ordinary edit on a
+			// `.void/tmp` path from appearing for review.
+			if (this._settingsService.state.globalSettings.autoAcceptLLMChanges || isScratchUri(uri)) {
 				this.acceptOrRejectAllDiffAreas({ uri, removeCtrlKs: false, behavior: 'accept' })
 			}
 		}
@@ -1647,7 +1658,12 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			onFinishEdit()
 
 			// auto accept
-			if (this._settingsService.state.globalSettings.autoAcceptLLMChanges) {
+			// Auto accept. A scratch file is accepted here whatever the setting says: the
+			// scratchpad exists so its writes are not project changes, and a diff waiting
+			// for the user would make them project changes in every way except the commit.
+			// Keeping it in every apply path is what stops an ordinary edit on a
+			// `.void/tmp` path from appearing for review.
+			if (this._settingsService.state.globalSettings.autoAcceptLLMChanges || isScratchUri(uri)) {
 				this.acceptOrRejectAllDiffAreas({ uri, removeCtrlKs: false, behavior: 'accept' })
 			}
 		}
@@ -1987,7 +2003,12 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			onFinishEdit()
 
 			// auto accept
-			if (this._settingsService.state.globalSettings.autoAcceptLLMChanges) {
+			// Auto accept. A scratch file is accepted here whatever the setting says: the
+			// scratchpad exists so its writes are not project changes, and a diff waiting
+			// for the user would make them project changes in every way except the commit.
+			// Keeping it in every apply path is what stops an ordinary edit on a
+			// `.void/tmp` path from appearing for review.
+			if (this._settingsService.state.globalSettings.autoAcceptLLMChanges || isScratchUri(uri)) {
 				this.acceptOrRejectAllDiffAreas({ uri, removeCtrlKs: false, behavior: 'accept' })
 			}
 		}

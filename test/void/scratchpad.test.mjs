@@ -39,7 +39,7 @@ async function callTool(page, name, params) {
 		// a tool that takes a URI must receive a resolved one. The scratch tools are
 		// given the raw params on purpose: their own guard is what must reject a
 		// traversal, not only the schema.
-		const validated = nameArg === 'rewrite_file'
+		const validated = (nameArg === 'rewrite_file' || nameArg === 'edit_file')
 			? svc._toolsService.validateParams[nameArg](paramsArg)
 			: paramsArg
 		const res = await svc._runToolCall(threadId, nameArg, idArg, undefined, {
@@ -112,6 +112,49 @@ describe('agent scratchpad', () => {
 			t.diagnostic(`delete_scratch traversal: ${protectedFile.rowType}`)
 			assert.equal(protectedFile.rowType, 'tool_error', 'delete_scratch must not reach a project file')
 			assert.ok(existsSync(join(s.dirs.workspacePath, 'control.txt')), 'the project file must still be there')
+		})
+	})
+
+	test('editing a scratch file leaves nothing to review', async (t) => {
+		// `write_scratch` writes directly, but the ordinary edit tools go through the diff
+		// service — so a scratch file edited with `edit_file` showed up as a change the
+		// user was asked to accept, which is the one thing the scratchpad exists to avoid.
+		await h.withScenario('scratchpad/edit', async (s) => {
+			const written = await callTool(s.page, 'write_scratch', { path: 'probe.mjs', content: 'const n = 1\n' })
+			assert.equal(written.rowType, 'success', `the scratch write failed: ${written.rowContent}`)
+			const scratchPath = join(s.dirs.workspacePath, '.void', 'tmp', written.threadId, 'probe.mjs')
+			const relative = `.void/tmp/${written.threadId}/probe.mjs`
+
+			const edited = await callTool(s.page, 'edit_file', {
+				uri: relative,
+				edits: JSON.stringify([{ original: 'const n = 1', updated: 'const n = 2' }]),
+			})
+			t.diagnostic(`edit_file on scratch: ${edited.rowType} ${edited.rowContent.slice(0, 120)}`)
+			assert.equal(edited.rowType, 'success', `editing a scratch file failed: ${edited.rowContent}`)
+			assert.equal(readFileSync(scratchPath, 'utf8'), 'const n = 2\n', 'the edit must still be applied to the file')
+			h.assertAbsent(
+				'an edited scratch file does not appear among the files awaiting review',
+				!edited.changedPaths.some(p => p.endsWith('probe.mjs')),
+				{ subject: true },
+			)
+
+			const rewritten = await callTool(s.page, 'rewrite_file', { uri: relative, new_content: 'const n = 3\n' })
+			t.diagnostic(`rewrite_file on scratch: ${rewritten.rowType}`)
+			assert.equal(rewritten.rowType, 'success', `rewriting a scratch file failed: ${rewritten.rowContent}`)
+			assert.equal(readFileSync(scratchPath, 'utf8'), 'const n = 3\n', 'the rewrite must still be applied to the file')
+			h.assertAbsent(
+				'a rewritten scratch file does not appear among the files awaiting review',
+				!rewritten.changedPaths.some(p => p.endsWith('probe.mjs')),
+				{ subject: true },
+			)
+
+			// Control: the same two tools on a project file still produce a review item.
+			// Without it, an edit path that quietly stopped tracking everything would pass.
+			const controlWrite = await callTool(s.page, 'rewrite_file', { uri: 'edited.txt', new_content: 'project\n' })
+			assert.equal(controlWrite.rowType, 'success', `the control write failed: ${controlWrite.rowContent}`)
+			const controlEdit = await callTool(s.page, 'edit_file', { uri: 'edited.txt', edits: JSON.stringify([{ original: 'project', updated: 'project two' }]) })
+			assert.equal(controlEdit.rowType, 'success', `the control edit failed: ${controlEdit.rowContent}`)
+			assert.ok(controlEdit.changedPaths.some(p => p.endsWith('edited.txt')), 'a project edit must still appear among the files awaiting review')
 		})
 	})
 })

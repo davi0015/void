@@ -6,7 +6,7 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { URI } from '../../../../../base/common/uri.js'
-import { normalizeScratchPath, scratchEntryUri, scratchRootUri } from '../scratchPad.js'
+import { isScratchUri, normalizeScratchPath, scratchEntryUri, scratchRootUri } from '../scratchPad.js'
 
 // The scratch path is the only caller-supplied input that decides where a
 // scratch write lands, so the interesting cases are the ones that try to leave
@@ -59,5 +59,26 @@ describe('scratchpad paths', () => {
 
 	test('non-string names are rejected', () => {
 		assert.throws(() => normalizeScratchPath(undefined), /expected a string/)
+	})
+
+	// The edit service asks this to keep a scratch write out of review. A false
+	// negative there is a diff the user is asked to accept for a throwaway file,
+	// and a false positive silently hides a real project change — so both sides
+	// are pinned, including the case the filesystem reports differently.
+	test('every path inside .void/tmp is scratch, and nothing else is', () => {
+		const entry = scratchEntryUri(scratchRootUri(root, 'thread-1'), 'nested/probe.mjs')
+		assert.equal(isScratchUri(entry), true, 'a file inside a thread scratchpad')
+		assert.equal(isScratchUri(scratchRootUri(root, 'thread-1')), true, 'the thread root itself')
+		assert.equal(isScratchUri(URI.joinPath(root, '.void', 'tmp')), true, 'the scratch root itself')
+		assert.equal(isScratchUri(URI.joinPath(root, '.void', 'tmp', 'other-thread', 'x.txt')), true, 'another thread: still not a project change')
+
+		assert.equal(isScratchUri(URI.joinPath(root, 'control.txt')), false, 'a project file');
+		assert.equal(isScratchUri(URI.joinPath(root, '.void', '.gitignore')), false, 'the ignore file is not scratch content')
+		assert.equal(isScratchUri(URI.joinPath(root, 'src', 'tmp', 'x.ts')), false, 'a folder that happens to be named tmp');
+		assert.equal(isScratchUri(URI.joinPath(root, 'tmp', 'x.ts')), false, '.void is what makes it scratch')
+
+		// Windows preserves the case the tool was given, and the ignore file is
+		// written with a fixed case; the check must not depend on which one won.
+		assert.equal(isScratchUri(URI.file('c:/work/project/.VOID/TMP/thread-1/probe.mjs')), true)
 	})
 })
