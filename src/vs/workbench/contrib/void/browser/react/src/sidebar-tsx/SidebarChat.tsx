@@ -3329,7 +3329,11 @@ export const SidebarChat = () => {
 
 	// Manual compaction state
 	const [showCompactDialog, setShowCompactDialog] = useState(false)
-	const [isCompacting, setIsCompacting] = useState(false)
+	// Which thread is compacting, not "is compaction running": the pane is reused across
+	// tab switches, so a boolean carried the "Compacting..." label into whatever
+	// conversation the user opened next, complete with a disabled Compact button.
+	const [compactingThreadId, setCompactingThreadId] = useState<string | null>(null)
+	const isCompacting = compactingThreadId === currentThread.id
 	const [compactError, setCompactError] = useState<string | null>(null)
 	// What it kept once it finished — the numbers the dialog previewed, now real.
 	const [compactResult, setCompactResult] = useState<null | {
@@ -3342,7 +3346,7 @@ export const SidebarChat = () => {
 		setCompactError(null)
 		setCompactResult(null)
 		setCompactNotice(null)
-		setIsCompacting(true)
+		setCompactingThreadId(currentThread.id)
 		try {
 			const outcome = await chatThreadsService.compactCurrentThread({ compactPercent: percent, protectTurns })
 			if (outcome.status === 'failed') {
@@ -3366,9 +3370,11 @@ export const SidebarChat = () => {
 				}
 			}
 		} finally {
-			setIsCompacting(false)
+			// Only clear if this thread is still the one compacting: a later compaction in
+			// another tab must not be cancelled out by an earlier one finishing.
+			setCompactingThreadId(prev => prev === currentThread.id ? null : prev)
 		}
-	}, [chatThreadsService])
+	}, [chatThreadsService, currentThread.id])
 
 	// The completion line is information, not a log: clear it on its own so the
 	// composer row returns to normal without the user dismissing anything.
@@ -3377,6 +3383,16 @@ export const SidebarChat = () => {
 		const timer = setTimeout(() => { setCompactResult(null); setCompactNotice(null) }, 12000)
 		return () => clearTimeout(timer)
 	}, [compactResult, compactNotice])
+
+	// Everything above belongs to the thread the user asked in. This pane is reused across
+	// tab switches, so local state would otherwise carry a half-open dialog, a failure
+	// message, or "kept N messages" into a conversation it has nothing to do with.
+	useEffect(() => {
+		setShowCompactDialog(false)
+		setCompactError(null)
+		setCompactResult(null)
+		setCompactNotice(null)
+	}, [currentThread.id])
 
 	const sidebarRef = useRef<HTMLDivElement>(null)
 
